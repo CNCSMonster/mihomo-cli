@@ -119,26 +119,6 @@ bash build.sh    # One-shot build for all 6 targets
 - **Polished CLI**: clap-powered auto-completion, fuzzy command suggestions, `--help` docs
 - **Truly cross-platform**: macOS LaunchDaemon + Linux systemd, unified command interface
 
-## Comparison
-
-| | mihomo-cli | [mihomosh](https://github.com/SamuNatsu/mihomosh) | [clashtui](https://github.com/JohanChane/clashtui) | [clashctl](https://github.com/George-Miao/clashctl) | [clash-cli](https://github.com/ip2a/clash-cli) | [mihoro](https://github.com/spencerwooo/mihoro) |
-|---|---|---|---|---|---|---|
-| **Language** | Rust | Rust | Rust | Rust | Python + Shell | Rust |
-| **Interface** | CLI | CLI | **TUI** | TUI + CLI | CLI | CLI |
-| **Install** | ✅ One-shot | ❌ Manual mihomo | ❌ Manual mihomo | ❌ Manual | ✅ Install script | ✅ Linux systemd |
-| **vmess convert** | ✅ Auto | ❌ | ❌ (proxy-provider) | ❌ | ❌ | ❌ Error |
-| **Node select** | ✅ fzf fuzzy | ✅ List | ❌ Web panel | ✅ TUI panel | ❌ None | ❌ None |
-| **TUN toggle** | ✅ CLI | ❌ | ❌ Template | ❌ | ✅ CLI | ❌ |
-| **Exit IP** | ✅ Built-in | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **Connection mgmt** | ✅ View/close | ✅ View/close | ❌ | ✅ TUI | ❌ | ❌ |
-| **Latency test** | ✅ Built-in | ✅ | ❌ | ✅ TUI | ❌ | ❌ |
-| **macOS** | ✅ LaunchDaemon | ✅ | ❌ | ✅ | ❌ Linux only | ❌ Linux only |
-| **Linux** | ✅ systemd | ✅ | ✅ systemd | ✅ | ✅ systemd | ✅ systemd |
-| **Windows** | ✅ sc.exe | ❌ | ✅ nssm | ✅ | ❌ | ❌ |
-| **Shell completions** | ✅ bash/zsh/fish | ✅ | ❌ | ✅ | ❌ | ❌ |
-| **Fuzzy cmd hint** | ✅ clap | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **Zero deps** | ✅ Single binary | ✅ Single binary | ✅ Single binary | ✅ Single binary | ❌ pip + shell | ❌ cargo |
-
 ## Build
 
 ```bash

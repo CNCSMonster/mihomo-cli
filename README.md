@@ -119,26 +119,6 @@ bash build.sh    # 一键构建全部 6 个平台
 - **完善 CLI 体验**：clap 提供自动补全、模糊命令提示、`--help` 文档
 - **真正的跨平台**：macOS LaunchDaemon + Linux systemd，统一命令接口
 
-## 与同类工具对比
-
-| | mihomo-cli | [mihomosh](https://github.com/SamuNatsu/mihomosh) | [clashtui](https://github.com/JohanChane/clashtui) | [clashctl](https://github.com/George-Miao/clashctl) | [clash-cli](https://github.com/ip2a/clash-cli) | [mihoro](https://github.com/spencerwooo/mihoro) |
-|---|---|---|---|---|---|---|
-| **语言** | Rust | Rust | Rust | Rust | Python + Shell | Rust |
-| **形态** | CLI | CLI | **TUI** | TUI + CLI | CLI | CLI |
-| **安装部署** | ✅ 一键安装 | ❌ 需手动装 mihomo | ❌ 需手动装 mihomo | ❌ 需手动装 | ✅ 有安装脚本 | ✅ Linux systemd |
-| **vmess 转换** | ✅ 自动转换 | ❌ | ❌ (proxy-provider) | ❌ | ❌ | ❌ 报错 |
-| **节点选择** | ✅ fzf 模糊搜索 | ✅ 列表选择 | ❌ 依赖 Web 面板 | ✅ TUI 面板 | ❌ 无 | ❌ 无 |
-| **TUN 开关** | ✅ cli 切换 | ❌ | ❌ 依赖模板 | ❌ | ✅ cli 切换 | ❌ |
-| **出口 IP 查询** | ✅ 内置 | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **连接管理** | ✅ 查看/关闭 | ✅ 查看/关闭 | ❌ | ✅ TUI | ❌ | ❌ |
-| **延迟测试** | ✅ 内置 | ✅ | ❌ | ✅ TUI | ❌ | ❌ |
-| **macOS** | ✅ LaunchDaemon | ✅ | ❌ | ✅ | ❌ 仅 Linux | ❌ 仅 Linux |
-| **Linux** | ✅ systemd | ✅ | ✅ systemd | ✅ | ✅ systemd | ✅ systemd |
-| **Windows** | ✅ sc.exe | ❌ | ✅ nssm | ✅ | ❌ | ❌ |
-| **Shell 补全** | ✅ bash/zsh/fish | ✅ | ❌ | ✅ | ❌ | ❌ |
-| **模糊命令提示** | ✅ clap | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **零依赖** | ✅ 单二进制 | ✅ 单二进制 | ✅ 单二进制 | ✅ 单二进制 | ❌ pip + shell | ❌ cargo |
-
 ## 构建
 
 ```bash
