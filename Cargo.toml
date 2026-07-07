@@ -1,0 +1,32 @@
+[package]
+name = "mihomo-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Mihomo CLI — cross-platform setup & control tool for Mihomo proxy"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+base64 = "0.22"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+dialoguer = { version = "0.11", features = ["fuzzy-select"] }
+indicatif = "0.17"
+flate2 = "1"
+tar = "0.4"
+zip = "2"
+which = "7"
+dirs = "6"
+shellexpand = "3"
+futures = "0.3"
+tempfile = "3"
+regex = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
