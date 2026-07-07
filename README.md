@@ -47,7 +47,7 @@ mihomo-cli tun off     # 关闭 TUN
 
 | 命令 | 说明 |
 |------|------|
-| `mihomo-cli install` | 全流程安装：下载 mihomo 核心 → 配置订阅 → 安装开机自启 |
+| `mihomo-cli install` | 下载核心 + 生成配置 + 安装开机自启（交互式） |
 | `mihomo-cli config` | 配置订阅链接（支持 vmess://、base64、Clash YAML） |
 | `mihomo-cli uninstall` | 卸载服务（可选保留配置） |
 | `mihomo-cli update` | 更新 mihomo 核心 |
