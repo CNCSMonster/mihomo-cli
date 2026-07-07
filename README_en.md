@@ -11,6 +11,24 @@
 
 mihomo-cli is a Rust CLI tool for Mihomo (Clash.Meta). It combines **installation** and **daily control** into a single binary, with fzf-style interactive proxy selection, TUN mode toggle, vmess subscription auto-conversion, and more. Works on macOS, Linux, and Windows.
 
+## Install
+
+Build from source via GitHub:
+
+```bash
+cargo install --git https://github.com/CNCSMonster/mihomo-cli
+```
+
+Clone and build locally:
+
+```bash
+git clone https://github.com/CNCSMonster/mihomo-cli
+cd mihomo-cli
+cargo install --path .
+```
+
+[Releases](https://github.com/CNCSMonster/mihomo-cli/releases) provide pre-built binaries (Linux / macOS / Windows). Download, extract, and put in PATH.
+
 ## Quick Start
 
 ```bash

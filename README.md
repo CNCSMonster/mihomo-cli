@@ -11,6 +11,24 @@
 
 mihomo-cli 是一个用 Rust 编写的 Mihomo（Clash.Meta）命令行工具。它将 **安装部署** 和 **日常控制** 合二为一，提供 `fzf` 式交互节点选择、TUN 模式开关、vmess 订阅自动转换等功能，macOS 和 Linux 通用。
 
+## 安装
+
+从 GitHub 源码编译：
+
+```bash
+cargo install --git https://github.com/CNCSMonster/mihomo-cli
+```
+
+本地克隆后编译：
+
+```bash
+git clone https://github.com/CNCSMonster/mihomo-cli
+cd mihomo-cli
+cargo install --path .
+```
+
+[Release 页面](https://github.com/CNCSMonster/mihomo-cli/releases) 提供预编译二进制（Linux / macOS / Windows），下载解压放入 PATH 即可。
+
 ## 快速开始
 
 ```bash
