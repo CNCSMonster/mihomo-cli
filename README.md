@@ -20,7 +20,7 @@ mihomo-cli install
 mihomo-cli start
 
 # 3. 添加订阅源（支持 vmess://、base64、Clash YAML，自动格式转换）
-mihomo-cli config -u 'https://your-subscription-url'
+mihomo-cli config -u '<your-subscription-url>'
 
 # 4. fzf 模糊搜索选择节点
 mihomo-cli select
