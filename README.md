@@ -13,24 +13,32 @@ mihomo-cli 是一个用 Rust 编写的 Mihomo（Clash.Meta）命令行工具。�
 ## 快速开始
 
 ```bash
-# 下载对应平台的二进制，放到 PATH 中
-chmod +x mihomo-cli
-
-# 一键安装
+# 1. 安装 mihomo 核心 + 系统服务（自动下载，无需手动装依赖）
 mihomo-cli install
 
-# fzf 交互式选择节点
+# 2. 启动服务（默认 TUN 关闭，不影响当前网络）
+mihomo-cli start
+
+# 3. 添加订阅源（支持 vmess://、base64、Clash YAML，自动格式转换）
+mihomo-cli config -u 'https://your-subscription-url'
+
+# 4. fzf 模糊搜索选择节点
 mihomo-cli select
 
-# 查看出口 IP
-mihomo-cli ip
-
-# 开关 TUN
+# 5. 开启 TUN 透明代理
 mihomo-cli tun on
-mihomo-cli tun off
 
-# 查看状态
-mihomo-cli status
+# ✅ 完成 — 所有流量自动通过代理
+```
+
+**其他常用操作：**
+
+```bash
+mihomo-cli ip          # 查看当前出口 IP 和归属地
+mihomo-cli status      # 运行状态概览
+mihomo-cli proxy on    # 设置当前终端的 http_proxy 环境变量（用 eval）
+mihomo-cli restart     # 重启服务
+mihomo-cli tun off     # 关闭 TUN
 ```
 
 ## 命令列表
@@ -41,12 +49,20 @@ mihomo-cli status
 |------|------|
 | `mihomo-cli install` | 全流程安装：下载 mihomo 核心 → 配置订阅 → 安装开机自启 |
 | `mihomo-cli config` | 配置订阅链接（支持 vmess://、base64、Clash YAML） |
-| `mihomo-cli service` | 安装开机自启服务（macOS LaunchDaemon / Linux systemd） |
 | `mihomo-cli uninstall` | 卸载服务（可选保留配置） |
 | `mihomo-cli update` | 更新 mihomo 核心 |
 | `mihomo-cli version` | 版本信息 |
 
-### 日常控制
+### 服务与连接
+
+| 命令 | 说明 |
+|------|------|
+| `mihomo-cli start [--user]` | 启动 mihomo 服务 |
+| `mihomo-cli stop [--user]` | 停止 mihomo 服务 |
+| `mihomo-cli restart [--user]` | 重启 mihomo 服务 |
+| `mihomo-cli status` | 运行状态概览（含出口 IP） |
+
+### 日常使用
 
 | 命令 | 说明 |
 |------|------|
@@ -55,10 +71,11 @@ mihomo-cli status
 | `mihomo-cli delay` | 测试组内节点延迟 |
 | `mihomo-cli tun on/off` | 启用/关闭 TUN 虚拟网卡 |
 | `mihomo-cli ip` | 查看当前出口 IP 归属地 |
-| `mihomo-cli conn` | 查看活跃连接 |
-| `mihomo-cli flush` | 关闭所有连接 |
-| `mihomo-cli status` | 运行状态概览 |
+| `mihomo-cli proxy on/off` | 输出 shell 代理环境变量（`eval "$(mihomo-cli proxy on)"`） |
+| `mihomo-cli conn` | 查看活跃连接（`--flush` 关闭全部） |
 | `mihomo-cli completions` | 生成 shell 自动补全（bash/zsh/fish） |
+
+> 💡 **所有命令均支持 `-h` / `--help` 查看详细用法**，例如 `mihomo-cli install -h`、`mihomo-cli config -h`。
 
 ## 平台支持
 
