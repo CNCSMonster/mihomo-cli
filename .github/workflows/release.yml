@@ -1,0 +1,132 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-gnu
+            os: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@cargo-zigbuild
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Build
+        run: cargo zigbuild --target ${{ matrix.target }} --release
+
+      - name: Package (Unix)
+        if: runner.os != 'windows-latest' && matrix.target != 'x86_64-pc-windows-gnu'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../mihomo-cli-${{ matrix.target }}.tar.gz mihomo-cli
+          cd ../../..
+
+      - name: Package (Windows)
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a ../../../mihomo-cli-${{ matrix.target }}.zip mihomo-cli.exe
+          cd ../../..
+
+      - name: Generate checksum
+        run: |
+          if [ "${{ matrix.target }}" = "x86_64-pc-windows-gnu" ]; then
+            sha256sum mihomo-cli-${{ matrix.target }}.zip > mihomo-cli-${{ matrix.target }}.zip.sha256
+          else
+            sha256sum mihomo-cli-${{ matrix.target }}.tar.gz > mihomo-cli-${{ matrix.target }}.tar.gz.sha256
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mihomo-cli-${{ matrix.target }}
+          path: |
+            mihomo-cli-${{ matrix.target }}.tar.gz
+            mihomo-cli-${{ matrix.target }}.tar.gz.sha256
+            mihomo-cli-${{ matrix.target }}.zip
+            mihomo-cli-${{ matrix.target }}.zip.sha256
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum *.tar.gz *.zip > checksums.txt
+          cat checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body: |
+            ## Assets
+
+            | Platform | File |
+            |----------|------|
+            | Linux x64 (glibc) | `mihomo-cli-x86_64-unknown-linux-gnu.tar.gz` |
+            | Linux x64 (musl) | `mihomo-cli-x86_64-unknown-linux-musl.tar.gz` |
+            | Linux arm64 (musl) | `mihomo-cli-aarch64-unknown-linux-musl.tar.gz` |
+            | macOS x64 | `mihomo-cli-x86_64-apple-darwin.tar.gz` |
+            | macOS arm64 | `mihomo-cli-aarch64-apple-darwin.tar.gz` |
+            | Windows x64 | `mihomo-cli-x86_64-pc-windows-gnu.zip` |
+
+            ## Install
+
+            Download the binary for your platform from **Assets** below, then:
+
+            ```bash
+            chmod +x mihomo-cli
+            sudo mv mihomo-cli /usr/local/bin/
+            mihomo-cli install
+            ```
+
+            ## Checksums
+
+            See `checksums.txt` in Assets for SHA256 verification.

@@ -2,7 +2,12 @@
 name = "mihomo-cli"
 version = "0.1.0"
 edition = "2021"
-description = "Mihomo CLI — cross-platform setup & control tool for Mihomo proxy"
+description = "Cross-platform setup & control CLI for Mihomo (Clash.Meta) proxy"
+repository = "https://github.com/CNCSMonster/mihomo-cli"
+license = "MIT"
+readme = "README.md"
+keywords = ["mihomo", "clash", "proxy", "cli", "tun"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
