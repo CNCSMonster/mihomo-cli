@@ -5,6 +5,7 @@
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)]()
+[English](README_en.md)
 
 ---
 
@@ -49,7 +50,7 @@ mihomo-cli tun off     # 关闭 TUN
 |------|------|
 | `mihomo-cli install` | 下载核心 + 生成配置 + 安装开机自启（交互式） |
 | `mihomo-cli config` | 配置订阅链接（支持 vmess://、base64、Clash YAML） |
-| `mihomo-cli uninstall` | 卸载服务（可选保留配置） |
+| `mihomo-cli uninstall` | 卸载服务（可选保留全部文件） |
 | `mihomo-cli update` | 更新 mihomo 核心 |
 | `mihomo-cli version` | 版本信息 |
 
