@@ -110,7 +110,7 @@ Cross-compilation via `cargo-zigbuild`, no Docker needed:
 bash build.sh    # One-shot build for all 6 targets
 ```
 
-## Features
+## Design Principles
 
 - **All-in-one**: Single binary for installation, configuration, and daily control
 - **Auto subscription conversion**: Detects and converts vmess:// / base64 / Clash YAML automatically
