@@ -39,10 +39,20 @@ jobs:
 
       - name: Install zig
         run: |
-          curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz -o zig.tar.xz
+          case "$(uname -s)" in
+            Linux)  ZIG_OS="linux" ;;
+            Darwin) ZIG_OS="macos" ;;
+          esac
+          case "$(uname -m)" in
+            x86_64)  ZIG_ARCH="x86_64" ;;
+            aarch64|arm64) ZIG_ARCH="aarch64" ;;
+          esac
+          ZIG_URL="https://ziglang.org/download/0.13.0/zig-${ZIG_OS}-${ZIG_ARCH}-0.13.0.tar.xz"
+          echo "Downloading: $ZIG_URL"
+          curl -fsSL "$ZIG_URL" -o zig.tar.xz
           tar xf zig.tar.xz
-          echo "$PWD/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
-          "$PWD/zig-linux-x86_64-0.13.0/zig" version
+          echo "$PWD/zig-${ZIG_OS}-${ZIG_ARCH}-0.13.0" >> "$GITHUB_PATH"
+          "$PWD/zig-${ZIG_OS}-${ZIG_ARCH}-0.13.0/zig" version
 
       - name: Install cargo-zigbuild
         run: cargo install cargo-zigbuild
