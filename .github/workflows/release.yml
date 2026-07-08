@@ -39,9 +39,10 @@ jobs:
 
       - name: Install zig
         run: |
-          wget -q https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz
-          tar xf zig-linux-x86_64-0.13.0.tar.xz
+          curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz -o zig.tar.xz
+          tar xf zig.tar.xz
           echo "$PWD/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+          "$PWD/zig-linux-x86_64-0.13.0/zig" version
 
       - name: Install cargo-zigbuild
         run: cargo install cargo-zigbuild
