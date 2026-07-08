@@ -38,7 +38,10 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install zig
-        uses: mlugg/setup-zig@v1
+        run: |
+          wget -q https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz
+          tar xf zig-linux-x86_64-0.13.0.tar.xz
+          echo "$PWD/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
 
       - name: Install cargo-zigbuild
         run: cargo install cargo-zigbuild
