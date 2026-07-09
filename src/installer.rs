@@ -5,15 +5,40 @@ use std::time::Duration;
 
 pub async fn download_mihomo() -> anyhow::Result<()> {
     let (os_name, arch_name, bin_name) = if cfg!(target_os = "windows") {
-        ("windows", match std::env::consts::ARCH { "x86_64" => "amd64", "aarch64" => "arm64", o => o }, "mihomo.exe")
+        (
+            "windows",
+            match std::env::consts::ARCH {
+                "x86_64" => "amd64",
+                "aarch64" => "arm64",
+                o => o,
+            },
+            "mihomo.exe",
+        )
     } else if cfg!(target_os = "macos") {
-        ("darwin", match std::env::consts::ARCH { "x86_64" => "amd64", "aarch64" => "arm64", o => o }, "mihomo")
+        (
+            "darwin",
+            match std::env::consts::ARCH {
+                "x86_64" => "amd64",
+                "aarch64" => "arm64",
+                o => o,
+            },
+            "mihomo",
+        )
     } else {
-        ("linux", match std::env::consts::ARCH { "x86_64" => "amd64", "aarch64" => "arm64", o => o }, "mihomo")
+        (
+            "linux",
+            match std::env::consts::ARCH {
+                "x86_64" => "amd64",
+                "aarch64" => "arm64",
+                o => o,
+            },
+            "mihomo",
+        )
     };
 
     let bin_path = if cfg!(target_os = "windows") {
-        let local = dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("C:\\ProgramData"));
+        let local =
+            dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("C:\\ProgramData"));
         format!("{}\\mihomo\\{}", local.display(), bin_name)
     } else {
         let home = dirs::home_dir().unwrap_or_default();
@@ -26,7 +51,11 @@ pub async fn download_mihomo() -> anyhow::Result<()> {
     }
 
     let version = "v1.19.27";
-    let ext = if cfg!(target_os = "windows") { "zip" } else { "gz" };
+    let ext = if cfg!(target_os = "windows") {
+        "zip"
+    } else {
+        "gz"
+    };
     let url = format!(
         "https://github.com/MetaCubeX/mihomo/releases/download/{version}/mihomo-{os_name}-{arch_name}-{version}.{ext}"
     );
@@ -89,7 +118,12 @@ async fn download_with_retry(url: &str, part_path: &str) -> anyhow::Result<Vec<u
     for attempt in 0..max_retries {
         if attempt > 0 {
             let delay = Duration::from_secs(1 << (attempt - 1)); // 1s, 2s, 4s
-            eprintln!("  Retrying in {}s... (attempt {}/{})", delay.as_secs(), attempt + 1, max_retries);
+            eprintln!(
+                "  Retrying in {}s... (attempt {}/{})",
+                delay.as_secs(),
+                attempt + 1,
+                max_retries
+            );
             tokio::time::sleep(delay).await;
         }
 
@@ -102,7 +136,11 @@ async fn download_with_retry(url: &str, part_path: &str) -> anyhow::Result<Vec<u
         }
     }
 
-    anyhow::bail!("Download failed after {} attempts: {}", max_retries, last_error)
+    anyhow::bail!(
+        "Download failed after {} attempts: {}",
+        max_retries,
+        last_error
+    )
 }
 
 async fn download_once(
@@ -130,7 +168,11 @@ async fn download_once(
         // Server doesn't support resume or range already satisfied — start fresh
         crate::log!("Range not satisfiable, starting fresh");
         let _ = std::fs::remove_file(part_path);
-        let resp = client.get(url).header("User-Agent", "mihomo-cli").send().await?;
+        let resp = client
+            .get(url)
+            .header("User-Agent", "mihomo-cli")
+            .send()
+            .await?;
         if !resp.status().is_success() {
             anyhow::bail!("HTTP {}", resp.status());
         }
@@ -156,8 +198,10 @@ async fn download_body(
             .template("{spinner:.green} {bytes}/{total_bytes} [{elapsed_precise}] {bar:30.cyan/blue} {bytes_per_sec}")?
             .progress_chars("=>-"));
     } else {
-        pb.set_style(ProgressStyle::default_bar()
-            .template("{spinner:.green} {bytes} [{elapsed_precise}] {bytes_per_sec}")?);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} {bytes} [{elapsed_precise}] {bytes_per_sec}")?,
+        );
     }
 
     let mut file = std::fs::OpenOptions::new()
@@ -165,8 +209,8 @@ async fn download_body(
         .append(true)
         .open(part_path)?;
 
-    use std::io::Write;
     use futures::StreamExt;
+    use std::io::Write;
 
     let mut stream = resp.bytes_stream();
     let mut total_bytes = offset;
@@ -220,10 +264,7 @@ pub async fn ensure_geo_files() -> bool {
     let mut ok = true;
     let gh_token = gh_token();
 
-    for (name, primary_url) in [
-        ("geoip.metadb", GEOIP_URL),
-        ("GeoSite.dat", GEOSITE_URL),
-    ] {
+    for (name, primary_url) in [("geoip.metadb", GEOIP_URL), ("GeoSite.dat", GEOSITE_URL)] {
         let dest = format!("{dir}/{name}");
         let mut urls: Vec<String> = vec![primary_url.to_string()];
         urls.extend(build_mirrors(primary_url));
@@ -245,7 +286,9 @@ fn gh_token() -> Option<String> {
         .output()
         .ok()?;
     if output.status.success() {
-        String::from_utf8(output.stdout).ok().map(|s| s.trim().to_string())
+        String::from_utf8(output.stdout)
+            .ok()
+            .map(|s| s.trim().to_string())
     } else {
         None
     }
@@ -260,25 +303,49 @@ async fn download_geo_with_fallback(
     // If final file already exists, check it's a valid binary (not an HTML error page)
     if let Ok(meta) = std::fs::metadata(dest) {
         if meta.len() > 1_000_000 && is_valid_geo_file(dest) {
-            let name = std::path::Path::new(dest).file_name().unwrap_or_default().to_string_lossy();
+            let name = std::path::Path::new(dest)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
             println!("  {} already exists ({} bytes), skip", name, meta.len());
             crate::log!("  {dest} already exists ({} bytes), skip", meta.len());
             return true;
         }
         if meta.len() > 1_000_000 {
             crate::log!("  {dest} exists but appears corrupt, re-downloading");
-            eprintln!("  {} exists but first byte is invalid, re-downloading", 
-                std::path::Path::new(dest).file_name().unwrap_or_default().to_string_lossy());
+            eprintln!(
+                "  {} exists but first byte is invalid, re-downloading",
+                std::path::Path::new(dest)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            );
         } else if meta.len() > 0 {
-            eprintln!("  {} is too small ({} bytes), re-downloading",
-                std::path::Path::new(dest).file_name().unwrap_or_default().to_string_lossy(), meta.len());
+            eprintln!(
+                "  {} is too small ({} bytes), re-downloading",
+                std::path::Path::new(dest)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy(),
+                meta.len()
+            );
         } else {
-            eprintln!("  {} is empty, re-downloading",
-                std::path::Path::new(dest).file_name().unwrap_or_default().to_string_lossy());
+            eprintln!(
+                "  {} is empty, re-downloading",
+                std::path::Path::new(dest)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            );
         }
     } else {
-        eprintln!("  {} not found, downloading",
-            std::path::Path::new(dest).file_name().unwrap_or_default().to_string_lossy());
+        eprintln!(
+            "  {} not found, downloading",
+            std::path::Path::new(dest)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
     }
 
     let tmp = format!("{dest}.tmp");
@@ -300,7 +367,15 @@ async fn download_geo_with_fallback(
             format!("  Trying {} {}", short, url)
         };
 
-        let resumed = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+        // When switching to a different mirror, discard the partial tmp file
+        // from the previous URL — different servers may serve different content
+        // at the same byte offset, corrupting the concatenated file.
+        let resumed = if i == 0 {
+            std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0)
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+            0
+        };
         if resumed > 0 {
             println!("  {label} (resuming from {resumed} bytes)");
         } else {
@@ -458,7 +533,9 @@ fn is_valid_geo_file(path: &str) -> bool {
     if f.read_exact(&mut buf).is_err() {
         return false;
     }
-    // Binary MMDB files start with non-ASCII bytes (>=0x80 or control chars).
-    // HTML starts with '<', JSON with '{' — both are ASCII printable.
-    !matches!(buf[0], b'<' | b'{' | b' ' | b'\t' | b'\r' | b'\n')
+    // Only reject HTML/JSON error pages.
+    // - '<' = HTML error page, '{' = JSON error page
+    // Note: GeoSite.dat is protobuf, first byte is 0x0A ('\n') — valid.
+    // Note: geoip.metadb (MMDB) starts with 0xAB — valid.
+    !matches!(buf[0], b'<' | b'{')
 }

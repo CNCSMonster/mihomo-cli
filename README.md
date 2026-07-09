@@ -53,7 +53,7 @@ mihomo-cli tun on
 **其他常用操作：**
 
 ```bash
-mihomo-cli ip          # 查看当前出口 IP 和归属地
+mihomo-cli ip          # 探测出口 IP（直连 vs 代理，诊断 TUN 状态）
 mihomo-cli status      # 运行状态概览
 mihomo-cli proxy on    # 设置当前终端的 http_proxy 环境变量（用 eval）
 mihomo-cli restart     # 重启服务
@@ -89,12 +89,103 @@ mihomo-cli tun off     # 关闭 TUN
 | `mihomo-cli list` | 列出所有代理组及当前节点 |
 | `mihomo-cli delay` | 测试组内节点延迟 |
 | `mihomo-cli tun on/off` | 启用/关闭 TUN 虚拟网卡 |
-| `mihomo-cli ip` | 查看当前出口 IP 归属地 |
+| `mihomo-cli ip` | 探测出口 IP（直连显示 ISP 真实 IP，代理显示节点出口 IP，支持 `--url` 测试特定 URL 路由，自动标记 LAN 地址） |
 | `mihomo-cli proxy on/off` | 输出 shell 代理环境变量（`eval "$(mihomo-cli proxy on)"`） |
 | `mihomo-cli conn` | 查看活跃连接（`--flush` 关闭全部） |
+| `mihomo-cli rule` | 管理自定义路由规则（添加/删除/导入/导出） |
 | `mihomo-cli completions` | 生成 shell 自动补全（bash/zsh/fish） |
 
 > 💡 **所有命令均支持 `-h` / `--help` 查看详细用法**，例如 `mihomo-cli install -h`、`mihomo-cli config -h`。
+
+### `mihomo-cli ip` 详解
+
+探测两条网络路径的出口 IP，诊断 TUN 状态：
+
+```bash
+$ mihomo-cli ip
+
+=== Exit IP Probe ===
+
+  TUN mode:      disabled
+
+  Direct:        120.231.212.245 (China) via api.ip.sb
+  Mihomo proxy:  2406:da12:f1d:9000:7f25:e2fc:49a7:a01e (South Korea) via api.ip.sb
+
+  ✓ Normal: direct shows ISP, proxy shows node exit
+```
+
+**LAN 地址检测：**
+
+局域网地址（10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7, fe80::/10）会标记 `[LAN]`：
+
+```
+  Direct:        192.168.1.100 [LAN] via api.ip.sb
+  ⚠ Direct route exits via LAN address (192.168.1.100)
+```
+
+**测试特定 URL 路由：**
+
+```bash
+$ mihomo-cli ip --url https://github.com
+
+=== Exit IP Probe ===
+
+  TUN mode:      disabled
+
+  Direct:        120.231.212.245 (China) via api.ip.sb (after target)
+  Mihomo proxy:  43.203.158.60 (South Korea) via api.ip.sb (after target)
+
+  ✓ Normal: direct shows ISP, proxy shows node exit
+```
+
+这会先请求目标 URL，再检查出口 IP，用于验证 mihomo 规则配置是否正确。
+
+
+### `mihomo-cli rule` 详解
+
+管理用户自定义路由规则，规则会在 mihomo 启动/重载时自动合并到配置中。
+
+**基本用法：**
+
+```bash
+# 添加规则（让特定域名走直连）
+mihomo-cli rule add DOMAIN-SUFFIX,company.com,DIRECT
+mihomo-cli rule add IP-CIDR,192.168.0.0/16,DIRECT
+
+# 添加规则（指定代理组）
+mihomo-cli rule add "DOMAIN-SUFFIX,google.com,节点选择"
+
+# 列出所有规则
+mihomo-cli rule list
+
+# 删除规则（按索引）
+mihomo-cli rule remove 2
+
+# 清空所有规则
+mihomo-cli rule clear --yes
+
+# 导入/导出规则文件
+mihomo-cli rule import ./my-rules.yaml
+mihomo-cli rule export ./backup.yaml
+
+# 设置默认插入位置（front=优先，back=兜底）
+mihomo-cli rule position front
+mihomo-cli rule position back
+```
+
+**工作原理：**
+
+1. 规则存储在 `~/.config/mihomo/rules.yaml`（YAML 格式，与 mihomo 配置兼容）
+2. 插入位置配置在 `~/.config/mihomo/.rules-position`（默认 `front`）
+3. 每次启动/重载时，从 `config.original.yaml`（原始订阅配置）读取并合并用户规则到 `config.yaml`
+4. 规则变更后自动调用 mihomo API 热重载
+
+**插入位置说明：**
+
+- `front`（默认）：用户规则优先级最高，覆盖订阅配置中的规则
+- `back`：用户规则作为兜底，订阅配置优先
+
+> 💡 **典型场景**：让公司内网、本地服务走直连，而不影响订阅配置中的其他规则。
 
 ## 平台支持
 
@@ -109,6 +200,10 @@ mihomo-cli tun off     # 关闭 TUN
 ```bash
 bash build.sh    # 一键构建全部 6 个平台
 ```
+
+## 术语说明
+
+- **ISP** (Internet Service Provider)：互联网服务提供商，指你的宽带或移动网络运营商。`mihomo-cli ip` 命令中"Direct"路径显示的是 ISP 分配给你的真实公网 IP。
 
 ## 核心设计理念
 
@@ -143,6 +238,7 @@ src/
 ├── config.rs        订阅下载 + vmess → Clash YAML 转换
 ├── installer.rs     Mihomo 核心二进制下载
 ├── service.rs       macOS LaunchDaemon / Linux systemd
+├── rules.rs         用户自定义路由规则管理
 ├── ui.rs            交互式 fuzzy-select
 └── utils.rs         工具函数
 ```

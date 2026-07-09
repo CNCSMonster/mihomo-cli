@@ -1,4 +1,4 @@
-use crate::utils;
+use crate::utils::{self, AppPaths};
 use base64::Engine;
 
 /// Try downloading with UA negotiation first, then without as fallback
@@ -13,15 +13,24 @@ pub async fn download_sub_smart(url: &str) -> anyhow::Result<(String, bool)> {
     if resp.status().is_success() {
         let content = resp.text().await?;
         if is_clash_yaml(&content) {
-            crate::log!("UA negotiation succeeded: got Clash YAML ({} lines)", content.lines().count());
+            crate::log!(
+                "UA negotiation succeeded: got Clash YAML ({} lines)",
+                content.lines().count()
+            );
             return Ok((content, true));
         }
-        crate::log!("UA negotiation returned non-YAML format ({} bytes), will convert", content.len());
+        crate::log!(
+            "UA negotiation returned non-YAML format ({} bytes), will convert",
+            content.len()
+        );
         let is_kind = is_clash_yaml(&content);
         return Ok((content, is_kind));
     }
     // Attempt 2: without UA
-    crate::log!("UA negotiation failed (HTTP {}), retrying without UA", resp.status());
+    crate::log!(
+        "UA negotiation failed (HTTP {}), retrying without UA",
+        resp.status()
+    );
     let resp = client.get(url).send().await?;
     let content = resp.text().await?;
     let is_ok = is_clash_yaml(&content);
@@ -53,7 +62,10 @@ pub fn convert_vmess_to_clash(content: &str) -> anyhow::Result<String> {
         anyhow::bail!("No proxies found in subscription");
     }
 
-    let names: Vec<String> = proxies.iter().filter_map(|p| p["name"].as_str().map(String::from)).collect();
+    let names: Vec<String> = proxies
+        .iter()
+        .filter_map(|p| p["name"].as_str().map(String::from))
+        .collect();
     // let names_json = serde_json::to_string(&names)?;
 
     let controller_line = if cfg!(target_os = "windows") {
@@ -126,7 +138,11 @@ fn parse_lines(content: &str) -> Vec<String> {
     // Check if it starts with protocol prefixes
     for prefix in &["vmess://", "ss://", "trojan://"] {
         if raw.starts_with(prefix) || raw.lines().any(|l| l.starts_with(prefix)) {
-            return raw.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+            return raw
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
         }
     }
     // Try base64 decode
@@ -134,17 +150,26 @@ fn parse_lines(content: &str) -> Vec<String> {
         let b64 = format!("{raw}{pad}");
         if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&b64) {
             if let Ok(decoded_str) = String::from_utf8(decoded) {
-                return decoded_str.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+                return decoded_str
+                    .lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect();
             }
         }
     }
-    raw.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
+    raw.lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
 }
 
 fn parse_vmess(line: &str) -> Option<serde_yaml::Value> {
     let b64 = line.strip_prefix("vmess://")?;
     let b64_padded = format!("{}{}", b64, "=".repeat((4 - b64.len() % 4) % 4));
-    let json = base64::engine::general_purpose::STANDARD.decode(&b64_padded).ok()?;
+    let json = base64::engine::general_purpose::STANDARD
+        .decode(&b64_padded)
+        .ok()?;
     let d: serde_json::Value = serde_json::from_slice(&json).ok()?;
 
     let name = d["ps"].as_str().unwrap_or("vmess");
@@ -158,7 +183,10 @@ fn parse_vmess(line: &str) -> Option<serde_yaml::Value> {
     let mut proxy = serde_yaml::Mapping::new();
     macro_rules! insert {
         ($m:expr, $k:expr, $v:expr) => {
-            $m.insert(serde_yaml::Value::String($k.to_string()), serde_yaml::Value::String($v.to_string()));
+            $m.insert(
+                serde_yaml::Value::String($k.to_string()),
+                serde_yaml::Value::String($v.to_string()),
+            );
         };
     }
 
@@ -171,7 +199,10 @@ fn parse_vmess(line: &str) -> Option<serde_yaml::Value> {
     insert!(proxy, "cipher", "auto");
 
     if tls == "tls" {
-        proxy.insert(serde_yaml::Value::String("tls".into()), serde_yaml::Value::Bool(true));
+        proxy.insert(
+            serde_yaml::Value::String("tls".into()),
+            serde_yaml::Value::Bool(true),
+        );
     }
 
     if net == "ws" || net == "h2" {
@@ -186,7 +217,10 @@ fn parse_vmess(line: &str) -> Option<serde_yaml::Value> {
             if !host.is_empty() {
                 let mut headers = serde_yaml::Mapping::new();
                 insert!(headers, "Host", host);
-                opts.insert(serde_yaml::Value::String("headers".into()), serde_yaml::Value::Mapping(headers));
+                opts.insert(
+                    serde_yaml::Value::String("headers".into()),
+                    serde_yaml::Value::Mapping(headers),
+                );
             }
         }
         if !opts.is_empty() {
@@ -223,12 +257,19 @@ fn parse_trojan(line: &str) -> Option<serde_yaml::Value> {
     let (host, port_str) = host_port.rsplit_once(':')?;
     let port: u64 = port_str.parse().ok()?;
 
-    let _query = if qm < after_at.len() { &after_at[qm + 1..] } else { "" };
+    let _query = if qm < after_at.len() {
+        &after_at[qm + 1..]
+    } else {
+        ""
+    };
 
     let mut proxy = serde_yaml::Mapping::new();
     macro_rules! insert {
         ($m:expr, $k:expr, $v:expr) => {
-            $m.insert(serde_yaml::Value::String($k.to_string()), serde_yaml::Value::String($v.to_string()));
+            $m.insert(
+                serde_yaml::Value::String($k.to_string()),
+                serde_yaml::Value::String($v.to_string()),
+            );
         };
     }
 
@@ -249,7 +290,8 @@ pub fn save_config(content: &str) -> anyhow::Result<()> {
     // Ensure the config has external-controller setup
     let content = ensure_controller(content);
 
-    std::fs::write(&path, &content)?;
+    // Atomic write: write to .tmp then rename
+    utils::atomic_write_file(&path, &content)?;
     println!("Config saved to {path}");
     Ok(())
 }
@@ -299,7 +341,10 @@ pub(crate) fn ensure_controller(yaml: &str) -> String {
         // Insert after the first line that is not mode/mixed-port/ipv6
         let mut inserted = false;
         for (i, line) in lines.clone().iter().enumerate() {
-            if line.starts_with("mode:") || line.starts_with("mixed-port:") || line.starts_with("ipv6:") {
+            if line.starts_with("mode:")
+                || line.starts_with("mixed-port:")
+                || line.starts_with("ipv6:")
+            {
                 continue;
             }
             lines.insert(i, controller.to_string());
@@ -320,7 +365,379 @@ pub fn check_config_exists() -> bool {
 
 fn indent(s: &str, spaces: usize) -> String {
     let prefix = " ".repeat(spaces);
-    s.lines().map(|l| if l.is_empty() { String::new() } else { format!("{prefix}{l}") })
-        .collect::<Vec<_>>().join("\n")
+    s.lines()
+        .map(|l| {
+            if l.is_empty() {
+                String::new()
+            } else {
+                format!("{prefix}{l}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
+/// Merge user-defined rules and DNS policies into config.yaml.
+///
+/// Uses a marker-based approach:
+/// - User rules are delimited by `# === USER RULES START ===` / `# === USER RULES END ===`
+/// - On merge, reads config.yaml, finds/replaces the user rules section
+/// - If no markers exist, inserts them at the configured position (front/back)
+/// - Writes config.yaml atomically (write .tmp then rename)
+/// - No config.original.yaml needed — config.yaml is the single source of truth
+pub fn merge_user_config_at(paths: &AppPaths) -> anyhow::Result<()> {
+    use crate::rules::{self, RulePosition};
+
+    let config_path = paths.config_path();
+
+    // Load user rules and DNS policies
+    let user_rules = if paths.rules_path().exists() {
+        rules::load_rules_at(paths).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let dns_policies = if paths.dns_policy_path().exists() {
+        crate::dns::load_policies_at(paths).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // Read current config.yaml
+    let config_content = std::fs::read_to_string(&config_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read config.yaml: {}", e))?;
+
+    let mut result = config_content.clone();
+
+    // ── Merge rules using markers ──
+    // Always process rules section to handle both adding and removing rules
+    {
+        let position = rules::get_position_at(paths).unwrap_or(RulePosition::Front);
+        result = merge_rules_marker_based(&result, &user_rules, position);
+        if user_rules.is_empty() {
+            crate::log!("No user rules, removing markers from config");
+        } else {
+            crate::log!(
+                "Merged {} user rules (position: {:?})",
+                user_rules.len(),
+                position
+            );
+        }
+    }
+
+    // ── Merge DNS policies into nameserver-policy ──
+    if !dns_policies.is_empty() {
+        // Use the existing line-based approach for DNS policies
+        result = merge_dns_policies(&result, &dns_policies);
+        crate::log!("Merged {} DNS policies", dns_policies.len());
+    }
+
+    // Only write if content changed
+    if result != config_content {
+        // Atomic write
+        utils::atomic_write_file(&config_path.display().to_string(), &result)?;
+    }
+
+    Ok(())
+}
+
+pub fn merge_user_config() -> anyhow::Result<()> {
+    merge_user_config_at(&AppPaths::from_system())
+}
+
+const USER_RULES_START: &str = "# === USER RULES START ===";
+const USER_RULES_END: &str = "# === USER RULES END ===";
+
+/// Merge user rules into config content using marker-based approach.
+/// If markers exist, replaces the section between them.
+/// If not, inserts markers + rules at the configured position.
+fn merge_rules_marker_based(
+    config: &str,
+    user_rules: &[String],
+    position: crate::rules::RulePosition,
+) -> String {
+    use crate::rules::RulePosition;
+
+    // Check if markers already exist
+    if let Some(start_idx) = config.find(USER_RULES_START) {
+        if let Some(end_idx) = config.find(USER_RULES_END) {
+            if end_idx > start_idx {
+                let end_of_end_marker = end_idx + USER_RULES_END.len();
+                // If no user rules, remove the entire marker block (including trailing newline)
+                if user_rules.is_empty() {
+                    let mut result = String::new();
+                    result.push_str(&config[..start_idx]);
+                    // Skip trailing newline after END marker if present
+                    let rest = &config[end_of_end_marker..];
+                    let rest = rest.strip_prefix('\n').unwrap_or(rest);
+                    result.push_str(rest);
+                    return result;
+                }
+                // Otherwise replace existing user rules section
+                let rules_block = build_rules_block(user_rules);
+                let mut result = String::new();
+                result.push_str(&config[..start_idx]);
+                result.push_str(&rules_block);
+                result.push_str(&config[end_of_end_marker..]);
+                return result;
+            }
+        }
+    }
+
+    // No markers — if no user rules, nothing to insert
+    if user_rules.is_empty() {
+        return config.to_string();
+    }
+
+    let rules_block = build_rules_block(user_rules);
+
+    // No markers — need to insert them
+    // Find the rules: section in the YAML
+    if let Some(rules_key_pos) = find_rules_key_position(config) {
+        match position {
+            RulePosition::Front => {
+                // Insert user rules right after "rules:" line
+                let insert_pos = rules_key_pos;
+                let mut result = String::new();
+                result.push_str(&config[..insert_pos]);
+                result.push_str(&rules_block);
+                result.push('\n');
+                result.push_str(&config[insert_pos..]);
+                return result;
+            }
+            RulePosition::Back => {
+                // Find the end of the rules section (next top-level key or EOF)
+                let rules_end = find_rules_section_end(config, rules_key_pos);
+                let mut result = String::new();
+                result.push_str(&config[..rules_end]);
+                result.push('\n');
+                result.push_str(&rules_block);
+                result.push_str(&config[rules_end..]);
+                return result;
+            }
+        }
+    }
+
+    // Fallback: no rules section found, append at end
+    let mut result = config.to_string();
+    result.push_str("\n\nrules:\n");
+    result.push_str(&rules_block);
+    result
+}
+
+/// Build the rules block with markers
+fn build_rules_block(user_rules: &[String]) -> String {
+    let mut block = String::new();
+    block.push_str(USER_RULES_START);
+    block.push('\n');
+    for rule in user_rules {
+        block.push_str(&format!("  - {}\n", rule));
+    }
+    block.push_str(USER_RULES_END);
+    block.push('\n');
+    block
+}
+
+/// Find the position right after "rules:" key line
+fn find_rules_key_position(config: &str) -> Option<usize> {
+    for (i, line) in config.lines().enumerate() {
+        if line.starts_with("rules:") {
+            // Return position right after this line
+            let mut pos = 0;
+            for (j, l) in config.lines().enumerate() {
+                if j == i {
+                    pos += l.len() + 1; // +1 for newline
+                    return Some(pos);
+                }
+                pos += l.len() + 1;
+            }
+        }
+    }
+    None
+}
+
+/// Find the end of the rules section (next top-level key or EOF)
+fn find_rules_section_end(config: &str, rules_key_pos: usize) -> usize {
+    let after_rules = &config[rules_key_pos..];
+    for (i, line) in after_rules.lines().enumerate() {
+        // A top-level key (no leading whitespace) that isn't empty
+        if !line.is_empty()
+            && !line.starts_with(' ')
+            && !line.starts_with('#')
+            && !line.starts_with('-')
+        {
+            // Calculate absolute position
+            let mut pos = rules_key_pos;
+            for (j, l) in after_rules.lines().enumerate() {
+                if j == i {
+                    return pos;
+                }
+                pos += l.len() + 1;
+            }
+        }
+    }
+    // EOF
+    config.len()
+}
+
+/// Merge DNS policies into config content (line-based approach)
+fn merge_dns_policies(config: &str, policies: &[crate::dns::DnsPolicy]) -> String {
+    let mut content = config.to_string();
+
+    // Build the nameserver-policy YAML block
+    let mut block = String::from("  nameserver-policy:\n");
+    for p in policies {
+        let ips: Vec<&str> = p.target.split(',').map(|s| s.trim()).collect();
+        if ips.len() == 1 {
+            block.push_str(&format!("    {}: {}\n", p.match_pattern, ips[0]));
+        } else {
+            block.push_str(&format!("    {}:\n", p.match_pattern));
+            for ip in &ips {
+                block.push_str(&format!("      - {}\n", ip));
+            }
+        }
+    }
+
+    // Remove existing nameserver-policy block if present
+    let lines: Vec<&str> = content.lines().collect();
+    let mut new_lines: Vec<String> = Vec::new();
+    let mut skip = false;
+    for line in &lines {
+        if line.starts_with("  nameserver-policy:") {
+            skip = true;
+            continue;
+        }
+        if skip {
+            if line.is_empty() || (line.starts_with("  ") && !line.starts_with("    ")) {
+                skip = false;
+            } else {
+                continue;
+            }
+        }
+        new_lines.push(line.to_string());
+    }
+    content = new_lines.join("\n");
+    content = content.trim_end().to_string();
+    content.push('\n');
+
+    // Insert after "enhanced-mode:" line in the dns section
+    if let Some(pos) = content.find("\n  enhanced-mode:") {
+        let insert_pos = content[pos..]
+            .find('\n')
+            .map(|p| pos + p + 1)
+            .unwrap_or(pos + 1);
+        content.insert_str(insert_pos, &block);
+    } else if let Some(pos) = content.find("\ndns:") {
+        let insert_pos = content[pos..]
+            .find('\n')
+            .map(|p| pos + p + 1)
+            .unwrap_or(pos + 1);
+        content.insert_str(insert_pos, &block);
+    }
+
+    content
+}
+
+/// Legacy wrapper: merge rules only (backward compat).
+pub fn merge_rules_to_config() -> anyhow::Result<()> {
+    merge_user_config()
+}
+
+/// Update nameserver-policy in config.yaml based on DNS policies.
+/// This is a convenience wrapper that calls merge_user_config.
+pub fn update_nameserver_policy_at(
+    paths: &AppPaths,
+    _policies: &[crate::dns::DnsPolicy],
+) -> anyhow::Result<()> {
+    merge_user_config_at(paths)
+}
+
+pub fn update_nameserver_policy(_policies: &[crate::dns::DnsPolicy]) -> anyhow::Result<()> {
+    update_nameserver_policy_at(&AppPaths::from_system(), _policies)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rules::{self, RulePosition};
+    use tempfile::TempDir;
+
+    fn setup_config(content: &str) -> (TempDir, AppPaths) {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(paths.config_path(), content).unwrap();
+        (tmp, paths)
+    }
+
+    #[test]
+    fn test_merge_user_rules_front_is_valid_yaml() {
+        let (_tmp, paths) = setup_config(
+            "mixed-port: 7890\nrules:\n  - DOMAIN-SUFFIX,google.com,Proxy\n  - DOMAIN-SUFFIX,github.com,DIRECT\ndns:\n  enable: true\n  enhanced-mode: fake-ip\n",
+        );
+        rules::save_rules_at(
+            &paths,
+            &[
+                "DOMAIN-SUFFIX,company.com,DIRECT".to_string(),
+                "IP-CIDR,10.0.0.0/8,DIRECT".to_string(),
+            ],
+        )
+        .unwrap();
+
+        merge_user_config_at(&paths).unwrap();
+
+        let text = std::fs::read_to_string(paths.config_path()).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+        let rule_values = parsed["rules"].as_sequence().unwrap();
+        let rules: Vec<&str> = rule_values.iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(
+            rules,
+            vec![
+                "DOMAIN-SUFFIX,company.com,DIRECT",
+                "IP-CIDR,10.0.0.0/8,DIRECT",
+                "DOMAIN-SUFFIX,google.com,Proxy",
+                "DOMAIN-SUFFIX,github.com,DIRECT",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_merge_user_rules_back_before_next_top_level_key() {
+        let (_tmp, paths) = setup_config(
+            "mixed-port: 7890\nrules:\n  - DOMAIN-SUFFIX,google.com,Proxy\n  - DOMAIN-SUFFIX,github.com,DIRECT\ndns:\n  enable: true\n  enhanced-mode: fake-ip\n",
+        );
+        rules::set_position_at(&paths, RulePosition::Back).unwrap();
+        rules::save_rules_at(&paths, &["DOMAIN-SUFFIX,back.com,DIRECT".to_string()]).unwrap();
+
+        merge_user_config_at(&paths).unwrap();
+
+        let text = std::fs::read_to_string(paths.config_path()).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+        let rule_values = parsed["rules"].as_sequence().unwrap();
+        let rules: Vec<&str> = rule_values.iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(
+            rules,
+            vec![
+                "DOMAIN-SUFFIX,google.com,Proxy",
+                "DOMAIN-SUFFIX,github.com,DIRECT",
+                "DOMAIN-SUFFIX,back.com,DIRECT",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_merge_empty_rules_removes_marker_block() {
+        let (_tmp, paths) = setup_config(
+            "mixed-port: 7890\nrules:\n# === USER RULES START ===\n  - DOMAIN-SUFFIX,old.com,DIRECT\n# === USER RULES END ===\n  - DOMAIN-SUFFIX,google.com,Proxy\n",
+        );
+        rules::clear_rules_at(&paths).unwrap();
+
+        merge_user_config_at(&paths).unwrap();
+
+        let text = std::fs::read_to_string(paths.config_path()).unwrap();
+        assert!(!text.contains("USER RULES START"), "{text}");
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+        let rule_values = parsed["rules"].as_sequence().unwrap();
+        let rules: Vec<&str> = rule_values.iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(rules, vec!["DOMAIN-SUFFIX,google.com,Proxy"]);
+    }
+}

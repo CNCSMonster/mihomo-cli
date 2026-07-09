@@ -16,6 +16,7 @@
 │  config.rs     Subscription download + format convert │
 │  installer.rs  Mihomo core binary download           │
 │  service.rs    Service management + sudo dispatch     │
+│  rules.rs      User-defined routing rule management   │
 │  ui.rs         Interactive fuzzy-select (dialoguer)   │
 │  utils.rs      File paths, service mode markers       │
 ├─────────────────────────────────────────────────────┤
@@ -108,7 +109,142 @@ Design decisions:
 | `mihomo-cli proxy on/off` | Output shell export/unset commands for http_proxy/https_proxy | None (via socket, uses `eval`) |
 | `mihomo-cli tun on/off` | Enable/disable TUN virtual NIC | None (via socket) |
 | `mihomo-cli conn` | View active connections | None (via socket) |
+| `mihomo-cli ip` | Probe exit IP via Direct + Mihomo proxy, diagnose TUN status | None (via socket for TUN state) |
+| `mihomo-cli rule` | Manage user-defined routing rules (add/list/remove/clear/import/export/position) | None |
+| `mihomo-cli dns` | Manage DNS routing policies (policy add/list/remove, status) | None |
 | `mihomo-cli completions` | Generate shell completions | None |
+
+#### `mihomo-cli ip` — Exit IP Diagnostic
+
+Displays current environment state and probes three network paths:
+
+```
+=== Exit IP Report ===
+
+  TUN:           disabled
+  http_proxy:    not set
+  https_proxy:   not set
+
+  ISP               103.29.142.145  Hong Kong
+  Now               103.29.142.145  Hong Kong
+  Via Mihomo       54.116.44.255  South Korea
+```
+
+**Three probe lines:**
+
+| Line | Meaning | How probed |
+|------|---------|-----------|
+| `ISP` | Pure ISP exit (no proxy, no TUN) | Direct probe when TUN off; cached from last TUN-off run when TUN on |
+| `Now` | Current system route exit | `reqwest` without proxy — shows ISP when TUN off, proxy node when TUN on |
+| `Via Mihomo` | Exit through mihomo proxy | `reqwest` via `http://127.0.0.1:{mixed-port}` |
+
+**ISP cache:** When TUN is off, `probe_all_ips` writes the ISP result to `~/.config/mihomo/.isp_cache`. When TUN is on, reads from cache and labels `ISP (cached)`. No cache available → shows `(unreachable)`.
+
+`--url` option:
+
+`mihomo-cli ip --url <URL>` first makes a request to the target URL through each path, then checks the exit IP. This tests how mihomo's routing rules handle specific domains:
+
+```
+$ mihomo-cli ip --url https://github.com
+
+=== Exit IP Report ===
+
+  TUN:           disabled
+  http_proxy:    not set
+  https_proxy:   not set
+
+  ISP               120.231.212.245  China
+  Now               120.231.212.245  China
+  Via Mihomo       1.2.3.4  United States
+```
+
+**Behavior:**
+
+1. Read TUN state from mihomo API (`GET /configs`)
+2. Read `http_proxy` / `https_proxy` environment variables
+3. Probe ISP: direct when TUN off (with cache), cached when TUN on
+4. Probe Now (system route): no proxy client
+5. Probe Via Mihomo: via mihomo mixed-port
+6. Diagnose with contextual messages (e.g. TUN enabled, proxy unreachable, LAN leak)
+
+**Use cases:**
+- Verify TUN is working (both paths show proxy IP)
+- Check if shell is using proxy correctly
+- Diagnose routing issues after config changes
+
+
+#### `mihomo-cli rule` — User-Defined Routing Rules
+
+Manage custom routing rules that are merged into the mihomo config at startup/reload. Rules are stored in a separate `rules.yaml` file and merged into `config.yaml` based on configurable insertion position.
+
+**Subcommands:**
+
+| Command | Description |
+|---------|-------------|
+| `mihomo-cli rule add <RULE>` | Add a rule (e.g. `DOMAIN-SUFFIX,example.com,DIRECT`) |
+| `mihomo-cli rule add --position front\|back <RULE>` | Add with explicit position override |
+| `mihomo-cli rule list` (alias: `ls`) | List all user-defined rules (1-based index) |
+| `mihomo-cli rule remove <INDEX>` (alias: `rm`) | Remove rule by 1-based index |
+| `mihomo-cli rule clear [--yes]` | Clear all rules (requires confirmation, `--yes` skips) |
+| `mihomo-cli rule import <PATH>` | Import rules from a YAML file (replaces existing) |
+| `mihomo-cli rule export <PATH>` | Export current rules to a YAML file |
+| `mihomo-cli rule position [front\|back]` | Set or show default insertion position |
+
+**How it works:**
+
+1. User rules are stored in `~/.config/mihomo/rules.yaml` (YAML format, mihomo-compatible)
+2. Insertion position is stored in `~/.config/mihomo/.rules-position` (default: `front`)
+3. On every `start`/`restart`/`reload`, `merge_rules_to_config()` reads from `config.original.yaml` (the unmodified subscription config) and merges user rules into `config.yaml`
+4. After each rule mutation, `PUT /configs` is called to hot-reload mihomo
+
+**Merge strategy:**
+
+- `config.original.yaml` is the clean source (saved by `install`/`config refresh`)
+- `config.yaml` is the merged output (original + user rules)
+- This prevents rule duplication on repeated merges
+
+**Example:**
+
+```bash
+# Make company intranet go direct
+mihomo-cli rule add DOMAIN-SUFFIX,company.com,DIRECT
+
+# Make a specific domain use a proxy group
+mihomo-cli rule add "DOMAIN-SUFFIX,google.com,节点选择"
+
+# IP range direct
+mihomo-cli rule add IP-CIDR,10.0.0.0/8,DIRECT
+
+# Check merged result
+mihomo-cli rule list
+```
+
+
+
+**Design Decisions:**
+
+1. **Why `config.original.yaml`?**
+   - Initial implementation merged rules into `config.yaml` directly
+   - This caused rule duplication on repeated merges (each restart/reload would append user rules again)
+   - Solution: Keep `config.original.yaml` as the clean merge source, always merge from original + user rules → `config.yaml`
+   - `save_config()` now saves both files; `install` and `config refresh` create the initial `config.original.yaml`
+
+2. **Merge Strategy**
+   - `merge_rules_to_config()` is called in: `start_mihomo()`, `reload_configs()`, and after each rule mutation
+   - Reads from `config.original.yaml` (if exists) or falls back to `config.yaml`
+   - Merges user rules based on position config (front/back)
+   - Writes result to `config.yaml`
+   - Calls `PUT /configs` API for hot-reload
+
+3. **Hot-Reload**
+   - After each rule mutation (add/remove/clear/import), automatically calls mihomo API to reload
+   - If API is unavailable, prints hint to run `mihomo-cli restart` manually
+   - This ensures rules take effect immediately without manual intervention
+
+4. **Non-Interactive Support**
+   - `rule clear` normally requires confirmation via interactive prompt
+   - Added `--yes` flag to skip confirmation for scripting/automation
+   - Uses `interact_opt()` instead of `interact()` for safer TTY handling
 
 ### 2.4 Proxy Environment Variables
 
@@ -124,6 +260,46 @@ Design:
   - No hardcoded port — follows config changes automatically
   - Subprocess cannot modify parent shell env → eval pattern required
 ```
+
+#### `mihomo-cli dns` — DNS Policy Management
+
+Manage `nameserver-policy` entries that tell mihomo which DNS server to use for specific domains. Essential for internal company domains that can't be resolved by public DNS.
+
+**Subcommands:**
+
+| Command | Description |
+|---------|-------------|
+| `mihomo-cli dns policy add <MATCH> <TARGET>` | Add a DNS policy |
+| `mihomo-cli dns policy list` (alias: `ls`) | List all DNS policies (1-based) |
+| `mihomo-cli dns policy remove <INDEX\|MATCH>` (alias: `rm`) | Remove a policy |
+| `mihomo-cli dns status` | Show current DNS configuration |
+
+MATCH is a domain suffix (e.g. `ubtrobot.com`). TARGET is a DNS server IP address, or comma-separated list of IPs (e.g. `10.10.1.251,10.10.1.120`).
+
+**Example:**
+
+```bash
+# Route company domain DNS queries to internal DNS servers
+$ mihomo-cli dns policy add ubtrobot.com 10.10.1.251,10.10.1.120
+  ✓ Policy added: ubtrobot.com → 10.10.1.251,10.10.1.120
+  ✓ Config reloaded — DNS policy is now active
+
+$ mihomo-cli dns policy list
+  DNS policies:
+  1. ubtrobot.com → system
+
+$ mihomo-cli dns status
+  DNS: enabled (fake-ip)
+  Default nameservers: 114.114.114.114, 223.5.5.5, 119.29.29.29
+  Fake-IP range: 28.0.0.1/8
+  Listen: 127.0.0.1:1053
+  Policies:
+    1. ubtrobot.com → system
+```
+
+**Storage:** Policies stored in `~/.config/mihomo/dns-policy.yaml`, merged into `config.yaml` via `merge_user_config()`.
+
+**Hot-Reload:** Uses mihomo API PATCH to apply immediately; also merged into config file for persistence across restarts.
 
 ### 2.5 Select UX (Flat Selector)
 
@@ -266,7 +442,10 @@ The socket file can be deleted independently of the mihomo process:
 └── mihomo-cli          # CLI tool
 
 ~/.config/mihomo/
-├── config.yaml          # Clash YAML configuration
+├── config.yaml          # Clash YAML configuration (merged with user rules)
+├── config.original.yaml # Clean subscription config (merge source, avoids duplication)
+├── rules.yaml           # User-defined routing rules
+├── .rules-position      # Rule insertion position: "front" (default) or "back"
 ├── start.sh             # Shell wrapper (macOS LaunchDaemon uses this)
 ├── mihomo.log           # Runtime log (if not using journalctl)
 ├── cache.db             # Proxy provider cache
@@ -378,6 +557,7 @@ Commands never silently fail. `-v` flag enables debug logging for troubleshootin
 | LaunchDaemon | macOS service management mechanism |
 | dialoguer | Rust library for interactive terminal prompts |
 | Clash YAML | Configuration format used by mihomo/clash ecosystem |
+| ISP | Internet Service Provider (互联网服务提供商) — 你的宽带/移动网络运营商分配的真实公网 IP |
 
 ---
 
@@ -393,6 +573,7 @@ Commands never silently fail. `-v` flag enables debug logging for troubleshootin
 | Flat select UX | `mihomo-cli select` — flat list across all groups, fuzzy search by node name | `51eaf20` |
 | API readiness race | `wait_for_api_ready()` polls /configs after start/restart to prevent false "unresponsive" | `70b1809` |
 | Geo pre-download | `ensure_geo_files()` downloads geoip.metadb/GeoSite.dat before mihomo starts — eliminates chicken-and-egg deadlock (mihomo needs proxy to reach GitHub, but isn't proxy yet). Resume support, mirror fallback, progress bar, corrupt detection. | `0d3029d`…`cfcc10a` |
+| Rule management | `mihomo-cli rule add/list/remove/clear/import/export/position` — user-defined routing rules stored in `rules.yaml`, merged into `config.yaml` at start/reload with configurable insertion position (front/back). Uses `config.original.yaml` as clean merge source to prevent duplication. Design: rules stored in mihomo-compatible YAML format; `front` (default) gives user rules highest priority to override subscription; `back` as fallback; hot-reload via `PUT /configs` after each mutation; `config.original.yaml` saved by `install`/`config refresh` as clean merge source to prevent rule duplication on repeated merges. | — |
 
 ### Planned
 
@@ -400,3 +581,111 @@ Commands never silently fail. `-v` flag enables debug logging for troubleshootin
 |---------|-------|
 | Config backup/restore | Snapshot config before risky operations |
 | Desktop notification | Notify on node switch via D-Bus/notification center |
+| Rule group support | Support rule-provider / rule-groups from external files |
+| Rule position per-rule | Allow individual rules to override insertion position |
+
+## 规则管理 V2：原子性配置更新
+
+### 设计改进
+
+**V1 问题**：
+- 需要维护 `config.original.yaml` 和 `config.yaml` 两个文件
+- 非原子性写入可能导致配置损坏
+- 逻辑分散，难以维护
+
+**V2 方案**：
+- 使用标记法（`# === USER RULES START ===` / `# === USER RULES END ===`）
+- 单一数据源：只维护 `config.yaml`
+- 原子性写入：先写临时文件，再 rename
+- 自动插入/替换 markers 之间的用户规则
+
+### 实现细节
+
+1. **标记插入**：首次添加规则时，在 `rules:` 部分插入 markers 和用户规则
+2. **标记替换**：后续操作直接替换 markers 之间的内容
+3. **原子写入**：`utils::atomic_write_file()` 确保写入的原子性
+4. **位置控制**：支持 `front`（默认）和 `back` 两种插入位置
+
+### 优势
+
+- ✅ 无需维护 `config.original.yaml`
+- ✅ 配置更新原子性，不会损坏
+- ✅ 规则边界清晰，易于调试
+- ✅ 支持手动编辑（markers 之间的内容）
+
+
+## 12. Rule Management V2: Marker-Based Atomic Updates
+
+### 设计动机
+
+V1 实现使用 `config.original.yaml` 作为合并源，存在以下问题：
+- 需要维护两个配置文件，增加复杂度
+- 非原子性写入可能导致配置损坏
+- 订阅更新时需要重新生成 original 文件
+
+### V2 方案：标记法 + 原子写入
+
+#### 核心思路
+
+在 `config.yaml` 中使用特殊标记界定用户规则区域：
+
+```yaml
+rules:
+# === USER RULES START ===
+  - DOMAIN-SUFFIX,company.com,DIRECT
+  - IP-CIDR,10.0.0.0/8,DIRECT
+# === USER RULES END ===
+  - DOMAIN-SUFFIX,google.com,Proxy
+  - DOMAIN-SUFFIX,github.com,DIRECT
+```
+
+#### 工作流程
+
+1. **添加规则**：
+   - 如果标记不存在，在 `rules:` 后插入标记 + 规则
+   - 如果标记已存在，替换标记之间的内容
+   - 使用 `atomic_write_file()` 原子写入
+
+2. **删除/清空规则**：
+   - 更新 `rules.yaml`
+   - 如果规则为空，移除整个标记块
+   - 原子写入 `config.yaml`
+
+3. **位置控制**：
+   - `front`（默认）：标记插入到 `rules:` 后第一行
+   - `back`：标记插入到规则列表末尾
+
+#### 原子写入实现
+
+```rust
+pub fn atomic_write_file(path: &str, content: &str) -> Result<()> {
+    let temp_path = format!("{}.tmp", path);
+    std::fs::write(&temp_path, content)?;
+    std::fs::rename(&temp_path, path)?;
+    Ok(())
+}
+```
+
+### 优势对比
+
+| 特性 | V1 (config.original.yaml) | V2 (标记法) |
+|------|---------------------------|-------------|
+| 配置文件数量 | 2 个 | 1 个 |
+| 写入原子性 | ❌ 非原子 | ✅ 原子 |
+| 规则边界 | 隐式（需要对比） | ✅ 显式标记 |
+| 手动编辑 | ❌ 困难 | ✅ 直观 |
+| 订阅更新 | 需要重新生成 original | ✅ 自动处理 |
+| 磁盘占用 | 较高 | ✅ 较低 |
+
+### 关键实现
+
+- `utils::atomic_write_file()`: 原子写入函数
+- `config::merge_user_config()`: 基于标记的规则合并
+- `config::merge_rules_marker_based()`: 标记插入/替换逻辑
+- 清空规则时自动移除标记块
+
+### 向后兼容
+
+- 保留 `merge_rules_to_config()` 作为 legacy wrapper
+- 现有 `rule` 命令接口不变
+- `rules.yaml` 格式不变

@@ -2,12 +2,12 @@ use serde_json::Value;
 
 #[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-#[cfg(unix)]
-use tokio::net::UnixStream;
 #[cfg(windows)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::ClientOptions;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 
 /// Lightweight check: does the socket file exist?
 pub fn socket_file_exists() -> bool {
@@ -33,9 +33,13 @@ pub fn mihomo_process_running() -> bool {
 
 fn socket_path() -> &'static str {
     #[cfg(unix)]
-    { "/tmp/verge/verge-mihomo.sock" }
+    {
+        "/tmp/verge/verge-mihomo.sock"
+    }
     #[cfg(windows)]
-    { r"\\.\pipe\mihomo" }
+    {
+        r"\\.\pipe\mihomo"
+    }
 }
 
 /// Percent-encode non-ASCII and reserved characters in the URL path.
@@ -43,8 +47,9 @@ fn percent_encode_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for b in path.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'~' | b'/' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{:02X}", b)),
         }
     }
@@ -70,7 +75,9 @@ async fn socket_request(method: &str, path: &str, body: Option<&[u8]>) -> anyhow
 
 async fn do_socket_request(method: &str, path: &str, body: Option<&[u8]>) -> anyhow::Result<Value> {
     let encoded_path = percent_encode_path(path);
-    let body_str = body.map(|b| String::from_utf8_lossy(b).to_string()).unwrap_or_default();
+    let body_str = body
+        .map(|b| String::from_utf8_lossy(b).to_string())
+        .unwrap_or_default();
     let request = if !body_str.is_empty() {
         format!("{method} {encoded_path} HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body_str.len(), body_str)
     } else {
@@ -82,13 +89,16 @@ async fn do_socket_request(method: &str, path: &str, body: Option<&[u8]>) -> any
         let mut stream = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             UnixStream::connect(socket_path()),
-        ).await??;
+        )
+        .await??;
         stream.write_all(request.as_bytes()).await?;
         let mut data = Vec::new();
         let mut buf = vec![0u8; 8192];
         loop {
             let n = stream.read(&mut buf).await?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             data.extend_from_slice(&buf[..n]);
         }
         data
@@ -96,14 +106,15 @@ async fn do_socket_request(method: &str, path: &str, body: Option<&[u8]>) -> any
 
     #[cfg(windows)]
     let response = {
-        let mut stream = ClientOptions::new()
-            .open(socket_path())?;
+        let mut stream = ClientOptions::new().open(socket_path())?;
         stream.write_all(request.as_bytes()).await?;
         let mut data = Vec::new();
         let mut buf = vec![0u8; 8192];
         loop {
             let n = stream.read(&mut buf).await?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             data.extend_from_slice(&buf[..n]);
         }
         data
@@ -118,14 +129,24 @@ async fn do_socket_request(method: &str, path: &str, body: Option<&[u8]>) -> any
     }
     let body_start = response_str.find("\r\n\r\n").unwrap_or(0) + 4;
     let json_str = response_str[body_start..].trim();
-    if json_str.is_empty() { return Ok(Value::Null); }
+    if json_str.is_empty() {
+        return Ok(Value::Null);
+    }
     Ok(serde_json::from_str(json_str)?)
 }
 
-async fn api_get(path: &str) -> anyhow::Result<Value> { socket_request("GET", path, None).await }
-pub async fn api_put(path: &str, body: Value) -> anyhow::Result<Value> { socket_request("PUT", path, Some(&serde_json::to_vec(&body)?)).await }
-pub async fn api_patch(path: &str, body: Value) -> anyhow::Result<Value> { socket_request("PATCH", path, Some(&serde_json::to_vec(&body)?)).await }
-async fn api_delete(path: &str) -> anyhow::Result<Value> { socket_request("DELETE", path, None).await }
+async fn api_get(path: &str) -> anyhow::Result<Value> {
+    socket_request("GET", path, None).await
+}
+pub async fn api_put(path: &str, body: Value) -> anyhow::Result<Value> {
+    socket_request("PUT", path, Some(&serde_json::to_vec(&body)?)).await
+}
+pub async fn api_patch(path: &str, body: Value) -> anyhow::Result<Value> {
+    socket_request("PATCH", path, Some(&serde_json::to_vec(&body)?)).await
+}
+async fn api_delete(path: &str) -> anyhow::Result<Value> {
+    socket_request("DELETE", path, None).await
+}
 
 pub async fn get_all_proxies() -> anyhow::Result<Value> {
     api_get("/proxies").await
@@ -157,34 +178,53 @@ pub async fn wait_for_api_ready(timeout_secs: u64) -> bool {
 
 pub async fn list_proxies() -> anyhow::Result<()> {
     let data = api_get("/proxies").await?;
-    let proxies = data["proxies"].as_object().ok_or_else(|| anyhow::anyhow!("no proxies"))?;
+    let proxies = data["proxies"]
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("no proxies"))?;
     let mut pairs: Vec<(&String, &Value)> = proxies.iter().collect();
     pairs.sort_by_key(|(k, _)| *k);
     for (name, p) in pairs {
         let ptype = p["type"].as_str().unwrap_or("?");
-        if !["Selector", "URLTest", "Fallback"].contains(&ptype) { continue; }
+        if !["Selector", "URLTest", "Fallback"].contains(&ptype) {
+            continue;
+        }
         let now = p["now"].as_str().unwrap_or("-");
         println!("[{ptype:8}] {name}  →  {now}");
         if let Some(all) = p["all"].as_array() {
-            for sub in all { let s = sub.as_str().unwrap_or(""); if s != now { println!("          └ {s}"); } }
+            for sub in all {
+                let s = sub.as_str().unwrap_or("");
+                if s != now {
+                    println!("          └ {s}");
+                }
+            }
         }
     }
     Ok(())
 }
 
 pub async fn delay_test(group: &str) -> anyhow::Result<()> {
-    let path = format!("/proxies/{group}/delay?url=http://www.gstatic.com/generate_204&timeout=5000");
+    let path =
+        format!("/proxies/{group}/delay?url=http://www.gstatic.com/generate_204&timeout=5000");
     let data = api_get(&path).await?;
-    let obj = data.as_object().ok_or_else(|| anyhow::anyhow!("no delay data"))?;
+    let obj = data
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("no delay data"))?;
     let mut results: Vec<(u64, String)> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     for (name, ms) in obj {
-        if let Some(ms) = ms.as_u64() { results.push((ms, name.clone())); }
-        else { errors.push(name.clone()); }
+        if let Some(ms) = ms.as_u64() {
+            results.push((ms, name.clone()));
+        } else {
+            errors.push(name.clone());
+        }
     }
     results.sort_by_key(|(ms, _)| *ms);
-    for (ms, name) in &results { println!("{name}: {ms}ms"); }
-    for name in &errors { println!("{name}: timeout"); }
+    for (ms, name) in &results {
+        println!("{name}: {ms}ms");
+    }
+    for name in &errors {
+        println!("{name}: timeout");
+    }
     Ok(())
 }
 
@@ -218,14 +258,25 @@ pub async fn tun_toggle(action: Option<crate::TunAction>) -> anyhow::Result<()> 
         }
         None => {
             let data = api_get("/configs").await?;
-            println!("TUN is {}", if data["tun"]["enable"].as_bool().unwrap_or(false) { "enabled" } else { "disabled" });
+            println!(
+                "TUN is {}",
+                if data["tun"]["enable"].as_bool().unwrap_or(false) {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
         }
     }
     Ok(())
 }
 
 pub async fn select_proxy(group: &str, node: &str) -> anyhow::Result<()> {
-    api_put(&format!("/proxies/{group}"), serde_json::json!({"name": node})).await?;
+    api_put(
+        &format!("/proxies/{group}"),
+        serde_json::json!({"name": node}),
+    )
+    .await?;
     Ok(())
 }
 
@@ -237,7 +288,10 @@ pub async fn get_group_nodes(group: &str) -> anyhow::Result<Vec<String>> {
             group
         )
     })?;
-    Ok(all.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+    Ok(all
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect())
 }
 
 pub async fn connections(flush: bool) -> anyhow::Result<()> {
@@ -251,15 +305,29 @@ pub async fn connections(flush: bool) -> anyhow::Result<()> {
     println!("Active connections: {}", conns.len());
     for c in conns {
         let meta = &c["metadata"];
-        let host = meta["host"].as_str().or(meta["destinationIP"].as_str()).unwrap_or("?");
+        let host = meta["host"]
+            .as_str()
+            .or(meta["destinationIP"].as_str())
+            .unwrap_or("?");
         let port = meta["destinationPort"].as_str().unwrap_or("?");
         let net = meta["network"].as_str().unwrap_or("?");
-        println!("  {host}:{port} ({net})  ↑{} ↓{}", c["upload"].as_u64().unwrap_or(0), c["download"].as_u64().unwrap_or(0));
+        println!(
+            "  {host}:{port} ({net})  ↑{} ↓{}",
+            c["upload"].as_u64().unwrap_or(0),
+            c["download"].as_u64().unwrap_or(0)
+        );
     }
     Ok(())
 }
 
+pub async fn get_config() -> anyhow::Result<Value> {
+    api_get("/configs").await
+}
+
 pub async fn reload_configs() -> anyhow::Result<()> {
+    // Merge user rules and DNS policies into config before reloading
+    crate::config::merge_user_config()?;
+
     let path = crate::utils::config_path();
     api_put("/configs", serde_json::json!({"path": path})).await?;
     Ok(())
@@ -316,7 +384,10 @@ pub async fn status() -> anyhow::Result<()> {
     // ── Prerequisites ──
     if !bin_ok {
         println!("  mihomo binary: NOT FOUND");
-        println!("  Config:        {}", if cfg_ok { "exists" } else { "missing" });
+        println!(
+            "  Config:        {}",
+            if cfg_ok { "exists" } else { "missing" }
+        );
         println!();
         println!("  Fix: mihomo-cli install");
         return Ok(());
@@ -345,7 +416,10 @@ pub async fn status() -> anyhow::Result<()> {
 
             println!("  mihomo:        running");
             println!("  Mode:          {mode}");
-            println!("  TUN:           {}", if tun { "enabled" } else { "disabled" });
+            println!(
+                "  TUN:           {}",
+                if tun { "enabled" } else { "disabled" }
+            );
             println!("  Port:          {port}");
             println!("  Service:       {svc_label}");
 
@@ -353,7 +427,10 @@ pub async fn status() -> anyhow::Result<()> {
                 println!("  Node:          {}", data["now"].as_str().unwrap_or("?"));
             }
 
-            println!("  Auto-start:    {}", if svc_installed { "enabled" } else { "disabled" });
+            println!(
+                "  Auto-start:    {}",
+                if svc_installed { "enabled" } else { "disabled" }
+            );
 
             println!();
             print!("  Exit IP:       ");
@@ -394,53 +471,299 @@ pub async fn status() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn fetch_ip_info() -> anyhow::Result<(String, String, String)> {
-    let port = get_mihomo_port();
-    let proxy_url = format!("http://127.0.0.1:{port}");
+/// Result of an IP probe: exit IP, country, source endpoint name.
+#[derive(Clone)]
+pub struct IpProbeResult {
+    pub ip: String,
+    pub country: String,
+    pub source: String,
+}
 
-    let sources: &[(&str, &str, fn(&serde_json::Value) -> Option<(String, String)>)] = &[
-        ("https://api.ip.sb/geoip", "api.ip.sb", |v| {
-            let ip = v["ip"].as_str()?;
-            let country = v["country"].as_str()?;
-            Some((ip.to_string(), country.to_string()))
-        }),
-        ("http://ip-api.com/json?fields=query,country", "ip-api.com", |v| {
+type IpParser = fn(&serde_json::Value) -> Option<(String, String)>;
+const IP_SOURCES: &[(&str, &str, IpParser)] = &[
+    ("https://api.ip.sb/geoip", "api.ip.sb", |v| {
+        let ip = v["ip"].as_str()?;
+        let country = v["country"].as_str()?;
+        Some((ip.to_string(), country.to_string()))
+    }),
+    (
+        "http://ip-api.com/json?fields=query,country",
+        "ip-api.com",
+        |v| {
             let ip = v["query"].as_str()?;
             let country = v["country"].as_str()?;
             Some((ip.to_string(), country.to_string()))
-        }),
-        ("https://ifconfig.me/all.json", "ifconfig.me", |v| {
-            let ip = v["ip_addr"].as_str()?;
-            let country = v["country"].as_str().unwrap_or("?");
-            Some((ip.to_string(), country.to_string()))
-        }),
-    ];
+        },
+    ),
+    ("https://ifconfig.me/all.json", "ifconfig.me", |v| {
+        let ip = v["ip_addr"].as_str()?;
+        let country = v["country"].as_str().unwrap_or("?");
+        Some((ip.to_string(), country.to_string()))
+    }),
+];
 
-    let client = reqwest::Client::builder()
-        .proxy(reqwest::Proxy::all(&proxy_url)?)
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
+/// Build a reqwest client for the given probe mode.
+fn build_ip_client(use_proxy: bool) -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5));
 
-    for (url, name, parse) in sources {
-        let result = tokio::time::timeout(
+    if use_proxy {
+        let port = get_mihomo_port();
+        let proxy_url = format!("http://127.0.0.1:{port}");
+        builder = builder.proxy(reqwest::Proxy::all(&proxy_url)?);
+    } else {
+        // Direct connection — explicitly set empty proxy to bypass env vars
+        // Note: no_proxy() sets a bypass list, not "disable proxy"
+        builder = builder.proxy(reqwest::Proxy::custom(|_: &reqwest::Url| {
+            None::<reqwest::Url>
+        }));
+    }
+
+    Ok(builder.build()?)
+}
+
+/// Probe exit IP through a specific path (direct or mihomo proxy).
+/// If `target_url` is provided, make a request to that URL first, then check exit IP.
+/// Otherwise, use IP lookup APIs directly.
+async fn probe_ip(use_proxy: bool, target_url: Option<&str>) -> Option<IpProbeResult> {
+    let client = match build_ip_client(use_proxy) {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+
+    // If target_url is provided, make a request to it first
+    if let Some(url) = target_url {
+        let _ = tokio::time::timeout(
             std::time::Duration::from_secs(8),
-            async {
-                let resp = client.get(*url)
-                    .header("User-Agent", "mihomo-cli")
-                    .send()
-                    .await?;
-                let data: serde_json::Value = resp.json().await?;
-                parse(&data).ok_or_else(|| anyhow::anyhow!("unexpected response format"))
-            },
-        ).await;
+            client.get(url).header("User-Agent", "mihomo-cli").send(),
+        )
+        .await;
+        // Request completed (or timed out), now check exit IP
+    }
+
+    // Check exit IP by requesting an IP echo API
+    for (url, name, parse) in IP_SOURCES {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            let resp = client
+                .get(*url)
+                .header("User-Agent", "mihomo-cli")
+                .send()
+                .await?;
+            let data: serde_json::Value = resp.json().await?;
+            parse(&data).ok_or_else(|| anyhow::anyhow!("unexpected response format"))
+        })
+        .await;
 
         match result {
-            Ok(Ok((ip, country))) => return Ok((ip, country, name.to_string())),
+            Ok(Ok((ip, country))) => {
+                let source = if target_url.is_some() {
+                    format!("{} (after target)", name)
+                } else {
+                    name.to_string()
+                };
+                return Some(IpProbeResult {
+                    ip,
+                    country,
+                    source,
+                });
+            }
             _ => continue,
         }
     }
 
-    anyhow::bail!("all IP check endpoints unreachable via proxy")
+    None
+}
+
+/// Check if an IP address is a LAN/private address.
+fn is_lan_ip(ip: &str) -> bool {
+    use std::net::IpAddr;
+
+    if let Ok(addr) = ip.parse::<IpAddr>() {
+        match addr {
+            IpAddr::V4(v4) => {
+                // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8
+                v4.is_private() || v4.is_loopback() || v4.is_link_local()
+            }
+            IpAddr::V6(v6) => {
+                // fc00::/7 (unique local), fe80::/10 (link-local), ::1 (loopback)
+                v6.is_loopback() || {
+                    let segments = v6.segments();
+                    // fc00::/7: first 7 bits are 1111110
+                    (segments[0] & 0xfe00) == 0xfc00
+                    // fe80::/10: link-local
+                    || (segments[0] & 0xffc0) == 0xfe80
+                }
+            }
+        }
+    } else {
+        false
+    }
+}
+
+/// Format the exit IP report with environment info and three probe lines.
+pub fn format_ip_report(
+    tun_enabled: bool,
+    http_proxy_val: Option<String>,
+    https_proxy_val: Option<String>,
+    isp: Option<IpProbeResult>,
+    now: Option<IpProbeResult>,
+    via_mihomo: Option<IpProbeResult>,
+) -> String {
+    let mut lines = Vec::new();
+
+    lines.push("=== Exit IP Report ===".to_string());
+    lines.push(String::new());
+
+    lines.push(format!(
+        "  TUN:           {}",
+        if tun_enabled { "enabled" } else { "disabled" }
+    ));
+    lines.push(format!(
+        "  http_proxy:    {}",
+        http_proxy_val.as_deref().unwrap_or("not set")
+    ));
+    lines.push(format!(
+        "  https_proxy:   {}",
+        https_proxy_val.as_deref().unwrap_or("not set")
+    ));
+    lines.push(String::new());
+
+    let format_ip_line = |r: &Option<IpProbeResult>| -> String {
+        match r {
+            Some(r) => {
+                if is_lan_ip(&r.ip) {
+                    format!("{}  [LAN]", r.ip)
+                } else {
+                    format!("{}  {}", r.ip, r.country)
+                }
+            }
+            None => "(unreachable)".to_string(),
+        }
+    };
+
+    // ISP line: annotated if from cache
+    let show_cached = matches!(&isp, Some(r) if r.source == "cached");
+    let isp_label = if show_cached {
+        "  ISP (cached)     "
+    } else {
+        "  ISP               "
+    };
+    lines.push(format!("{}{}", isp_label, format_ip_line(&isp)));
+    lines.push(format!("  Now               {}", format_ip_line(&now)));
+    lines.push(format!(
+        "  Via Mihomo       {}",
+        format_ip_line(&via_mihomo)
+    ));
+
+    lines.push(String::new());
+
+    // Diagnostic message
+    match (&now, &via_mihomo) {
+        (Some(n), Some(v)) if n.ip == v.ip => {
+            if tun_enabled {
+                lines.push("  → TUN enabled: system route exits via proxy".to_string());
+            } else {
+                lines.push(
+                    "  → System route and proxy exit are the same — proxy may not be working"
+                        .to_string(),
+                );
+            }
+        }
+        (Some(_), Some(_)) => {
+            if tun_enabled {
+                lines.push("  → TUN enabled: system route exits via proxy node".to_string());
+            }
+            // TUN off + different = normal, no message needed
+        }
+        (None, Some(_)) => lines.push("  → System route unreachable".to_string()),
+        (Some(_), None) => lines.push("  → Mihomo proxy unreachable".to_string()),
+        (None, None) => {
+            if tun_enabled {
+                lines.push(
+                    "  → Both routes unreachable — TUN may not be fully connected".to_string(),
+                );
+            } else {
+                lines.push("  → Both routes unreachable".to_string());
+            }
+        }
+    }
+
+    // LAN leak detection
+    for (label, result) in [("Now", &now), ("Via Mihomo", &via_mihomo)] {
+        if let Some(r) = result {
+            if is_lan_ip(&r.ip) {
+                lines.push(format!("  → {} exits via LAN address ({})", label, r.ip));
+            }
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn read_isp_cache(path: &str) -> Option<IpProbeResult> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let parts: Vec<&str> = content.trim().splitn(2, '|').collect();
+    if parts.len() == 2 {
+        Some(IpProbeResult {
+            ip: parts[0].to_string(),
+            country: parts[1].to_string(),
+            source: "cached".to_string(),
+        })
+    } else {
+        None
+    }
+}
+
+fn write_isp_cache(path: &str, r: &IpProbeResult) {
+    let data = format!("{}|{}", r.ip, r.country);
+    let _ = std::fs::write(path, data);
+}
+
+/// Probe both System route and Mihomo proxy paths, return formatted report.
+/// If `target_url` is provided, probe that URL instead of IP lookup APIs.
+pub async fn probe_all_ips(target_url: Option<&str>) -> String {
+    // Read TUN state from mihomo API
+    let tun_enabled = match api_get("/configs").await {
+        Ok(data) => data["tun"]["enable"].as_bool().unwrap_or(false),
+        Err(_) => false,
+    };
+
+    let http_proxy_val = std::env::var("http_proxy").ok();
+    let https_proxy_val = std::env::var("https_proxy").ok();
+    let cache_path = crate::utils::isp_cache_path();
+
+    let (isp, now, via_mihomo) = if tun_enabled {
+        // TUN on: ISP from cache, Now + Via Mihomo probed
+        let isp = read_isp_cache(&cache_path);
+        let (now, via_mihomo) =
+            tokio::join!(probe_ip(false, target_url), probe_ip(true, target_url),);
+        (isp, now, via_mihomo)
+    } else {
+        // TUN off: ISP = Now (same direct probe), cache it
+        let (result, via_mihomo) =
+            tokio::join!(probe_ip(false, target_url), probe_ip(true, target_url),);
+        if let Some(ref r) = result {
+            write_isp_cache(&cache_path, r);
+        }
+        let isp = result.clone();
+        (isp, result, via_mihomo)
+    };
+
+    format_ip_report(
+        tun_enabled,
+        http_proxy_val,
+        https_proxy_val,
+        isp,
+        now,
+        via_mihomo,
+    )
+}
+
+/// Backward-compatible: probe via mihomo proxy (original behavior).
+pub async fn fetch_ip_info() -> anyhow::Result<(String, String, String)> {
+    match probe_ip(true, None).await {
+        Some(r) => Ok((r.ip, r.country, r.source)),
+        None => anyhow::bail!("all IP check endpoints unreachable via proxy"),
+    }
 }
 
 fn get_mihomo_port() -> u16 {
@@ -534,5 +857,154 @@ mod tests {
         });
         let result = parse_selector_nodes(&data);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_format_ip_report_tun_disabled_normal() {
+        let isp = Some(IpProbeResult {
+            ip: "113.113.113.113".to_string(),
+            country: "China".to_string(),
+            source: "api.ip.sb".to_string(),
+        });
+        let now = Some(IpProbeResult {
+            ip: "113.113.113.113".to_string(),
+            country: "China".to_string(),
+            source: "api.ip.sb".to_string(),
+        });
+        let via_mihomo = Some(IpProbeResult {
+            ip: "1.2.3.4".to_string(),
+            country: "United States".to_string(),
+            source: "api.ip.sb".to_string(),
+        });
+        let report = format_ip_report(false, None, None, isp, now, via_mihomo);
+        assert!(report.contains("TUN:           disabled"));
+        assert!(report.contains("http_proxy:    not set"));
+        assert!(report.contains("https_proxy:   not set"));
+        assert!(report.contains("ISP               113.113.113.113  China"));
+        assert!(report.contains("Now               113.113.113.113  China"));
+        assert!(report.contains("Via Mihomo       1.2.3.4  United States"));
+    }
+
+    #[test]
+    fn test_format_ip_report_tun_enabled_with_cache() {
+        let isp = Some(IpProbeResult {
+            ip: "113.113.113.113".to_string(),
+            country: "China".to_string(),
+            source: "cached".to_string(),
+        });
+        let now = Some(IpProbeResult {
+            ip: "1.2.3.4".to_string(),
+            country: "United States".to_string(),
+            source: "api.ip.sb".to_string(),
+        });
+        let via_mihomo = Some(IpProbeResult {
+            ip: "1.2.3.4".to_string(),
+            country: "United States".to_string(),
+            source: "api.ip.sb".to_string(),
+        });
+        let report = format_ip_report(
+            true,
+            Some("127.0.0.1:7890".to_string()),
+            Some("127.0.0.1:7890".to_string()),
+            isp,
+            now,
+            via_mihomo,
+        );
+        assert!(report.contains("TUN:           enabled"));
+        assert!(report.contains("http_proxy:    127.0.0.1:7890"));
+        assert!(report.contains("ISP (cached)     113.113.113.113  China"));
+        assert!(report.contains("Now               1.2.3.4  United States"));
+        assert!(report.contains("TUN enabled: system route exits via proxy"));
+    }
+
+    #[test]
+    fn test_format_ip_report_tun_enabled_no_cache() {
+        let now = Some(IpProbeResult {
+            ip: "1.2.3.4".to_string(),
+            country: "United States".to_string(),
+            source: "api.ip.sb".to_string(),
+        });
+        let via_mihomo = Some(IpProbeResult {
+            ip: "1.2.3.4".to_string(),
+            country: "United States".to_string(),
+            source: "api.ip.sb".to_string(),
+        });
+        let report = format_ip_report(
+            true, None, None, None, // no ISP cache
+            now, via_mihomo,
+        );
+        assert!(report.contains("ISP               (unreachable)"));
+    }
+
+    #[test]
+    fn test_format_ip_report_now_unreachable() {
+        let isp = Some(IpProbeResult {
+            ip: "113.113.113.113".to_string(),
+            country: "China".to_string(),
+            source: "api.ip.sb".to_string(),
+        });
+        let via_mihomo = Some(IpProbeResult {
+            ip: "1.2.3.4".to_string(),
+            country: "United States".to_string(),
+            source: "api.ip.sb".to_string(),
+        });
+        let report = format_ip_report(false, None, None, isp, None, via_mihomo);
+        assert!(report.contains("Now               (unreachable)"));
+        assert!(report.contains("System route unreachable"));
+    }
+
+    #[test]
+    fn test_format_ip_report_via_mihomo_unreachable() {
+        let isp = Some(IpProbeResult {
+            ip: "113.113.113.113".to_string(),
+            country: "China".to_string(),
+            source: "api.ip.sb".to_string(),
+        });
+        let now = Some(IpProbeResult {
+            ip: "113.113.113.113".to_string(),
+            country: "China".to_string(),
+            source: "api.ip.sb".to_string(),
+        });
+        let report = format_ip_report(false, None, None, isp, now, None);
+        assert!(report.contains("Via Mihomo       (unreachable)"));
+        assert!(report.contains("Mihomo proxy unreachable"));
+    }
+
+    #[test]
+    fn test_format_ip_report_both_unreachable() {
+        let report = format_ip_report(false, None, None, None, None, None);
+        assert!(report.contains("ISP               (unreachable)"));
+        assert!(report.contains("Now               (unreachable)"));
+        assert!(report.contains("Via Mihomo       (unreachable)"));
+        assert!(report.contains("Both routes unreachable"));
+    }
+
+    #[test]
+    fn test_format_ip_report_tun_disabled_same_ip() {
+        let isp = Some(IpProbeResult {
+            ip: "1.2.3.4".to_string(),
+            country: "United States".to_string(),
+            source: "api.ip.sb".to_string(),
+        });
+        let now = Some(IpProbeResult {
+            ip: "1.2.3.4".to_string(),
+            country: "United States".to_string(),
+            source: "api.ip.sb".to_string(),
+        });
+        let via_mihomo = Some(IpProbeResult {
+            ip: "1.2.3.4".to_string(),
+            country: "United States".to_string(),
+            source: "api.ip.sb".to_string(),
+        });
+        let report = format_ip_report(
+            false,
+            Some("127.0.0.1:7890".to_string()),
+            Some("127.0.0.1:7890".to_string()),
+            isp,
+            now,
+            via_mihomo,
+        );
+        assert!(report.contains("http_proxy:    127.0.0.1:7890"));
+        assert!(report.contains("proxy may not be working"));
     }
 }

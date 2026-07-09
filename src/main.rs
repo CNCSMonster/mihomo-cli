@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[macro_export]
 macro_rules! log {
     ($($arg:tt)*) => {
-        if crate::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
+        if $crate::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
             eprintln!("[DEBUG] {}", format!($($arg)*));
         }
     };
@@ -12,8 +12,10 @@ macro_rules! log {
 pub static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 mod config;
+mod dns;
 mod installer;
 mod mihomo_api;
+mod rules;
 mod service;
 mod ui;
 mod utils;
@@ -108,9 +110,7 @@ enum Command {
 
     /// Toggle or check TUN mode
     #[command(name = "tun")]
-    Tun {
-        action: Option<TunAction>,
-    },
+    Tun { action: Option<TunAction> },
 
     /// View active connections (use --flush to close all)
     #[command(name = "conn")]
@@ -130,11 +130,28 @@ enum Command {
     Status,
 
     /// Check current exit IP and location
-    Ip,
+    Ip {
+        /// Probe exit IP after requesting this URL (tests routing rules)
+        #[arg(short, long)]
+        url: Option<String>,
+    },
+    /// Manage user-defined routing rules
+    Rule {
+        #[command(subcommand)]
+        action: RuleAction,
+    },
+    /// Manage DNS routing policies (nameserver-policy)
+    Dns {
+        #[command(subcommand)]
+        action: DnsAction,
+    },
 }
 
 #[derive(ValueEnum, Clone)]
-enum TunAction { On, Off }
+enum TunAction {
+    On,
+    Off,
+}
 
 #[derive(Subcommand, Clone)]
 enum ProxyAction {
@@ -142,6 +159,82 @@ enum ProxyAction {
     On,
     /// Output unset commands for proxy variables
     Off,
+}
+
+#[derive(Subcommand, Clone)]
+enum RuleAction {
+    /// Add a routing rule (e.g. DOMAIN-SUFFIX,example.com,DIRECT)
+    Add {
+        /// Rule string: TYPE,PARAMETER,POLICY
+        rule: String,
+        /// Insert at front or back (overrides default position)
+        #[arg(short, long)]
+        position: Option<String>,
+    },
+    /// List all user-defined rules
+    #[command(visible_alias = "ls")]
+    List,
+    /// Remove a rule by index (1-based)
+    #[command(visible_alias = "rm")]
+    Remove {
+        /// Rule index (1-based, as shown in `rule list`)
+        index: usize,
+    },
+    /// Clear all user-defined rules
+    Clear {
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Import rules from a YAML file
+    Import {
+        /// Path to the YAML file to import
+        path: String,
+    },
+    /// Export current rules to a YAML file
+    Export {
+        /// Path to write the rules file
+        path: String,
+    },
+    /// Set or show the default rule insertion position
+    Position {
+        /// Position: front or back (omit to show current)
+        position: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum DnsAction {
+    /// Manage DNS routing policies
+    Policy {
+        #[command(subcommand)]
+        action: DnsPolicyAction,
+    },
+    /// Show current DNS configuration
+    Status,
+}
+
+#[derive(Subcommand, Clone)]
+enum DnsPolicyAction {
+    /// Add a DNS policy (domain → DNS target)
+    Add {
+        /// Domain suffix pattern (e.g. ubtrobot.com)
+        #[arg(value_name = "MATCH")]
+        match_pattern: String,
+        /// DNS target: "system" for system DNS, or IP address (e.g. 10.10.1.251)
+        #[arg(value_name = "TARGET")]
+        target: String,
+    },
+    /// List all DNS policies
+    #[command(visible_alias = "ls")]
+    List,
+    /// Remove a DNS policy by index (1-based) or match pattern
+    #[command(visible_alias = "rm")]
+    Remove {
+        /// Policy index (1-based) or match pattern
+        #[arg(value_name = "INDEX|MATCH")]
+        selector: String,
+    },
 }
 
 #[tokio::main]
@@ -158,7 +251,10 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
-    match cli.command.unwrap_or(Command::Install { user: false, force: false }) {
+    match cli.command.unwrap_or(Command::Install {
+        user: false,
+        force: false,
+    }) {
         Command::Install { user, force } => cmd_install(user, force).await,
         Command::Config { url, fix, refresh } => cmd_config(url, fix, refresh).await,
         Command::Uninstall { all } => cmd_uninstall(all),
@@ -176,7 +272,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Connections { flush } => mihomo_api::connections(flush).await,
         Command::Proxy { action } => cmd_proxy(action).await,
         Command::Status => mihomo_api::status().await,
-        Command::Ip => cmd_ip().await,
+        Command::Ip { url } => cmd_ip(url.as_deref()).await,
+        Command::Rule { action } => cmd_rule(action).await,
+        Command::Dns { action } => cmd_dns(action).await,
     }
 }
 
@@ -191,8 +289,11 @@ async fn cmd_install(user_mode: bool, force: bool) -> anyhow::Result<()> {
     println!("=== mihomo-cli install ({}) ===\n", std::env::consts::OS);
 
     println!("[1/3] Mihomo core binary...");
-    installer::download_mihomo().await
-        .map_err(|e| anyhow::anyhow!("Failed to download mihomo: {e}\n  Check network and try --verbose for details"))?;
+    installer::download_mihomo().await.map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to download mihomo: {e}\n  Check network and try --verbose for details"
+        )
+    })?;
 
     println!();
     println!("[2/3] Start script...");
@@ -220,7 +321,11 @@ async fn cmd_install(user_mode: bool, force: bool) -> anyhow::Result<()> {
 
     // Ask if user wants to install and start service
     use dialoguer::Confirm;
-    let mode_label = if user_mode { "user-level" } else { "root (system)" };
+    let mode_label = if user_mode {
+        "user-level"
+    } else {
+        "root (system)"
+    };
     println!();
     if Confirm::new()
         .with_prompt(format!("Install and start {mode_label} service?"))
@@ -262,7 +367,10 @@ async fn setup_config_interactive() -> anyhow::Result<()> {
         .interact_text()?;
 
     if url.is_empty() {
-        println!("  Skipped. Place config manually at {}", utils::config_path());
+        println!(
+            "  Skipped. Place config manually at {}",
+            utils::config_path()
+        );
         return Ok(());
     }
 
@@ -271,8 +379,9 @@ async fn setup_config_interactive() -> anyhow::Result<()> {
 
 async fn apply_subscription(url: &str) -> anyhow::Result<()> {
     log!("Downloading subscription from: {url}");
-    let (content, is_yaml) = config::download_sub_smart(url).await
-        .map_err(|e| anyhow::anyhow!("Cannot reach subscription URL.\n  {e}\n  Check your network or the URL"))?;
+    let (content, is_yaml) = config::download_sub_smart(url).await.map_err(|e| {
+        anyhow::anyhow!("Cannot reach subscription URL.\n  {e}\n  Check your network or the URL")
+    })?;
 
     if is_yaml {
         log!("Format: Clash YAML (UA negotiation succeeded)");
@@ -283,16 +392,22 @@ async fn apply_subscription(url: &str) -> anyhow::Result<()> {
     } else {
         log!("Format: raw subscription — converting");
         println!("  Converting subscription format (vmess/base64 → Clash YAML)...");
-        let clash_config = config::convert_vmess_to_clash(&content)
-            .map_err(|e| anyhow::anyhow!(
+        let clash_config = config::convert_vmess_to_clash(&content).map_err(|e| {
+            anyhow::anyhow!(
                 "Failed to convert subscription.\n  \
                  The server returned a non-Clash format and conversion failed.\n  \
                  Error: {e}\n  \
                  Tip: Try opening the URL in a browser to verify it."
-            ))?;
+            )
+        })?;
         config::save_config(&clash_config)?;
-        let count = clash_config.lines()
-            .filter(|l| l.trim().starts_with("- name:") && !l.contains("节点选择") && !l.contains("自动选择"))
+        let count = clash_config
+            .lines()
+            .filter(|l| {
+                l.trim().starts_with("- name:")
+                    && !l.contains("节点选择")
+                    && !l.contains("自动选择")
+            })
             .count();
         println!("  Converted {count} proxies to Clash format");
         // Pre-download geo files so mihomo doesn't deadlock on startup
@@ -330,7 +445,10 @@ fn write_start_script() -> anyhow::Result<()> {
     std::fs::create_dir_all(utils::config_dir())?;
     std::fs::write(&script_path, &script)?;
     #[cfg(unix)]
-    { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?; }
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
+    }
     log!("Created {}", script_path);
     Ok(())
 }
@@ -373,9 +491,7 @@ async fn cmd_config(url: Option<String>, fix: bool, refresh: bool) -> anyhow::Re
     // If no URL arg and no flags, show interactive management menu
     let url = match url {
         Some(u) => Some(u),
-        None => {
-            show_config_menu().await?
-        }
+        None => show_config_menu().await?,
     };
 
     let url = match url {
@@ -418,18 +534,22 @@ async fn show_config_menu() -> anyhow::Result<Option<String>> {
         println!();
 
         // Build menu items: URLs + action rows
-        let mut items: Vec<String> = urls.iter().enumerate().map(|(i, u)| {
-            let short = if u.len() > 55 {
-                format!("  {}…{}", &u[..30], &u[u.len()-20..])
-            } else {
-                u.clone()
-            };
-            if i == 0 {
-                format!("▶ {}", short)
-            } else {
-                format!("  {}", short)
-            }
-        }).collect();
+        let mut items: Vec<String> = urls
+            .iter()
+            .enumerate()
+            .map(|(i, u)| {
+                let short = if u.len() > 55 {
+                    format!("  {}…{}", &u[..30], &u[u.len() - 20..])
+                } else {
+                    u.clone()
+                };
+                if i == 0 {
+                    format!("▶ {}", short)
+                } else {
+                    format!("  {}", short)
+                }
+            })
+            .collect();
 
         if items.is_empty() {
             items.push("  (no sources saved)".to_string());
@@ -469,7 +589,10 @@ async fn show_config_menu() -> anyhow::Result<Option<String>> {
         // User picked a URL → use it
         if choice < url_count {
             let url = &urls[choice];
-            println!("  Downloading from {}...", &url[..url.find('?').unwrap_or(url.len()).min(40)]);
+            println!(
+                "  Downloading from {}...",
+                &url[..url.find('?').unwrap_or(url.len()).min(40)]
+            );
             apply_subscription(url).await?;
             let mut new_urls = urls.clone();
             new_urls.remove(choice);
@@ -483,7 +606,9 @@ async fn show_config_menu() -> anyhow::Result<Option<String>> {
             return Ok(None);
         }
 
-        if selected == "───" { continue; }
+        if selected == "───" {
+            continue;
+        }
 
         if selected == "+ Add new source" || selected.contains("(no sources saved)") {
             let new_url: String = Input::new()
@@ -493,9 +618,17 @@ async fn show_config_menu() -> anyhow::Result<Option<String>> {
             utils::add_subscription_url(&new_url)?;
             println!("  Saved.");
         } else if selected == "- Remove a source" {
-            let remove_items: Vec<String> = urls.iter().enumerate().map(|(i, u)| {
-                format!("{}: {}", i+1, &u[..u.find('?').unwrap_or(u.len()).min(50)])
-            }).collect();
+            let remove_items: Vec<String> = urls
+                .iter()
+                .enumerate()
+                .map(|(i, u)| {
+                    format!(
+                        "{}: {}",
+                        i + 1,
+                        &u[..u.find('?').unwrap_or(u.len()).min(50)]
+                    )
+                })
+                .collect();
             let rem = Select::new()
                 .with_prompt("Remove which source? (Esc to go back)")
                 .items(&remove_items)
@@ -530,14 +663,208 @@ async fn cmd_proxy(action: ProxyAction) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_ip() -> anyhow::Result<()> {
-    match mihomo_api::fetch_ip_info().await {
-        Ok((ip, country, source)) => {
-            println!("  Exit IP: {} ({}) via {}", ip, country, source);
+async fn cmd_ip(url: Option<&str>) -> anyhow::Result<()> {
+    let report = mihomo_api::probe_all_ips(url).await;
+    println!("{}", report);
+    Ok(())
+}
+
+async fn cmd_rule(action: RuleAction) -> anyhow::Result<()> {
+    use crate::rules::RulePosition;
+
+    match action {
+        RuleAction::Add { rule, position } => {
+            let pos = match position {
+                Some(p) => Some(p.parse::<RulePosition>()?),
+                None => None,
+            };
+            crate::rules::add_rule(&rule, pos)?;
+            println!("  ✓ Rule added: {}", rule);
+
+            // Try to hot-reload if mihomo is running
+            if mihomo_api::reload_configs().await.is_ok() {
+                println!("  ✓ Config reloaded — rule is now active");
+            } else {
+                println!("  ℹ Run: mihomo-cli restart  (to apply the new rule)");
+            }
             Ok(())
         }
-        Err(_) => {
-            anyhow::bail!("Failed to fetch IP info.\n  Is mihomo running? Run: mihomo-cli status");
+        RuleAction::List => {
+            let rules = crate::rules::list_rules()?;
+            let pos = crate::rules::get_position().unwrap_or_default();
+            println!("  Insert position: {}", pos);
+            println!();
+            if rules.is_empty() {
+                println!("  (no user rules)");
+                println!();
+                println!("  Add a rule:  mihomo-cli rule add DOMAIN-SUFFIX,example.com,DIRECT");
+            } else {
+                for (i, r) in rules.iter().enumerate() {
+                    println!("  {}. {}", i + 1, r);
+                }
+            }
+            Ok(())
+        }
+        RuleAction::Remove { index } => {
+            // User-facing index is 1-based
+            if index == 0 {
+                anyhow::bail!("Rule index starts from 1 (as shown in `rule list`)");
+            }
+            crate::rules::remove_rule(index - 1)?;
+            println!("  ✓ Rule {} removed", index);
+
+            if mihomo_api::reload_configs().await.is_ok() {
+                println!("  ✓ Config reloaded");
+            } else {
+                println!("  ℹ Run: mihomo-cli restart  (to apply)");
+            }
+            Ok(())
+        }
+        RuleAction::Clear { yes } => {
+            let rules = crate::rules::list_rules()?;
+            if rules.is_empty() {
+                println!("  No rules to clear.");
+                return Ok(());
+            }
+
+            // Skip confirmation if --yes flag is provided
+            if !yes {
+                use dialoguer::Confirm;
+                if !Confirm::new()
+                    .with_prompt(format!("Clear all {} user rules?", rules.len()))
+                    .default(false)
+                    .interact_opt()?
+                    .unwrap_or(false)
+                {
+                    println!("  Cancelled.");
+                    return Ok(());
+                }
+            }
+
+            crate::rules::clear_rules()?;
+            println!("  ✓ All rules cleared");
+
+            if mihomo_api::reload_configs().await.is_ok() {
+                println!("  ✓ Config reloaded");
+            } else {
+                println!("  ℹ Run: mihomo-cli restart  (to apply)");
+            }
+            Ok(())
+        }
+        RuleAction::Import { path } => {
+            crate::rules::import_rules(&path)?;
+            let count = crate::rules::list_rules()?.len();
+            println!("  ✓ Imported {} rules from {}", count, path);
+
+            if mihomo_api::reload_configs().await.is_ok() {
+                println!("  ✓ Config reloaded");
+            } else {
+                println!("  ℹ Run: mihomo-cli restart  (to apply)");
+            }
+            Ok(())
+        }
+        RuleAction::Export { path } => {
+            crate::rules::export_rules(&path)?;
+            let count = crate::rules::list_rules()?.len();
+            println!("  ✓ Exported {} rules to {}", count, path);
+            Ok(())
+        }
+        RuleAction::Position { position } => match position {
+            Some(p) => {
+                let pos: RulePosition = p.parse()?;
+                crate::rules::set_position(pos)?;
+                println!("  ✓ Default insert position set to: {}", pos);
+                Ok(())
+            }
+            None => {
+                let pos = crate::rules::get_position().unwrap_or_default();
+                println!("  Default insert position: {}", pos);
+                println!();
+                println!("  Change it:  mihomo-cli rule position front|back");
+                Ok(())
+            }
+        },
+    }
+}
+
+async fn cmd_dns(action: DnsAction) -> anyhow::Result<()> {
+    match action {
+        DnsAction::Policy { action } => match action {
+            DnsPolicyAction::Add {
+                match_pattern,
+                target,
+            } => {
+                crate::dns::add_policy(&match_pattern, &target)?;
+                println!("  ✓ Policy added: {} → {}", match_pattern, target);
+
+                // Update config.yaml directly (preserves original YAML format)
+                let policies = crate::dns::load_policies().unwrap_or_default();
+                crate::config::update_nameserver_policy(&policies)?;
+
+                // Also try PATCH for hot-reload (may need restart)
+                let patch =
+                    serde_json::json!({"dns": {"nameserver-policy": {match_pattern: target}}});
+                let _ = crate::mihomo_api::api_patch("/configs", patch).await;
+                println!("  ✓ Config updated — restart mihomo to apply DNS changes");
+                Ok(())
+            }
+            DnsPolicyAction::List => {
+                let policies = crate::dns::list_policies()?;
+                if policies.is_empty() {
+                    println!("  No DNS policies defined.");
+                    println!();
+                    println!("  Add one:  mihomo-cli dns policy add <MATCH> <TARGET>");
+                    println!("  Example:  mihomo-cli dns policy add ubtrobot.com system");
+                } else {
+                    println!("  DNS policies:");
+                    for (idx, policy) in &policies {
+                        println!("  {}. {}", idx, policy);
+                    }
+                }
+                Ok(())
+            }
+            DnsPolicyAction::Remove { selector } => {
+                let removed = crate::dns::remove_policy(&selector)?;
+                println!("  ✓ Policy removed: {}", removed);
+
+                let policies = crate::dns::load_policies().unwrap_or_default();
+                crate::config::update_nameserver_policy(&policies)?;
+                println!("  ✓ Config updated — restart mihomo to apply DNS changes");
+                Ok(())
+            }
+        },
+        DnsAction::Status => {
+            let data = mihomo_api::get_config().await?;
+            let dns = &data["dns"];
+
+            let enabled = dns["enable"].as_bool().unwrap_or(false);
+            let enhanced = dns["enhanced-mode"].as_str().unwrap_or("normal");
+            let fake_ip_range = dns["fake-ip-range"].as_str().unwrap_or("-");
+            let listen = dns["listen"].as_str().unwrap_or("-");
+
+            println!(
+                "  DNS: {} ({})",
+                if enabled { "enabled" } else { "disabled" },
+                enhanced
+            );
+            if let Some(ns) = dns["default-nameserver"].as_array() {
+                let nameservers: Vec<&str> = ns.iter().filter_map(|v| v.as_str()).collect();
+                if !nameservers.is_empty() {
+                    println!("  Default nameservers: {}", nameservers.join(", "));
+                }
+            }
+            println!("  Fake-IP range: {}", fake_ip_range);
+            println!("  Listen: {}", listen);
+
+            let policies = crate::dns::list_policies()?;
+            if !policies.is_empty() {
+                println!();
+                println!("  Policies:");
+                for (idx, policy) in &policies {
+                    println!("    {}. {}", idx, policy);
+                }
+            }
+            Ok(())
         }
     }
 }
@@ -553,16 +880,31 @@ fn cmd_uninstall(all: bool) -> anyhow::Result<()> {
 
     println!("=== mihomo-cli uninstall ===\n");
     println!("This will:");
-    if mihomo_exists { println!("  - Stop running mihomo process"); }
-    if service_exists { println!("  - Remove auto-start service"); }
+    if mihomo_exists {
+        println!("  - Stop running mihomo process");
+    }
+    if service_exists {
+        println!("  - Remove auto-start service");
+    }
     if all {
         println!("  - Delete mihomo binary ({})", utils::mihomo_path());
     }
     println!("  - Keep config at {}", utils::config_dir());
     println!();
 
-    let prompt = if all { "Proceed with full removal?" } else { "Proceed?" };
-    if !Confirm::new().with_prompt(prompt).default(false).interact()? { println!("Cancelled."); return Ok(()); }
+    let prompt = if all {
+        "Proceed with full removal?"
+    } else {
+        "Proceed?"
+    };
+    if !Confirm::new()
+        .with_prompt(prompt)
+        .default(false)
+        .interact()?
+    {
+        println!("Cancelled.");
+        return Ok(());
+    }
 
     if mihomo_exists {
         println!("\nStopping mihomo...");

@@ -1,5 +1,5 @@
-use std::process::Command;
 use crate::utils;
+use std::process::Command;
 
 /// Resolve service mode: explicit --user flag overrides, otherwise auto-detect from marker.
 fn resolve_mode(forced: bool) -> String {
@@ -39,6 +39,9 @@ pub fn uninstall_service() -> anyhow::Result<()> {
 }
 
 pub fn start_mihomo(user: bool) -> anyhow::Result<()> {
+    // Merge user rules into config before starting
+    crate::config::merge_rules_to_config()?;
+
     // Pre-download geo files to avoid chicken-and-egg deadlock on startup
     println!("  Geo data...");
     tokio::task::block_in_place(|| {
@@ -88,11 +91,15 @@ pub fn start_mihomo(user: bool) -> anyhow::Result<()> {
 
     // Verify mihomo actually started
     let running = if cfg!(target_os = "windows") {
-        Command::new("tasklist").args(["/FI", "IMAGENAME eq mihomo.exe"]).output()
+        Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq mihomo.exe"])
+            .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).contains("mihomo"))
             .unwrap_or(false)
     } else {
-        Command::new("pgrep").args(["-x", "mihomo"]).output()
+        Command::new("pgrep")
+            .args(["-x", "mihomo"])
+            .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
     };
@@ -109,11 +116,15 @@ pub fn start_mihomo(user: bool) -> anyhow::Result<()> {
         std::thread::sleep(std::time::Duration::from_secs(3));
 
         let still_running = if cfg!(target_os = "windows") {
-            Command::new("tasklist").args(["/FI", "IMAGENAME eq mihomo.exe"]).output()
+            Command::new("tasklist")
+                .args(["/FI", "IMAGENAME eq mihomo.exe"])
+                .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).contains("mihomo"))
                 .unwrap_or(false)
         } else {
-            Command::new("pgrep").args(["-x", "mihomo"]).output()
+            Command::new("pgrep")
+                .args(["-x", "mihomo"])
+                .output()
                 .map(|o| o.status.success())
                 .unwrap_or(false)
         };
@@ -125,7 +136,10 @@ pub fn start_mihomo(user: bool) -> anyhow::Result<()> {
                 println!("  Check: mihomo-cli status");
             }
         } else {
-            anyhow::bail!("Failed to recreate socket.\n  Check logs: tail -20 {}", utils::log_path());
+            anyhow::bail!(
+                "Failed to recreate socket.\n  Check logs: tail -20 {}",
+                utils::log_path()
+            );
         }
     } else {
         if check_api_ready() {
@@ -193,8 +207,13 @@ pub fn restart_mihomo(user: bool) -> anyhow::Result<()> {
         crate::log!("service detected, using restart_service");
 
         let svc_mode = resolve_mode(user);
-        println!("  Service: {} ({})",
-            if cfg!(target_os = "linux") { "systemd" } else { "launchd" },
+        println!(
+            "  Service: {} ({})",
+            if cfg!(target_os = "linux") {
+                "systemd"
+            } else {
+                "launchd"
+            },
             svc_mode
         );
 
@@ -401,7 +420,7 @@ fn is_root() -> bool {
 /// Check if sudo credentials are already cached (non-interactive check).
 fn sudo_credentials_cached() -> bool {
     std::process::Command::new("sudo")
-        .args(["-n", "true"])  // -n: non-interactive, exits immediately if password needed
+        .args(["-n", "true"]) // -n: non-interactive, exits immediately if password needed
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -460,7 +479,9 @@ pub fn service_installed() -> bool {
 
 pub fn kill_mihomo() {
     if cfg!(target_os = "windows") {
-        let _ = Command::new("taskkill").args(["/F", "/IM", "mihomo.exe"]).status();
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", "mihomo.exe"])
+            .status();
         return;
     }
 
@@ -522,8 +543,12 @@ fn install_launchdaemon() -> anyhow::Result<()> {
     child.stdin.take().unwrap().write_all(plist.as_bytes())?;
     child.wait()?;
 
-    Command::new("sudo").args(["chmod", "644", plist_path]).status()?;
-    Command::new("sudo").args(["launchctl", "load", plist_path]).status()?;
+    Command::new("sudo")
+        .args(["chmod", "644", plist_path])
+        .status()?;
+    Command::new("sudo")
+        .args(["launchctl", "load", plist_path])
+        .status()?;
 
     // Write service mode marker
     utils::write_service_mode("root")?;
@@ -547,8 +572,13 @@ fn install_launchdaemon() -> anyhow::Result<()> {
 
 fn uninstall_launchdaemon() -> anyhow::Result<()> {
     let p = "/Library/LaunchDaemons/io.mihomo.plist";
-    if !std::path::Path::new(p).exists() { println!("No LaunchDaemon found"); return Ok(()); }
-    let _ = Command::new("sudo").args(["launchctl", "bootout", "system", p]).status();
+    if !std::path::Path::new(p).exists() {
+        println!("No LaunchDaemon found");
+        return Ok(());
+    }
+    let _ = Command::new("sudo")
+        .args(["launchctl", "bootout", "system", p])
+        .status();
     let _ = Command::new("sudo").args(["rm", p]).status();
     let _ = std::fs::remove_file(utils::service_mode_path());
     println!("LaunchDaemon removed");
@@ -559,15 +589,21 @@ fn uninstall_launchdaemon() -> anyhow::Result<()> {
 
 fn install_systemd_system() -> anyhow::Result<()> {
     let home = dirs::home_dir().unwrap_or_default().display().to_string();
-    
+
     // Clean up old user service if exists
     let user_unit = format!("{}/.config/systemd/user/mihomo.service", home);
     if std::path::Path::new(&user_unit).exists() {
         println!("Removing old user service...");
-        let _ = Command::new("systemctl").args(["--user", "stop", "mihomo"]).status();
-        let _ = Command::new("systemctl").args(["--user", "disable", "mihomo"]).status();
+        let _ = Command::new("systemctl")
+            .args(["--user", "stop", "mihomo"])
+            .status();
+        let _ = Command::new("systemctl")
+            .args(["--user", "disable", "mihomo"])
+            .status();
         let _ = std::fs::remove_file(&user_unit);
-        let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).status();
+        let _ = Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status();
     }
 
     let unit = format!(
@@ -594,8 +630,12 @@ fn install_systemd_system() -> anyhow::Result<()> {
     child.stdin.take().unwrap().write_all(unit.as_bytes())?;
     child.wait()?;
 
-    Command::new("sudo").args(["systemctl", "daemon-reload"]).status()?;
-    Command::new("sudo").args(["systemctl", "enable", "--now", "mihomo"]).status()?;
+    Command::new("sudo")
+        .args(["systemctl", "daemon-reload"])
+        .status()?;
+    Command::new("sudo")
+        .args(["systemctl", "enable", "--now", "mihomo"])
+        .status()?;
 
     // Write service mode marker
     utils::write_service_mode("root")?;
@@ -606,15 +646,21 @@ fn install_systemd_system() -> anyhow::Result<()> {
 
 fn install_systemd_user() -> anyhow::Result<()> {
     let home = dirs::home_dir().unwrap_or_default().display().to_string();
-    
+
     // Clean up old system service if exists
     let sys_unit = "/etc/systemd/system/mihomo.service";
     if std::path::Path::new(sys_unit).exists() {
         println!("Removing old system service...");
-        let _ = Command::new("sudo").args(["systemctl", "stop", "mihomo"]).status();
-        let _ = Command::new("sudo").args(["systemctl", "disable", "mihomo"]).status();
+        let _ = Command::new("sudo")
+            .args(["systemctl", "stop", "mihomo"])
+            .status();
+        let _ = Command::new("sudo")
+            .args(["systemctl", "disable", "mihomo"])
+            .status();
         let _ = Command::new("sudo").args(["rm", sys_unit]).status();
-        let _ = Command::new("sudo").args(["systemctl", "daemon-reload"]).status();
+        let _ = Command::new("sudo")
+            .args(["systemctl", "daemon-reload"])
+            .status();
     }
 
     let sd_dir = format!("{home}/.config/systemd/user");
@@ -632,8 +678,12 @@ fn install_systemd_user() -> anyhow::Result<()> {
     );
     let unit_path = format!("{sd_dir}/mihomo.service");
     std::fs::write(&unit_path, &unit)?;
-    Command::new("systemctl").args(["--user", "daemon-reload"]).status()?;
-    Command::new("systemctl").args(["--user", "enable", "--now", "mihomo"]).status()?;
+    Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status()?;
+    Command::new("systemctl")
+        .args(["--user", "enable", "--now", "mihomo"])
+        .status()?;
 
     // Write service mode marker
     utils::write_service_mode("user")?;
@@ -645,17 +695,23 @@ fn install_systemd_user() -> anyhow::Result<()> {
 fn uninstall_systemd() -> anyhow::Result<()> {
     let home = dirs::home_dir().unwrap_or_default().display().to_string();
     let mode = utils::read_service_mode();
-    
+
     if mode == "root" {
         let unit_path = "/etc/systemd/system/mihomo.service";
         if !std::path::Path::new(unit_path).exists() {
             println!("No system service found");
             return Ok(());
         }
-        let _ = Command::new("sudo").args(["systemctl", "stop", "mihomo"]).status();
-        let _ = Command::new("sudo").args(["systemctl", "disable", "mihomo"]).status();
+        let _ = Command::new("sudo")
+            .args(["systemctl", "stop", "mihomo"])
+            .status();
+        let _ = Command::new("sudo")
+            .args(["systemctl", "disable", "mihomo"])
+            .status();
         let _ = Command::new("sudo").args(["rm", unit_path]).status();
-        let _ = Command::new("sudo").args(["systemctl", "daemon-reload"]).status();
+        let _ = Command::new("sudo")
+            .args(["systemctl", "daemon-reload"])
+            .status();
         let _ = std::fs::remove_file(utils::service_mode_path());
         println!("systemd system service removed");
     } else {
@@ -664,10 +720,16 @@ fn uninstall_systemd() -> anyhow::Result<()> {
             println!("No user service found");
             return Ok(());
         }
-        let _ = Command::new("systemctl").args(["--user", "stop", "mihomo"]).status();
-        let _ = Command::new("systemctl").args(["--user", "disable", "mihomo"]).status();
+        let _ = Command::new("systemctl")
+            .args(["--user", "stop", "mihomo"])
+            .status();
+        let _ = Command::new("systemctl")
+            .args(["--user", "disable", "mihomo"])
+            .status();
         let _ = std::fs::remove_file(&unit_path);
-        let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).status();
+        let _ = Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status();
         let _ = std::fs::remove_file(utils::service_mode_path());
         println!("systemd user service removed");
     }
@@ -677,7 +739,8 @@ fn uninstall_systemd() -> anyhow::Result<()> {
 // --- Windows ---
 
 fn mihomo_dirs() -> (String, String, String) {
-    let local = dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("C:\\ProgramData"));
+    let local =
+        dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("C:\\ProgramData"));
     let config_dir = format!("{}\\mihomo", local.display());
     let bin_path = format!("{}\\mihomo.exe", config_dir);
     let config_path = format!("{}\\config.yaml", config_dir);
@@ -688,18 +751,24 @@ fn install_windows() -> anyhow::Result<()> {
     let (config_dir, bin_path, _) = mihomo_dirs();
     std::fs::create_dir_all(&config_dir)?;
 
-    Command::new("sc.exe").args([
-        "create", "mihomo",
-        "binPath=", &format!("\"{bin_path}\" -d \"{config_dir}\""),
-        "start=", "auto",
-        "DisplayName=", "Mihomo Proxy Service",
-    ]).status()?;
+    Command::new("sc.exe")
+        .args([
+            "create",
+            "mihomo",
+            "binPath=",
+            &format!("\"{bin_path}\" -d \"{config_dir}\""),
+            "start=",
+            "auto",
+            "DisplayName=",
+            "Mihomo Proxy Service",
+        ])
+        .status()?;
 
     Command::new("sc.exe").args(["start", "mihomo"]).status()?;
-    
+
     // Write service mode marker
     utils::write_service_mode("root")?;
-    
+
     println!("Windows service installed and started");
     Ok(())
 }
