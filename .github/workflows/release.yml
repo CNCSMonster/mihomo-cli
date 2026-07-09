@@ -149,3 +149,7 @@ jobs:
             ## Checksums
 
             See `checksums.txt` in Assets for SHA256 verification.
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/checksums.txt
