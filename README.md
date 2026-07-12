@@ -45,7 +45,6 @@ mihomo-cli tun on                    # 开启 TUN
 |------|------|
 | [USAGE.md](USAGE.md) | 完整命令参考与使用示例 |
 | [CHANGELOG.md](CHANGELOG.md) | 变更记录 |
-| [ROADMAP.md](ROADMAP.md) | 功能规划与 Bug 追踪 |
 | [SPEC.md](SPEC.md) | 软件设计文档 |
 | [CONTEXT.md](CONTEXT.md) | 领域知识与术语表 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 贡献指南 |
