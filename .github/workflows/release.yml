@@ -37,24 +37,18 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install zig
+      - name: Install zig (Linux only)
+        if: runner.os == 'Linux'
         run: |
-          case "$(uname -s)" in
-            Linux)  ZIG_OS="linux" ;;
-            Darwin) ZIG_OS="macos" ;;
-          esac
-          case "$(uname -m)" in
-            x86_64)  ZIG_ARCH="x86_64" ;;
-            aarch64|arm64) ZIG_ARCH="aarch64" ;;
-          esac
-          ZIG_URL="https://ziglang.org/download/0.13.0/zig-${ZIG_OS}-${ZIG_ARCH}-0.13.0.tar.xz"
+          ZIG_URL="https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz"
           echo "Downloading: $ZIG_URL"
           curl -fsSL "$ZIG_URL" -o zig.tar.xz
           tar xf zig.tar.xz
-          echo "$PWD/zig-${ZIG_OS}-${ZIG_ARCH}-0.13.0" >> "$GITHUB_PATH"
-          "$PWD/zig-${ZIG_OS}-${ZIG_ARCH}-0.13.0/zig" version
+          echo "$PWD/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+          "$PWD/zig-linux-x86_64-0.13.0/zig" version
 
-      - name: Install cargo-zigbuild
+      - name: Install cargo-zigbuild (Linux only)
+        if: runner.os == 'Linux'
         run: cargo install cargo-zigbuild
 
       - name: Cache cargo
@@ -68,7 +62,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-
 
-      - name: Build
+      - name: Build (macOS native)
+        if: runner.os == 'macOS'
+        run: cargo build --target ${{ matrix.target }} --release
+
+      - name: Build (Linux cross-compile)
+        if: runner.os == 'Linux'
         run: cargo zigbuild --target ${{ matrix.target }} --release
 
       - name: Package (Unix)
