@@ -31,8 +31,8 @@ pub fn load_policies_at(paths: &AppPaths) -> Result<Vec<DnsPolicy>> {
     }
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("Failed to read: {}", path.display()))?;
-    let file: DnsPolicyFile =
-        serde_yaml::from_str(&content).with_context(|| "Failed to parse dns-policy.yaml")?;
+    let file: DnsPolicyFile = serde_yaml::from_str(&content)
+        .with_context(|| "Failed to parse dns-policy.yaml")?;
     Ok(file.policies)
 }
 
@@ -173,12 +173,13 @@ pub fn to_nameserver_policy(policies: &[DnsPolicy]) -> serde_yaml::Value {
             serde_yaml::Value::String(ips[0].to_string())
         } else {
             serde_yaml::Value::Sequence(
-                ips.iter()
-                    .map(|ip| serde_yaml::Value::String(ip.to_string()))
-                    .collect(),
+                ips.iter().map(|ip| serde_yaml::Value::String(ip.to_string())).collect()
             )
         };
-        map.insert(serde_yaml::Value::String(p.match_pattern.clone()), value);
+        map.insert(
+            serde_yaml::Value::String(p.match_pattern.clone()),
+            value,
+        );
     }
     serde_yaml::Value::Mapping(map)
 }
@@ -287,7 +288,10 @@ mod tests {
         assert_eq!(mapping.len(), 2);
 
         // Single IP
-        assert_eq!(mapping["internal.corp"].as_str().unwrap(), "10.10.1.251");
+        assert_eq!(
+            mapping["internal.corp"].as_str().unwrap(),
+            "10.10.1.251"
+        );
 
         // Multiple IPs
         let seq = mapping["ubtrobot.com"].as_sequence().unwrap();

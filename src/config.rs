@@ -4,34 +4,51 @@ use base64::Engine;
 /// Try downloading with UA negotiation first, then without as fallback
 pub async fn download_sub_smart(url: &str) -> anyhow::Result<(String, bool)> {
     // Attempt 1: with Clash UA (most servers return YAML directly)
-    let client = reqwest::Client::new();
-    let resp = client
+    let client = crate::utils::http_client_builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let resp = match client
         .get(url)
         .header("User-Agent", "clash-verge/2.0.0")
         .send()
-        .await?;
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            crate::log!("Network error: {e}");
+            crate::log!("Is the URL reachable? Try: curl -I '{}'", url);
+            return Err(anyhow::anyhow!(
+                "Network error: {e}\n\n\
+                 Possible causes:\n  \
+                 - DNS resolution failed\n  \
+                 - Connection refused or timed out\n  \
+                 - TLS certificate error\n  \
+                 - TUN mode is intercepting traffic (try: mihomo-cli tun off)\n\n\
+                 Verify the URL is reachable:\n  \
+                 curl -I '{url}'"
+            ));
+        }
+    };
     if resp.status().is_success() {
         let content = resp.text().await?;
         if is_clash_yaml(&content) {
-            crate::log!(
-                "UA negotiation succeeded: got Clash YAML ({} lines)",
-                content.lines().count()
-            );
+            crate::log!("UA negotiation succeeded: got Clash YAML ({} lines)", content.lines().count());
             return Ok((content, true));
         }
-        crate::log!(
-            "UA negotiation returned non-YAML format ({} bytes), will convert",
-            content.len()
-        );
+        crate::log!("UA negotiation returned non-YAML format ({} bytes), will convert", content.len());
         let is_kind = is_clash_yaml(&content);
         return Ok((content, is_kind));
     }
     // Attempt 2: without UA
-    crate::log!(
-        "UA negotiation failed (HTTP {}), retrying without UA",
-        resp.status()
-    );
-    let resp = client.get(url).send().await?;
+    crate::log!("UA negotiation failed (HTTP {}), retrying without UA", resp.status());
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            crate::log!("Network error (retry): {e}");
+            return Err(anyhow::anyhow!("Network error (retry): {e}"));
+        }
+    };
     let content = resp.text().await?;
     let is_ok = is_clash_yaml(&content);
     Ok((content, is_ok))
@@ -62,10 +79,7 @@ pub fn convert_vmess_to_clash(content: &str) -> anyhow::Result<String> {
         anyhow::bail!("No proxies found in subscription");
     }
 
-    let names: Vec<String> = proxies
-        .iter()
-        .filter_map(|p| p["name"].as_str().map(String::from))
-        .collect();
+    let names: Vec<String> = proxies.iter().filter_map(|p| p["name"].as_str().map(String::from)).collect();
     // let names_json = serde_json::to_string(&names)?;
 
     let controller_line = if cfg!(target_os = "windows") {
@@ -138,11 +152,7 @@ fn parse_lines(content: &str) -> Vec<String> {
     // Check if it starts with protocol prefixes
     for prefix in &["vmess://", "ss://", "trojan://"] {
         if raw.starts_with(prefix) || raw.lines().any(|l| l.starts_with(prefix)) {
-            return raw
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect();
+            return raw.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
         }
     }
     // Try base64 decode
@@ -150,26 +160,17 @@ fn parse_lines(content: &str) -> Vec<String> {
         let b64 = format!("{raw}{pad}");
         if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&b64) {
             if let Ok(decoded_str) = String::from_utf8(decoded) {
-                return decoded_str
-                    .lines()
-                    .map(|l| l.trim().to_string())
-                    .filter(|l| !l.is_empty())
-                    .collect();
+                return decoded_str.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
             }
         }
     }
-    raw.lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect()
+    raw.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
 }
 
 fn parse_vmess(line: &str) -> Option<serde_yaml::Value> {
     let b64 = line.strip_prefix("vmess://")?;
     let b64_padded = format!("{}{}", b64, "=".repeat((4 - b64.len() % 4) % 4));
-    let json = base64::engine::general_purpose::STANDARD
-        .decode(&b64_padded)
-        .ok()?;
+    let json = base64::engine::general_purpose::STANDARD.decode(&b64_padded).ok()?;
     let d: serde_json::Value = serde_json::from_slice(&json).ok()?;
 
     let name = d["ps"].as_str().unwrap_or("vmess");
@@ -183,10 +184,7 @@ fn parse_vmess(line: &str) -> Option<serde_yaml::Value> {
     let mut proxy = serde_yaml::Mapping::new();
     macro_rules! insert {
         ($m:expr, $k:expr, $v:expr) => {
-            $m.insert(
-                serde_yaml::Value::String($k.to_string()),
-                serde_yaml::Value::String($v.to_string()),
-            );
+            $m.insert(serde_yaml::Value::String($k.to_string()), serde_yaml::Value::String($v.to_string()));
         };
     }
 
@@ -199,10 +197,7 @@ fn parse_vmess(line: &str) -> Option<serde_yaml::Value> {
     insert!(proxy, "cipher", "auto");
 
     if tls == "tls" {
-        proxy.insert(
-            serde_yaml::Value::String("tls".into()),
-            serde_yaml::Value::Bool(true),
-        );
+        proxy.insert(serde_yaml::Value::String("tls".into()), serde_yaml::Value::Bool(true));
     }
 
     if net == "ws" || net == "h2" {
@@ -217,10 +212,7 @@ fn parse_vmess(line: &str) -> Option<serde_yaml::Value> {
             if !host.is_empty() {
                 let mut headers = serde_yaml::Mapping::new();
                 insert!(headers, "Host", host);
-                opts.insert(
-                    serde_yaml::Value::String("headers".into()),
-                    serde_yaml::Value::Mapping(headers),
-                );
+                opts.insert(serde_yaml::Value::String("headers".into()), serde_yaml::Value::Mapping(headers));
             }
         }
         if !opts.is_empty() {
@@ -257,19 +249,12 @@ fn parse_trojan(line: &str) -> Option<serde_yaml::Value> {
     let (host, port_str) = host_port.rsplit_once(':')?;
     let port: u64 = port_str.parse().ok()?;
 
-    let _query = if qm < after_at.len() {
-        &after_at[qm + 1..]
-    } else {
-        ""
-    };
+    let _query = if qm < after_at.len() { &after_at[qm + 1..] } else { "" };
 
     let mut proxy = serde_yaml::Mapping::new();
     macro_rules! insert {
         ($m:expr, $k:expr, $v:expr) => {
-            $m.insert(
-                serde_yaml::Value::String($k.to_string()),
-                serde_yaml::Value::String($v.to_string()),
-            );
+            $m.insert(serde_yaml::Value::String($k.to_string()), serde_yaml::Value::String($v.to_string()));
         };
     }
 
@@ -338,13 +323,19 @@ pub(crate) fn ensure_controller(yaml: &str) -> String {
     }
 
     if !replaced {
-        // Insert after the first line that is not mode/mixed-port/ipv6
+        // Insert before the first top-level key (non-indented, non-comment line)
+        // after skipping common header keys: mode, mixed-port, ipv6, log-level
         let mut inserted = false;
         for (i, line) in lines.clone().iter().enumerate() {
-            if line.starts_with("mode:")
-                || line.starts_with("mixed-port:")
-                || line.starts_with("ipv6:")
-            {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if trimmed.starts_with("mode:") || trimmed.starts_with("mixed-port:") || trimmed.starts_with("ipv6:") || trimmed.starts_with("log-level:") {
+                continue;
+            }
+            // Only insert before top-level keys (no leading whitespace)
+            if line.starts_with(' ') || line.starts_with('\t') {
                 continue;
             }
             lines.insert(i, controller.to_string());
@@ -365,17 +356,10 @@ pub fn check_config_exists() -> bool {
 
 fn indent(s: &str, spaces: usize) -> String {
     let prefix = " ".repeat(spaces);
-    s.lines()
-        .map(|l| {
-            if l.is_empty() {
-                String::new()
-            } else {
-                format!("{prefix}{l}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    s.lines().map(|l| if l.is_empty() { String::new() } else { format!("{prefix}{l}") })
+        .collect::<Vec<_>>().join("\n")
 }
+
 
 /// Merge user-defined rules and DNS policies into config.yaml.
 ///
@@ -416,11 +400,7 @@ pub fn merge_user_config_at(paths: &AppPaths) -> anyhow::Result<()> {
         if user_rules.is_empty() {
             crate::log!("No user rules, removing markers from config");
         } else {
-            crate::log!(
-                "Merged {} user rules (position: {:?})",
-                user_rules.len(),
-                position
-            );
+            crate::log!("Merged {} user rules (position: {:?})", user_rules.len(), position);
         }
     }
 
@@ -450,11 +430,7 @@ const USER_RULES_END: &str = "# === USER RULES END ===";
 /// Merge user rules into config content using marker-based approach.
 /// If markers exist, replaces the section between them.
 /// If not, inserts markers + rules at the configured position.
-fn merge_rules_marker_based(
-    config: &str,
-    user_rules: &[String],
-    position: crate::rules::RulePosition,
-) -> String {
+fn merge_rules_marker_based(config: &str, user_rules: &[String], position: crate::rules::RulePosition) -> String {
     use crate::rules::RulePosition;
 
     // Check if markers already exist
@@ -500,7 +476,7 @@ fn merge_rules_marker_based(
                 let mut result = String::new();
                 result.push_str(&config[..insert_pos]);
                 result.push_str(&rules_block);
-                result.push('\n');
+                result.push_str("\n");
                 result.push_str(&config[insert_pos..]);
                 return result;
             }
@@ -509,7 +485,7 @@ fn merge_rules_marker_based(
                 let rules_end = find_rules_section_end(config, rules_key_pos);
                 let mut result = String::new();
                 result.push_str(&config[..rules_end]);
-                result.push('\n');
+                result.push_str("\n");
                 result.push_str(&rules_block);
                 result.push_str(&config[rules_end..]);
                 return result;
@@ -528,12 +504,12 @@ fn merge_rules_marker_based(
 fn build_rules_block(user_rules: &[String]) -> String {
     let mut block = String::new();
     block.push_str(USER_RULES_START);
-    block.push('\n');
+    block.push_str("\n");
     for rule in user_rules {
         block.push_str(&format!("  - {}\n", rule));
     }
     block.push_str(USER_RULES_END);
-    block.push('\n');
+    block.push_str("\n");
     block
 }
 
@@ -560,11 +536,7 @@ fn find_rules_section_end(config: &str, rules_key_pos: usize) -> usize {
     let after_rules = &config[rules_key_pos..];
     for (i, line) in after_rules.lines().enumerate() {
         // A top-level key (no leading whitespace) that isn't empty
-        if !line.is_empty()
-            && !line.starts_with(' ')
-            && !line.starts_with('#')
-            && !line.starts_with('-')
-        {
+        if !line.is_empty() && !line.starts_with(' ') && !line.starts_with('#') && !line.starts_with('-') {
             // Calculate absolute position
             let mut pos = rules_key_pos;
             for (j, l) in after_rules.lines().enumerate() {
@@ -621,16 +593,10 @@ fn merge_dns_policies(config: &str, policies: &[crate::dns::DnsPolicy]) -> Strin
 
     // Insert after "enhanced-mode:" line in the dns section
     if let Some(pos) = content.find("\n  enhanced-mode:") {
-        let insert_pos = content[pos..]
-            .find('\n')
-            .map(|p| pos + p + 1)
-            .unwrap_or(pos + 1);
+        let insert_pos = content[pos..].find('\n').map(|p| pos + p + 1).unwrap_or(pos + 1);
         content.insert_str(insert_pos, &block);
     } else if let Some(pos) = content.find("\ndns:") {
-        let insert_pos = content[pos..]
-            .find('\n')
-            .map(|p| pos + p + 1)
-            .unwrap_or(pos + 1);
+        let insert_pos = content[pos..].find('\n').map(|p| pos + p + 1).unwrap_or(pos + 1);
         content.insert_str(insert_pos, &block);
     }
 
@@ -644,16 +610,14 @@ pub fn merge_rules_to_config() -> anyhow::Result<()> {
 
 /// Update nameserver-policy in config.yaml based on DNS policies.
 /// This is a convenience wrapper that calls merge_user_config.
-pub fn update_nameserver_policy_at(
-    paths: &AppPaths,
-    _policies: &[crate::dns::DnsPolicy],
-) -> anyhow::Result<()> {
+pub fn update_nameserver_policy_at(paths: &AppPaths, _policies: &[crate::dns::DnsPolicy]) -> anyhow::Result<()> {
     merge_user_config_at(paths)
 }
 
 pub fn update_nameserver_policy(_policies: &[crate::dns::DnsPolicy]) -> anyhow::Result<()> {
     update_nameserver_policy_at(&AppPaths::from_system(), _policies)
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -674,13 +638,10 @@ mod tests {
         let (_tmp, paths) = setup_config(
             "mixed-port: 7890\nrules:\n  - DOMAIN-SUFFIX,google.com,Proxy\n  - DOMAIN-SUFFIX,github.com,DIRECT\ndns:\n  enable: true\n  enhanced-mode: fake-ip\n",
         );
-        rules::save_rules_at(
-            &paths,
-            &[
-                "DOMAIN-SUFFIX,company.com,DIRECT".to_string(),
-                "IP-CIDR,10.0.0.0/8,DIRECT".to_string(),
-            ],
-        )
+        rules::save_rules_at(&paths, &[
+            "DOMAIN-SUFFIX,company.com,DIRECT".to_string(),
+            "IP-CIDR,10.0.0.0/8,DIRECT".to_string(),
+        ])
         .unwrap();
 
         merge_user_config_at(&paths).unwrap();
@@ -739,5 +700,72 @@ mod tests {
         let rule_values = parsed["rules"].as_sequence().unwrap();
         let rules: Vec<&str> = rule_values.iter().map(|v| v.as_str().unwrap()).collect();
         assert_eq!(rules, vec!["DOMAIN-SUFFIX,google.com,Proxy"]);
+    }
+
+    // ── Failure path tests ──
+
+    #[test]
+    fn test_ensure_controller_inserts_at_top_level() {
+        // Config where the first non-header line has indentation (proxy list)
+        let yaml = "proxies:\n  - name: 节点选择\n    type: selector\n";
+        let result = ensure_controller(yaml);
+        assert!(result.contains("external-controller-unix"));
+        // Should be inserted BEFORE proxies, not in the middle of the proxy list
+        assert!(result.find("external-controller-unix").unwrap() < result.find("proxies:").unwrap(),
+            "\n---\n{result}\n---");
+    }
+
+    #[test]
+    fn test_ensure_controller_malformed_input() {
+        // ensure_controller should not panic on malformed YAML
+        let result = ensure_controller("mixed-port: 7890\n  - invalid indent\nfoo: bar");
+        assert!(result.contains("external-controller-unix"));
+    }
+
+    #[test]
+    fn test_ensure_controller_empty() {
+        let result = ensure_controller("");
+        assert!(result.contains("external-controller-unix"));
+    }
+
+    #[test]
+    fn test_ensure_controller_already_has_unix() {
+        let input = "mixed-port: 7890\nexternal-controller-unix: /tmp/verge/verge-mihomo.sock\n";
+        let result = ensure_controller(input);
+        assert_eq!(result, input, "should not modify already-configured config");
+    }
+
+    #[test]
+    fn test_fix_existing_config_no_controller_adds_it() {
+        // A config without external-controller-unix should get it added
+        let content = "mixed-port: 7890\nmode: rule\n";
+        let result = ensure_controller(content);
+        assert!(result.contains("external-controller-unix: /tmp/verge/verge-mihomo.sock"));
+        assert!(result.contains("mixed-port: 7890"));
+    }
+
+    #[test]
+    fn test_atomic_write_and_interrupt_leaves_target_untouched() {
+        use std::io::Write;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("config.yaml");
+        let target_str = target.display().to_string();
+
+        // Write original content
+        std::fs::write(&target, "original").unwrap();
+
+        // Simulate interrupt by writing .tmp but NOT renaming
+        let tmp_path = format!("{}.tmp", target_str);
+        let mut f = std::fs::File::create(&tmp_path).unwrap();
+        f.write_all(b"new content that should not appear").unwrap();
+        drop(f); // close handle without renaming
+
+        // Now atomic_write_file should overwrite .tmp AND rename
+        crate::utils::atomic_write_file(&target_str, "final content").unwrap();
+
+        // Target should be "final content", not "original" or "new content"
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "final content");
+        // .tmp should NOT exist after atomic write
+        assert!(!std::path::Path::new(&tmp_path).exists());
     }
 }

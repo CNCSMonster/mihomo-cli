@@ -2,16 +2,64 @@ use serde_json::Value;
 
 #[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
+use tokio::net::UnixStream;
 #[cfg(windows)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::ClientOptions;
-#[cfg(unix)]
-use tokio::net::UnixStream;
 
 /// Lightweight check: does the socket file exist?
 pub fn socket_file_exists() -> bool {
     std::path::Path::new(socket_path()).exists()
+}
+
+/// Check if the socket is actually connectable (not just file exists).
+/// Returns true if a connection attempt succeeds.
+pub fn socket_is_alive() -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::net::UnixStream as StdUnixStream;
+        StdUnixStream::connect(socket_path()).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        use std::fs::OpenOptions;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(socket_path())
+            .is_ok()
+    }
+}
+
+/// Return the socket path for display purposes.
+pub fn socket_path_display() -> &'static str {
+    socket_path()
+}
+
+/// Build a context-aware fix suggestion message when socket/API is unreachable.
+pub fn socket_fix_suggestion() -> String {
+    #[cfg(not(unix))]
+    {
+        return "  Is mihomo running? Run: mihomo-cli status".to_string();
+    }
+    #[cfg(unix)]
+    {
+        let proc_alive = mihomo_process_running();
+        let sock_alive = socket_is_alive();
+        let svc_installed = crate::service::service_installed();
+
+        if proc_alive && sock_alive {
+            "  Try: mihomo-cli config --fix && mihomo-cli restart".to_string()
+        } else if proc_alive && !sock_alive {
+            "  Config may be missing API controller. Try: mihomo-cli config --fix".to_string()
+        } else if !proc_alive && svc_installed {
+            "  Try: mihomo-cli restart".to_string()
+        } else {
+            "  Try: mihomo-cli start".to_string()
+        }
+    }
 }
 
 /// Check if mihomo process is actually running (via pgrep/tasklist)
@@ -33,13 +81,9 @@ pub fn mihomo_process_running() -> bool {
 
 fn socket_path() -> &'static str {
     #[cfg(unix)]
-    {
-        "/tmp/verge/verge-mihomo.sock"
-    }
+    { "/tmp/verge/verge-mihomo.sock" }
     #[cfg(windows)]
-    {
-        r"\\.\pipe\mihomo"
-    }
+    { r"\\.\pipe\mihomo" }
 }
 
 /// Percent-encode non-ASCII and reserved characters in the URL path.
@@ -47,9 +91,22 @@ fn percent_encode_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for b in path.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
-                out.push(b as char)
-            }
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+            | b'-' | b'_' | b'.' | b'~' | b'/' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// Encode a query parameter value (like JS encodeURIComponent).
+/// Encodes everything except unreserved chars: A-Z a-z 0-9 - _ . ~
+fn encode_query_param(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() * 2);
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+            | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
             _ => out.push_str(&format!("%{:02X}", b)),
         }
     }
@@ -62,10 +119,12 @@ async fn socket_request(method: &str, path: &str, body: Option<&[u8]>) -> anyhow
     let result = do_socket_request(method, path, body).await;
     match result {
         Err(e) => {
+            crate::log!("socket_request failed: {e}");
+            let suggestion = socket_fix_suggestion();
             anyhow::bail!(
                 "Cannot reach mihomo: {e}\n  \
-                 Is mihomo running? Run: mihomo-cli status\n  \
-                 Socket: {}",
+                 Socket: {}\n\
+                 {suggestion}",
                 socket_path()
             )
         }
@@ -74,14 +133,11 @@ async fn socket_request(method: &str, path: &str, body: Option<&[u8]>) -> anyhow
 }
 
 async fn do_socket_request(method: &str, path: &str, body: Option<&[u8]>) -> anyhow::Result<Value> {
-    let encoded_path = percent_encode_path(path);
-    let body_str = body
-        .map(|b| String::from_utf8_lossy(b).to_string())
-        .unwrap_or_default();
+    let body_str = body.map(|b| String::from_utf8_lossy(b).to_string()).unwrap_or_default();
     let request = if !body_str.is_empty() {
-        format!("{method} {encoded_path} HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body_str.len(), body_str)
+        format!("{method} {path} HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body_str.len(), body_str)
     } else {
-        format!("{method} {encoded_path} HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        format!("{method} {path} HTTP/1.0\r\nHost: localhost\r\n\r\n")
     };
 
     #[cfg(unix)]
@@ -89,16 +145,13 @@ async fn do_socket_request(method: &str, path: &str, body: Option<&[u8]>) -> any
         let mut stream = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             UnixStream::connect(socket_path()),
-        )
-        .await??;
+        ).await??;
         stream.write_all(request.as_bytes()).await?;
         let mut data = Vec::new();
         let mut buf = vec![0u8; 8192];
         loop {
             let n = stream.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
+            if n == 0 { break; }
             data.extend_from_slice(&buf[..n]);
         }
         data
@@ -106,15 +159,14 @@ async fn do_socket_request(method: &str, path: &str, body: Option<&[u8]>) -> any
 
     #[cfg(windows)]
     let response = {
-        let mut stream = ClientOptions::new().open(socket_path())?;
+        let mut stream = ClientOptions::new()
+            .open(socket_path())?;
         stream.write_all(request.as_bytes()).await?;
         let mut data = Vec::new();
         let mut buf = vec![0u8; 8192];
         loop {
             let n = stream.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
+            if n == 0 { break; }
             data.extend_from_slice(&buf[..n]);
         }
         data
@@ -129,24 +181,14 @@ async fn do_socket_request(method: &str, path: &str, body: Option<&[u8]>) -> any
     }
     let body_start = response_str.find("\r\n\r\n").unwrap_or(0) + 4;
     let json_str = response_str[body_start..].trim();
-    if json_str.is_empty() {
-        return Ok(Value::Null);
-    }
+    if json_str.is_empty() { return Ok(Value::Null); }
     Ok(serde_json::from_str(json_str)?)
 }
 
-async fn api_get(path: &str) -> anyhow::Result<Value> {
-    socket_request("GET", path, None).await
-}
-pub async fn api_put(path: &str, body: Value) -> anyhow::Result<Value> {
-    socket_request("PUT", path, Some(&serde_json::to_vec(&body)?)).await
-}
-pub async fn api_patch(path: &str, body: Value) -> anyhow::Result<Value> {
-    socket_request("PATCH", path, Some(&serde_json::to_vec(&body)?)).await
-}
-async fn api_delete(path: &str) -> anyhow::Result<Value> {
-    socket_request("DELETE", path, None).await
-}
+async fn api_get(path: &str) -> anyhow::Result<Value> { socket_request("GET", path, None).await }
+pub async fn api_put(path: &str, body: Value) -> anyhow::Result<Value> { socket_request("PUT", path, Some(&serde_json::to_vec(&body)?)).await }
+pub async fn api_patch(path: &str, body: Value) -> anyhow::Result<Value> { socket_request("PATCH", path, Some(&serde_json::to_vec(&body)?)).await }
+async fn api_delete(path: &str) -> anyhow::Result<Value> { socket_request("DELETE", path, None).await }
 
 pub async fn get_all_proxies() -> anyhow::Result<Value> {
     api_get("/proxies").await
@@ -160,8 +202,11 @@ pub async fn wait_for_api_ready(timeout_secs: u64) -> bool {
     let mut warned_5s = false;
     let mut warned_10s = false;
     while std::time::Instant::now() < deadline {
-        if api_get("/configs").await.is_ok() {
-            return true;
+        match api_get("/configs").await {
+            Ok(_) => return true,
+            Err(e) => {
+                crate::log!("connection to {} failed: {e}", socket_path());
+            }
         }
         let elapsed = start.elapsed().as_secs();
         if elapsed >= 10 && !warned_10s {
@@ -178,53 +223,36 @@ pub async fn wait_for_api_ready(timeout_secs: u64) -> bool {
 
 pub async fn list_proxies() -> anyhow::Result<()> {
     let data = api_get("/proxies").await?;
-    let proxies = data["proxies"]
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("no proxies"))?;
+    let proxies = data["proxies"].as_object().ok_or_else(|| anyhow::anyhow!("no proxies"))?;
     let mut pairs: Vec<(&String, &Value)> = proxies.iter().collect();
     pairs.sort_by_key(|(k, _)| *k);
     for (name, p) in pairs {
         let ptype = p["type"].as_str().unwrap_or("?");
-        if !["Selector", "URLTest", "Fallback"].contains(&ptype) {
-            continue;
-        }
+        if !["Selector", "URLTest", "Fallback"].contains(&ptype) { continue; }
         let now = p["now"].as_str().unwrap_or("-");
         println!("[{ptype:8}] {name}  →  {now}");
         if let Some(all) = p["all"].as_array() {
-            for sub in all {
-                let s = sub.as_str().unwrap_or("");
-                if s != now {
-                    println!("          └ {s}");
-                }
-            }
+            for sub in all { let s = sub.as_str().unwrap_or(""); if s != now { println!("          └ {s}"); } }
         }
     }
     Ok(())
 }
 
 pub async fn delay_test(group: &str) -> anyhow::Result<()> {
-    let path =
-        format!("/proxies/{group}/delay?url=http://www.gstatic.com/generate_204&timeout=5000");
+    let enc = percent_encode_path(group);
+    let test_url = encode_query_param("http://www.gstatic.com/generate_204");
+    let path = format!("/group/{enc}/delay?url={test_url}&timeout=5000");
     let data = api_get(&path).await?;
-    let obj = data
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("no delay data"))?;
+    let obj = data.as_object().ok_or_else(|| anyhow::anyhow!("no delay data"))?;
     let mut results: Vec<(u64, String)> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     for (name, ms) in obj {
-        if let Some(ms) = ms.as_u64() {
-            results.push((ms, name.clone()));
-        } else {
-            errors.push(name.clone());
-        }
+        if let Some(ms) = ms.as_u64() { results.push((ms, name.clone())); }
+        else { errors.push(name.clone()); }
     }
     results.sort_by_key(|(ms, _)| *ms);
-    for (ms, name) in &results {
-        println!("{name}: {ms}ms");
-    }
-    for name in &errors {
-        println!("{name}: timeout");
-    }
+    for (ms, name) in &results { println!("{name}: {ms}ms"); }
+    for name in &errors { println!("{name}: timeout"); }
     Ok(())
 }
 
@@ -258,40 +286,28 @@ pub async fn tun_toggle(action: Option<crate::TunAction>) -> anyhow::Result<()> 
         }
         None => {
             let data = api_get("/configs").await?;
-            println!(
-                "TUN is {}",
-                if data["tun"]["enable"].as_bool().unwrap_or(false) {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            );
+            println!("TUN is {}", if data["tun"]["enable"].as_bool().unwrap_or(false) { "enabled" } else { "disabled" });
         }
     }
     Ok(())
 }
 
 pub async fn select_proxy(group: &str, node: &str) -> anyhow::Result<()> {
-    api_put(
-        &format!("/proxies/{group}"),
-        serde_json::json!({"name": node}),
-    )
-    .await?;
+    let enc = percent_encode_path(group);
+    api_put(&format!("/proxies/{enc}"), serde_json::json!({"name": node})).await?;
     Ok(())
 }
 
 pub async fn get_group_nodes(group: &str) -> anyhow::Result<Vec<String>> {
-    let data = api_get(&format!("/proxies/{group}")).await?;
+    let enc = percent_encode_path(group);
+    let data = api_get(&format!("/proxies/{enc}")).await?;
     let all = data["all"].as_array().ok_or_else(|| {
         anyhow::anyhow!(
             "Group '{}' not found or has no nodes.\n  Run: mihomo-cli list  (to see available groups)",
             group
         )
     })?;
-    Ok(all
-        .iter()
-        .filter_map(|v| v.as_str().map(String::from))
-        .collect())
+    Ok(all.iter().filter_map(|v| v.as_str().map(String::from)).collect())
 }
 
 pub async fn connections(flush: bool) -> anyhow::Result<()> {
@@ -305,17 +321,10 @@ pub async fn connections(flush: bool) -> anyhow::Result<()> {
     println!("Active connections: {}", conns.len());
     for c in conns {
         let meta = &c["metadata"];
-        let host = meta["host"]
-            .as_str()
-            .or(meta["destinationIP"].as_str())
-            .unwrap_or("?");
+        let host = meta["host"].as_str().or(meta["destinationIP"].as_str()).unwrap_or("?");
         let port = meta["destinationPort"].as_str().unwrap_or("?");
         let net = meta["network"].as_str().unwrap_or("?");
-        println!(
-            "  {host}:{port} ({net})  ↑{} ↓{}",
-            c["upload"].as_u64().unwrap_or(0),
-            c["download"].as_u64().unwrap_or(0)
-        );
+        println!("  {host}:{port} ({net})  ↑{} ↓{}", c["upload"].as_u64().unwrap_or(0), c["download"].as_u64().unwrap_or(0));
     }
     Ok(())
 }
@@ -374,6 +383,8 @@ pub async fn get_port() -> anyhow::Result<u64> {
 }
 
 pub async fn status() -> anyhow::Result<()> {
+    let verbose = crate::VERBOSE.load(std::sync::atomic::Ordering::Relaxed);
+
     println!("=== Mihomo Status ===");
 
     let mihomo_path = crate::utils::mihomo_path();
@@ -384,10 +395,7 @@ pub async fn status() -> anyhow::Result<()> {
     // ── Prerequisites ──
     if !bin_ok {
         println!("  mihomo binary: NOT FOUND");
-        println!(
-            "  Config:        {}",
-            if cfg_ok { "exists" } else { "missing" }
-        );
+        println!("  Config:        {}", if cfg_ok { "exists" } else { "missing" });
         println!();
         println!("  Fix: mihomo-cli install");
         return Ok(());
@@ -416,21 +424,15 @@ pub async fn status() -> anyhow::Result<()> {
 
             println!("  mihomo:        running");
             println!("  Mode:          {mode}");
-            println!(
-                "  TUN:           {}",
-                if tun { "enabled" } else { "disabled" }
-            );
+            println!("  TUN:           {}", if tun { "enabled" } else { "disabled" });
             println!("  Port:          {port}");
             println!("  Service:       {svc_label}");
 
-            if let Ok(data) = api_get("/proxies/节点选择").await {
+            if let Ok(data) = api_get(&format!("/proxies/{}", percent_encode_path("节点选择"))).await {
                 println!("  Node:          {}", data["now"].as_str().unwrap_or("?"));
             }
 
-            println!(
-                "  Auto-start:    {}",
-                if svc_installed { "enabled" } else { "disabled" }
-            );
+            println!("  Auto-start:    {}", if svc_installed { "enabled" } else { "disabled" });
 
             println!();
             print!("  Exit IP:       ");
@@ -441,29 +443,94 @@ pub async fn status() -> anyhow::Result<()> {
         }
         Err(_) => {
             // ── Unhealthy — diagnose ──
-            println!("  mihomo binary: {}", mihomo_path);
-            println!("  Config:        {}", config_path);
+            let sock_alive = socket_is_alive();
+            if verbose {
+                println!();
+                println!("=== Diagnostics ===");
+                println!("  Binary:        ✅ {}", mihomo_path);
+                println!("  Config:        ✅ {}", config_path);
 
-            if proc_alive && !sock_exists {
+                // Config syntax check
+                if std::path::Path::new(&mihomo_path).exists() {
+                    let output = std::process::Command::new(&mihomo_path)
+                        .args(["-t", "-d", &crate::utils::config_dir()])
+                        .output();
+                    match output {
+                        Ok(o) if o.status.success() =>
+                            println!("  Config syntax: ✅ valid"),
+                        Ok(o) => {
+                            let stderr = String::from_utf8_lossy(&o.stderr);
+                            println!("  Config syntax: ❌ invalid");
+                            for line in stderr.lines().take(5) {
+                                println!("    {line}");
+                            }
+                        }
+                        Err(_) => println!("  Config syntax: ⚠ cannot test (mihomo -t failed)"),
+                    }
+                }
+
+                // Socket controller check (only Unix socket, not TCP)
+                let config_content = std::fs::read_to_string(&config_path).unwrap_or_default();
+                if config_content.contains("external-controller-unix") {
+                    println!("  API controller: ✅ configured");
+                } else {
+                    println!("  API controller: ❌ missing → Try: mihomo-cli config --fix");
+                }
+
+                // Socket status
+                println!("  Socket file:   {} {}", if sock_exists { "✅" } else { "❌" }, socket_path_display());
+                println!("  Socket alive:  {}", if sock_alive { "✅" } else { "❌" });
+                println!("  Process:       {}", if proc_alive { "✅ running" } else { "❌ not running" });
+                println!("  Service:       {} {}",
+                    if svc_installed { "✅ installed" } else { "❌ not installed" },
+                    if svc_installed { format!("({})", crate::utils::read_service_mode()) } else { String::new() }
+                );
+
+                // Recent logs
+                let log_path = crate::utils::log_path();
+                if std::path::Path::new(&log_path).exists() {
+                    println!();
+                    println!("  Recent logs (tail -20):");
+                    if let Ok(content) = std::fs::read_to_string(&log_path) {
+                        let lines: Vec<&str> = content.lines().collect();
+                        for line in lines.iter().skip(lines.len().saturating_sub(20)) {
+                            println!("    {line}");
+                        }
+                    }
+                }
+
+                // Fix suggestion
                 println!();
-                println!("  ⚠  mihomo is running but the API socket is missing.");
-                println!("     The socket file was deleted (this doesn't affect proxy traffic)");
-                println!("     but CLI commands like select/list/delay won't work.");
-            } else if proc_alive {
-                println!();
-                println!("  ⚠  mihomo is running but unresponsive.");
+                println!("  Suggestion:");
+                println!("{}", socket_fix_suggestion());
             } else {
-                println!();
-                println!("  ❌ mihomo is NOT running.");
-            }
+                println!("  mihomo binary: {}", mihomo_path);
+                println!("  Config:        {}", config_path);
 
-            println!();
-            println!("  Fix: mihomo-cli restart");
+                if proc_alive && !sock_exists {
+                    println!();
+                    println!("  ⚠  mihomo is running but the API socket is missing.");
+                    println!("     The socket file was deleted (this doesn't affect proxy traffic)");
+                    println!("     but CLI commands like select/list/delay won't work.");
+                } else if proc_alive {
+                    println!();
+                    println!("  ⚠  mihomo is running but unresponsive.");
+                } else {
+                    println!();
+                    println!("  ❌ mihomo is NOT running.");
+                }
 
-            if svc_installed && !proc_alive {
                 println!();
-                println!("  Auto-start service is installed but the process is dead.");
-                println!("  Check logs: tail -f {}", crate::utils::log_path());
+                println!("{}", socket_fix_suggestion());
+
+                if svc_installed && !proc_alive {
+                    println!();
+                    println!("  Auto-start service is installed but the process is dead.");
+                    println!("  Check logs: tail -f {}", crate::utils::log_path());
+                }
+
+                println!();
+                println!("  Run: mihomo-cli status -v  for diagnostics");
             }
         }
     }
@@ -479,22 +546,17 @@ pub struct IpProbeResult {
     pub source: String,
 }
 
-type IpParser = fn(&serde_json::Value) -> Option<(String, String)>;
-const IP_SOURCES: &[(&str, &str, IpParser)] = &[
+const IP_SOURCES: &[(&str, &str, fn(&serde_json::Value) -> Option<(String, String)>)] = &[
     ("https://api.ip.sb/geoip", "api.ip.sb", |v| {
         let ip = v["ip"].as_str()?;
         let country = v["country"].as_str()?;
         Some((ip.to_string(), country.to_string()))
     }),
-    (
-        "http://ip-api.com/json?fields=query,country",
-        "ip-api.com",
-        |v| {
-            let ip = v["query"].as_str()?;
-            let country = v["country"].as_str()?;
-            Some((ip.to_string(), country.to_string()))
-        },
-    ),
+    ("http://ip-api.com/json?fields=query,country", "ip-api.com", |v| {
+        let ip = v["query"].as_str()?;
+        let country = v["country"].as_str()?;
+        Some((ip.to_string(), country.to_string()))
+    }),
     ("https://ifconfig.me/all.json", "ifconfig.me", |v| {
         let ip = v["ip_addr"].as_str()?;
         let country = v["country"].as_str().unwrap_or("?");
@@ -504,7 +566,8 @@ const IP_SOURCES: &[(&str, &str, IpParser)] = &[
 
 /// Build a reqwest client for the given probe mode.
 fn build_ip_client(use_proxy: bool) -> anyhow::Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5));
+    let mut builder = crate::utils::http_client_builder()
+        .timeout(std::time::Duration::from_secs(5));
 
     if use_proxy {
         let port = get_mihomo_port();
@@ -513,9 +576,7 @@ fn build_ip_client(use_proxy: bool) -> anyhow::Result<reqwest::Client> {
     } else {
         // Direct connection — explicitly set empty proxy to bypass env vars
         // Note: no_proxy() sets a bypass list, not "disable proxy"
-        builder = builder.proxy(reqwest::Proxy::custom(|_: &reqwest::Url| {
-            None::<reqwest::Url>
-        }));
+        builder = builder.proxy(reqwest::Proxy::custom(|_: &reqwest::Url| None::<reqwest::Url>));
     }
 
     Ok(builder.build()?)
@@ -534,24 +595,26 @@ async fn probe_ip(use_proxy: bool, target_url: Option<&str>) -> Option<IpProbeRe
     if let Some(url) = target_url {
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(8),
-            client.get(url).header("User-Agent", "mihomo-cli").send(),
-        )
-        .await;
+            client.get(url)
+                .header("User-Agent", "mihomo-cli")
+                .send(),
+        ).await;
         // Request completed (or timed out), now check exit IP
     }
 
     // Check exit IP by requesting an IP echo API
     for (url, name, parse) in IP_SOURCES {
-        let result = tokio::time::timeout(std::time::Duration::from_secs(8), async {
-            let resp = client
-                .get(*url)
-                .header("User-Agent", "mihomo-cli")
-                .send()
-                .await?;
-            let data: serde_json::Value = resp.json().await?;
-            parse(&data).ok_or_else(|| anyhow::anyhow!("unexpected response format"))
-        })
-        .await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            async {
+                let resp = client.get(*url)
+                    .header("User-Agent", "mihomo-cli")
+                    .send()
+                    .await?;
+                let data: serde_json::Value = resp.json().await?;
+                parse(&data).ok_or_else(|| anyhow::anyhow!("unexpected response format"))
+            },
+        ).await;
 
         match result {
             Ok(Ok((ip, country))) => {
@@ -565,7 +628,7 @@ async fn probe_ip(use_proxy: bool, target_url: Option<&str>) -> Option<IpProbeRe
                     country,
                     source,
                 });
-            }
+            },
             _ => continue,
         }
     }
@@ -576,7 +639,7 @@ async fn probe_ip(use_proxy: bool, target_url: Option<&str>) -> Option<IpProbeRe
 /// Check if an IP address is a LAN/private address.
 fn is_lan_ip(ip: &str) -> bool {
     use std::net::IpAddr;
-
+    
     if let Ok(addr) = ip.parse::<IpAddr>() {
         match addr {
             IpAddr::V4(v4) => {
@@ -649,10 +712,7 @@ pub fn format_ip_report(
     };
     lines.push(format!("{}{}", isp_label, format_ip_line(&isp)));
     lines.push(format!("  Now               {}", format_ip_line(&now)));
-    lines.push(format!(
-        "  Via Mihomo       {}",
-        format_ip_line(&via_mihomo)
-    ));
+    lines.push(format!("  Via Mihomo       {}", format_ip_line(&via_mihomo)));
 
     lines.push(String::new());
 
@@ -662,10 +722,7 @@ pub fn format_ip_report(
             if tun_enabled {
                 lines.push("  → TUN enabled: system route exits via proxy".to_string());
             } else {
-                lines.push(
-                    "  → System route and proxy exit are the same — proxy may not be working"
-                        .to_string(),
-                );
+                lines.push("  → System route and proxy exit are the same — proxy may not be working".to_string());
             }
         }
         (Some(_), Some(_)) => {
@@ -678,9 +735,7 @@ pub fn format_ip_report(
         (Some(_), None) => lines.push("  → Mihomo proxy unreachable".to_string()),
         (None, None) => {
             if tun_enabled {
-                lines.push(
-                    "  → Both routes unreachable — TUN may not be fully connected".to_string(),
-                );
+                lines.push("  → Both routes unreachable — TUN may not be fully connected".to_string());
             } else {
                 lines.push("  → Both routes unreachable".to_string());
             }
@@ -734,13 +789,17 @@ pub async fn probe_all_ips(target_url: Option<&str>) -> String {
     let (isp, now, via_mihomo) = if tun_enabled {
         // TUN on: ISP from cache, Now + Via Mihomo probed
         let isp = read_isp_cache(&cache_path);
-        let (now, via_mihomo) =
-            tokio::join!(probe_ip(false, target_url), probe_ip(true, target_url),);
+        let (now, via_mihomo) = tokio::join!(
+            probe_ip(false, target_url),
+            probe_ip(true, target_url),
+        );
         (isp, now, via_mihomo)
     } else {
         // TUN off: ISP = Now (same direct probe), cache it
-        let (result, via_mihomo) =
-            tokio::join!(probe_ip(false, target_url), probe_ip(true, target_url),);
+        let (result, via_mihomo) = tokio::join!(
+            probe_ip(false, target_url),
+            probe_ip(true, target_url),
+        );
         if let Some(ref r) = result {
             write_isp_cache(&cache_path, r);
         }
@@ -748,14 +807,7 @@ pub async fn probe_all_ips(target_url: Option<&str>) -> String {
         (isp, result, via_mihomo)
     };
 
-    format_ip_report(
-        tun_enabled,
-        http_proxy_val,
-        https_proxy_val,
-        isp,
-        now,
-        via_mihomo,
-    )
+    format_ip_report(tun_enabled, http_proxy_val, https_proxy_val, isp, now, via_mihomo)
 }
 
 /// Backward-compatible: probe via mihomo proxy (original behavior).
@@ -876,7 +928,14 @@ mod tests {
             country: "United States".to_string(),
             source: "api.ip.sb".to_string(),
         });
-        let report = format_ip_report(false, None, None, isp, now, via_mihomo);
+        let report = format_ip_report(
+            false,
+            None,
+            None,
+            isp,
+            now,
+            via_mihomo,
+        );
         assert!(report.contains("TUN:           disabled"));
         assert!(report.contains("http_proxy:    not set"));
         assert!(report.contains("https_proxy:   not set"));
@@ -930,8 +989,12 @@ mod tests {
             source: "api.ip.sb".to_string(),
         });
         let report = format_ip_report(
-            true, None, None, None, // no ISP cache
-            now, via_mihomo,
+            true,
+            None,
+            None,
+            None,  // no ISP cache
+            now,
+            via_mihomo,
         );
         assert!(report.contains("ISP               (unreachable)"));
     }
@@ -948,7 +1011,14 @@ mod tests {
             country: "United States".to_string(),
             source: "api.ip.sb".to_string(),
         });
-        let report = format_ip_report(false, None, None, isp, None, via_mihomo);
+        let report = format_ip_report(
+            false,
+            None,
+            None,
+            isp,
+            None,
+            via_mihomo,
+        );
         assert!(report.contains("Now               (unreachable)"));
         assert!(report.contains("System route unreachable"));
     }
@@ -965,14 +1035,28 @@ mod tests {
             country: "China".to_string(),
             source: "api.ip.sb".to_string(),
         });
-        let report = format_ip_report(false, None, None, isp, now, None);
+        let report = format_ip_report(
+            false,
+            None,
+            None,
+            isp,
+            now,
+            None,
+        );
         assert!(report.contains("Via Mihomo       (unreachable)"));
         assert!(report.contains("Mihomo proxy unreachable"));
     }
 
     #[test]
     fn test_format_ip_report_both_unreachable() {
-        let report = format_ip_report(false, None, None, None, None, None);
+        let report = format_ip_report(
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(report.contains("ISP               (unreachable)"));
         assert!(report.contains("Now               (unreachable)"));
         assert!(report.contains("Via Mihomo       (unreachable)"));
@@ -1006,5 +1090,44 @@ mod tests {
         );
         assert!(report.contains("http_proxy:    127.0.0.1:7890"));
         assert!(report.contains("proxy may not be working"));
+    }
+
+    // ── Failure path tests ──
+
+    #[test]
+    fn test_percent_encode_path_ascii() {
+        assert_eq!(percent_encode_path("/configs"), "/configs");
+        assert_eq!(percent_encode_path("/proxies/节点选择"), "/proxies/%E8%8A%82%E7%82%B9%E9%80%89%E6%8B%A9");
+    }
+
+    #[test]
+    fn test_percent_encode_path_already_encoded() {
+        // % should be encoded to %25 (prevents double-encoding regression)
+        let already = "/group/%E8%8A%82%E7%82%B9/delay";
+        assert_eq!(percent_encode_path(already), "/group/%25E8%258A%2582%25E7%2582%25B9/delay");
+    }
+
+    #[test]
+    fn test_percent_encode_path_preserves_query_delimiters() {
+        // ? = & are NOT in the allowlist, so they get encoded
+        // Callers must construct query strings AFTER percent-encoding the path
+        assert_eq!(percent_encode_path("/delay?url=test&timeout=5"), "/delay%3Furl%3Dtest%26timeout%3D5");
+    }
+
+    #[test]
+    fn test_encode_query_param_url() {
+        assert_eq!(encode_query_param("http://example.com"), "http%3A%2F%2Fexample.com");
+    }
+
+    #[test]
+    fn test_encode_query_param_special() {
+        assert_eq!(encode_query_param("a b&c=d#?"), "a%20b%26c%3Dd%23%3F");
+    }
+
+    #[test]
+    fn test_encode_query_param_edge_cases() {
+        assert_eq!(encode_query_param(""), "");
+        assert_eq!(encode_query_param("hello"), "hello");
+        assert_eq!(encode_query_param("a~b.c-d_e"), "a~b.c-d_e");
     }
 }

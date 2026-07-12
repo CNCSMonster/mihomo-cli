@@ -689,3 +689,96 @@ pub fn atomic_write_file(path: &str, content: &str) -> Result<()> {
 - 保留 `merge_rules_to_config()` 作为 legacy wrapper
 - 现有 `rule` 命令接口不变
 - `rules.yaml` 格式不变
+
+---
+
+## Core Design Principles
+
+> 从实际 bug 中总结的 3 条关键设计原则，指导所有新功能的实现。
+
+### 1. 前置条件检查：每个命令执行前校验状态
+
+**原则**: 命令执行前检查前置条件是否满足，不假设 happy path。
+
+**示例**:
+- `install` 发现 config 已存在时，运行 `mihomo -t` 验证有效性，损坏则重新生成（而非直接跳过）
+- `start` / `restart` 启动前检查 geo 文件完整性
+- `status` 非 verbose 模式根据进程/socket/config 三种状态给出不同诊断
+
+### 2. 关键操作原子化：要么全成功，要么可回滚
+
+**原则**: 影响状态的操作用原子写入 + 中间状态标记，中断后不会留下不一致状态。
+
+**示例**:
+- Geo 文件下载: `.tmp` → `rename`（原子写入）；残留 `.tmp` 下次自动清空恢复
+- 规则合并: 临时文件 → `rename` 覆盖 `config.yaml`；不修改原始订阅配置
+- `uninstall --all`: 检查所有残留（binary、service、config、geo），全部清除
+
+### 3. 失败路径也测试：不只有 happy path
+
+**原则**: 同时为正常路径和故障路径编写测试和错误处理，确保系统在异常状态下也有合理行为。
+
+**漏洞案例**:
+- Ctrl+C 中断 install → 留下孤儿 config → `uninstall --all` 早期返回不处理 → 重新 install 复用损坏 config → mihomo 启动失败
+- 新版 mihomo API 变更 → `delay` 命令 404 → 没有 fallback 路径或版本检测
+- systemd 启动失败时日志文件不存在 → 错误提示指向不存在的文件，用户无法排查
+
+---
+
+## Architecture Decision Records (ADR)
+
+### ADR-01: Unix socket over HTTP controller
+
+**决策**: 使用 Unix socket (`/tmp/verge/verge-mihomo.sock`) 而非 HTTP TCP 端口作为 mihomo API 通信方式。
+
+**理由**:
+- 安全性：不暴露网络端口，仅本机访问
+- 兼容 clash-verge-rev：使用相同 socket 路径，共享 mihomo 实例
+- 权限隔离：socket 文件权限由 mihomo 进程控制
+
+**影响**: 所有 API 调用走 Unix socket，不支持远程管理。
+
+### ADR-02: 配置热重载 vs 重启
+
+**决策**: 配置变更默认通过 `/configs` API 热重载，但 controller 变更必须重启。
+
+**理由**: 
+- 热重载无需中断服务
+- controller 是启动参数，无法运行时变更
+
+**影响**: `config --fix` 添加 controller 后提示用户 restart。
+
+### ADR-03: 单二进制分发
+
+**决策**: 纯 Rust 实现，不依赖外部工具（curl、jq、python3、fzf）。
+
+**理由**:
+- 零运行时依赖，跨平台安装体验一致
+- Clap 提供完整的 CLI 体验（补全、帮助、模糊匹配）
+- `dialoguer` 替代 fzf 实现交互式选择
+
+### ADR-04: 预下载 Geo 数据
+
+**决策**: mihomo-cli 在 install/start 时预下载 geoip.metadb 和 GeoSite.dat。
+
+**理由**: 防止"鸡生蛋死锁"（mihomo 启动时需要 geo 文件，但代理还没启动无法下载）。
+
+**影响**: 下载逻辑在 `installer.rs::ensure_geo_files()`，支持 GitHub + 镜像 fallback。
+
+### ADR-05: 规则标记合并法
+
+**决策**: 用户规则通过 YAML 标记 (`# === USER RULES START/END ===`) 合并到 config.yaml。
+
+**理由**:
+- 不修改原始订阅配置（config.yaml 是单一真相源）
+- 标记可精确定位用户规则位置
+- 支持 front/back 插入策略
+
+### ADR-06: -v/--verbose 统一调试输出
+
+**决策**: 使用 `--verbose` 全局标志 + `crate::log!()` 宏统一调试输出。
+
+**理由**: 排查 API 失败、启动异常、配置问题时不需要修改代码。
+
+**影响**: 所有 `crate::log!()` 调用仅在 `-v` 模式下输出到 stderr。
+

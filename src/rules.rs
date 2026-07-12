@@ -4,12 +4,17 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Rule insertion position
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RulePosition {
-    #[default]
     Front,
     Back,
+}
+
+impl Default for RulePosition {
+    fn default() -> Self {
+        Self::Front
+    }
 }
 
 impl std::str::FromStr for RulePosition {
@@ -19,10 +24,7 @@ impl std::str::FromStr for RulePosition {
         match s.to_lowercase().as_str() {
             "front" => Ok(Self::Front),
             "back" => Ok(Self::Back),
-            _ => Err(anyhow::anyhow!(
-                "Invalid position: {}. Use 'front' or 'back'",
-                s
-            )),
+            _ => Err(anyhow::anyhow!("Invalid position: {}. Use 'front' or 'back'", s)),
         }
     }
 }
@@ -53,8 +55,8 @@ pub fn load_rules_at(paths: &AppPaths) -> Result<Vec<String>> {
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("Failed to read rules file: {}", path.display()))?;
 
-    let rules_file: RulesFile =
-        serde_yaml::from_str(&content).with_context(|| "Failed to parse rules.yaml")?;
+    let rules_file: RulesFile = serde_yaml::from_str(&content)
+        .with_context(|| "Failed to parse rules.yaml")?;
 
     Ok(rules_file.rules)
 }
@@ -154,7 +156,8 @@ pub fn get_position_at(paths: &AppPaths) -> Result<RulePosition> {
         return Ok(RulePosition::default());
     }
 
-    let content = std::fs::read_to_string(&path).with_context(|| "Failed to read position file")?;
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| "Failed to read position file")?;
 
     content.trim().parse()
 }
@@ -182,8 +185,8 @@ pub fn import_rules_at(paths: &AppPaths, source_path: &str) -> Result<()> {
     let content = std::fs::read_to_string(source_path)
         .with_context(|| format!("Failed to read source file: {}", source_path))?;
 
-    let rules_file: RulesFile =
-        serde_yaml::from_str(&content).with_context(|| "Failed to parse source rules file")?;
+    let rules_file: RulesFile = serde_yaml::from_str(&content)
+        .with_context(|| "Failed to parse source rules file")?;
 
     save_rules_at(paths, &rules_file.rules)?;
     Ok(())
@@ -226,10 +229,7 @@ mod tests {
 
     #[test]
     fn test_rule_position_parse() {
-        assert_eq!(
-            "front".parse::<RulePosition>().unwrap(),
-            RulePosition::Front
-        );
+        assert_eq!("front".parse::<RulePosition>().unwrap(), RulePosition::Front);
         assert_eq!("back".parse::<RulePosition>().unwrap(), RulePosition::Back);
         assert!("invalid".parse::<RulePosition>().is_err());
     }
@@ -274,14 +274,11 @@ mod tests {
     #[test]
     fn test_remove_rule() {
         let (_tmp, paths) = setup_test_paths();
-        save_rules_at(
-            &paths,
-            &vec![
-                "RULE1".to_string(),
-                "RULE2".to_string(),
-                "RULE3".to_string(),
-            ],
-        )
+        save_rules_at(&paths, &vec![
+            "RULE1".to_string(),
+            "RULE2".to_string(),
+            "RULE3".to_string(),
+        ])
         .unwrap();
 
         remove_rule_at(&paths, 1).unwrap();

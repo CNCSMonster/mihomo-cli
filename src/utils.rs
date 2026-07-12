@@ -7,9 +7,7 @@ pub struct AppPaths {
 
 impl AppPaths {
     pub fn new(config_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            config_dir: config_dir.into(),
-        }
+        Self { config_dir: config_dir.into() }
     }
 
     pub fn from_system() -> Self {
@@ -74,8 +72,7 @@ fn default_config_dir() -> PathBuf {
 
 pub fn mihomo_path() -> String {
     if cfg!(target_os = "windows") {
-        let local =
-            dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("C:\\ProgramData"));
+        let local = dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("C:\\ProgramData"));
         format!("{}\\mihomo\\mihomo.exe", local.display())
     } else {
         let home = dirs::home_dir().unwrap_or_default();
@@ -92,17 +89,11 @@ pub fn config_path() -> String {
 }
 
 pub fn start_script_path() -> String {
-    AppPaths::from_system()
-        .start_script_path()
-        .display()
-        .to_string()
+    AppPaths::from_system().start_script_path().display().to_string()
 }
 
 pub fn service_mode_path() -> String {
-    AppPaths::from_system()
-        .service_mode_path()
-        .display()
-        .to_string()
+    AppPaths::from_system().service_mode_path().display().to_string()
 }
 
 pub fn read_service_mode() -> String {
@@ -122,10 +113,7 @@ pub fn log_path() -> String {
 
 // ── Subscription URL management ──
 pub fn subscription_urls_path() -> String {
-    AppPaths::from_system()
-        .subscription_urls_path()
-        .display()
-        .to_string()
+    AppPaths::from_system().subscription_urls_path().display().to_string()
 }
 
 /// Read all saved subscription URLs (one per line).
@@ -133,8 +121,7 @@ pub fn read_subscription_urls() -> Vec<String> {
     let path = subscription_urls_path();
     if std::path::Path::new(&path).exists() {
         let content = std::fs::read_to_string(&path).unwrap_or_default();
-        let urls: Vec<String> = content
-            .lines()
+        let urls: Vec<String> = content.lines()
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty() && l.starts_with("http"))
             .collect();
@@ -194,25 +181,16 @@ pub fn rules_path() -> String {
 
 #[allow(dead_code)]
 pub fn rules_position_path() -> String {
-    AppPaths::from_system()
-        .rules_position_path()
-        .display()
-        .to_string()
+    AppPaths::from_system().rules_position_path().display().to_string()
 }
 
 pub fn isp_cache_path() -> String {
-    AppPaths::from_system()
-        .isp_cache_path()
-        .display()
-        .to_string()
+    AppPaths::from_system().isp_cache_path().display().to_string()
 }
 
 #[allow(dead_code)]
 pub fn dns_policy_path() -> String {
-    AppPaths::from_system()
-        .dns_policy_path()
-        .display()
-        .to_string()
+    AppPaths::from_system().dns_policy_path().display().to_string()
 }
 
 /// Atomically write a file: write to .tmp then rename.
@@ -224,4 +202,24 @@ pub fn atomic_write_file(path: &str, content: &str) -> anyhow::Result<()> {
     std::fs::rename(&temp_path, path)
         .map_err(|e| anyhow::anyhow!("Failed to rename {} -> {}: {}", temp_path, path, e))?;
     Ok(())
+}
+
+/// Build a reqwest client that trusts the system root certificates in addition to rustls built-in.
+/// This fixes compatibility with sites whose CA is trusted by the OS but not by rustls' default store.
+pub fn http_client_builder() -> reqwest::ClientBuilder {
+    let mut builder = reqwest::Client::builder();
+
+    // Load system native certificates and add them as extra roots
+    let native = rustls_native_certs::load_native_certs();
+    let count = native.certs.len();
+    for c in native.certs {
+        if let Ok(cert) = reqwest::Certificate::from_der(c.as_ref()) {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+    if !native.errors.is_empty() {
+        crate::log!("native cert errors: {:?}", native.errors);
+    }
+    crate::log!("added {count} native certs to TLS trust store");
+    builder
 }
