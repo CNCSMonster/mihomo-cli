@@ -245,6 +245,20 @@ pub async fn ensure_geo_files() -> bool {
             ok = false;
         }
     }
+
+    // Layer 3: final validation — run mihomo -t to verify geo files are loadable
+    // Only runs after ALL files downloaded, so config references are fully satisfied
+    if ok && validate_geo_files(&dir) {
+        crate::log!("Geo files validated by mihomo -t");
+    } else if ok {
+        // Validation failed — remove corrupt files so next run re-downloads
+        eprintln!("  ⚠ Geo files failed mihomo validation, will retry next time");
+        for name in ["geoip.metadb", "GeoSite.dat"] {
+            let _ = std::fs::remove_file(format!("{dir}/{name}"));
+        }
+        ok = false;
+    }
+
     ok
 }
 
@@ -410,6 +424,15 @@ async fn try_download_geo(
             0
         };
 
+        // Expected final file size for integrity check after download completes.
+        // 206 Partial: content_length is the remaining range → add offset.
+        // 200 OK (server ignored Range): content_length is the full file size.
+        let expected_final_size = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            resp.content_length().map(|cl| cl + actual_offset)
+        } else {
+            resp.content_length()
+        };
+
         // Progress bar
         let total = resp.content_length().map(|l| l + actual_offset);
         let pb = ProgressBar::new(total.unwrap_or(0));
@@ -459,7 +482,18 @@ async fn try_download_geo(
             total_bytes += chunk.len() as u64;
             pb.set_position(total_bytes);
         }
-        let _ = file.flush();
+
+        // Layer 1: size validation — detect truncated or oversized downloads
+        if let Some(expected) = expected_final_size {
+            if total_bytes != expected {
+                crate::log!("    size mismatch: got {total_bytes}, expected {expected}");
+                pb.abandon_with_message("Incomplete");
+                return false;
+            }
+        }
+
+        // Layer 4: ensure data is physically written to disk
+        let _ = file.sync_all();
         pb.finish_with_message("Done");
         return true;
     }
@@ -483,4 +517,49 @@ fn is_valid_geo_file(path: &str) -> bool {
     // Note: GeoSite.dat is protobuf, first byte is 0x0A ('\n') — valid.
     // Note: geoip.metadb (MMDB) starts with 0xAB — valid.
     !matches!(buf[0], b'<' | b'{')
+}
+
+/// Layer 3 validation: run `mihomo -t` to verify geo files can actually be loaded.
+/// Returns true if validation passes OR if we can't validate (mihomo/config not ready yet).
+/// Returns false only when geo files are definitively corrupt.
+fn validate_geo_files(config_dir: &str) -> bool {
+    let mihomo = crate::utils::mihomo_path();
+    if !std::path::Path::new(&mihomo).exists() {
+        crate::log!("mihomo binary not found, skipping geo validation");
+        return true;
+    }
+    let config_path = format!("{config_dir}/config.yaml");
+    if !std::path::Path::new(&config_path).exists() {
+        crate::log!("config.yaml not found, skipping geo validation");
+        return true;
+    }
+    match std::process::Command::new(&mihomo)
+        .args(["-t", "-d", config_dir])
+        .output()
+    {
+        Ok(o) if !o.status.success() => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let output = format!("{stdout}\n{stderr}");
+            // Only flag as corrupt if the error is geo-file related.
+            // Other config errors (rules, ports, etc.) are not our concern here.
+            let geo_related = output.to_lowercase();
+            if geo_related.contains("geo")
+                || geo_related.contains("mmdb")
+                || geo_related.contains("geosite")
+                || geo_related.contains("load")
+            {
+                crate::log!("mihomo -t geo validation failed: {output}");
+                false
+            } else {
+                crate::log!("mihomo -t failed but not geo-related, skipping: {output}");
+                true
+            }
+        }
+        Ok(_) => true,
+        Err(e) => {
+            crate::log!("cannot run mihomo -t for validation: {e}");
+            true
+        }
+    }
 }
