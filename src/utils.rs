@@ -7,7 +7,9 @@ pub struct AppPaths {
 
 impl AppPaths {
     pub fn new(config_dir: impl Into<PathBuf>) -> Self {
-        Self { config_dir: config_dir.into() }
+        Self {
+            config_dir: config_dir.into(),
+        }
     }
 
     pub fn from_system() -> Self {
@@ -27,20 +29,17 @@ impl AppPaths {
         self.config_dir.join("config.yaml")
     }
 
-    pub fn start_script_path(&self) -> PathBuf {
-        self.config_dir.join("start.sh")
-    }
-
-    pub fn service_mode_path(&self) -> PathBuf {
+    /// Deprecated v1/v2 mode marker path.
+    ///
+    /// v3 must not use this for mode resolution. It is exposed only so cleanup
+    /// paths can remove stale `.service-mode` files left by older releases.
+    pub fn legacy_service_mode_path(&self) -> PathBuf {
         self.config_dir.join(".service-mode")
     }
 
+    #[allow(dead_code)]
     pub fn log_path(&self) -> PathBuf {
         self.config_dir.join("mihomo.log")
-    }
-
-    pub fn subscription_urls_path(&self) -> PathBuf {
-        self.config_dir.join(".subscription-urls")
     }
 
     pub fn rules_path(&self) -> PathBuf {
@@ -51,28 +50,76 @@ impl AppPaths {
         self.config_dir.join(".rules-position")
     }
 
-    pub fn isp_cache_path(&self) -> PathBuf {
-        self.config_dir.join(".isp_cache")
-    }
-
     pub fn dns_policy_path(&self) -> PathBuf {
         self.config_dir.join("dns-policy.yaml")
+    }
+
+    pub fn override_path(&self) -> PathBuf {
+        self.config_dir.join("override.yaml")
+    }
+
+    pub fn delay_cache_path(&self) -> PathBuf {
+        self.config_dir.join("delay-cache.json")
+    }
+
+    // ── Multi-subscription paths ──
+
+    /// ~/.config/mihomo/subscriptions/
+    pub fn subscriptions_dir(&self) -> PathBuf {
+        self.config_dir.join("subscriptions")
+    }
+
+    /// ~/.config/mihomo/subscriptions.yaml
+    pub fn subscriptions_meta_path(&self) -> PathBuf {
+        self.config_dir.join("subscriptions.yaml")
+    }
+
+    /// ~/.config/mihomo/subscriptions/active
+    pub fn active_file_path(&self) -> PathBuf {
+        self.subscriptions_dir().join("active")
+    }
+
+    /// ~/.config/mihomo/subscriptions/<id>.yaml
+    pub fn subscription_file_path(&self, id: &str) -> PathBuf {
+        self.subscriptions_dir().join(format!("{id}.yaml"))
     }
 }
 
 fn default_config_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("MIHOMO_CLI_CONFIG_DIR") {
+        if !dir.trim().is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+
     if cfg!(target_os = "windows") {
-        let local = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("C:\\ProgramData"));
-        local.join("mihomo")
+        windows_config_dir(
+            std::env::var_os("APPDATA").map(PathBuf::from),
+            dirs::home_dir(),
+        )
     } else {
         let home = dirs::home_dir().unwrap_or_default();
         home.join(".config/mihomo")
     }
 }
 
+fn windows_config_dir(app_data: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    app_data
+        .or_else(|| home.map(|home| home.join("AppData").join("Roaming")))
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("mihomo")
+}
+
 pub fn mihomo_path() -> String {
+    if let Ok(path) = std::env::var("MIHOMO_CLI_MIHOMO_PATH") {
+        if !path.trim().is_empty() {
+            return path;
+        }
+    }
+
     if cfg!(target_os = "windows") {
-        let local = dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("C:\\ProgramData"));
+        let local =
+            dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("C:\\ProgramData"));
         format!("{}\\mihomo\\mihomo.exe", local.display())
     } else {
         let home = dirs::home_dir().unwrap_or_default();
@@ -80,117 +127,55 @@ pub fn mihomo_path() -> String {
     }
 }
 
+#[allow(dead_code)]
 pub fn config_dir() -> String {
     AppPaths::from_system().config_dir().display().to_string()
+}
+
+/// Get the per-user core API socket directory.
+/// - Linux: $XDG_RUNTIME_DIR/mihomo (standard XDG runtime location)
+/// - macOS: /tmp/mihomo-$UID (v3 per-user runtime directory)
+/// - Windows: not applicable (uses named pipes)
+#[cfg(unix)]
+pub fn socket_dir() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
+            // Fallback: get UID from /proc/self/loginuid or use 1000 as default
+            let uid = std::fs::read_to_string("/proc/self/loginuid")
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(1000);
+            format!("/run/user/{}", uid)
+        });
+        format!("{}/mihomo", runtime_dir)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_socket_dir(unsafe { libc::getuid() })
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_socket_dir(uid: u32) -> String {
+    format!("/tmp/mihomo-{uid}")
 }
 
 pub fn config_path() -> String {
     AppPaths::from_system().config_path().display().to_string()
 }
 
-pub fn start_script_path() -> String {
-    AppPaths::from_system().start_script_path().display().to_string()
+/// Deprecated v1/v2 mode marker path; cleanup only, never mode resolution.
+pub fn legacy_service_mode_path() -> String {
+    AppPaths::from_system()
+        .legacy_service_mode_path()
+        .display()
+        .to_string()
 }
 
-pub fn service_mode_path() -> String {
-    AppPaths::from_system().service_mode_path().display().to_string()
-}
-
-pub fn read_service_mode() -> String {
-    std::fs::read_to_string(service_mode_path())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "user".to_string())
-}
-
-pub fn write_service_mode(mode: &str) -> anyhow::Result<()> {
-    std::fs::write(service_mode_path(), mode)?;
-    Ok(())
-}
-
+#[allow(dead_code)]
 pub fn log_path() -> String {
     AppPaths::from_system().log_path().display().to_string()
-}
-
-// ── Subscription URL management ──
-pub fn subscription_urls_path() -> String {
-    AppPaths::from_system().subscription_urls_path().display().to_string()
-}
-
-/// Read all saved subscription URLs (one per line).
-pub fn read_subscription_urls() -> Vec<String> {
-    let path = subscription_urls_path();
-    if std::path::Path::new(&path).exists() {
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
-        let urls: Vec<String> = content.lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty() && l.starts_with("http"))
-            .collect();
-        if !urls.is_empty() {
-            return urls;
-        }
-    }
-    // Migrate legacy single-URL file
-    let legacy = format!("{}/.subscription-url", config_dir());
-    if std::path::Path::new(&legacy).exists() {
-        if let Ok(content) = std::fs::read_to_string(&legacy) {
-            let url = content.trim().to_string();
-            if !url.is_empty() && url.starts_with("http") {
-                let urls = vec![url];
-                let _ = write_subscription_urls(&urls);
-                let _ = std::fs::remove_file(&legacy);
-                return urls;
-            }
-        }
-    }
-    vec![]
-}
-
-/// Save all subscription URLs (one per line).
-pub fn write_subscription_urls(urls: &[String]) -> anyhow::Result<()> {
-    let path = subscription_urls_path();
-    std::fs::create_dir_all(config_dir())?;
-    std::fs::write(&path, urls.join("\n"))?;
-    Ok(())
-}
-
-/// Add a new subscription URL (dedup, adds to end).
-pub fn add_subscription_url(url: &str) -> anyhow::Result<()> {
-    let mut urls = read_subscription_urls();
-    if !urls.contains(&url.to_string()) {
-        urls.push(url.to_string());
-        write_subscription_urls(&urls)?;
-    }
-    Ok(())
-}
-
-/// Remove a subscription URL by index.
-pub fn remove_subscription_url(index: usize) -> anyhow::Result<()> {
-    let mut urls = read_subscription_urls();
-    if index < urls.len() {
-        urls.remove(index);
-        write_subscription_urls(&urls)?;
-    }
-    Ok(())
-}
-
-// ── Rule management paths ──
-#[allow(dead_code)]
-pub fn rules_path() -> String {
-    AppPaths::from_system().rules_path().display().to_string()
-}
-
-#[allow(dead_code)]
-pub fn rules_position_path() -> String {
-    AppPaths::from_system().rules_position_path().display().to_string()
-}
-
-pub fn isp_cache_path() -> String {
-    AppPaths::from_system().isp_cache_path().display().to_string()
-}
-
-#[allow(dead_code)]
-pub fn dns_policy_path() -> String {
-    AppPaths::from_system().dns_policy_path().display().to_string()
 }
 
 /// Atomically write a file: write to .tmp then rename.
@@ -207,9 +192,13 @@ pub fn atomic_write_file(path: &str, content: &str) -> anyhow::Result<()> {
 /// Build a reqwest client that trusts the system root certificates in addition to rustls built-in.
 /// This fixes compatibility with sites whose CA is trusted by the OS but not by rustls' default store.
 pub fn http_client_builder() -> reqwest::ClientBuilder {
-    let mut builder = reqwest::Client::builder();
+    let builder = reqwest::Client::builder();
+    add_native_cert_roots(builder)
+}
 
-    // Load system native certificates and add them as extra roots
+#[cfg(not(windows))]
+fn add_native_cert_roots(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    // Load system native certificates and add them as extra roots for rustls.
     let native = rustls_native_certs::load_native_certs();
     let count = native.certs.len();
     for c in native.certs {
@@ -222,4 +211,64 @@ pub fn http_client_builder() -> reqwest::ClientBuilder {
     }
     crate::log!("added {count} native certs to TLS trust store");
     builder
+}
+
+#[cfg(windows)]
+fn add_native_cert_roots(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    // Windows uses reqwest native-tls/schannel, which reads the OS trust store
+    // directly and avoids compiling rustls' ring provider for Windows targets.
+    builder
+}
+
+/// Combine stdout and stderr from a child process output.
+/// Many programs (including mihomo) write error messages to stdout, not stderr.
+/// Always check both streams when diagnosing failures.
+pub fn combine_output(o: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    let mut combined = String::new();
+    let out = stdout.trim();
+    let err = stderr.trim();
+    if !out.is_empty() {
+        combined.push_str(out);
+    }
+    if !err.is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(err);
+    }
+    combined
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macos_socket_dir_uses_v3_uid_scoped_tmp_dir() {
+        assert_eq!(macos_socket_dir(501), "/tmp/mihomo-501");
+    }
+
+    #[test]
+    fn windows_config_dir_uses_appdata_roaming_per_v3() {
+        assert_eq!(
+            windows_config_dir(
+                Some(PathBuf::from(r"C:\Users\Alice\AppData\Roaming")),
+                Some(PathBuf::from(r"C:\Users\Alice")),
+            ),
+            PathBuf::from(r"C:\Users\Alice\AppData\Roaming").join("mihomo")
+        );
+    }
+
+    #[test]
+    fn windows_config_dir_falls_back_to_home_roaming() {
+        assert_eq!(
+            windows_config_dir(None, Some(PathBuf::from(r"C:\Users\Alice"))),
+            PathBuf::from(r"C:\Users\Alice")
+                .join("AppData")
+                .join("Roaming")
+                .join("mihomo")
+        );
+    }
 }

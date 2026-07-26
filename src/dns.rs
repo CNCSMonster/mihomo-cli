@@ -31,14 +31,9 @@ pub fn load_policies_at(paths: &AppPaths) -> Result<Vec<DnsPolicy>> {
     }
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("Failed to read: {}", path.display()))?;
-    let file: DnsPolicyFile = serde_yaml::from_str(&content)
-        .with_context(|| "Failed to parse dns-policy.yaml")?;
+    let file: DnsPolicyFile =
+        serde_yaml::from_str(&content).with_context(|| "Failed to parse dns-policy.yaml")?;
     Ok(file.policies)
-}
-
-/// Load DNS policies from the system dns-policy.yaml.
-pub fn load_policies() -> Result<Vec<DnsPolicy>> {
-    load_policies_at(&AppPaths::from_system())
 }
 
 /// Save DNS policies to dns-policy.yaml using explicit paths.
@@ -60,14 +55,11 @@ pub fn save_policies_at(paths: &AppPaths, policies: &[DnsPolicy]) -> Result<()> 
 #     target: 10.10.1.251
 
 ";
-    std::fs::write(&path, format!("{}{}", header, content))?;
+    crate::utils::atomic_write_file(
+        &path.display().to_string(),
+        &format!("{}{}", header, content),
+    )?;
     Ok(())
-}
-
-/// Save DNS policies to the system dns-policy.yaml.
-#[allow(dead_code)]
-pub fn save_policies(policies: &[DnsPolicy]) -> Result<()> {
-    save_policies_at(&AppPaths::from_system(), policies)
 }
 
 /// Add a DNS policy using explicit paths.
@@ -93,6 +85,7 @@ pub fn add_policy_at(paths: &AppPaths, match_pattern: &str, target: &str) -> Res
 }
 
 /// Add a DNS policy to the system dns-policy.yaml.
+#[allow(dead_code)]
 pub fn add_policy(match_pattern: &str, target: &str) -> Result<()> {
     add_policy_at(&AppPaths::from_system(), match_pattern, target)
 }
@@ -132,6 +125,7 @@ pub fn remove_policy_at(paths: &AppPaths, selector: &str) -> Result<String> {
 }
 
 /// Remove a DNS policy by match pattern or by 1-based index from the system dns-policy.yaml.
+#[allow(dead_code)]
 pub fn remove_policy(selector: &str) -> Result<String> {
     remove_policy_at(&AppPaths::from_system(), selector)
 }
@@ -144,44 +138,6 @@ pub fn list_policies_at(paths: &AppPaths) -> Result<Vec<(usize, DnsPolicy)>> {
         .enumerate()
         .map(|(i, p)| (i + 1, p))
         .collect())
-}
-
-/// List all system DNS policies (returns (index, policy) pairs).
-pub fn list_policies() -> Result<Vec<(usize, DnsPolicy)>> {
-    list_policies_at(&AppPaths::from_system())
-}
-
-/// Check if any policies are defined using explicit paths.
-pub fn has_policies_at(paths: &AppPaths) -> Result<bool> {
-    Ok(!load_policies_at(paths)?.is_empty())
-}
-
-/// Check if any system policies are defined.
-#[allow(dead_code)]
-pub fn has_policies() -> Result<bool> {
-    has_policies_at(&AppPaths::from_system())
-}
-
-/// Convert policies to mihomo nameserver-policy format (YAML Value mapping).
-/// Each policy target is a comma-separated list of DNS server IPs.
-#[allow(dead_code)]
-pub fn to_nameserver_policy(policies: &[DnsPolicy]) -> serde_yaml::Value {
-    let mut map = serde_yaml::Mapping::new();
-    for p in policies {
-        let ips: Vec<&str> = p.target.split(',').map(|s| s.trim()).collect();
-        let value = if ips.len() == 1 {
-            serde_yaml::Value::String(ips[0].to_string())
-        } else {
-            serde_yaml::Value::Sequence(
-                ips.iter().map(|ip| serde_yaml::Value::String(ip.to_string())).collect()
-            )
-        };
-        map.insert(
-            serde_yaml::Value::String(p.match_pattern.clone()),
-            value,
-        );
-    }
-    serde_yaml::Value::Mapping(map)
 }
 
 #[cfg(test)]
@@ -267,36 +223,126 @@ mod tests {
 
         let list = list_policies_at(&paths).unwrap();
         assert!(list.is_empty());
-        assert!(!has_policies_at(&paths).unwrap());
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DnsTemplate {
+    pub name: &'static str,
+    pub description: &'static str,
+}
+
+pub fn dns_templates() -> &'static [DnsTemplate] {
+    &[
+        DnsTemplate {
+            name: "company",
+            description: "route one internal domain suffix to a company DNS server",
+        },
+        DnsTemplate {
+            name: "ads",
+            description: "route common ad/tracker DNS suffixes to a filtering DNS server",
+        },
+    ]
+}
+
+pub fn apply_template_at(
+    paths: &AppPaths,
+    name: &str,
+    domain: Option<&str>,
+    target: Option<&str>,
+) -> Result<Vec<DnsPolicy>> {
+    let policies = match name {
+        "company" => {
+            let domain = domain
+                .ok_or_else(|| anyhow::anyhow!("company template requires --domain <DOMAIN>"))?;
+            let target = target
+                .ok_or_else(|| anyhow::anyhow!("company template requires --target <DNS>"))?;
+            vec![DnsPolicy {
+                match_pattern: normalize_match(domain),
+                target: target.to_string(),
+            }]
+        }
+        "ads" => {
+            let target =
+                target.ok_or_else(|| anyhow::anyhow!("ads template requires --target <DNS>"))?;
+            vec![
+                DnsPolicy {
+                    match_pattern: normalize_match("doubleclick.net"),
+                    target: target.to_string(),
+                },
+                DnsPolicy {
+                    match_pattern: normalize_match("googlesyndication.com"),
+                    target: target.to_string(),
+                },
+                DnsPolicy {
+                    match_pattern: normalize_match("google-analytics.com"),
+                    target: target.to_string(),
+                },
+            ]
+        }
+        other => anyhow::bail!(
+            "Unknown DNS template `{}`. Run: mihomo-cli dns template list",
+            other
+        ),
+    };
+
+    let mut existing = load_policies_at(paths)?;
+    for policy in &policies {
+        existing.retain(|p| p.match_pattern != policy.match_pattern);
+        existing.push(policy.clone());
+    }
+    save_policies_at(paths, &existing)?;
+    Ok(policies)
+}
+
+fn normalize_match(match_pattern: &str) -> String {
+    if match_pattern.starts_with("+.") {
+        match_pattern.to_string()
+    } else {
+        format!("+.{match_pattern}")
+    }
+}
+
+#[cfg(test)]
+mod template_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn setup_test_paths() -> (TempDir, AppPaths) {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        (tmp, paths)
     }
 
     #[test]
-    fn test_to_nameserver_policy() {
-        let policies = vec![
-            DnsPolicy {
-                match_pattern: "ubtrobot.com".to_string(),
-                target: "10.10.1.251,10.10.1.120".to_string(),
-            },
-            DnsPolicy {
-                match_pattern: "internal.corp".to_string(),
-                target: "10.10.1.251".to_string(),
-            },
-        ];
+    fn company_template_requires_domain_and_target() {
+        let (_tmp, paths) = setup_test_paths();
+        assert!(apply_template_at(&paths, "company", None, Some("10.0.0.1")).is_err());
+        assert!(apply_template_at(&paths, "company", Some("corp.example"), None).is_err());
+    }
 
-        let value = to_nameserver_policy(&policies);
-        let mapping = value.as_mapping().unwrap();
-        assert_eq!(mapping.len(), 2);
+    #[test]
+    fn company_template_adds_policy() {
+        let (_tmp, paths) = setup_test_paths();
+        let added =
+            apply_template_at(&paths, "company", Some("corp.example"), Some("10.0.0.1")).unwrap();
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].match_pattern, "+.corp.example");
+        assert_eq!(added[0].target, "10.0.0.1");
+        let policies = load_policies_at(&paths).unwrap();
+        assert_eq!(policies, added);
+    }
 
-        // Single IP
-        assert_eq!(
-            mapping["internal.corp"].as_str().unwrap(),
-            "10.10.1.251"
-        );
-
-        // Multiple IPs
-        let seq = mapping["ubtrobot.com"].as_sequence().unwrap();
-        assert_eq!(seq.len(), 2);
-        assert_eq!(seq[0].as_str().unwrap(), "10.10.1.251");
-        assert_eq!(seq[1].as_str().unwrap(), "10.10.1.120");
+    #[test]
+    fn ads_template_requires_target_and_dedups() {
+        let (_tmp, paths) = setup_test_paths();
+        assert!(apply_template_at(&paths, "ads", None, None).is_err());
+        let first = apply_template_at(&paths, "ads", None, Some("94.140.14.14")).unwrap();
+        let second = apply_template_at(&paths, "ads", None, Some("94.140.14.14")).unwrap();
+        assert_eq!(first.len(), 3);
+        assert_eq!(second.len(), 3);
+        let policies = load_policies_at(&paths).unwrap();
+        assert_eq!(policies.len(), 3);
+        assert!(policies.iter().all(|p| p.target == "94.140.14.14"));
     }
 }
