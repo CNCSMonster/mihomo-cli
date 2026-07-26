@@ -29,7 +29,7 @@ mod utils;
 mod yaml_editor;
 
 #[derive(Parser)]
-#[command(name = "mihomo-cli", version, about = "Mihomo CLI — cross-platform setup & control tool", long_about = None)]
+#[command(name = "mihomo-cli", version = env!("MIHOMO_CLI_VERSION"), about = "Mihomo CLI — cross-platform setup & control tool", long_about = None)]
 struct Cli {
     /// Enable verbose debug output
     #[arg(short, long, global = true)]
@@ -65,6 +65,13 @@ enum Command {
     /// Check for and install the latest mihomo core version
     Upgrade {
         /// Target system service instance
+        #[arg(long = "system")]
+        system: bool,
+    },
+
+    /// Show mihomo-cli build information and current mihomo core version
+    Version {
+        /// Target system service instance when probing core version
         #[arg(long = "system")]
         system: bool,
     },
@@ -548,6 +555,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             proxy,
         } => cmd_install_entry(system, user, force, version.as_deref(), proxy.as_deref()).await,
         Command::Upgrade { system } => cmd_upgrade(system, false).await,
+        Command::Version { system } => cmd_version(system, false).await,
         Command::Config {
             system,
             url,
@@ -5024,6 +5032,48 @@ fn update_missing_binary_error(bin: &str) -> String {
     )
 }
 
+fn build_info_lines(core_version: Option<&str>, core_error: Option<&str>) -> Vec<String> {
+    let mut lines = vec![
+        "mihomo-cli".to_string(),
+        format!("  Version:      {}", env!("MIHOMO_CLI_VERSION")),
+        format!("  Package:      {}", env!("MIHOMO_CLI_PKG_VERSION")),
+        format!("  Git commit:   {}", env!("MIHOMO_CLI_GIT_COMMIT")),
+        format!("  Git short:    {}", env!("MIHOMO_CLI_GIT_SHORT_COMMIT")),
+        format!("  Git branch:   {}", env!("MIHOMO_CLI_GIT_BRANCH")),
+        format!("  Git dirty:    {}", env!("MIHOMO_CLI_GIT_DIRTY")),
+        format!(
+            "  Build time:   {} (unix seconds)",
+            env!("MIHOMO_CLI_BUILD_UNIX")
+        ),
+        format!("  Target:       {}", env!("MIHOMO_CLI_BUILD_TARGET")),
+        format!("  Profile:      {}", env!("MIHOMO_CLI_BUILD_PROFILE")),
+        String::new(),
+        "mihomo core".to_string(),
+    ];
+    match core_version {
+        Some(version) => lines.push(format!("  Version:      {version}")),
+        None => lines.push("  Version:      unavailable".to_string()),
+    }
+    if let Some(error) = core_error {
+        lines.push(format!("  Probe error:  {error}"));
+    }
+    lines
+}
+
+async fn cmd_version(system: bool, user: bool) -> anyhow::Result<()> {
+    let client = resolve_api_client(system, user, instance::CommandIntent::ReadOnly);
+    let (core_version, core_error) = match client {
+        Ok(client) => match mihomo_api::get_version_with_client(&client).await {
+            Ok(version) => (Some(version), None),
+            Err(err) => (None, Some(err.to_string())),
+        },
+        Err(err) => (None, Some(err.to_string())),
+    };
+    let lines = build_info_lines(core_version.as_deref(), core_error.as_deref());
+    print_lines(lines);
+    Ok(())
+}
+
 fn format_update_start() -> Vec<String> {
     vec!["Updating mihomo core...".to_string()]
 }
@@ -5915,6 +5965,37 @@ RuntimeDirectory=mihomo"#;
             Some(Command::Config { list, .. }) => assert!(list),
             _ => panic!("expected config --list"),
         }
+    }
+
+    #[test]
+    fn version_command_formats_build_metadata() {
+        let lines = build_info_lines(Some("v1.2.3"), None);
+        let text = lines.join(
+            "
+",
+        );
+        assert!(text.contains("mihomo-cli"));
+        assert!(text.contains("Version:"));
+        assert!(text.contains("Git commit:"));
+        assert!(text.contains("mihomo core"));
+        assert!(text.contains("v1.2.3"));
+
+        let lines = build_info_lines(None, Some("not running"));
+        let text = lines.join(
+            "
+",
+        );
+        assert!(text.contains("unavailable"));
+        assert!(text.contains("not running"));
+    }
+
+    #[test]
+    fn version_command_supports_system_override_without_user_flag() {
+        match parse(&["version", "--system"]).command {
+            Some(Command::Version { system }) => assert!(system),
+            _ => panic!("expected version --system"),
+        }
+        assert!(Cli::try_parse_from(["mihomo-cli", "version", "--user"]).is_err());
     }
 
     #[test]
