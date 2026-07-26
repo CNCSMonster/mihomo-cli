@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-07-27 (v0.4.1)
+
+### ✨ Features
+- **Build metadata** — `mihomo-cli --version` 和 `mihomo-cli version` 现在显示完整的构建信息：git commit hash、分支、构建时间、目标平台等
+
+---
+
 ## 2026-07-27
 
 ### ✨ Features
