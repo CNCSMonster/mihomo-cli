@@ -883,14 +883,28 @@ fn current_instance_inventory() -> instance::InstanceInventory {
         .and_then(|ctx| ctx.paths.service_file.as_ref())
         .map(|p| p.exists())
         .unwrap_or(false);
+    // Windows system mode has no service file (service_file: None); probe the
+    // actual Windows service instead (sc query mihomo).
+    let system_service_installed = if cfg!(target_os = "windows") {
+        windows_mihomo_service_installed()
+    } else {
+        system_service_file_exists
+    };
     let system_payload = system_ctx
         .as_ref()
         .map(|ctx| ctx.paths.core_binary.exists())
         .unwrap_or(false);
-    let user_service = user_ctx
+    let user_service_installed = user_ctx
         .as_ref()
-        .and_then(|ctx| ctx.paths.service_file.as_ref())
-        .map(|p| p.exists())
+        .map(|ctx| match ctx.os {
+            instance::TargetOs::Windows => instance::windows_user_install_marker(ctx)
+                .is_some_and(|marker| marker.exists()),
+            _ => ctx
+                .paths
+                .service_file
+                .as_ref()
+                .is_some_and(|p| p.exists()),
+        })
         .unwrap_or(false);
     let user_payload = user_ctx
         .as_ref()
@@ -912,16 +926,35 @@ fn current_instance_inventory() -> instance::InstanceInventory {
 
     instance::InstanceInventory {
         system: instance::SystemInstanceObservation {
-            service: system_service_file_exists && legacy_root.is_none(),
+            service: system_service_installed && legacy_root.is_none(),
             payload: system_payload,
         },
         user: instance::UserInstanceObservation {
-            service: user_service,
+            service: user_service_installed,
             payload: user_payload,
         },
         legacy_root,
         user_contamination,
     }
+}
+
+/// Windows: is the `mihomo` Windows service registered?
+#[cfg(target_os = "windows")]
+fn windows_mihomo_service_installed() -> bool {
+    use crate::service::windows_service_query_indicates_installed;
+    match std::process::Command::new("sc.exe")
+        .args(["query", "mihomo"])
+        .output()
+    {
+        Ok(o) => windows_service_query_indicates_installed(&o.stdout),
+        Err(_) => false,
+    }
+}
+
+/// Non-Windows: no Windows service to probe.
+#[cfg(not(target_os = "windows"))]
+fn windows_mihomo_service_installed() -> bool {
+    false
 }
 
 fn current_service_presence() -> instance::ServicePresence {
@@ -6524,6 +6557,9 @@ fn cmd_uninstall_instance_mode(
         println!();
         println!("Would remove:");
         println!("  Service: stop & disable + remove service file");
+        if let Some(marker) = instance::windows_user_install_marker(&ctx) {
+            println!("  Marker:  {}", marker.display());
+        }
         if selected_binary {
             println!("  Binary:  {}", ctx.paths.core_binary.display());
             if ctx.paths.cli_binary != ctx.paths.core_binary {
@@ -6587,6 +6623,11 @@ fn cmd_uninstall_instance_mode(
             ctx.permissions == instance::PermissionModel::PrivilegedSystem;
         remove_instance_path(service_file, service_file_privileged)?;
         println!("  Removed service file");
+    }
+    // 2b. Windows user mode: remove the install marker (it is part of the
+    // service artifact — presence detection must no longer resolve the mode).
+    if let Some(marker) = instance::windows_user_install_marker(&ctx) {
+        remove_instance_path(&marker, false)?;
     }
 
     // 3. Remove binary

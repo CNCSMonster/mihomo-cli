@@ -884,6 +884,8 @@ pub fn planned_windows_install_plan(ctx: &InstanceContext) -> Option<InstanceIns
         });
     }
 
+    let mut files = Vec::new();
+
     let commands = match ctx.mode {
         InstanceMode::System => vec![
             PlannedCommand {
@@ -913,14 +915,41 @@ pub fn planned_windows_install_plan(ctx: &InstanceContext) -> Option<InstanceIns
                 privileged: true,
             },
         ],
-        InstanceMode::User => planned_windows_user_process_start(ctx).commands,
+        InstanceMode::User => {
+            let plan = planned_windows_user_process_start(ctx);
+            // BUG: Windows user mode install previously left no persistent
+            // marker — presence detection could never prove the mode was
+            // installed. Write a marker file under the user install root so
+            // current_instance_inventory can resolve the user mode.
+            if let Some(marker) = windows_user_install_marker(ctx) {
+                files.push(PlannedFile {
+                    path: marker,
+                    mode: 0,
+                    privileged: false,
+                    content: "mihomo-cli windows user mode\n".to_string(),
+                });
+            }
+            plan.commands
+        }
     };
 
     Some(InstanceInstallPlan {
         directories,
-        files: Vec::new(),
+        files,
         commands,
     })
+}
+
+/// Marker file path proving a Windows user-mode install. Lives under the
+/// per-user install root (`%LOCALAPPDATA%\mihomo`) next to the core binary.
+pub(crate) fn windows_user_install_marker(ctx: &InstanceContext) -> Option<PathBuf> {
+    if ctx.os != TargetOs::Windows || ctx.mode != InstanceMode::User {
+        return None;
+    }
+    ctx.paths
+        .core_binary
+        .parent()
+        .map(|dir| dir.join(".user-installed"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1268,6 +1297,15 @@ fn windows_uninstall_plan(ctx: &InstanceContext, privileged: bool) -> InstanceSe
             path: log_file.clone(),
             mode: 0,
             privileged,
+        });
+    }
+    // Windows user mode: remove the install marker so presence detection no
+    // longer resolves the user mode as installed.
+    if let Some(marker) = windows_user_install_marker(ctx) {
+        remove_paths.push(PlannedDirectory {
+            path: marker,
+            mode: 0,
+            privileged: false,
         });
     }
     InstanceServicePlan {
@@ -3229,5 +3267,72 @@ mod tests {
 
         // Cleanup
         let _ = fs::remove_file(&lock_path);
+    }
+
+    #[test]
+    fn windows_user_install_marker_lives_under_user_install_root() {
+        let ctx = InstanceContext::planned(TargetOs::Windows, InstanceMode::User, &inputs());
+        let marker = windows_user_install_marker(&ctx).expect("user marker for windows user");
+        assert_eq!(
+            marker,
+            PathBuf::from(r"C:\Users\alice\AppData\Local")
+                .join("mihomo/bin/.user-installed")
+        );
+        // System mode and non-Windows must not produce a user marker.
+        let system_ctx =
+            InstanceContext::planned(TargetOs::Windows, InstanceMode::System, &inputs());
+        assert!(windows_user_install_marker(&system_ctx).is_none());
+        let linux_ctx = InstanceContext::planned(TargetOs::Linux, InstanceMode::User, &inputs());
+        assert!(windows_user_install_marker(&linux_ctx).is_none());
+    }
+
+    #[test]
+    fn windows_user_install_plan_writes_marker_and_uninstall_removes_it() {
+        let ctx = InstanceContext::planned(TargetOs::Windows, InstanceMode::User, &inputs());
+        let marker = windows_user_install_marker(&ctx).unwrap();
+
+        let install = planned_windows_install_plan(&ctx).expect("windows user install plan");
+        let marker_file = install
+            .files
+            .iter()
+            .find(|f| f.path == marker)
+            .expect("install plan must write the user marker");
+        assert!(!marker_file.privileged);
+
+        // System install plan must not carry the user marker.
+        let system_ctx =
+            InstanceContext::planned(TargetOs::Windows, InstanceMode::System, &inputs());
+        let system_install =
+            planned_windows_install_plan(&system_ctx).expect("windows system install plan");
+        assert!(
+            system_install.files.iter().all(|f| f.path != marker),
+            "system install plan must not write the user marker"
+        );
+
+        // User uninstall plan must remove the marker.
+        let uninstall = planned_service_plan(&ctx, ServiceAction::Uninstall);
+        assert!(
+            uninstall.remove_paths.iter().any(|d| d.path == marker),
+            "user uninstall plan must remove the marker"
+        );
+    }
+
+    #[test]
+    fn windows_user_mode_service_presence_requires_marker() {
+        // The service_presence_for_mode_resolution contract: Windows user mode
+        // is "installed" only when the marker exists (payload alone is shared
+        // with system mode and cannot prove either mode).
+        let mut inv = empty_inventory();
+        inv.user.payload = true;
+        // Payload only, no marker → user service not present.
+        assert!(
+            !inv.service_presence_for_mode_resolution().user,
+            "payload alone must not imply user mode installed"
+        );
+        inv.user.service = true;
+        assert!(
+            inv.service_presence_for_mode_resolution().user,
+            "marker presence must resolve user mode installed"
+        );
     }
 }

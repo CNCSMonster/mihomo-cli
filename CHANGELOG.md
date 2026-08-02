@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-08-02 (incremental)
+
+### 🐛 Bug Fixes
+- **Windows user/system presence 缺口** — Windows 模式此前 `service_file: None` 导致 `status`/`start`/`config --fix` 恒判"未安装"；修复：User 模式 install 写入 `.user-installed` 标记文件、inventory 用 `sc query mihomo` 探测 System 服务
+
+---
+
 ## 2026-08-02
 
 ### ✨ Features

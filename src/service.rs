@@ -743,7 +743,7 @@ fn sudo_pkill_mihomo_command() -> PlannedCommand {
     PlannedCommand::new("sudo", ["pkill", "-9", "-x", "mihomo"])
 }
 
-fn windows_service_query_indicates_installed(stdout: &[u8]) -> bool {
+pub(crate) fn windows_service_query_indicates_installed(stdout: &[u8]) -> bool {
     String::from_utf8_lossy(stdout).contains("STATE")
 }
 

@@ -8,9 +8,9 @@
 
 #[cfg(any(unix, windows))]
 use crate::ipc::{DaemonCommand, DaemonResponse};
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 use crate::instance::ApiEndpoint;
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 use crate::mihomo_api;
 use std::path::PathBuf;
 #[cfg(any(unix, windows))]
