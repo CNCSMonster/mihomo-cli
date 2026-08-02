@@ -747,6 +747,67 @@ pub(crate) fn windows_service_query_indicates_installed(stdout: &[u8]) -> bool {
     String::from_utf8_lossy(stdout).contains("STATE")
 }
 
+#[cfg(windows)]
+/// Install the mihomo Windows service via the service-manager crate.
+///
+/// service-manager's `sc create` path escapes the binPath properly (shell_escape,
+/// lifted from mullvad/windows-service-rs) — fixing the StartService 87 caused by
+/// manual binPath quoting through PowerShell.
+pub fn windows_install_service(ctx: &crate::instance::InstanceContext) -> anyhow::Result<()> {
+    use service_manager::{
+        ServiceInstallCtx, ServiceLabel, ServiceManager, ServiceStartCtx,
+    };
+
+    let manager = <dyn ServiceManager>::native()
+        .map_err(|e| anyhow::anyhow!("failed to get service manager: {e}"))?;
+    let label: ServiceLabel = "mihomo"
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid service label: {e}"))?;
+
+    // Remove any stale service first (idempotent install).
+    let _ = manager.uninstall(service_manager::ServiceUninstallCtx {
+        label: label.clone(),
+    });
+
+    manager
+        .install(ServiceInstallCtx {
+            label: label.clone(),
+            program: ctx.paths.cli_binary.clone(),
+            args: vec![std::ffi::OsString::from("daemon")],
+            contents: None,
+            username: None,
+            working_directory: None,
+            environment: None,
+            // ADR-17: default NO autostart; user opts in via `autostart on`.
+            autostart: false,
+            restart_policy: service_manager::RestartPolicy::OnFailure {
+                delay_secs: Some(2),
+                max_retries: None,
+                reset_after_secs: Some(60),
+            },
+        })
+        .map_err(|e| anyhow::anyhow!("failed to install mihomo service: {e}"))?;
+
+    manager
+        .start(ServiceStartCtx { label })
+        .map_err(|e| anyhow::anyhow!("failed to start mihomo service: {e}"))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+/// Uninstall the mihomo Windows service via the service-manager crate.
+pub fn windows_uninstall_service() -> anyhow::Result<()> {
+    use service_manager::{ServiceManager, ServiceUninstallCtx};
+
+    let manager = <dyn ServiceManager>::native()
+        .map_err(|e| anyhow::anyhow!("failed to get service manager: {e}"))?;
+    let label: service_manager::ServiceLabel = "mihomo"
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid service label: {e}"))?;
+    let _ = manager.uninstall(ServiceUninstallCtx { label });
+    Ok(())
+}
+
 fn linux_service_detection(system_unit_exists: bool, user_unit_exists: bool) -> ServiceDetection {
     if system_unit_exists {
         ServiceDetection::Installed(ServiceMode::System)

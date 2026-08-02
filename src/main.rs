@@ -3763,12 +3763,24 @@ async fn cmd_install_instance(
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
     if should_install_service_answer(&input) {
-        for command in &plan.commands {
-            let is_best_effort_unload = is_best_effort_install_cleanup_command(command);
-            if is_best_effort_unload {
-                run_install_cleanup_command(command);
-            } else {
-                service::run_instance_command(command)?;
+        #[cfg(target_os = "windows")]
+        let via_service_manager = mode == instance::InstanceMode::System;
+        #[cfg(not(target_os = "windows"))]
+        let via_service_manager = false;
+
+        if via_service_manager {
+            // Windows system service: use service-manager (correct binPath
+            // quoting — fixes StartService 87 from manual sc create).
+            #[cfg(target_os = "windows")]
+            service::windows_install_service(&ctx)?;
+        } else {
+            for command in &plan.commands {
+                let is_best_effort_unload = is_best_effort_install_cleanup_command(command);
+                if is_best_effort_unload {
+                    run_install_cleanup_command(command);
+                } else {
+                    service::run_instance_command(command)?;
+                }
             }
         }
         print_lines(format_install_service_installed());
