@@ -1680,10 +1680,22 @@ mod tests {
     }
 
     fn sample_metadata(pid: u32) -> CorePidMetadata {
+        // Use the current platform's v3 system paths so trust checks pass on
+        // every OS (Linux: /usr/local/lib; macOS: /Library/Application Support).
+        #[cfg(target_os = "macos")]
+        let (config_path, core_binary) = (
+            PathBuf::from("/Users/alice/.config/mihomo/config.yaml"),
+            PathBuf::from("/Library/Application Support/mihomo/bin/mihomo"),
+        );
+        #[cfg(not(target_os = "macos"))]
+        let (config_path, core_binary) = (
+            PathBuf::from("/home/alice/.config/mihomo/config.yaml"),
+            PathBuf::from("/usr/local/lib/mihomo/mihomo"),
+        );
         CorePidMetadata {
             pid,
-            config_path: PathBuf::from("/home/alice/.config/mihomo/config.yaml"),
-            core_binary: PathBuf::from("/usr/local/lib/mihomo/mihomo"),
+            config_path,
+            core_binary,
             api_endpoint: Some("/var/run/mihomo/mihomo.sock".to_string()),
         }
     }
@@ -2015,10 +2027,16 @@ external-controller: 127.0.0.1:9090
 
     #[test]
     fn daemon_accepts_only_clean_per_user_mihomo_config_paths() {
+        // Current platform's legitimate per-user config path must be accepted.
+        #[cfg(target_os = "macos")]
+        let valid = "/Users/alice/.config/mihomo/config.yaml";
+        #[cfg(not(target_os = "macos"))]
+        let valid = "/home/alice/.config/mihomo/config.yaml";
         assert!(validate_daemon_config_path_shape(std::path::Path::new(
-            "/home/alice/.config/mihomo/config.yaml"
+            valid
         ))
         .is_ok());
+        // The other platform's path shape must be rejected.
         let platform_other_home = if cfg!(target_os = "macos") {
             "/home/alice/.config/mihomo/config.yaml"
         } else {
@@ -2138,7 +2156,7 @@ second
     fn cmdline_matching_requires_core_binary_identity_when_available() {
         let metadata = sample_metadata(1234);
         assert!(cmdline_matches_core_metadata(
-            &["/usr/local/lib/mihomo/mihomo".to_string(), "-d".to_string()],
+            &[metadata.core_binary.to_string_lossy().to_string(), "-d".to_string()],
             &metadata
         ));
         assert!(!cmdline_matches_core_metadata(

@@ -93,41 +93,46 @@ jobs:
       - name: Smoke test
         shell: bash
         run: |
-          # Windows artifact is mihomo-cli.exe; expose it as mihomo-cli too
+          # Windows: binary is mihomo-cli.exe (case-insensitive FS makes a
+          # no-suffix copy impossible). Export CLI as the per-platform path.
           if [ -f bin/mihomo-cli.exe ]; then
-            cp bin/mihomo-cli.exe bin/mihomo-cli
+            echo "CLI=$PWD/bin/mihomo-cli.exe" >> "$GITHUB_ENV"
+            "$PWD/bin/mihomo-cli.exe" --version
+            "$PWD/bin/mihomo-cli.exe" version
+          else
+            chmod +x bin/mihomo-cli
+            echo "CLI=$PWD/bin/mihomo-cli" >> "$GITHUB_ENV"
+            bin/mihomo-cli --version
+            bin/mihomo-cli version
           fi
-          chmod +x bin/mihomo-cli 2>/dev/null || true
-          mihomo-cli --version
-          mihomo-cli version
 
       # install --skip-config：非交互安装，跳过订阅配置步骤
       # （CI 无真实订阅；config 留空，service 生命周期验证不受影响）
       - name: User mode install
         shell: bash
         run: |
-          mihomo-cli install --user --skip-config
+          $CLI install --user --skip-config
           echo "=== status after install ==="
-          mihomo-cli status || true
+          $CLI status || true
 
       - name: User mode lifecycle (start/status/stop)
         shell: bash
         run: |
-          mihomo-cli start || true
-          mihomo-cli status || true
-          mihomo-cli stop || true
+          $CLI start || true
+          $CLI status || true
+          $CLI stop || true
 
       - name: User mode uninstall
         shell: bash
         run: |
-          mihomo-cli uninstall --user --yes || true
+          $CLI uninstall --user --yes || true
 
       - name: Diagnostics
         if: always()
         shell: bash
         run: |
           echo "=== status ==="
-          mihomo-cli status 2>&1 || true
+          $CLI status 2>&1 || true
           echo "=== platform checks ==="
           case "${{ matrix.os }}" in
             ubuntu-latest)
@@ -171,35 +176,35 @@ jobs:
             cp bin/mihomo-cli.exe bin/mihomo-cli
           fi
           chmod +x bin/mihomo-cli 2>/dev/null || true
-          mihomo-cli --version
+          $CLI --version
 
       - name: System mode install
         shell: bash
         run: |
-          mihomo-cli install --system --skip-config
+          $CLI install --system --skip-config
           echo "=== status after install ==="
-          mihomo-cli status || true
+          $CLI status || true
 
       - name: System mode lifecycle (start/status/stop/start)
         shell: bash
         run: |
-          mihomo-cli start || true
-          mihomo-cli status || true
-          mihomo-cli stop || true
-          mihomo-cli start || true
-          mihomo-cli status || true
+          $CLI start || true
+          $CLI status || true
+          $CLI stop || true
+          $CLI start || true
+          $CLI status || true
 
       - name: System mode uninstall
         shell: bash
         run: |
-          mihomo-cli uninstall --system --yes || true
+          $CLI uninstall --system --yes || true
 
       - name: Diagnostics
         if: always()
         shell: bash
         run: |
           echo "=== status ==="
-          mihomo-cli status 2>&1 || true
+          $CLI status 2>&1 || true
           echo "=== platform checks ==="
           case "${{ matrix.os }}" in
             ubuntu-latest)
