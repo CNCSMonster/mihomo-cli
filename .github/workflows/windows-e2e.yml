@@ -1,0 +1,122 @@
+name: Windows E2E
+
+# 触发：手动 dispatch（workflow_dispatch）+ 打 tag（v*）
+# 说明：Windows 是二等公民，E2E 验证走 GitHub Actions runner，
+#       不在开发机/真机上执行（避免与真实使用环境冲突）。
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  windows-e2e:
+    name: Windows E2E
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-e2e-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            windows-e2e-cargo-
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Add binary to PATH
+        shell: bash
+        run: |
+          echo "$PWD/target/release" >> "$GITHUB_PATH"
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          mihomo-cli --version
+          mihomo-cli version
+
+      # ── 单元测试（unix 专用测试在 Windows 上自动跳过）──
+      - name: Unit tests
+        shell: bash
+        run: cargo test --release
+
+      # ── User 模式 E2E ──
+      # 预置最小 config（含 Windows user named pipe endpoint），
+      # install 检测到 config 存在即跳过订阅交互（CI 无真实订阅）。
+      - name: User mode install
+        shell: bash
+        env:
+          MIHOMO_CLI_CONFIG_DIR: "${{ runner.temp }}/mihomo-user-config"
+        run: |
+          mkdir -p "$MIHOMO_CLI_CONFIG_DIR"
+          printf 'mixed-port: 7897\nlog-level: info\nexternal-controller: 127.0.0.1:9097\n' > "$MIHOMO_CLI_CONFIG_DIR/config.yaml"
+          mihomo-cli install --user
+          echo "=== status ==="
+          mihomo-cli status || true
+
+      - name: User mode lifecycle
+        shell: bash
+        env:
+          MIHOMO_CLI_CONFIG_DIR: "${{ runner.temp }}/mihomo-user-config"
+        run: |
+          mihomo-cli start || true
+          mihomo-cli status || true
+          mihomo-cli stop || true
+
+      - name: User mode uninstall
+        shell: bash
+        env:
+          MIHOMO_CLI_CONFIG_DIR: "${{ runner.temp }}/mihomo-user-config"
+        run: |
+          mihomo-cli uninstall --user --yes || true
+
+      # ── System 模式 E2E ──
+      # GitHub Windows runner 默认以 Administrator 运行，可注册 Windows service。
+      # 注意：与 user 模式互斥（v3），先确认 user 已卸载。
+      - name: System mode install
+        shell: bash
+        env:
+          MIHOMO_CLI_CONFIG_DIR: "${{ runner.temp }}/mihomo-system-config"
+        run: |
+          mkdir -p "$MIHOMO_CLI_CONFIG_DIR"
+          printf 'mixed-port: 7897\nlog-level: info\nexternal-controller: 127.0.0.1:9097\n' > "$MIHOMO_CLI_CONFIG_DIR/config.yaml"
+          mihomo-cli install --system
+          echo "=== status ==="
+          mihomo-cli status || true
+
+      - name: System mode lifecycle
+        shell: bash
+        run: |
+          mihomo-cli start || true
+          mihomo-cli status || true
+          mihomo-cli stop || true
+          mihomo-cli start || true
+          mihomo-cli status || true
+
+      - name: System mode uninstall
+        shell: bash
+        run: |
+          mihomo-cli uninstall --system --yes || true
+
+      # 收集诊断信息（失败时定位）
+      - name: Diagnostics
+        if: always()
+        shell: bash
+        run: |
+          echo "=== mihomo-cli status ==="
+          mihomo-cli status 2>&1 || true
+          echo "=== Windows services ==="
+          sc.exe query mihomo 2>&1 || true
+          echo "=== mihomo processes ==="
+          tasklist | grep -i mihomo || true
+          echo "=== user marker ==="
+          ls "$LOCALAPPDATA/mihomo/bin/.user-installed" 2>&1 || true
