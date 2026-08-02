@@ -223,6 +223,12 @@ jobs:
                   sc.exe query mihomo 2>&1 || true
                   echo "--- service binPath (qc) ---"
                   sc.exe qc mihomo 2>&1 || true
+                  echo "--- CONTROL: manual sc create with proper binPath ---"
+                  sc.exe delete mihomo-test 2>/dev/null || true
+                  sc.exe create mihomo-test binPath= "\"C:\ProgramData\mihomo\bin\mihomo-cli.exe\" daemon" start= demand DisplayName= "Mihomo Test" 2>&1 || true
+                  sc.exe start mihomo-test 2>&1 || true
+                  sc.exe query mihomo-test 2>&1 | head -8 || true
+                  sc.exe delete mihomo-test 2>/dev/null || true
                   echo "--- manual daemon smoke (3s) ---"
                   "C:\ProgramData\mihomo\bin\mihomo-cli.exe" daemon &
                   DAEMON_PID=$!
