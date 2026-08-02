@@ -904,8 +904,12 @@ pub fn planned_windows_install_plan(ctx: &InstanceContext) -> Option<InstanceIns
                     "create".to_string(),
                     "mihomo".to_string(),
                     format!("binPath= \"{}\" daemon", ctx.paths.cli_binary.display()),
-                    "start= auto".to_string(),
-                    "DisplayName= Mihomo Proxy Service".to_string(),
+                    // sc.exe parses `start= auto` as two tokens (name= + value);
+                    // a single token with an embedded space breaks the parser.
+                    "start=".to_string(),
+                    "auto".to_string(),
+                    "DisplayName=".to_string(),
+                    "Mihomo Proxy Service".to_string(),
                 ],
                 privileged: true,
             },
@@ -2478,7 +2482,7 @@ mod tests {
             "binPath= \"{}\" daemon",
             ctx.paths.cli_binary.display()
         )));
-        for required in ["sc.exe", "create", "start= auto"] {
+        for required in ["sc.exe", "create", "start=", "auto"] {
             assert!(
                 rendered.contains(required),
                 "missing {required}\n{rendered}"
