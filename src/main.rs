@@ -61,6 +61,9 @@ enum Command {
         /// e.g. https://ghproxy.com/
         #[arg(long = "github-mirror")]
         github_mirror: Option<String>,
+        /// Skip the interactive subscription setup step (non-interactive installs)
+        #[arg(long = "skip-config")]
+        skip_config: bool,
     },
 
     /// Check for and install the latest mihomo core version
@@ -603,6 +606,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         force: false,
         version: None,
         github_mirror: None,
+        skip_config: false,
     }) {
         Command::Install {
             system,
@@ -610,6 +614,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             force,
             version,
             github_mirror,
+            skip_config,
         } => {
             cmd_install_entry(
                 system,
@@ -617,6 +622,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 force,
                 version.as_deref(),
                 github_mirror.as_deref(),
+                skip_config,
             )
             .await
         }
@@ -1524,7 +1530,7 @@ async fn prompt_install_for_start() -> anyhow::Result<bool> {
     println!("No mihomo service is installed yet.");
     println!("Start needs an installed service/core first.");
     println!();
-    cmd_install_entry(false, false, false, None, None).await?;
+    cmd_install_entry(false, false, false, None, None, false).await?;
     Ok(true)
 }
 
@@ -2182,7 +2188,7 @@ async fn prompt_switch_user_to_system_for_tun(
         return Ok(false);
     }
     uninstall_user_service_artifacts_for_tun_switch()?;
-    cmd_install_instance(instance::InstanceMode::System, true, None, github_mirror).await?;
+    cmd_install_instance(instance::InstanceMode::System, true, None, github_mirror, false).await?;
     Ok(true)
 }
 
@@ -2200,7 +2206,7 @@ async fn prompt_install_system_service_for_tun(github_mirror: Option<&str>) -> a
         println!("  Cancelled.");
         return Ok(false);
     }
-    cmd_install_instance(instance::InstanceMode::System, true, None, github_mirror).await?;
+    cmd_install_instance(instance::InstanceMode::System, true, None, github_mirror, false).await?;
     Ok(true)
 }
 
@@ -3465,6 +3471,7 @@ async fn cmd_install_entry(
     force: bool,
     version: Option<&str>,
     github_mirror: Option<&str>,
+    skip_config: bool,
 ) -> anyhow::Result<()> {
     let mode = if system {
         instance::InstanceMode::System
@@ -3485,7 +3492,7 @@ async fn cmd_install_entry(
             instance::InstanceMode::User
         }
     };
-    cmd_install_instance(mode, force, version, github_mirror).await
+    cmd_install_instance(mode, force, version, github_mirror, skip_config).await
 }
 
 fn install_mode_conflict_message(
@@ -3514,6 +3521,7 @@ async fn cmd_install_instance(
     force: bool,
     version: Option<&str>,
     github_mirror: Option<&str>,
+    skip_config: bool,
 ) -> anyhow::Result<()> {
     let ctx = instance::planned_current_context(mode)
         .ok_or_else(|| anyhow::anyhow!("Unsupported OS for instance install"))?;
@@ -3695,6 +3703,9 @@ async fn cmd_install_instance(
                 true
             }
         }
+    } else if skip_config {
+        println!("  ⏭ Skipped (--skip-config)");
+        true
     } else {
         setup_instance_config(&ctx).await?
     };

@@ -1784,6 +1784,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // UnixSocket endpoint semantics; not applicable on Windows
     fn test_ensure_controller_already_has_unix() {
         #[cfg(unix)]
         let input = format!(
@@ -1801,6 +1802,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // UnixSocket endpoint semantics; not applicable on Windows
     fn test_ensure_controller_replaces_wrong_unix_socket() {
         let input = "mixed-port: 7890\nexternal-controller: ''\nexternal-controller-unix: /tmp/verge/verge-mihomo.sock\n";
         let endpoint = ApiEndpoint::UnixSocket(std::path::PathBuf::from(format!(
@@ -1941,6 +1943,7 @@ external-controller-unix: /tmp/stale-user.sock
     }
 
     #[test]
+    #[cfg(unix)] // UnixSocket endpoint semantics; not applicable on Windows
     fn test_fix_existing_config_no_controller_adds_it() {
         let content = "mixed-port: 7890\nmode: rule\n";
         let endpoint = ApiEndpoint::UnixSocket(std::path::PathBuf::from(format!(

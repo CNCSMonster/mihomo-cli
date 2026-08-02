@@ -94,22 +94,17 @@ jobs:
           mihomo-cli --version
           mihomo-cli version
 
-      # 预置最小 config 跳过订阅交互（CI 无真实订阅）。
+      # install --skip-config：非交互安装，跳过订阅配置步骤
+      # （CI 无真实订阅；config 留空，service 生命周期验证不受影响）
       - name: User mode install
         shell: bash
-        env:
-          MIHOMO_CLI_CONFIG_DIR: "${{ runner.temp }}/mihomo-user-config"
         run: |
-          mkdir -p "$MIHOMO_CLI_CONFIG_DIR"
-          printf 'mixed-port: 7897\nlog-level: info\nexternal-controller: 127.0.0.1:9097\n' > "$MIHOMO_CLI_CONFIG_DIR/config.yaml"
-          mihomo-cli install --user
+          mihomo-cli install --user --skip-config
           echo "=== status after install ==="
           mihomo-cli status || true
 
       - name: User mode lifecycle (start/status/stop)
         shell: bash
-        env:
-          MIHOMO_CLI_CONFIG_DIR: "${{ runner.temp }}/mihomo-user-config"
         run: |
           mihomo-cli start || true
           mihomo-cli status || true
@@ -117,8 +112,6 @@ jobs:
 
       - name: User mode uninstall
         shell: bash
-        env:
-          MIHOMO_CLI_CONFIG_DIR: "${{ runner.temp }}/mihomo-user-config"
         run: |
           mihomo-cli uninstall --user --yes || true
 
@@ -171,12 +164,8 @@ jobs:
 
       - name: System mode install
         shell: bash
-        env:
-          MIHOMO_CLI_CONFIG_DIR: "${{ runner.temp }}/mihomo-system-config"
         run: |
-          mkdir -p "$MIHOMO_CLI_CONFIG_DIR"
-          printf 'mixed-port: 7897\nlog-level: info\nexternal-controller: 127.0.0.1:9097\n' > "$MIHOMO_CLI_CONFIG_DIR/config.yaml"
-          mihomo-cli install --system
+          mihomo-cli install --system --skip-config
           echo "=== status after install ==="
           mihomo-cli status || true
 
