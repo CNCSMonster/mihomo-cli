@@ -221,5 +221,19 @@ jobs:
             windows-latest)
               echo "--- service ---"
                   sc.exe query mihomo 2>&1 || true
+                  echo "--- service binPath (qc) ---"
+                  sc.exe qc mihomo 2>&1 || true
+                  echo "--- manual daemon smoke (3s) ---"
+                  "C:\ProgramData\mihomo\bin\mihomo-cli.exe" daemon &
+                  DAEMON_PID=$!
+                  sleep 3
+                  if kill -0 $DAEMON_PID 2>/dev/null; then
+                    echo "daemon alive after 3s (pid $DAEMON_PID)"
+                    kill $DAEMON_PID 2>/dev/null || true
+                  else
+                    echo "daemon exited within 3s"
+                  fi
+                  echo "--- event log (Service Control Manager) ---"
+                  powershell -NoProfile -Command "Get-WinEvent -LogName System -MaxEvents 20 | Where-Object {\$_.ProviderName -match 'Service Control Manager'} | Select-Object -First 3 TimeCreated, Id, Message | Format-List" 2>&1 || true
               ;;
           esac
