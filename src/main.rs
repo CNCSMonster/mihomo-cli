@@ -592,6 +592,19 @@ async fn main() {
     if cli.verbose {
         VERBOSE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    // Windows daemon 子命令：同步进 SCM dispatcher（StartServiceCtrlDispatcher
+    // 必须由主线程调用；#[tokio::main] 的 block_on 在 main 线程执行，满足约束）。
+    // service_main 回调内再自建 tokio runtime 跑核心循环。
+    #[cfg(target_os = "windows")]
+    if matches!(cli.command, Some(Command::Daemon { recover: false })) {
+        match daemon::run_windows_service() {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("\n  Error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     if let Err(e) = run(cli).await {
         eprintln!("\n  Error: {e}");
         eprintln!("  Run with -v for more details");
@@ -753,7 +766,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             if recover {
                 daemon::recover_daemon(sock_path).await
             } else {
-                daemon::run_daemon(sock_path).await
+                // unix: launchd/systemd 管理生命周期，token 永不取消（保持现有行为）
+                daemon::run_daemon(sock_path, tokio_util::sync::CancellationToken::new()).await
             }
         }
         Command::Dashboard => cmd_dashboard().await,

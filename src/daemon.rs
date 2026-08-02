@@ -23,6 +23,8 @@ use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 #[cfg(any(unix, windows))]
 use tokio::sync::Mutex;
+#[cfg(any(unix, windows))]
+use tokio_util::sync::CancellationToken;
 
 #[cfg(any(unix, windows))]
 fn validate_daemon_config_path_shape(config_path: &std::path::Path) -> Result<(), String> {
@@ -162,29 +164,154 @@ fn validate_system_core_binary_request(core_binary: &std::path::Path) -> Result<
 }
 
 #[cfg(windows)]
-/// Run the Windows daemon main loop on a named pipe.
-pub async fn run_daemon(pipe_path: PathBuf) -> anyhow::Result<()> {
-    use tokio::net::windows::named_pipe::ServerOptions;
-
+/// Run the Windows daemon main loop on a named pipe until cancelled.
+pub async fn run_daemon(pipe_path: PathBuf, cancel: CancellationToken) -> anyhow::Result<()> {
     let pipe_name = pipe_path.display().to_string();
     let state = Arc::new(Mutex::new(WindowsDaemonState::default()));
     eprintln!("[mihomo-daemon] listening on {pipe_name}");
 
     loop {
-        let server = ServerOptions::new().create(&pipe_name)?;
-        server.connect().await?;
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            if let Err(e) = handle_windows_pipe(server, state).await {
-                eprintln!("[mihomo-daemon] pipe connection error: {e}");
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                eprintln!("[mihomo-daemon] shutdown requested, exiting accept loop");
+                return Ok(());
             }
-        });
+            accepted = accept_one_pipe_connection(&pipe_name) => {
+                match accepted {
+                    Ok(Some(server)) => {
+                        let st = Arc::clone(&state);
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_windows_pipe(server, st).await {
+                                eprintln!("[mihomo-daemon] pipe connection error: {e}");
+                            }
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("[mihomo-daemon] pipe create/connect error: {e}");
+                    }
+                }
+            }
+        }
     }
+}
+
+#[cfg(windows)]
+async fn accept_one_pipe_connection(
+    pipe_name: &str,
+) -> anyhow::Result<Option<tokio::net::windows::named_pipe::NamedPipeServer>> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    let server = ServerOptions::new().create(pipe_name)?;
+    server.connect().await?;
+    Ok(Some(server))
 }
 
 #[cfg(not(any(unix, windows)))]
 pub async fn run_daemon(_socket_path: PathBuf) -> anyhow::Result<()> {
     anyhow::bail!("system service daemon is not implemented on this platform")
+}
+
+#[cfg(windows)]
+/// Enter the Windows SCM dispatcher. Must be called synchronously from the
+/// main thread (StartServiceCtrlDispatcher requirement); service_main builds
+/// its own tokio runtime to run the daemon loop.
+pub fn run_windows_service() -> anyhow::Result<()> {
+    windows_service_entry::run_dispatcher().map_err(|e| anyhow::anyhow!(e.to_string()))
+}
+
+#[cfg(windows)]
+mod windows_service_entry {
+    use std::ffi::OsString;
+    use std::time::Duration;
+
+    use tokio_util::sync::CancellationToken;
+    use windows_service::service::{
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState as WinState,
+        ServiceStatus, ServiceType,
+    };
+    use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+    use windows_service::{define_windows_service, service_dispatcher};
+
+    use crate::ipc;
+
+    const SERVICE_LABEL: &str = "mihomo";
+
+    define_windows_service!(ffi_service_main, service_main);
+
+    pub fn run_dispatcher() -> windows_service::Result<()> {
+        service_dispatcher::start(SERVICE_LABEL, ffi_service_main)
+    }
+
+    fn service_main(_arguments: Vec<OsString>) {
+        let stop = CancellationToken::new();
+        let handler_stop = stop.clone();
+
+        let event_handler = move |event| match event {
+            ServiceControl::Stop | ServiceControl::Shutdown => {
+                handler_stop.cancel();
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        };
+
+        let status_handle = match service_control_handler::register(SERVICE_LABEL, event_handler) {
+            Ok(handle) => handle,
+            Err(e) => {
+                eprintln!("[mihomo-daemon] failed to register service control handler: {e}");
+                return;
+            }
+        };
+
+        if let Err(e) = status_handle.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: WinState::Running,
+            controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: Duration::ZERO,
+            process_id: None,
+        }) {
+            eprintln!("[mihomo-daemon] failed to report Running: {e}");
+            return;
+        }
+
+        let pipe_path = ipc::system_service_socket_path();
+        let cancel = stop.clone();
+        let runtime = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("[mihomo-daemon] failed to build tokio runtime: {e}");
+                let _ = status_handle.set_service_status(ServiceStatus {
+                    service_type: ServiceType::OWN_PROCESS,
+                    current_state: WinState::Stopped,
+                    controls_accepted: ServiceControlAccept::empty(),
+                    exit_code: ServiceExitCode::Win32(1),
+                    checkpoint: 0,
+                    wait_hint: Duration::ZERO,
+                    process_id: None,
+                });
+                return;
+            }
+        };
+
+        let result = runtime.block_on(super::run_daemon(pipe_path, cancel));
+
+        if let Err(e) = &result {
+            eprintln!("[mihomo-daemon] daemon loop error: {e}");
+        }
+
+        let _ = status_handle.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: WinState::Stopped,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(if result.is_ok() { 0 } else { 1 }),
+            checkpoint: 0,
+            wait_hint: Duration::ZERO,
+            process_id: None,
+        });
+    }
 }
 
 #[cfg(windows)]
@@ -553,7 +680,7 @@ impl Default for DaemonState {
 /// This function blocks until the daemon is shut down.
 /// It should be called as the main entry point when the binary
 /// is invoked as a system service daemon.
-pub async fn run_daemon(socket_path: PathBuf) -> anyhow::Result<()> {
+pub async fn run_daemon(socket_path: PathBuf, cancel: CancellationToken) -> anyhow::Result<()> {
     // Ensure parent directory exists
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -588,14 +715,22 @@ pub async fn run_daemon(socket_path: PathBuf) -> anyhow::Result<()> {
     eprintln!("[mihomo-daemon] listening on {}", socket_path.display());
 
     loop {
-        let (stream, _addr) = listener.accept().await?;
-        let state = Arc::clone(&state);
-
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, state).await {
-                eprintln!("[mihomo-daemon] connection error: {e}");
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                eprintln!("[mihomo-daemon] shutdown requested, exiting accept loop");
+                return Ok(());
             }
-        });
+            accepted = listener.accept() => {
+                let (stream, _addr) = accepted?;
+                let state = Arc::clone(&state);
+
+                tokio::spawn(async move {
+                    if let Err(e) = handle_connection(stream, state).await {
+                        eprintln!("[mihomo-daemon] connection error: {e}");
+                    }
+                });
+            }
+        }
     }
 }
 
@@ -623,13 +758,13 @@ pub async fn recover_daemon(socket_path: PathBuf) -> anyhow::Result<()> {
     }
 
     // Run the normal daemon startup which handles recovery automatically
-    run_daemon(socket_path).await
+    run_daemon(socket_path, CancellationToken::new()).await
 }
 
 #[cfg(not(unix))]
 pub async fn recover_daemon(socket_path: PathBuf) -> anyhow::Result<()> {
     eprintln!("[mihomo-daemon] recovery mode not supported on this platform");
-    run_daemon(socket_path).await
+    run_daemon(socket_path, CancellationToken::new()).await
 }
 
 #[cfg(unix)]
