@@ -1,8 +1,10 @@
-name: Windows E2E
+name: Cross-platform E2E
 
 # 触发：手动 dispatch（workflow_dispatch）或打 tag（v*）
-# job 之间天然隔离（各自独立 runner），user/system 在干净环境分别验证，
-# 无需在单 job 内处理 v3 互斥顺序。
+# 矩阵：ubuntu-latest / macos-latest / windows-latest
+# job 之间天然隔离（各自独立 runner），user/system 在干净环境分别验证。
+# Windows 是二等公民（此前在真机上与 clash-verge-rev 冲突风险），
+# 验证统一走 GitHub Actions runner。
 on:
   workflow_dispatch:
   push:
@@ -11,8 +13,11 @@ on:
 
 jobs:
   build:
-    name: Build
-    runs-on: windows-latest
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -26,9 +31,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: windows-e2e-cargo-${{ hashFiles('Cargo.lock') }}
+          key: e2e-cargo-${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            windows-e2e-cargo-
+            e2e-cargo-${{ matrix.os }}-
 
       - name: Build release binary
         run: cargo build --release
@@ -36,13 +41,16 @@ jobs:
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: mihomo-cli-windows
-          path: target/release/mihomo-cli.exe
+          name: mihomo-cli-${{ matrix.os }}
+          path: target/release/mihomo-cli
 
   unit-tests:
-    name: Unit tests
+    name: Unit tests (${{ matrix.os }})
     needs: build
-    runs-on: windows-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -54,23 +62,26 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: windows-e2e-cargo-${{ hashFiles('Cargo.lock') }}
+          key: e2e-cargo-${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            windows-e2e-cargo-
-      - name: Unit tests (unix-only tests auto-skipped on Windows)
+            e2e-cargo-${{ matrix.os }}-
+      - name: Unit + integration tests (platform-specific tests auto-skipped)
         shell: bash
         run: cargo test --release
 
   user-e2e:
-    name: User mode E2E
+    name: User mode E2E (${{ matrix.os }})
     needs: build
-    runs-on: windows-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - name: Download binary
         uses: actions/download-artifact@v4
         with:
-          name: mihomo-cli-windows
+          name: mihomo-cli-${{ matrix.os }}
           path: bin/
       - name: Add binary to PATH
         shell: bash
@@ -79,11 +90,11 @@ jobs:
       - name: Smoke test
         shell: bash
         run: |
+          chmod +x bin/mihomo-cli 2>/dev/null || true
           mihomo-cli --version
           mihomo-cli version
 
-      # 预置最小 config（含 Windows user named pipe endpoint），
-      # install 检测到 config 存在即跳过订阅交互（CI 无真实订阅）。
+      # 预置最小 config 跳过订阅交互（CI 无真实订阅）。
       - name: User mode install
         shell: bash
         env:
@@ -117,21 +128,36 @@ jobs:
         run: |
           echo "=== status ==="
           mihomo-cli status 2>&1 || true
-          echo "=== mihomo processes ==="
-          tasklist | grep -i mihomo || true
-          echo "=== user marker ==="
-          ls "$LOCALAPPDATA/mihomo/bin/.user-installed" 2>&1 || true
+          echo "=== platform checks ==="
+          case "${{ matrix.os }}" in
+            ubuntu-latest)
+              echo "--- systemd user session ---"
+                  systemctl --user is-system-running 2>&1 || true
+                  loginctl show-user "$USER" -p Linger 2>&1 || true
+              ;;
+            macos-latest)
+              echo "--- launchctl gui domain ---"
+                  launchctl print "gui/$(id -u)" 2>&1 | head -3 || true
+              ;;
+            windows-latest)
+              echo "--- mihomo processes ---"
+                  tasklist | grep -i mihomo || true
+              ;;
+          esac
 
   system-e2e:
-    name: System mode E2E
+    name: System mode E2E (${{ matrix.os }})
     needs: build
-    runs-on: windows-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - name: Download binary
         uses: actions/download-artifact@v4
         with:
-          name: mihomo-cli-windows
+          name: mihomo-cli-${{ matrix.os }}
           path: bin/
       - name: Add binary to PATH
         shell: bash
@@ -140,9 +166,9 @@ jobs:
       - name: Smoke test
         shell: bash
         run: |
+          chmod +x bin/mihomo-cli 2>/dev/null || true
           mihomo-cli --version
 
-      # GitHub Windows runner 默认以 Administrator 运行，可注册 Windows service。
       - name: System mode install
         shell: bash
         env:
@@ -174,7 +200,18 @@ jobs:
         run: |
           echo "=== status ==="
           mihomo-cli status 2>&1 || true
-          echo "=== Windows services ==="
-          sc.exe query mihomo 2>&1 || true
-          echo "=== mihomo processes ==="
-          tasklist | grep -i mihomo || true
+          echo "=== platform checks ==="
+          case "${{ matrix.os }}" in
+            ubuntu-latest)
+              echo "--- systemd unit ---"
+                  systemctl status mihomo 2>&1 | head -5 || true
+              ;;
+            macos-latest)
+              echo "--- launchd daemon ---"
+                  launchctl print system/io.mihomo 2>&1 | head -3 || true
+              ;;
+            windows-latest)
+              echo "--- service ---"
+                  sc.exe query mihomo 2>&1 || true
+              ;;
+          esac
