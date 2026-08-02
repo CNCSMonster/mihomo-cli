@@ -8,6 +8,10 @@
 
 #[cfg(any(unix, windows))]
 use crate::ipc::{DaemonCommand, DaemonResponse};
+#[cfg(any(unix, windows))]
+use crate::instance::ApiEndpoint;
+#[cfg(any(unix, windows))]
+use crate::mihomo_api;
 use std::path::PathBuf;
 #[cfg(any(unix, windows))]
 use std::process::Stdio;
@@ -128,7 +132,7 @@ fn validate_daemon_config_path_for_peer(
 }
 
 #[cfg(any(unix, windows))]
-fn expected_system_core_binary_path() -> PathBuf {
+pub(crate) fn expected_system_core_binary_path() -> PathBuf {
     if cfg!(target_os = "macos") {
         PathBuf::from("/Library/Application Support/mihomo/bin/mihomo")
     } else if cfg!(target_os = "windows") {
@@ -497,6 +501,12 @@ fn windows_core_log_file_path() -> PathBuf {
 }
 
 #[cfg(unix)]
+/// Global lifecycle lock — serializes all lifecycle commands (start/stop/restart/
+/// TUN toggle) end-to-end, aligned with clash-verge-service OWNER_LIFECYCLE_LOCK.
+static OWNER_LIFECYCLE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+#[cfg(unix)]
 /// Daemon state shared across connections.
 struct DaemonState {
     /// Whether the mihomo core is currently running.
@@ -589,6 +599,39 @@ pub async fn run_daemon(socket_path: PathBuf) -> anyhow::Result<()> {
     }
 }
 
+/// Recover from daemon crash by restarting the daemon.
+///
+/// This function is called when the CLI detects that the daemon has crashed
+/// but the core process may still be running. The daemon's normal startup
+/// logic will detect the existing core process via the PID file and reattach to it.
+#[cfg(unix)]
+pub async fn recover_daemon(socket_path: PathBuf) -> anyhow::Result<()> {
+    eprintln!("[mihomo-daemon] recovery mode: checking for existing core process...");
+
+    // Check if there's a PID file with a running core
+    if let Some(metadata) = read_pid_file(&PathBuf::from("/var/run/mihomo/core.pid")) {
+        if pid_metadata_is_recoverable_system_core(&metadata) {
+            eprintln!(
+                "[mihomo-daemon] found running core (PID {}), will reattach",
+                metadata.pid
+            );
+        } else {
+            eprintln!("[mihomo-daemon] no recoverable core found, starting fresh");
+        }
+    } else {
+        eprintln!("[mihomo-daemon] no PID file found, starting fresh");
+    }
+
+    // Run the normal daemon startup which handles recovery automatically
+    run_daemon(socket_path).await
+}
+
+#[cfg(not(unix))]
+pub async fn recover_daemon(socket_path: PathBuf) -> anyhow::Result<()> {
+    eprintln!("[mihomo-daemon] recovery mode not supported on this platform");
+    run_daemon(socket_path).await
+}
+
 #[cfg(unix)]
 /// Handle a single IPC connection.
 async fn handle_connection(
@@ -619,8 +662,20 @@ async fn handle_connection(
         }
     };
 
-    // Process command
-    let response = process_command(cmd, state, peer_uid).await;
+    // Aligned with clash-verge-service OWNER_LIFECYCLE_LOCK:
+    // lifecycle commands (start/stop/restart/TUN toggle) are serialized by a
+    // single global mutex held for the *entire* operation — including core
+    // spawn and readiness wait — so concurrent clients cannot interleave.
+    // GetStatus is read-only and does not take the lifecycle lock.
+    let is_lifecycle = !matches!(cmd, DaemonCommand::GetStatus);
+    let response = if is_lifecycle {
+        let lock = OWNER_LIFECYCLE_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()));
+        let _guard = lock.lock().await;
+        process_command(cmd, state, peer_uid).await
+    } else {
+        process_command(cmd, state, peer_uid).await
+    };
 
     // Send response
     send_response(&mut writer, &response).await?;
@@ -1291,8 +1346,39 @@ async fn start_core(
                         );
                     }
                     s.core_child = Some(child);
+
+                    // Readiness: wait for the core API to become reachable before
+                    // declaring success. This moves the readiness contract from the
+                    // CLI client into the daemon (aligned with clash-verge-service:
+                    // the client receives Success only once the core is actually ready).
+                    let endpoint = ApiEndpoint::UnixSocket(
+                        endpoint_unix_path(&api_endpoint)
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|| PathBuf::from(&api_endpoint)),
+                    );
+                    let ready =
+                        mihomo_api::wait_for_api_ready_at_endpoint(&endpoint, 15).await;
+                    if !ready {
+                        // Core spawned but did not become ready; kill it and report failure.
+                        let _ = s.core_child.take();
+                        s.core_running = false;
+                        s.core_pid = None;
+                        s.config_path = None;
+                        s.api_endpoint = None;
+                        remove_pid_file(&s.pid_file);
+                        return DaemonResponse::Error {
+                            message: format!(
+                                "core started but did not become API-ready within 15s at {api_endpoint}\n  \
+                                 Logs: {}",
+                                s.core_log_file.display()
+                            ),
+                        };
+                    }
                     DaemonResponse::Success {
-                        message: format!("core started with config {}", config_path.display()),
+                        message: format!(
+                            "core started and API ready at {api_endpoint} (config {})",
+                            config_path.display()
+                        ),
                     }
                 }
             }
@@ -2078,5 +2164,72 @@ second
             &["bash".to_string(), "-c".to_string()],
             &legacy
         ));
+    }
+
+    // BUG-13 相关：OWNER_LIFECYCLE_LOCK 只串行化生命周期命令，GetStatus 不被阻塞
+    #[tokio::test]
+    async fn lifecycle_lock_serializes_lifecycle_but_not_status() {
+        // 两个并发任务：一个持锁（模拟生命周期操作），一个 GetStatus
+        // GetStatus 不经过生命周期锁 → 不阻塞
+        let lock = OWNER_LIFECYCLE_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()));
+        let guard = lock.lock().await;
+
+        // 持锁时，GetStatus 仍应立即执行（不取生命周期锁）
+        let cmd = DaemonCommand::GetStatus;
+        let is_lifecycle = !matches!(cmd, DaemonCommand::GetStatus);
+        assert!(!is_lifecycle, "GetStatus must not be a lifecycle command");
+
+        drop(guard);
+
+        // 生命周期命令（StartCore）应标记为需要锁
+        let cmd = DaemonCommand::StartCore {
+            config_path: PathBuf::from("/tmp/x/config.yaml"),
+        };
+        let is_lifecycle = !matches!(cmd, DaemonCommand::GetStatus);
+        assert!(is_lifecycle, "StartCore must be a lifecycle command");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_lock_serializes_concurrent_commands() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+        let current = Arc::new(AtomicUsize::new(0));
+
+        async fn simulate_lifecycle(
+            counter: Arc<AtomicUsize>,
+            max_concurrent: Arc<AtomicUsize>,
+            current: Arc<AtomicUsize>,
+        ) {
+            let lock = OWNER_LIFECYCLE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
+            let _guard = lock.lock().await;
+            let now = current.fetch_add(1, Ordering::SeqCst) + 1;
+            max_concurrent.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            current.fetch_sub(1, Ordering::SeqCst);
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let c = Arc::clone(&counter);
+            let m = Arc::clone(&max_concurrent);
+            let cur = Arc::clone(&current);
+            handles.push(tokio::spawn(simulate_lifecycle(c, m, cur)));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert_eq!(counter.load(Ordering::SeqCst), 5, "all 5 must complete");
+        assert_eq!(
+            max_concurrent.load(Ordering::SeqCst),
+            1,
+            "lifecycle operations must be strictly serialized (max concurrency 1)"
+        );
     }
 }

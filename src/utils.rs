@@ -33,13 +33,9 @@ impl AppPaths {
     ///
     /// v3 must not use this for mode resolution. It is exposed only so cleanup
     /// paths can remove stale `.service-mode` files left by older releases.
+    #[deprecated(since = "0.2.0", note = "v1/v2 legacy marker; cleanup only, never mode resolution. Use InstanceContext instead")]
     pub fn legacy_service_mode_path(&self) -> PathBuf {
         self.config_dir.join(".service-mode")
-    }
-
-    #[allow(dead_code)]
-    pub fn log_path(&self) -> PathBuf {
-        self.config_dir.join("mihomo.log")
     }
 
     pub fn rules_path(&self) -> PathBuf {
@@ -110,6 +106,12 @@ fn windows_config_dir(app_data: Option<PathBuf>, home: Option<PathBuf>) -> PathB
         .join("mihomo")
 }
 
+/// Resolve the default/fallback mihomo core binary path.
+///
+/// Delegates to `instance::planned_current_context(InstanceMode::User)` as the
+/// single source of truth for per-user core paths — this eliminates the
+/// duplicate path logic that drifted in the past (BUG-14: Windows path was
+/// missing the `bin\` segment). `MIHOMO_CLI_MIHOMO_PATH` env override still wins.
 pub fn mihomo_path() -> String {
     if let Ok(path) = std::env::var("MIHOMO_CLI_MIHOMO_PATH") {
         if !path.trim().is_empty() {
@@ -117,14 +119,22 @@ pub fn mihomo_path() -> String {
         }
     }
 
-    if cfg!(target_os = "windows") {
-        let local =
-            dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("C:\\ProgramData"));
-        format!("{}\\mihomo\\mihomo.exe", local.display())
-    } else {
-        let home = dirs::home_dir().unwrap_or_default();
-        format!("{}/.local/bin/mihomo", home.display())
-    }
+    crate::instance::planned_current_context(crate::instance::InstanceMode::User)
+        .map(|ctx| ctx.paths.core_binary.display().to_string())
+        .unwrap_or_else(|| {
+            // Last-resort fallback if instance path planning fails (e.g. unsupported OS).
+            #[cfg(target_os = "windows")]
+            {
+                let local = dirs::data_local_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("C:\\ProgramData"));
+                format!("{}\\mihomo\\bin\\mihomo.exe", local.display())
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let home = dirs::home_dir().unwrap_or_default();
+                format!("{}/.local/bin/mihomo", home.display())
+            }
+        })
 }
 
 #[allow(dead_code)]
@@ -141,10 +151,22 @@ pub fn socket_dir() -> String {
     #[cfg(target_os = "linux")]
     {
         let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
-            // Fallback: get UID from /proc/self/loginuid or use 1000 as default
+            // Fallback when XDG_RUNTIME_DIR is unset (e.g. containers, non-systemd
+            // sessions). Prefer the real UID; /proc/self/loginuid is -1 (4294967295)
+            // in containers and other non-login contexts, so fall back to `id -u`
+            // before assuming 1000.
             let uid = std::fs::read_to_string("/proc/self/loginuid")
                 .ok()
                 .and_then(|s| s.trim().parse::<u32>().ok())
+                .filter(|u| *u != u32::MAX) // loginuid 0xFFFFFFFF = no login session
+                .or_else(|| {
+                    std::process::Command::new("id")
+                        .arg("-u")
+                        .output()
+                        .ok()
+                        .and_then(|out| String::from_utf8(out.stdout).ok())
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                })
                 .unwrap_or(1000);
             format!("/run/user/{}", uid)
         });
@@ -166,16 +188,13 @@ pub fn config_path() -> String {
 }
 
 /// Deprecated v1/v2 mode marker path; cleanup only, never mode resolution.
+#[deprecated(since = "0.2.0", note = "v1/v2 legacy marker; cleanup only. Use InstanceContext instead")]
 pub fn legacy_service_mode_path() -> String {
+    #[allow(deprecated)]
     AppPaths::from_system()
         .legacy_service_mode_path()
         .display()
         .to_string()
-}
-
-#[allow(dead_code)]
-pub fn log_path() -> String {
-    AppPaths::from_system().log_path().display().to_string()
 }
 
 /// Atomically write a file: write to .tmp then rename.
@@ -269,6 +288,32 @@ mod tests {
                 .join("AppData")
                 .join("Roaming")
                 .join("mihomo")
+        );
+    }
+
+    // BUG-14 回归：mihomo_path() 必须与 instance.rs planned_paths 的 core_binary
+    // 一致（单一事实来源），不得有独立漂移的路径逻辑。
+    #[test]
+    fn mihomo_path_matches_instance_planned_user_core_binary() {
+        // 有 env override 时优先
+        unsafe {
+            std::env::set_var("MIHOMO_CLI_MIHOMO_PATH", "/custom/mihomo");
+        }
+        assert_eq!(mihomo_path(), "/custom/mihomo");
+
+        // 无 override 时委托 instance.rs 的 user 模式 core_binary
+        unsafe {
+            std::env::remove_var("MIHOMO_CLI_MIHOMO_PATH");
+        }
+        let expected = crate::instance::planned_current_context(
+            crate::instance::InstanceMode::User,
+        )
+        .map(|ctx| ctx.paths.core_binary.display().to_string())
+        .unwrap_or_default();
+        assert_eq!(
+            mihomo_path(),
+            expected,
+            "mihomo_path() must delegate to instance planned_paths (BUG-14)"
         );
     }
 }

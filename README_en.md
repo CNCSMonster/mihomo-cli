@@ -33,34 +33,22 @@ cargo install --path .
 
 ## Minimal Recommended Workflow
 
-Install the system service when you need TUN/system-wide transparent proxying; install the per-user service when you only need the current user proxy. The two modes are mutually exclusive because TUN captures traffic at the network layer.
+Daily use should not require remembering `--system`. Use normal/per-user proxy mode for browser/system-proxy workflows. When you need TUN/system-wide transparent proxying, run `mihomo-cli tun on`; the CLI guides system service installation and asks for an admin password when needed.
 
 ```bash
-# 1. Interactive install: choose system service or per-user service
-mihomo-cli install
-# Or be explicit:
-mihomo-cli install --system
-mihomo-cli install --user
-
-# 2. Add a subscription (supports vmess://, base64, Clash YAML)
+mihomo-cli install                         # Interactive: normal proxy mode / TUN all-traffic mode
 mihomo-cli config -u '<your-subscription-url>'
-
-# 3. Start the active/default instance; no running state defaults to per-user
-mihomo-cli start
-
-# 4. Select a node (j/k navigate, / filter)
-mihomo-cli select
-
-# 5. Enable TUN for system-wide proxying (system service only)
-mihomo-cli tun on
-
-# 6. Inspect/disable TUN
+mihomo-cli start                           # Auto-detect and start the current instance
+mihomo-cli select                          # Pick a node (TUI: j/k or arrows, / filter; or --node non-interactive)
+mihomo-cli status                          # Concise status; use --verbose for diagnostic paths/probes
+mihomo-cli exit-ip --group "Proxy"          # Probe current group exit IP
+mihomo-cli exit-ip --url https://github.com # Estimate route exit IP for a URL
+mihomo-cli tun on                          # Enable TUN; guides system service setup if needed
 mihomo-cli tun status
 mihomo-cli tun off
-mihomo-cli tun status
 ```
 
-Without root access, use `mihomo-cli install --user`. Per-user mode cannot enable TUN; use `eval "$(mihomo-cli proxy on)"` when you only need proxy variables in the current shell.
+Without admin rights, use `mihomo-cli install --user` for normal proxy mode. `--system` is still available for scripts, troubleshooting, or explicit system service targeting, but it is not the daily path.
 
 **Other common commands:**
 
@@ -80,17 +68,17 @@ mihomo-cli tun status     # Check TUN status
 | Command | Description |
 |---------|-------------|
 | `mihomo-cli install` | Download core + generate config + install boot service (interactive) |
-| `mihomo-cli config [--system]` | Configure subscription URL (supports vmess://, base64, Clash YAML) |
+| `mihomo-cli config` | Configure subscription URL (supports vmess://, base64, Clash YAML) |
 | `mihomo-cli uninstall` | Remove service (optionally remove all files) |
-| `mihomo-cli update [--system]` | Update mihomo core binary for the resolved instance |
+| `mihomo-cli update` | Update mihomo core binary for the resolved instance |
 
 ### Service & Connection
 
 | Command | Description |
 |---------|-------------|
-| `mihomo-cli start [--system]` | Start mihomo service/core (auto-detects by default) |
-| `mihomo-cli stop [--system]` | Stop mihomo service/core (auto-detects by default) |
-| `mihomo-cli restart [--system]` | Restart mihomo service/core (auto-detects by default) |
+| `mihomo-cli start` | Start mihomo service/core (auto-detects by default) |
+| `mihomo-cli stop` | Stop mihomo service/core (auto-detects by default) |
+| `mihomo-cli restart` | Restart mihomo service/core (auto-detects by default) |
 | `mihomo-cli status` | Runtime status overview (includes proxy probe) |
 
 ### Daily Use
@@ -100,11 +88,11 @@ mihomo-cli tun status     # Check TUN status
 | `mihomo-cli select` | Interactive node selector (j/k navigate, / filter, Enter select) |
 | `mihomo-cli list` | List all proxy groups and current node |
 | `mihomo-cli delay [--refresh] [--fastest]` | Batch-test group latency, reuse fresh cache, optionally select fastest node |
-| `mihomo-cli tun [--system] on/off/status` | Enable/disable/check TUN virtual NIC (system service only) |
-| `mihomo-cli proxy [--system] on/off` | Output shell proxy env vars (`eval "$(mihomo-cli proxy on)"`) |
+| `mihomo-cli tun on/off/status` | Enable/disable/check TUN virtual NIC (system service only) |
+| `mihomo-cli proxy on/off` | Output shell proxy env vars (`eval "$(mihomo-cli proxy on)"`) |
 | `mihomo-cli conn` | View active connections (`--flush` to close all) |
-| `mihomo-cli rule/dns/backup/restore [--system]` | Manage per-user config for the resolved instance; `--system` targets the system service context |
-| `mihomo-cli ip [--system]` | Show current proxy exit IP for the resolved instance |
+| `mihomo-cli rule/dns/backup/restore` | Manage per-user config for the auto-detected/resolved instance |
+| `mihomo-cli exit-ip --node/--group/--url/--direct` | Probe node/group/route/direct exit IP. `mihomo-cli ip` remains as a deprecated current-proxy probe. |
 
 > 💡 **All commands support `-h` / `--help`**, e.g. `mihomo-cli install -h`, `mihomo-cli config -h`.
 
@@ -126,10 +114,10 @@ bash build.sh    # One-shot build for all 6 targets
 
 - **All-in-one**: Single binary for installation, configuration, and daily control
 - **Auto subscription conversion**: Detects and converts vmess:// / base64 / Clash YAML automatically
-- **crossterm TUI**: `select` and `config` use crossterm for real keyboard shortcuts (j/k navigate, / filter)
+- **crossterm TUI**: `select` and `config` use crossterm for real keyboard shortcuts (j/k navigate, / filter); `select --node` switches non-interactively
 - **Zero runtime dependencies**: No curl, jq, python3, or fzf required
-- **Polished CLI**: clap-powered auto-completion, fuzzy command suggestions, `--help` docs
-- **Truly cross-platform**: macOS LaunchDaemon/LaunchAgent + Linux systemd system/user + Windows service/user process, unified command interface
+- **Polished CLI**: clap derive typed argument parsing, `--help` docs
+- **Truly cross-platform**: macOS LaunchDaemon/LaunchAgent + Linux systemd system/user + Windows service/user process, unified command interface; **Windows is a second-class citizen** (verified via pub repo CI runner)
 
 ## Build
 
@@ -154,7 +142,11 @@ src/
 ├── mihomo_api.rs    Unix socket REST client
 ├── config.rs        Subscription management + config generation
 ├── installer.rs     Core binary download + Geo file management
-├── service.rs       Service management (systemd/LaunchDaemon)
+├── service.rs       Service execution + privilege layer (systemd/LaunchDaemon)
+├── instance.rs      v3 Instance Model: path matrix + mode resolution + service plans
+├── daemon.rs        Daemon process (IPC + readiness + lifecycle serialization)
+├── ipc.rs           Daemon IPC client
+├── lock.rs          Concurrency locks
 ├── rules.rs         User routing rule management
 ├── dns.rs           DNS routing policy management
 ├── backup.rs        Config backup & restore

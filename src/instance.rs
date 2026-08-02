@@ -2,6 +2,123 @@
 
 use std::path::PathBuf;
 
+/// File-based instance lock to prevent concurrent mode switches.
+///
+/// When performing lifecycle operations (start/stop/restart), we acquire
+/// this lock to prevent race conditions when multiple terminals try to
+/// change the service state simultaneously.
+pub struct InstanceLock {
+    lock_file: PathBuf,
+    #[cfg(unix)]
+    fd: Option<std::os::unix::io::RawFd>,
+}
+
+impl InstanceLock {
+    /// Create a new lock instance (does not acquire the lock yet).
+    pub fn new(lock_file: PathBuf) -> Self {
+        Self {
+            lock_file,
+            #[cfg(unix)]
+            fd: None,
+        }
+    }
+
+    /// Try to acquire the lock. Returns true if successful.
+    ///
+    /// This is non-blocking - if the lock is already held, returns false immediately.
+    #[cfg(unix)]
+    pub fn try_acquire(&mut self) -> bool {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+
+        // Ensure parent directory exists
+        if let Some(parent) = self.lock_file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let file = match OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&self.lock_file)
+        {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+
+        let fd = file.as_raw_fd();
+        // Try non-blocking exclusive lock
+        let result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            // Keep file open by leaking it (we'll close on drop via fd)
+            self.fd = Some(fd);
+            std::mem::forget(file);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn try_acquire(&mut self) -> bool {
+        // Windows: use lock file existence as a simple check
+        if self.lock_file.exists() {
+            // Check if the lock is stale (older than 30 seconds)
+            if let Ok(metadata) = std::fs::metadata(&self.lock_file) {
+                if let Ok(modified) = metadata.modified() {
+                    if let Ok(age) = modified.elapsed() {
+                        if age.as_secs() > 30 {
+                            // Stale lock, remove it
+                            let _ = std::fs::remove_file(&self.lock_file);
+                        } else {
+                            return false;
+                        }
+                    }
+                }
+            } else {
+                return false;
+            }
+        }
+        std::fs::write(&self.lock_file, std::process::id().to_string()).is_ok()
+    }
+
+    /// Release the lock.
+    #[cfg(unix)]
+    pub fn release(&mut self) {
+        if let Some(fd) = self.fd.take() {
+            unsafe {
+                libc::flock(fd, libc::LOCK_UN);
+                libc::close(fd);
+            }
+            let _ = std::fs::remove_file(&self.lock_file);
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn release(&mut self) {
+        let _ = std::fs::remove_file(&self.lock_file);
+    }
+
+    /// Get the lock file path.
+    pub fn path(&self) -> &PathBuf {
+        &self.lock_file
+    }
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Get the instance lock path for the given mode.
+pub fn instance_lock_path(mode: InstanceMode) -> Option<PathBuf> {
+    let ctx = planned_current_context(mode)?;
+    ctx.paths.runtime_dir.as_ref().map(|d| d.join("instance.lock"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetOs {
     Macos,
@@ -258,7 +375,15 @@ fn planned_paths(os: TargetOs, mode: InstanceMode, inputs: &PathInputs) -> Insta
             let runtime_dir = inputs
                 .xdg_runtime_dir
                 .clone()
-                .unwrap_or_else(|| PathBuf::from("/run/user/1000"))
+                .unwrap_or_else(|| {
+                    // Fallback when XDG_RUNTIME_DIR is unset (e.g. containers, non-systemd
+                    // sessions). Use the real UID instead of assuming 1000, per XDG spec
+                    // which requires a suitable default with a warning.
+                    PathBuf::from(format!(
+                        "/run/user/{}",
+                        inputs.uid.unwrap_or(1000)
+                    ))
+                })
                 .join("mihomo");
             InstancePaths {
                 core_binary: inputs.home.join(".local/bin/mihomo"),
@@ -815,7 +940,7 @@ pub struct InstanceServicePlan {
 pub fn planned_service_plan(ctx: &InstanceContext, action: ServiceAction) -> InstanceServicePlan {
     match (ctx.os, ctx.mode, action) {
         (TargetOs::Macos, _, ServiceAction::Start) => launchctl_service_plan(ctx, false, false),
-        (TargetOs::Macos, _, ServiceAction::Stop) => launchctl_bootout_plan(ctx, false),
+        (TargetOs::Macos, _, ServiceAction::Stop) => launchctl_kill_plan(ctx),
         (TargetOs::Macos, _, ServiceAction::Restart) => launchctl_service_plan(ctx, true, false),
         (TargetOs::Macos, _, ServiceAction::Uninstall) => launchctl_uninstall_plan(ctx),
 
@@ -913,6 +1038,27 @@ fn launchctl_service_plan(
         commands: vec![PlannedCommand {
             program: "launchctl".to_string(),
             args,
+            privileged,
+        }],
+        remove_paths: Vec::new(),
+    }
+}
+
+fn launchctl_kill_plan(ctx: &InstanceContext) -> InstanceServicePlan {
+    // BUG-16: stop must NOT bootout (unload) the launchd job — start uses
+    // `launchctl kickstart` which requires the job to stay loaded. `launchctl
+    // kill SIGTERM` stops the process while keeping the job registered,
+    // mirroring `systemctl stop` semantics on Linux. bootout is reserved for
+    // uninstall.
+    let privileged = ctx.permissions == PermissionModel::PrivilegedSystem;
+    InstanceServicePlan {
+        commands: vec![PlannedCommand {
+            program: "launchctl".to_string(),
+            args: vec![
+                "kill".to_string(),
+                "SIGTERM".to_string(),
+                service_domain_label(ctx),
+            ],
             privileged,
         }],
         remove_paths: Vec::new(),
@@ -2339,10 +2485,19 @@ mod tests {
         );
         assert!(system_restart.commands[0].privileged);
 
+        let user_start = planned_service_plan(&user, ServiceAction::Start);
+        assert_eq!(
+            user_start.commands[0].args,
+            vec!["kickstart", "gui/501/io.mihomo"]
+        );
+        assert!(!user_start.commands[0].privileged);
+
+        // BUG-16: stop must not bootout — it would unload the job and break a
+        // subsequent start (kickstart requires the job to stay loaded).
         let user_stop = planned_service_plan(&user, ServiceAction::Stop);
         assert_eq!(
             user_stop.commands[0].args,
-            vec!["bootout", "gui/501/io.mihomo"]
+            vec!["kill", "SIGTERM", "gui/501/io.mihomo"]
         );
         assert!(!user_stop.commands[0].privileged);
     }
@@ -2674,5 +2829,405 @@ mod tests {
         assert_eq!(user.permissions, PermissionModel::DirectUser);
         // ADR-02: system and user share the same per-user config_dir, but differ in binary/service
         assert_ne!(system.paths.core_binary, user.paths.core_binary);
+    }
+
+    // ── Gate 1: 路径矩阵一致性 ─────────────────────────────────────
+
+    #[test]
+    fn g1_path_matrix_all_six_combinations_have_non_empty_critical_paths() {
+        let inputs = inputs();
+        for os in [TargetOs::Macos, TargetOs::Linux, TargetOs::Windows] {
+            for mode in [InstanceMode::System, InstanceMode::User] {
+                let ctx = InstanceContext::planned(os, mode, &inputs);
+                assert!(
+                    !ctx.paths.core_binary.as_os_str().is_empty(),
+                    "{os:?} {mode:?} core_binary is empty"
+                );
+                assert!(
+                    !ctx.paths.cli_binary.as_os_str().is_empty(),
+                    "{os:?} {mode:?} cli_binary is empty"
+                );
+                assert!(
+                    !ctx.paths.config_file.as_os_str().is_empty(),
+                    "{os:?} {mode:?} config_file is empty"
+                );
+                assert!(
+                    !ctx.paths.config_dir.as_os_str().is_empty(),
+                    "{os:?} {mode:?} config_dir is empty"
+                );
+                assert!(
+                    !ctx.paths.backup_dir.as_os_str().is_empty(),
+                    "{os:?} {mode:?} backup_dir is empty"
+                );
+                match &ctx.paths.api_endpoint {
+                    ApiEndpoint::UnixSocket(p) => assert!(
+                        !p.as_os_str().is_empty(),
+                        "{os:?} {mode:?} socket path is empty"
+                    ),
+                    ApiEndpoint::WindowsNamedPipe(p) => assert!(
+                        !p.is_empty(),
+                        "{os:?} {mode:?} pipe name is empty"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn g1_system_core_binary_matches_daemon_expected_path() {
+        let inputs = inputs();
+        let current_os = TargetOs::current().unwrap();
+        let ctx = InstanceContext::planned(current_os, InstanceMode::System, &inputs);
+        let daemon_expected = crate::daemon::expected_system_core_binary_path();
+        assert_eq!(
+            ctx.paths.core_binary, daemon_expected,
+            "planned_paths() core_binary diverges from daemon::expected_system_core_binary_path(); \
+             this will cause validate_system_core_binary_request() to reject legitimate installs"
+        );
+    }
+
+    #[test]
+    fn g1_user_and_system_share_config_dir_per_adr02() {
+        let inputs = inputs();
+        for os in [TargetOs::Macos, TargetOs::Linux, TargetOs::Windows] {
+            let system = InstanceContext::planned(os, InstanceMode::System, &inputs);
+            let user = InstanceContext::planned(os, InstanceMode::User, &inputs);
+            assert_eq!(
+                system.paths.config_dir, user.paths.config_dir,
+                "{os:?}: ADR-02 violated — system and user config_dir must be identical"
+            );
+        }
+    }
+
+    // BUG-11 回归：XDG_RUNTIME_DIR 未设置时，Linux User 模式回退路径必须用真实 uid
+    #[test]
+    fn g_bug11_linux_user_runtime_dir_falls_back_to_real_uid() {
+        let mut inputs = PathInputs::for_tests();
+        // 模拟容器/非 systemd 环境：XDG_RUNTIME_DIR 未设置
+        inputs.xdg_runtime_dir = None;
+        // 模拟非 1000 的 UID（容器 root = 0）
+        inputs.uid = Some(0);
+
+        let ctx = InstanceContext::planned(TargetOs::Linux, InstanceMode::User, &inputs);
+        match &ctx.paths.api_endpoint {
+            ApiEndpoint::UnixSocket(path) => {
+                let rendered = path.display().to_string();
+                assert!(
+                    rendered.contains("/run/user/0/mihomo/"),
+                    "BUG-11: fallback runtime dir must use real uid, got {rendered}"
+                );
+            }
+            other => panic!("expected UnixSocket, got {other:?}"),
+        }
+    }
+
+    // BUG-12 回归：配置生成侧的 socket 路径也必须用真实 uid（不硬编码 1000）
+    #[test]
+    fn g_bug12_config_generated_endpoint_uses_real_uid() {
+        let mut inputs = PathInputs::for_tests();
+        inputs.xdg_runtime_dir = None;
+        inputs.uid = Some(0);
+
+        let ctx = InstanceContext::planned(TargetOs::Linux, InstanceMode::User, &inputs);
+        let yaml = "proxies:\n  - name: 节点选择\n    type: selector\n";
+        let fixed =
+            crate::config::ensure_controller_for_endpoint(yaml, &ctx.paths.api_endpoint).unwrap();
+        assert!(
+            fixed.contains("/run/user/0/mihomo/mihomo.sock"),
+            "BUG-12: generated config must use real uid endpoint, got: {fixed}"
+        );
+        assert!(
+            !fixed.contains("/run/user/1000"),
+            "BUG-12: generated config must not hardcode /run/user/1000, got: {fixed}"
+        );
+    }
+
+    #[test]
+    fn g1_user_and_system_differ_on_binary_and_service_paths() {
+        let inputs = inputs();
+        for os in [TargetOs::Macos, TargetOs::Linux, TargetOs::Windows] {
+            let system = InstanceContext::planned(os, InstanceMode::System, &inputs);
+            let user = InstanceContext::planned(os, InstanceMode::User, &inputs);
+            assert_ne!(
+                system.paths.core_binary, user.paths.core_binary,
+                "{os:?}: system and user core_binary must differ"
+            );
+            assert_ne!(
+                system.paths.cli_binary, user.paths.cli_binary,
+                "{os:?}: system and user cli_binary must differ"
+            );
+            assert_ne!(
+                system.paths.api_endpoint, user.paths.api_endpoint,
+                "{os:?}: system and user api_endpoint must differ"
+            );
+        }
+    }
+
+    // ── Gate 2: Root 禁止 user-home ─────────────────────────────────
+
+    #[test]
+    fn g2_system_mode_paths_exclude_home_except_config_per_adr02() {
+        let inputs = inputs();
+
+        for os in [TargetOs::Macos, TargetOs::Linux, TargetOs::Windows] {
+            let ctx = InstanceContext::planned(os, InstanceMode::System, &inputs);
+            let home = &inputs.home;
+
+            // config_dir / config_file / backup_dir 允许 user 目录（ADR-02 设计例外）
+            // macOS/Linux: 在 home 下；Windows: 在 %APPDATA% 下（不同路径，等价设计）
+            let config_is_per_user = match os {
+                TargetOs::Macos | TargetOs::Linux => ctx.paths.config_dir.starts_with(home),
+                TargetOs::Windows => ctx.paths.config_dir.starts_with(&inputs.app_data),
+            };
+            assert!(
+                config_is_per_user,
+                "{os:?}: system config_dir = {} should be per-user (ADR-02)",
+                ctx.paths.config_dir.display()
+            );
+
+            // 其余路径禁止 home / app_data
+            let non_home_paths: Vec<(&str, &Path)> = vec![
+                ("core_binary", &ctx.paths.core_binary as &Path),
+                ("cli_binary", &ctx.paths.cli_binary as &Path),
+            ];
+            for (name, path) in non_home_paths {
+                assert!(
+                    !path.starts_with(home),
+                    "{os:?} system {name} = {} must NOT be under user home {}",
+                    path.display(),
+                    home.display()
+                );
+            }
+
+            if let Some(ref rd) = ctx.paths.runtime_dir {
+                assert!(
+                    !rd.starts_with(home),
+                    "{os:?} system runtime_dir = {} must NOT be under user home {}",
+                    rd.display(),
+                    home.display()
+                );
+            }
+            if let Some(ref sf) = ctx.paths.service_file {
+                assert!(
+                    !sf.starts_with(home),
+                    "{os:?} system service_file = {} must NOT be under user home {}",
+                    sf.display(),
+                    home.display()
+                );
+            }
+            if let Some(ref lf) = ctx.paths.log_file {
+                assert!(
+                    !lf.starts_with(home),
+                    "{os:?} system log_file = {} must NOT be under user home {}",
+                    lf.display(),
+                    home.display()
+                );
+            }
+
+            // 字符串级检查：排除 config_dir/config_file/backup_dir 后不应含 home
+            let non_config_rendered = format!(
+                "core_binary={:?}\ncli_binary={:?}\nruntime_dir={:?}\nservice_file={:?}\nlog_file={:?}",
+                ctx.paths.core_binary,
+                ctx.paths.cli_binary,
+                ctx.paths.runtime_dir,
+                ctx.paths.service_file,
+                ctx.paths.log_file,
+            );
+            let home_str = home.to_string_lossy();
+            assert!(
+                !non_config_rendered.contains(&*home_str),
+                "{os:?} system non-config paths contain home path {home_str}:\n{non_config_rendered}"
+            );
+        }
+    }
+
+    // ── Gate 3: 无硬编码路径回归 ────────────────────────────────────
+
+    #[test]
+    fn g3_no_hardcoded_system_paths_in_non_instance_modules() {
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+        // 允许包含硬编码路径的文件（设计如此）
+        // service.rs 包含 legacy 检测路径（macos_daemon_plist_path 等），
+        // 待 M3-M9 完成后迁移到 InstanceContext
+        let allowed_files = [
+            "instance.rs",
+            "daemon.rs",
+            "ipc.rs",
+            "lib.rs",
+            "main.rs",
+            "service.rs",
+        ];
+
+        let forbidden_patterns = [
+            "/var/run/mihomo",
+            "/tmp/mihomo",
+            "/usr/local/lib/mihomo",
+            "/usr/local/bin/mihomo",
+            "/Library/Application Support/mihomo",
+            "/Library/LaunchDaemons",
+            "/etc/systemd/system/mihomo",
+            "/var/log/mihomo",
+        ];
+
+        let entries = std::fs::read_dir(&src_dir)
+            .expect("src/ directory must exist");
+
+        for entry in entries {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().map_or(true, |e| e != "rs") {
+                continue;
+            }
+            let file_name = path.file_name().unwrap().to_string_lossy().to_string();
+            if allowed_files.contains(&file_name.as_str()) {
+                continue;
+            }
+
+            let content = std::fs::read_to_string(&path).unwrap();
+            // 只检查生产代码，跳过 #[cfg(test)] 块
+            let production_code = content
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap_or(&content);
+
+            for pattern in &forbidden_patterns {
+                assert!(
+                    !production_code.contains(pattern),
+                    "file {} contains hardcoded path '{}' in production code — \
+                     use InstanceContext::planned() paths instead",
+                    file_name,
+                    pattern
+                );
+            }
+        }
+    }
+
+    // ── Gate 4: 命令覆盖矩阵 ────────────────────────────────────────
+
+    #[test]
+    fn g4_all_config_commands_use_resolved_paths() {
+        // 验证配置相关命令的函数名遵循 _resolved 后缀或 app_paths_for_resolved_instance_command 模式
+        // 这是一个命名约定测试，确保新命令遵循 InstanceContext 路径解析模式
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main_rs = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+
+        // 这些命令函数应该使用 resolved 模式（通过 _resolved 后缀或使用 app_paths_for_resolved_instance_command）
+        let resolved_commands = [
+            "cmd_config",
+            "cmd_rule",
+            "cmd_dns",
+            "cmd_override",
+            "cmd_backup",
+            "cmd_restore",
+            "cmd_select_resolved",
+            "cmd_list_resolved",
+            "cmd_delay_resolved",
+            "cmd_tun_resolved",
+            "cmd_connections_resolved",
+            "cmd_ip_resolved",
+            "cmd_exit_ip",
+            "cmd_status_resolved",
+            "cmd_lifecycle_resolved",
+            "cmd_uninstall_resolved",
+        ];
+
+        for cmd in &resolved_commands {
+            assert!(
+                main_rs.contains(&format!("fn {}", cmd)) || main_rs.contains(&format!("async fn {}", cmd)),
+                "command function '{}' not found — all config/lifecycle commands should use resolved pattern",
+                cmd
+            );
+        }
+
+        // 验证 daemon 命令是特殊情况（直接使用 ipc::system_service_socket_path）
+        assert!(
+            main_rs.contains("Command::Daemon"),
+            "daemon command dispatch not found"
+        );
+    }
+
+    #[test]
+    fn g4_no_direct_config_path_construction_in_command_handlers() {
+        // 确保命令处理函数不直接构造 ~/.config/mihomo 路径
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main_rs = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+
+        // 这些模式不应该出现在命令处理函数中（应该用 app_paths_for_resolved_instance_command）
+        let forbidden_patterns = [
+            "home().join(\".config/mihomo\")",
+            "dirs::config_dir().unwrap().join(\"mihomo\")",
+            "PathBuf::from(\"~/.config/mihomo\")",
+        ];
+
+        // 只检查命令派发区域（Command:: match 块）
+        let command_dispatch: String = main_rs
+            .split("match cli.command")
+            .nth(1)
+            .map(|s| s.split('\n').take(200).collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default();
+
+        for pattern in &forbidden_patterns {
+            assert!(
+                !command_dispatch.contains(pattern),
+                "command dispatch contains direct path construction '{}' — \
+                 use app_paths_for_resolved_instance_command() instead",
+                pattern
+            );
+        }
+    }
+
+    // ── Gate 7: Instance Lock ────────────────────────────────────────
+
+    #[test]
+    fn g7_instance_lock_path_is_in_runtime_dir() {
+        // Instance lock should be in the runtime directory
+        for os in [TargetOs::Macos, TargetOs::Linux, TargetOs::Windows] {
+            for mode in [InstanceMode::System, InstanceMode::User] {
+                if let Some(lock_path) = instance_lock_path(mode) {
+                    let ctx = planned_current_context(mode).unwrap();
+                    if let Some(runtime_dir) = &ctx.paths.runtime_dir {
+                        assert!(
+                            lock_path.starts_with(runtime_dir),
+                            "{os:?} {mode:?}: lock path {:?} should be in runtime dir {:?}",
+                            lock_path,
+                            runtime_dir
+                        );
+                        assert!(
+                            lock_path.ends_with("instance.lock"),
+                            "{os:?} {mode:?}: lock path should end with instance.lock"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn g7_instance_lock_acquire_and_release() {
+        use std::fs;
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join("test.lock");
+
+        // First lock should succeed
+        let mut lock1 = InstanceLock::new(lock_path.clone());
+        assert!(lock1.try_acquire(), "first lock acquisition should succeed");
+
+        // Second lock should fail (non-blocking)
+        let mut lock2 = InstanceLock::new(lock_path.clone());
+        assert!(!lock2.try_acquire(), "second lock acquisition should fail while first is held");
+
+        // Release first lock
+        lock1.release();
+
+        // Now second lock should succeed
+        let mut lock3 = InstanceLock::new(lock_path.clone());
+        assert!(lock3.try_acquire(), "lock acquisition should succeed after release");
+
+        // Drop should also release
+        drop(lock3);
+
+        // Cleanup
+        let _ = fs::remove_file(&lock_path);
     }
 }

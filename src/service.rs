@@ -57,6 +57,57 @@ struct SudoCommandPlan {
     stdin: Option<String>,
 }
 
+/// Unified privilege executor — single entry point for all privileged operations.
+///
+/// Consolidates scattered sudo/root dispatch logic. All privileged file writes,
+/// command executions, and path removals go through this struct.
+///
+/// Smart dispatch:
+///   1. Already root → run directly, no sudo, no prompt.
+///   2. Sudo credentials cached → `sudo -n`, no prompt.
+///   3. Otherwise → prompt for password via dialoguer, pipe to `sudo -S`.
+pub(crate) struct PrivilegeExecutor;
+
+impl PrivilegeExecutor {
+    /// Check if currently running as root.
+    pub(crate) fn is_root() -> bool {
+        is_root()
+    }
+
+    /// Execute a command that may require elevated privileges.
+    pub(crate) fn run(args: &[&str]) -> anyhow::Result<()> {
+        run_privileged(args)
+    }
+
+    /// Write file content to a privileged path atomically (stage → install).
+    pub(crate) fn write_file(
+        path: &std::path::Path,
+        content: &[u8],
+        mode: u16,
+    ) -> anyhow::Result<()> {
+        install_staged_file_privileged(path, content, mode)
+    }
+
+    /// Write string content to a privileged path (convenience wrapper).
+    pub(crate) fn write_file_str(
+        path: &std::path::Path,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        write_file_privileged(path, content)
+    }
+
+    /// Remove a file or directory at a privileged path.
+    pub(crate) fn remove_path(path: &std::path::Path) -> anyhow::Result<()> {
+        remove_path_privileged(&path.display().to_string())
+    }
+
+    /// Create a directory at a privileged path.
+    pub(crate) fn ensure_dir(path: &std::path::Path, mode: u16) -> anyhow::Result<()> {
+        let mode_str = format!("{mode:o}");
+        run_privileged(&["install", "-d", "-m", &mode_str, &path.display().to_string()])
+    }
+}
+
 impl PlannedCommand {
     fn new(program: impl Into<String>, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
@@ -1095,94 +1146,6 @@ fn apply_service_uninstall_plan_with(
     }
 }
 
-/// Resolve service mode for legacy service helpers. Explicit --user overrides;
-/// otherwise use actual installed service artifacts instead of the deprecated marker.
-fn resolve_service_mode(forced_user: bool) -> ServiceMode {
-    if forced_user {
-        ServiceMode::User
-    } else {
-        match current_service_detection() {
-            ServiceDetection::Installed(mode) => mode,
-            ServiceDetection::NotInstalled => ServiceMode::User,
-        }
-    }
-}
-
-fn legacy_service_endpoint(forced_user: bool) -> Option<crate::instance::ApiEndpoint> {
-    let mode = match resolve_service_mode(forced_user) {
-        ServiceMode::System => crate::instance::InstanceMode::System,
-        ServiceMode::User => crate::instance::InstanceMode::User,
-    };
-    crate::instance::planned_current_context(mode).map(|ctx| ctx.paths.api_endpoint)
-}
-
-#[allow(dead_code)]
-fn legacy_service_entrypoint_error(action: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "legacy service::{action} entrypoint is disabled by v3 architecture; use the instance-aware main.rs lifecycle commands instead"
-    )
-}
-
-#[allow(dead_code)]
-pub(crate) fn install_service(_user_mode: bool) -> anyhow::Result<()> {
-    Err(legacy_service_entrypoint_error("install_service"))
-}
-
-#[allow(dead_code)]
-pub(crate) fn uninstall_service() -> anyhow::Result<()> {
-    Err(legacy_service_entrypoint_error("uninstall_service"))
-}
-
-#[allow(dead_code)]
-pub(crate) fn start_mihomo(_user: bool) -> anyhow::Result<()> {
-    Err(legacy_service_entrypoint_error("start_mihomo"))
-}
-
-/// Wait for mihomo API to become responsive (socket exists but HTTP server may still be initializing).
-fn check_api_ready(user: bool) -> bool {
-    let Some(endpoint) = legacy_service_endpoint(user) else {
-        return false;
-    };
-    tokio::task::block_in_place(|| {
-        let handle = tokio::runtime::Handle::current();
-        let ready = handle.block_on(crate::mihomo_api::wait_for_api_ready_at_endpoint(
-            &endpoint, 15,
-        ));
-        if !ready {
-            for line in api_not_ready_warning_lines() {
-                eprintln!("{line}");
-            }
-        }
-        ready
-    })
-}
-
-/// Check if the API socket needs fixing (i.e., not alive).
-fn socket_needs_fix(user: bool) -> bool {
-    let Some(endpoint) = legacy_service_endpoint(user) else {
-        return true;
-    };
-    let alive = crate::mihomo_api::endpoint_is_alive(&endpoint);
-    crate::log!("socket alive: {alive}");
-    !alive
-}
-
-/// Apply socket fix: ensure config has Unix socket controller.
-/// Returns true if fix was applied (caller should restart).
-fn apply_socket_fix() -> bool {
-    crate::log!("attempting config fix for socket");
-    let fixed = crate::config::fix_existing_config();
-    if fixed {
-        println!("{}", socket_fix_applied_message());
-    }
-    fixed
-}
-
-#[allow(dead_code)]
-pub(crate) fn stop_mihomo(_user: bool) -> anyhow::Result<()> {
-    Err(legacy_service_entrypoint_error("stop_mihomo"))
-}
-
 pub fn run_instance_command(command: &crate::instance::PlannedCommand) -> anyhow::Result<()> {
     if command.privileged {
         #[cfg(unix)]
@@ -1215,11 +1178,6 @@ pub fn run_instance_command(command: &crate::instance::PlannedCommand) -> anyhow
             command.args.join(" ")
         )
     }
-}
-
-#[allow(dead_code)]
-pub(crate) fn restart_mihomo(_user: bool) -> anyhow::Result<()> {
-    Err(legacy_service_entrypoint_error("restart_mihomo"))
 }
 
 /// Run `sudo systemctl restart mihomo` (or `--user` variant) with a 30-second timeout.
@@ -1586,27 +1544,6 @@ fn cleanup_stale_socket() {
     }
 }
 
-/// Remove stale pre-v3 macOS `/tmp/mihomo` socket directory when safe.
-/// If the legacy socket is alive (core still listening), skip deletion and warn.
-/// If stale, remove the socket file and try to remove the empty directory.
-#[cfg(target_os = "macos")]
-fn migrate_legacy_socket_dir() {
-    let legacy_dir = "/tmp/mihomo";
-    let legacy_sock = format!("{}/mihomo.sock", legacy_dir);
-
-    if std::path::Path::new(&legacy_sock).exists() {
-        let alive = std::os::unix::net::UnixStream::connect(&legacy_sock).is_ok();
-        if alive {
-            println!("  ⚠ Legacy socket /tmp/mihomo/mihomo.sock still in use — restart mihomo to complete migration");
-            return;
-        }
-        let _ = std::fs::remove_file(&legacy_sock);
-    }
-    if std::path::Path::new(legacy_dir).exists() {
-        let _ = std::fs::remove_dir(legacy_dir);
-    }
-}
-
 fn current_uid_gid() -> (String, String) {
     let uid = std::process::Command::new("id")
         .arg("-u")
@@ -1729,6 +1666,7 @@ fn install_launchdaemon() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(deprecated)]
 fn uninstall_launchdaemon() -> bool {
     let p = macos_daemon_plist_path();
     if !std::path::Path::new(p).exists() {
@@ -1756,6 +1694,7 @@ fn install_launchagent() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(deprecated)]
 fn uninstall_launchagent() -> bool {
     let home = dirs::home_dir().unwrap_or_default().display().to_string();
     let p = macos_agent_plist_path(&home);
@@ -1856,6 +1795,7 @@ fn install_systemd_user() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(deprecated)]
 fn uninstall_systemd() -> anyhow::Result<()> {
     let home = dirs::home_dir().unwrap_or_default().display().to_string();
     let mode = match current_service_detection() {
@@ -1902,6 +1842,7 @@ fn install_windows() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(deprecated)]
 fn uninstall_windows() -> anyhow::Result<()> {
     let marker = utils::legacy_service_mode_path();
     let plan = windows_uninstall_plan(&marker);
@@ -2276,32 +2217,6 @@ mod tests {
             "should use expanded home, not %h specifier"
         );
         assert!(unit.contains("/home/alice/.local/bin/mihomo"));
-    }
-
-    #[test]
-    fn legacy_public_service_entrypoints_are_disabled_by_v3() {
-        for (name, result) in [
-            ("install_service", install_service(true)),
-            ("uninstall_service", uninstall_service()),
-            ("start_mihomo", start_mihomo(true)),
-            ("stop_mihomo", stop_mihomo(true)),
-            ("restart_mihomo", restart_mihomo(true)),
-        ] {
-            let err = result.expect_err("legacy service entrypoint must be disabled");
-            let message = err.to_string();
-            assert!(
-                message.contains(name),
-                "message should name {name}: {message}"
-            );
-            assert!(
-                message.contains("disabled by v3 architecture"),
-                "message should explain v3 disablement: {message}"
-            );
-            assert!(
-                message.contains("instance-aware"),
-                "message should direct callers to the v3 lifecycle path: {message}"
-            );
-        }
     }
 
     #[test]

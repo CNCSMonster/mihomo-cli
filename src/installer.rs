@@ -923,9 +923,9 @@ fn build_mirrors(primary: &str) -> Vec<String> {
 
 /// Return geo file mirror URLs with optional custom proxy at front.
 /// Custom proxy is a base URL prepended to the primary GitHub URL.
-pub(crate) fn geo_urls_with_mirrors(primary: &str, proxy_url: Option<&str>) -> Vec<String> {
+pub(crate) fn geo_urls_with_mirrors(primary: &str, github_mirror: Option<&str>) -> Vec<String> {
     let mut urls = vec![primary.to_string()];
-    if let Some(proxy) = proxy_url {
+    if let Some(proxy) = github_mirror {
         let base = if proxy.ends_with('/') {
             proxy.to_string()
         } else {
@@ -946,14 +946,58 @@ pub fn geo_files_exist() -> bool {
         && std::path::Path::new(&format!("{dir}/GeoSite.dat")).exists()
 }
 
-#[allow(dead_code)]
-pub async fn ensure_geo_files(proxy_url: Option<&str>) -> bool {
-    let dir = crate::utils::config_dir();
-    ensure_geo_files_in(std::path::Path::new(&dir), proxy_url).await
+/// Check geo file size thresholds. Returns true if both files meet minimum sizes.
+pub fn geo_files_have_minimum_size(dir: &std::path::Path) -> bool {
+    let geoip = dir.join("geoip.metadb");
+    let geosite = dir.join("GeoSite.dat");
+    let geoip_ok = geoip
+        .metadata()
+        .map(|m| m.len() > 8_000_000)
+        .unwrap_or(false);
+    let geosite_ok = geosite
+        .metadata()
+        .map(|m| m.len() > 2_000_000)
+        .unwrap_or(false);
+    geoip_ok && geosite_ok
+}
+
+/// Full geo validity check: files exist + minimum size + first-byte check + mihomo -t.
+/// Returns true if geo files are present and valid for use.
+pub fn geo_files_are_valid(dir: &std::path::Path, mihomo_binary: &std::path::Path) -> bool {
+    // Layer 1: files exist
+    if !dir.join("geoip.metadb").exists() || !dir.join("GeoSite.dat").exists() {
+        return false;
+    }
+    // Layer 2: size thresholds
+    if !geo_files_have_minimum_size(dir) {
+        return false;
+    }
+    // Layer 3: first-byte check (not HTML/JSON error pages)
+    let dir_str = dir.display().to_string();
+    if !is_valid_geo_file(&format!("{dir_str}/geoip.metadb"))
+        || !is_valid_geo_file(&format!("{dir_str}/GeoSite.dat"))
+    {
+        return false;
+    }
+    // Layer 4: mihomo -t validation
+    if mihomo_binary.exists() {
+        let config_path = dir.join("config.yaml");
+        if config_path.exists() {
+            return validate_geo_files(&dir_str);
+        }
+    }
+    // Can't validate further, treat as ok
+    true
 }
 
 #[allow(dead_code)]
-pub async fn ensure_geo_files_in(dir_path: &std::path::Path, proxy_url: Option<&str>) -> bool {
+pub async fn ensure_geo_files(github_mirror: Option<&str>) -> bool {
+    let dir = crate::utils::config_dir();
+    ensure_geo_files_in(std::path::Path::new(&dir), github_mirror).await
+}
+
+#[allow(dead_code)]
+pub async fn ensure_geo_files_in(dir_path: &std::path::Path, github_mirror: Option<&str>) -> bool {
     let dir = dir_path.display().to_string();
     let client = match crate::utils::http_client_builder()
         .connect_timeout(std::time::Duration::from_secs(15))
@@ -968,7 +1012,7 @@ pub async fn ensure_geo_files_in(dir_path: &std::path::Path, proxy_url: Option<&
 
     for (name, primary_url) in [("geoip.metadb", GEOIP_URL), ("GeoSite.dat", GEOSITE_URL)] {
         let dest = format!("{dir}/{name}");
-        let urls = geo_urls_with_mirrors(primary_url, proxy_url);
+        let urls = geo_urls_with_mirrors(primary_url, github_mirror);
 
         if !download_geo_with_fallback(&client, &urls, &dest, gh_token.as_deref()).await {
             eprintln!("  ⚠ Failed to download {name} — mihomo will try at startup");
@@ -1832,7 +1876,7 @@ mod target_tests {
     }
 
     #[test]
-    fn geo_mirror_plan_accepts_custom_proxy_url() {
+    fn geo_mirror_plan_accepts_custom_github_mirror() {
         let proxy = "https://gitproxy.example.com/";
         let urls = geo_urls_with_mirrors(GEOIP_URL, Some(proxy));
         assert_eq!(urls[0], GEOIP_URL);
@@ -2022,5 +2066,68 @@ mod target_tests {
             "error was: {err}"
         );
         assert!(!bin.exists());
+    }
+
+    // ── geo_files_have_minimum_size / geo_files_are_valid ──
+
+    #[test]
+    fn geo_files_minimum_size_rejects_small_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create tiny files (way below 8MB / 2MB thresholds)
+        std::fs::write(tmp.path().join("geoip.metadb"), b"small").unwrap();
+        std::fs::write(tmp.path().join("GeoSite.dat"), b"small").unwrap();
+        assert!(!geo_files_have_minimum_size(tmp.path()));
+    }
+
+    #[test]
+    fn geo_files_minimum_size_accepts_large_enough_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create files above thresholds (geoip > 8MB, GeoSite > 2MB)
+        let geoip = tmp.path().join("geoip.metadb");
+        let geosite = tmp.path().join("GeoSite.dat");
+        // Use sparse files: set_len creates a file with the declared size
+        {
+            std::fs::File::create(&geoip).unwrap().set_len(9_000_000).unwrap();
+            std::fs::File::create(&geosite).unwrap().set_len(3_000_000).unwrap();
+        }
+        assert!(geo_files_have_minimum_size(tmp.path()));
+    }
+
+    #[test]
+    fn geo_files_minimum_size_rejects_missing_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Only geoip present, GeoSite missing
+        std::fs::File::create(tmp.path().join("geoip.metadb"))
+            .unwrap()
+            .set_len(9_000_000)
+            .unwrap();
+        assert!(!geo_files_have_minimum_size(tmp.path()));
+    }
+
+    #[test]
+    fn geo_files_are_valid_rejects_missing_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No files at all
+        assert!(!geo_files_are_valid(tmp.path(), std::path::Path::new("/nonexistent/mihomo")));
+    }
+
+    #[test]
+    fn geo_files_are_valid_rejects_html_error_pages() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Write HTML error page as geo files (first byte '<')
+        std::fs::write(tmp.path().join("geoip.metadb"), b"<html>404</html>").unwrap();
+        std::fs::write(tmp.path().join("GeoSite.dat"), b"<html>404</html>").unwrap();
+        // Use set_len to pass size check, but first byte is '<'
+        std::fs::File::create(tmp.path().join("geoip.metadb"))
+            .unwrap()
+            .set_len(9_000_000)
+            .unwrap();
+        std::fs::write(tmp.path().join("geoip.metadb"), b"<html>404</html>").unwrap();
+        std::fs::File::create(tmp.path().join("GeoSite.dat"))
+            .unwrap()
+            .set_len(3_000_000)
+            .unwrap();
+        std::fs::write(tmp.path().join("GeoSite.dat"), b"<html>404</html>").unwrap();
+        assert!(!geo_files_are_valid(tmp.path(), std::path::Path::new("/nonexistent/mihomo")));
     }
 }

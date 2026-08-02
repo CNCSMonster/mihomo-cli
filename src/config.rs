@@ -944,8 +944,9 @@ pub fn save_config_at_endpoint(
 }
 
 /// Fix the existing config file: ensure it has external-controller-unix/pipe.
-/// Reads current config, applies ensure_controller(), writes back.
+/// Reads current config, applies ensure_controller_for_endpoint(), writes back.
 /// Returns true if the file was modified.
+#[allow(dead_code)]
 pub fn fix_existing_config() -> bool {
     let paths = AppPaths::from_system();
     let mihomo = std::path::PathBuf::from(utils::mihomo_path());
@@ -958,6 +959,7 @@ pub fn fix_existing_config() -> bool {
     }
 }
 
+#[allow(dead_code)]
 pub fn fix_existing_config_at(
     paths: &AppPaths,
     mihomo_path: Option<&std::path::Path>,
@@ -1066,12 +1068,6 @@ fn unix_api_endpoint_from_socket_dir(socket_dir: impl AsRef<std::path::Path>) ->
 
 fn windows_user_core_pipe_name(username_or_sid: impl AsRef<str>) -> String {
     format!(r"\\.\pipe\mihomo-{}", username_or_sid.as_ref())
-}
-
-/// Add or repair external-controller-unix/pipe for the current legacy instance.
-#[allow(dead_code)]
-pub(crate) fn ensure_controller(yaml: &str) -> anyhow::Result<String> {
-    ensure_controller_for_endpoint(yaml, &current_api_endpoint())
 }
 
 /// Add or repair external-controller-unix/pipe for an explicit instance endpoint.
@@ -1761,7 +1757,8 @@ mod tests {
     #[test]
     fn test_ensure_controller_inserts_at_top_level() {
         let yaml = "proxies:\n  - name: 节点选择\n    type: selector\n";
-        let result = ensure_controller(yaml).unwrap();
+        let endpoint = ApiEndpoint::UnixSocket(std::path::PathBuf::from("/tmp/test.sock"));
+        let result = ensure_controller_for_endpoint(yaml, &endpoint).unwrap();
         assert!(result.contains("external-controller-unix"));
         assert!(
             result.find("external-controller-unix").unwrap() < result.find("proxies:").unwrap(),
@@ -1774,13 +1771,15 @@ mod tests {
         let yaml = "mixed-port: 7890\n  - invalid indent\nfoo: bar";
         // The editor accepts any serde_yaml-valid input and still repairs the controller.
         // Verify it produces a valid result
-        let result = ensure_controller(yaml).unwrap();
+        let endpoint = ApiEndpoint::UnixSocket(std::path::PathBuf::from("/tmp/test.sock"));
+        let result = ensure_controller_for_endpoint(yaml, &endpoint).unwrap();
         assert!(result.contains("external-controller-unix"));
     }
 
     #[test]
     fn test_ensure_controller_empty() {
-        let result = ensure_controller("").unwrap();
+        let endpoint = ApiEndpoint::UnixSocket(std::path::PathBuf::from("/tmp/test.sock"));
+        let result = ensure_controller_for_endpoint("", &endpoint).unwrap();
         assert!(result.contains("external-controller-unix"));
     }
 
@@ -1793,14 +1792,22 @@ mod tests {
         );
         #[cfg(not(unix))]
         let input = "mixed-port: 7890\nexternal-controller-unix: mihomo.sock\n".to_string();
-        let result = ensure_controller(&input).unwrap();
+        let endpoint = ApiEndpoint::UnixSocket(std::path::PathBuf::from(format!(
+            "{}/mihomo.sock",
+            crate::utils::socket_dir()
+        )));
+        let result = ensure_controller_for_endpoint(&input, &endpoint).unwrap();
         assert_eq!(result, input, "should not modify already-configured config");
     }
 
     #[test]
     fn test_ensure_controller_replaces_wrong_unix_socket() {
         let input = "mixed-port: 7890\nexternal-controller: ''\nexternal-controller-unix: /tmp/verge/verge-mihomo.sock\n";
-        let result = ensure_controller(input).unwrap();
+        let endpoint = ApiEndpoint::UnixSocket(std::path::PathBuf::from(format!(
+            "{}/mihomo.sock",
+            crate::utils::socket_dir()
+        )));
+        let result = ensure_controller_for_endpoint(input, &endpoint).unwrap();
         #[cfg(unix)]
         let expected = format!(
             "external-controller-unix: {}/mihomo.sock",
@@ -1936,7 +1943,11 @@ external-controller-unix: /tmp/stale-user.sock
     #[test]
     fn test_fix_existing_config_no_controller_adds_it() {
         let content = "mixed-port: 7890\nmode: rule\n";
-        let result = ensure_controller(content).unwrap();
+        let endpoint = ApiEndpoint::UnixSocket(std::path::PathBuf::from(format!(
+            "{}/mihomo.sock",
+            crate::utils::socket_dir()
+        )));
+        let result = ensure_controller_for_endpoint(content, &endpoint).unwrap();
         #[cfg(unix)]
         let expected = format!("{}/mihomo.sock", crate::utils::socket_dir());
         #[cfg(not(unix))]

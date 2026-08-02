@@ -51,13 +51,14 @@ cargo install --path .
 
 #### `install` (alias: `i`)
 
-下载 mihomo 核心 + 生成配置 + 安装启动项；不带 flags 时交互选择 system service 或 per-user service。
+下载 mihomo 核心 + 生成配置 + 安装启动项；不带 flags 时交互选择“普通代理模式”或“TUN 全机模式”。日常 TUN 用户也可以直接从 `mihomo-cli tun on` 开始，CLI 会在需要时引导安装 system service。
 
 ```bash
-mihomo-cli install              # 交互式选择 system/per-user 模式
-mihomo-cli install --system     # 安装 system daemon（首次需要提权）
-mihomo-cli install --user       # 安装 per-user 服务（无需 sudo）
+mihomo-cli install              # 交互式选择：普通代理模式 / TUN 全机模式
+mihomo-cli install --user       # 非交互式安装普通代理模式（无需 sudo）
+mihomo-cli install --system     # 非交互式安装 system service（高级/脚本/排障）
 mihomo-cli install --force      # 强制重新安装
+mihomo-cli install --github-mirror https://ghproxy.com/  # geo 下载走 GitHub 镜像（大陆网络加速）
 ```
 
 **安装步骤：**
@@ -66,6 +67,8 @@ mihomo-cli install --force      # 强制重新安装
 2. system 模式额外安装 `mihomo-cli daemon` 到稳定路径
 3. 配置订阅链接（交互式输入）并生成当前用户的 `~/.config/mihomo/config.yaml`
 4. 安装服务（systemd/LaunchDaemon 或 user service）
+
+> 💡 `--github-mirror`：geo 数据（geoip/geosite）下载的 GitHub 镜像前缀。国内网络直连 GitHub 慢时可指定镜像站（如 `https://ghproxy.com/`）；仅影响 geo 下载，订阅下载不走此镜像。
 
 ---
 
@@ -96,7 +99,7 @@ mihomo-cli config --refresh-all           # 刷新所有订阅
 mihomo-cli config --probe '<url>'         # 探测候选 UA 返回格式（不写文件）
 mihomo-cli config --set-ua <ID> auto      # 恢复订阅自动 UA 协商
 mihomo-cli config --set-ua <ID> "clash-verge/v2.0.4"  # 固定订阅 UA
-mihomo-cli config-agent "clash/v1.0.0"           # 本次操作临时使用指定 UA
+mihomo-cli config --user-agent "clash/v1.0.0"          # 本次 add/refresh 操作临时使用指定 UA（别名 --ua）
 
 # 配置验证与修复
 mihomo-cli config --validate              # 验证 config.yaml 语法（YAML + mihomo -t）
@@ -163,15 +166,45 @@ mihomo-cli update
 
 ---
 
+#### `upgrade`
+
+检查 GitHub 上最新 mihomo core 版本，并交互式升级。
+
+```bash
+mihomo-cli upgrade
+```
+
+---
+
+#### `version`
+
+显示 mihomo-cli 构建信息和当前 mihomo core 版本。
+
+```bash
+mihomo-cli version
+```
+
+---
+
+#### `dashboard` (alias: `dash`)
+
+实时状态仪表盘（TUI）。
+
+```bash
+mihomo-cli dashboard    # 或 mihomo-cli dash
+```
+
+---
+
 ### 服务控制
 
 #### `start`
 
-启动 mihomo 服务。
+启动 mihomo 服务。v3 自动检测当前实例模式（system service / per-user），无需指定模式。
 
 ```bash
-mihomo-cli start                # 使用系统服务
-mihomo-cli start         # 使用用户服务
+mihomo-cli start                # 启动当前实例（自动检测模式）
+mihomo-cli start --system       # 强制 system service 实例（排障用）
 ```
 
 启动后自动检查 socket 可用性和 API 响应。如果配置缺少 controller，会自动修复并重启。
@@ -184,7 +217,6 @@ mihomo-cli start         # 使用用户服务
 
 ```bash
 mihomo-cli stop
-mihomo-cli stop
 ```
 
 ---
@@ -194,7 +226,6 @@ mihomo-cli stop
 重启 mihomo 服务。
 
 ```bash
-mihomo-cli restart
 mihomo-cli restart
 ```
 
@@ -223,13 +254,15 @@ mihomo-cli status -v            # 详细诊断（含日志尾部）
 
 #### `select`
 
-crossterm TUI 交互选择节点（支持 j/k vim 快捷键 + / 过滤）。
+选择节点——**无 `--node` 时进入 crossterm TUI**（j/k vim 快捷键 + / 过滤），**有 `--node` 时非交互 CLI 直接切换**。
 
 ```bash
-mihomo-cli select                 # 平铺 当前实例所有代理组
-mihomo-cli select                 # 平铺 当前实例所有代理组
-mihomo-cli select --group 节点选择 # 限定 当前实例某个代理组
+mihomo-cli select                                  # 平铺 当前实例所有代理组（TUI）
+mihomo-cli select --group 节点选择                  # 限定 当前实例某个代理组（TUI）
+mihomo-cli select -g 节点选择 --node 韩国KR-HY2     # 非交互：切换 节点选择 组到指定节点
 ```
+
+> 💡 `--node` 用于脚本/CI 中确定性切换节点；`--node` 必须配合 `--group` 使用。
 
 **快捷键：**
 
@@ -251,8 +284,7 @@ mihomo-cli select --group 节点选择 # 限定 当前实例某个代理组
 列出所有代理组及当前节点。
 
 ```bash
-mihomo-cli list                   # 查看 当前实例
-mihomo-cli list                   # 查看 当前实例
+mihomo-cli list                   # 查看 当前实例所有代理组
 ```
 
 ---
@@ -263,7 +295,6 @@ mihomo-cli list                   # 查看 当前实例
 
 ```bash
 mihomo-cli delay                  # 默认测试 当前实例的"节点选择"组
-mihomo-cli delay                  # 测试 当前实例
 mihomo-cli delay --group ChatGPT  # 测试 当前实例指定组
 mihomo-cli delay --refresh        # 忽略缓存，重新测试
 mihomo-cli delay --cache-ttl 60   # 只复用 60 秒内缓存
@@ -289,7 +320,6 @@ mihomo-cli delay --fastest        # 自动选择测试成功的最快节点
 mihomo-cli tun on                  # 开启 system service TUN（per-user 模式会失败并提示）
 mihomo-cli tun off                 # 关闭 system service TUN
 mihomo-cli tun status              # 自动检测并查看 TUN 状态
-mihomo-cli tun --system status     # 显式查看 system daemon/Core TUN 状态
 mihomo-cli tun on --stack gvisor   # 使用 gvisor 栈
 mihomo-cli tun on --stack system   # 使用 system 栈
 mihomo-cli tun on --dns-hijack     # 启用 DNS 劫持（默认 any:53）
@@ -301,31 +331,47 @@ mihomo-cli tun on --dns-hijack any:53 # 指定 DNS 劫持目标
 | `--stack <system\|gvisor\|mixed>` | TUN 栈选择 |
 | `--dns-hijack [TARGET]` | 启用 DNS 劫持，不带值默认 `any:53` |
 
-> ⚠️ TUN 模式需要 system service。`mihomo-cli tun on` 在 per-user 模式下会提前失败并提示安装 `mihomo-cli install --system`。system-proxy 在 TUN 已开启时通常无效，CLI 会给出 warning。
+> ⚠️ TUN 模式需要 system service。日常直接运行 `mihomo-cli tun on`；如果尚未安装 system service，CLI 会交互引导安装并请求一次管理员密码。system-proxy 在 TUN 已开启时通常无效，CLI 会给出 warning。
 
 ---
 
 #### `conn`
 
-查看活跃连接。
+查看**瞬时活跃**连接。
 
 ```bash
 mihomo-cli conn         # 查看 当前实例连接列表
 mihomo-cli conn --flush # 关闭 当前实例所有连接
 ```
 
+> ⚠️ `conn` 只显示**当前正在传输**的连接——请求一旦完成连接即关闭并从列表消失。
+> 要查看**已经发生的**请求匹配了什么规则/走了什么策略（含已关闭连接），
+> 用 `mihomo-cli logs`（内核日志逐条记录 `match ... using ...`），而不是 `conn`。
+
 ---
 
-#### `ip`
+#### `exit-ip`
 
-查看当前解析实例的代理出口 IP。命令会先通过 mihomo API 读取当前实例的本地代理端口，再经该代理访问多个公共 IP 查询端点，返回最先成功的结果。
+查询节点、代理组、URL 路由或直连路径的出口 IP。该命令要求显式选择一个目标模式，不会默认猜测代理组。
 
 ```bash
-mihomo-cli ip            # 自动检测当前实例
-mihomo-cli ip --system   # 显式使用 system service 实例
+mihomo-cli exit-ip --node "Korea 01"              # 查询具体节点出口 IP
+mihomo-cli exit-ip --group "节点选择"             # 查询代理组当前有效出口 IP
+mihomo-cli exit-ip --url https://github.com       # 查询 URL 按规则会走到的出口估算
+mihomo-cli exit-ip --direct                       # 查询系统直连出口 IP
 ```
 
-> 注意：Mihomo 是规则代理。访问目标 URL 和访问 IP 查询网站是两个不同请求，可能命中不同规则；因此 `mihomo-cli ip` 只能表示 IP 查询请求的出口，不能保证代表任意目标 URL 的真实出口。判断某个域名按规则会走哪个策略，请使用 `mihomo-cli rule test <host>`。
+目标模式互斥：`--node` / `--group` / `--url` / `--direct` 一次只能使用一个。
+
+`--url` 会先按当前规则解析 URL/host 会走到哪个 policy/node，再通过 IP echo 服务估算该节点出口 IP。它不承诺目标网站本身观测到的源 IP 一定相同。
+
+#### `ip`（兼容/弱化）
+
+`mihomo-cli ip` 保留为兼容命令，只表示“通过当前 mihomo 规则访问 IP 查询服务时的观测出口”。它不代表系统直连 IP、TUN 状态、某个指定节点出口，或任意 URL 的真实出口。新用法建议改用 `exit-ip`。
+
+```bash
+mihomo-cli ip            # 兼容：当前 mihomo 访问 IP echo 服务的出口
+```
 
 ---
 
@@ -335,7 +381,6 @@ mihomo-cli ip --system   # 显式使用 system service 实例
 
 ```bash
 eval "$(mihomo-cli proxy on)"          # 设置 http_proxy / https_proxy（自动检测实例）
-eval "$(mihomo-cli proxy --system on)" # 显式使用 system service 实例端口
 eval "$(mihomo-cli proxy off)"         # 取消代理
 ```
 
@@ -347,7 +392,6 @@ eval "$(mihomo-cli proxy off)"         # 取消代理
 
 ```bash
 mihomo-cli system-proxy on           # 设置系统代理到当前实例 127.0.0.1:<mixed-port>
-mihomo-cli system-proxy --system on  # 显式使用 system service 实例端口
 mihomo-cli system-proxy off          # 取消系统代理
 ```
 
@@ -357,7 +401,24 @@ mihomo-cli system-proxy off          # 取消系统代理
 |------|----------|
 | macOS | `networksetup` (webproxy + securewebproxy + socksfirewallproxy) |
 | Linux GNOME | `gsettings` (org.gnome.system.proxy) |
-| Linux 其他 | 输出手动配置指引 |
+| Linux 其他 | ❌ 不支持，请使用环境变量或 TUN 模式 |
+
+**局限性：**
+
+- **Linux 仅支持 GNOME 桌面**（通过 gsettings）。KDE、XFCE、无头服务器等不支持，命令会报错退出
+- **仅影响读取系统代理设置的应用**（GTK/GNOME 应用、部分浏览器）。命令行工具（curl、wget、codex 等）通常不读取系统代理
+- **TUN 模式开启时无效**——TUN 已在内核层捕获所有流量，系统代理设置被忽略
+
+**无桌面环境的替代方案：**
+
+```bash
+# 方式一：环境变量（推荐，所有场景通用）
+export HTTP_PROXY=http://127.0.0.1:<mixed-port>
+export HTTPS_PROXY=http://127.0.0.1:<mixed-port>
+
+# 方式二：TUN 模式（全机透明代理，需管理员权限）
+mihomo-cli tun on
+```
 
 ---
 
@@ -368,17 +429,26 @@ mihomo-cli system-proxy off          # 取消系统代理
 ```bash
 mihomo-cli logs                     # 默认显示最后 50 行
 mihomo-cli logs --tail 200          # 显示最后 200 行
-mihomo-cli logs --system            # 显式查看 system service 日志
 mihomo-cli logs --level error       # 按级别过滤（debug/info/warn/error）
 mihomo-cli logs --level warning     # 过滤 warning 级别
 mihomo-cli logs -f                  # 持续跟随新日志
 ```
 
+> 💡 **用途**：内核日志逐条记录每条连接的规则匹配与出站策略
+> （`[TCP] host:443 match DomainSuffix(...) using DIRECT`），是排查
+> "某个请求走了哪条规则/哪个节点"的权威来源——尤其是连接已经关闭、
+> `conn` 列表里看不到的场景（查**历史**连接用 `logs`，查**活跃**连接用 `conn`）。
+>
+> 📍 日志文件位置：`mihomo-cli status` 的 `Logs:` 字段会标出。
+> System 模式在 `/var/log/mihomo/mihomo.log`，per-user 在
+> `~/Library/Logs/mihomo/mihomo.log`（macOS）/ 对应 XDG 日志路径（Linux）。
+> 也可用 `logs -f` 边发请求边实时观察规则匹配。
+
 ---
 
 #### `rule`
 
-管理用户自定义路由规则。rule 命令自动检测当前实例；需要显式使用 system service 时可加 `--system`。规则读写使用 resolved `AppPaths`。
+管理用户自定义路由规则。rule 命令自动检测当前实例；`--system` 仅用于脚本/排障时显式指定 system service context。规则读写使用 resolved `AppPaths`。
 
 ```bash
 # 添加规则（当前实例）
@@ -389,7 +459,6 @@ mihomo-cli rule add DOMAIN-SUFFIX,example.com,DIRECT --position front  # 指定�
 
 # 列出规则
 mihomo-cli rule list         # alias: ls
-mihomo-cli rule --system list  # 显式查看 system service 实例规则
 
 # 删除规则（按 1-based 索引）
 mihomo-cli rule remove 2     # alias: rm
@@ -450,20 +519,18 @@ mihomo-cli rule test 192.168.1.1
 
 #### `dns`
 
-管理 DNS 路由策略（nameserver-policy）。dns 命令自动检测当前实例；需要显式使用 system service 时可加 `--system`。DNS 配置读写使用 resolved `AppPaths`。
+管理 DNS 路由策略（nameserver-policy）。dns 命令自动检测当前实例；`--system` 仅用于脚本/排障时显式指定 system service context。DNS 配置读写使用 resolved `AppPaths`。
 
 ```bash
 # DNS 策略管理
 mihomo-cli dns policy add ubtrobot.com 10.10.1.251           # 添加策略
 mihomo-cli dns policy add corp.com 10.10.1.251,10.10.1.120   # 多个 DNS 服务器
 mihomo-cli dns policy list                                  # 列出当前实例策略 (alias: ls)
-mihomo-cli dns --system policy list                         # 显式查看 system service 实例策略
 mihomo-cli dns policy remove 1                              # 按索引删除 (alias: rm)
 mihomo-cli dns policy remove ubtrobot.com                   # 按域名删除
 
 # DNS 状态
 mihomo-cli dns status                                       # 查看当前实例 DNS 配置
-mihomo-cli dns --system status                              # 显式查看 system service 实例 DNS 配置
 
 # DNS 模板
 mihomo-cli dns template list                                       # 列出可用模板
@@ -482,24 +549,24 @@ mihomo-cli dns template apply ads                           # 应用广告过滤
 
 #### `backup` / `restore`
 
-备份和恢复当前实例的配置文件。命令自动检测活跃实例；需要显式使用 system service 时可加 `--system`。
+备份和恢复当前实例的配置文件。命令自动检测活跃实例；`--system` 仅用于脚本/排障时显式指定 system service context。
 
 ```bash
 # 备份
 mihomo-cli backup                    # 备份到 当前实例 backups/<timestamp>/
-mihomo-cli backup --system           # 显式备份 system service 使用的当前用户配置
 mihomo-cli backup /path/to/dir       # 备份到指定目录
 
 # 恢复
 mihomo-cli restore /path/to/backup          # 从备份恢复 当前实例（需确认）
 mihomo-cli restore /path/to/backup --yes    # 跳过确认
-mihomo-cli restore --system /path/to/backup # 显式恢复 system service 使用的当前用户配置
 ```
 
 **备份内容：**
-- `config.yaml`, `rules.yaml`, `dns-policy.yaml`, `override.yaml`
+- `config.yaml`, `rules.yaml`, `dns-policy.yaml`
 - `subscriptions.yaml`, `subscriptions/` 目录
 - `.rules-position`
+
+> 注：`override.yaml` 不在备份范围内（代码 `backup.rs` 的 `BACKUP_ITEMS` 不含 override）。
 
 ---
 
@@ -508,14 +575,13 @@ mihomo-cli restore --system /path/to/backup # 显式恢复 system service 使用
 
 ### override.yaml
 
-`~/.config/mihomo/override.yaml` 支持任意字段覆盖，在订阅内容之后、用户规则之前合并。可直接编辑文件，也可用 `override` 命令管理；需要显式使用 system service context 时加 `--system`：
+`~/.config/mihomo/override.yaml` 支持任意字段覆盖，在订阅内容之后、用户规则之前合并。可直接编辑文件，也可用 `override` 命令管理；命令默认自动检测当前实例，`--system` 仅用于脚本/排障：
 
 ```bash
 mihomo-cli override path
 mihomo-cli override show
 mihomo-cli override import ./override.yaml
 mihomo-cli override clear --yes
-mihomo-cli override --system show
 ```
 
 示例：

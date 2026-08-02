@@ -40,8 +40,8 @@ lto = true
 strip = true
 
 [target.'cfg(windows)'.dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["native-tls", "json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "json", "stream", "system-proxy"] }
 
 [target.'cfg(not(windows))'.dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "system-proxy"] }
 rustls-native-certs = "0.8"

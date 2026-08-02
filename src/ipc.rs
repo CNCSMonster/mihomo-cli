@@ -110,6 +110,11 @@ where
 }
 
 /// Send a command to the daemon and wait for a response.
+///
+/// Timeout boundary (aligned with clash-verge-service): the daemon's lifecycle
+/// operations (core spawn + readiness) must complete within 15s; the client
+/// waits up to 20s so it always receives the daemon's final business conclusion
+/// rather than a transport error.
 #[cfg(unix)]
 pub async fn send_command(cmd: &DaemonCommand) -> anyhow::Result<DaemonResponse> {
     use tokio::io::BufReader;
@@ -129,7 +134,16 @@ pub async fn send_command(cmd: &DaemonCommand) -> anyhow::Result<DaemonResponse>
     write_json_message(&mut stream, cmd).await?;
 
     let mut reader = BufReader::new(stream);
-    read_json_message(&mut reader, "daemon response").await
+    let read = async { read_json_message(&mut reader, "daemon response").await };
+    tokio::time::timeout(std::time::Duration::from_secs(20), read)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "timed out waiting for the system service to respond after 20s.\n  \
+                 The daemon may be busy with another lifecycle operation or stuck.\n  \
+                 Check: systemctl status mihomo  (or the service logs)"
+            )
+        })?
 }
 
 /// Send a command to the daemon and wait for a response.
@@ -151,7 +165,16 @@ pub async fn send_command(cmd: &DaemonCommand) -> anyhow::Result<DaemonResponse>
 
     write_json_message(&mut pipe, cmd).await?;
     let mut reader = BufReader::new(pipe);
-    read_json_message(&mut reader, "daemon response").await
+    let read = async { read_json_message(&mut reader, "daemon response").await };
+    tokio::time::timeout(std::time::Duration::from_secs(20), read)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "timed out waiting for the system service to respond after 20s.\n  \
+                 The daemon may be busy with another lifecycle operation or stuck.\n  \
+                 Check the service status."
+            )
+        })?
 }
 
 /// Send a command to the daemon and wait for a response.

@@ -30,38 +30,6 @@ fn socket_is_alive() -> bool {
     }
 }
 
-pub fn endpoint_is_alive(endpoint: &crate::instance::ApiEndpoint) -> bool {
-    match endpoint {
-        crate::instance::ApiEndpoint::UnixSocket(path) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::net::UnixStream as StdUnixStream;
-                StdUnixStream::connect(path).is_ok()
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = path;
-                false
-            }
-        }
-        crate::instance::ApiEndpoint::WindowsNamedPipe(pipe) => {
-            #[cfg(windows)]
-            {
-                std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(pipe)
-                    .is_ok()
-            }
-            #[cfg(not(windows))]
-            {
-                let _ = pipe;
-                false
-            }
-        }
-    }
-}
-
 /// Build a context-aware fix suggestion message when socket/API is unreachable.
 pub fn socket_fix_suggestion() -> String {
     #[cfg(not(unix))]
@@ -175,7 +143,7 @@ fn parse_socket_http_response(response: &[u8]) -> anyhow::Result<Value> {
     Ok(serde_json::from_str(json_str)?)
 }
 
-fn proxy_group_path(group: &str) -> String {
+pub(crate) fn proxy_group_path(group: &str) -> String {
     format!("/proxies/{}", percent_encode_path(group))
 }
 
@@ -326,6 +294,7 @@ pub async fn api_get_at_endpoint(
 
 /// Poll /configs until the API is ready, or timeout.
 /// Returns true if ready, false if timed out.
+#[allow(dead_code)]
 pub async fn wait_for_api_ready_at_endpoint(
     endpoint: &crate::instance::ApiEndpoint,
     timeout_secs: u64,
@@ -884,41 +853,6 @@ async fn query_ip_source(
 ///
 /// This keeps `status` useful (it still shows the current exit IP) without
 /// letting one slow third-party endpoint block the whole command.
-#[allow(dead_code)]
-async fn probe_ip_fast(use_proxy: bool, total_timeout: Duration) -> Option<IpProbeResult> {
-    use futures::stream::{FuturesUnordered, StreamExt};
-
-    let client = build_ip_client(use_proxy).ok()?;
-    let mut tasks = FuturesUnordered::new();
-
-    for (idx, (url, name, parse)) in IP_SOURCES.iter().enumerate() {
-        let client = client.clone();
-        let url = *url;
-        let name = *name;
-        let parse = *parse;
-        tasks.push(async move {
-            if idx > 0 {
-                tokio::time::sleep(Duration::from_millis((idx as u64) * 300)).await;
-            }
-            query_ip_source(client, url, name, parse).await
-        });
-    }
-
-    let winner = async {
-        while let Some(result) = tasks.next().await {
-            if result.is_some() {
-                return result;
-            }
-        }
-        None
-    };
-
-    tokio::time::timeout(total_timeout, winner)
-        .await
-        .ok()
-        .flatten()
-}
-
 /// Build a reqwest client for the given probe mode.
 #[allow(dead_code)]
 fn build_ip_client_for_proxy_port(proxy_port: Option<u16>) -> anyhow::Result<reqwest::Client> {
@@ -937,16 +871,6 @@ fn build_ip_client_for_proxy_port(proxy_port: Option<u16>) -> anyhow::Result<req
     }
 
     Ok(builder.build()?)
-}
-
-#[allow(dead_code)]
-fn build_ip_client(use_proxy: bool) -> anyhow::Result<reqwest::Client> {
-    let proxy_port = if use_proxy {
-        Some(get_mihomo_port())
-    } else {
-        None
-    };
-    build_ip_client_for_proxy_port(proxy_port)
 }
 
 /// Fast status-oriented IP probe via a specific local mihomo proxy port.
@@ -983,12 +907,34 @@ pub async fn fetch_ip_info_fast_with_proxy_port(
     }
 }
 
-/// Fast status-oriented IP probe via mihomo proxy.
-#[allow(dead_code)]
-pub async fn fetch_ip_info_fast(timeout: Duration) -> anyhow::Result<(String, String, String)> {
-    match probe_ip_fast(true, timeout).await {
+/// Fast IP probe without mihomo or environment proxies.
+pub async fn fetch_ip_info_direct(timeout: Duration) -> anyhow::Result<(String, String, String)> {
+    let client = build_ip_client_for_proxy_port(None)?;
+    let mut tasks = futures::stream::FuturesUnordered::new();
+    for (idx, (url, name, parse)) in IP_SOURCES.iter().enumerate() {
+        let client = client.clone();
+        let url = *url;
+        let name = *name;
+        let parse = *parse;
+        tasks.push(async move {
+            if idx > 0 {
+                tokio::time::sleep(Duration::from_millis((idx as u64) * 300)).await;
+            }
+            query_ip_source(client, url, name, parse).await
+        });
+    }
+    let winner = async {
+        use futures::stream::StreamExt;
+        while let Some(result) = tasks.next().await {
+            if result.is_some() {
+                return result;
+            }
+        }
+        None
+    };
+    match tokio::time::timeout(timeout, winner).await.ok().flatten() {
         Some(r) => Ok((r.ip, r.country, r.source)),
-        None => anyhow::bail!("status IP check timed out or all endpoints unreachable via proxy"),
+        None => anyhow::bail!("direct IP check timed out or all endpoints unreachable"),
     }
 }
 

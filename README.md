@@ -33,23 +33,23 @@ cargo install --path .
 
 ## 最小核心流程（推荐）
 
-如果你需要 TUN 全机透明代理，安装 system service；如果只需要当前用户代理，安装 per-user service。两种模式互斥：TUN 会在网络层接管全机流量，不能和 per-user core 有意义地共存。
+日常使用不需要记住 `--system`。普通代理模式走 per-user service；需要 TUN/全机透明代理时，直接执行 `mihomo-cli tun on`，CLI 会在需要时引导安装 system service 并请求一次管理员密码。
 
 ```bash
-mihomo-cli install                         # 交互式选择 system service 或 per-user service
-mihomo-cli install --system                # 安装 system daemon（首次需要提权，之后通过 IPC 控制）
-mihomo-cli install --user                  # 安装 per-user 服务（无需 root）
+mihomo-cli install                         # 交互式选择：普通代理模式 / TUN 全机模式
 mihomo-cli config -u '<subscription-url>'  # 添加订阅（始终写入当前用户配置）
-mihomo-cli start                           # 自动检测运行态；都未运行时默认启动 per-user
-mihomo-cli select --system                 # 显式选择 system 实例节点（通常可省略）
-mihomo-cli status --verbose                # 查看服务、daemon/core/TUN 运行态
-mihomo-cli ip                              # 查看当前代理出口 IP
+mihomo-cli start                           # 自动检测当前实例并启动 core/service
+mihomo-cli select                          # 选择节点（TUI：j/k 或 ↑/↓，/ 过滤；或 --node 非交互切换）
+mihomo-cli status                          # 简洁查看运行态；--verbose 查看诊断路径/探针
+mihomo-cli exit-ip --group "节点选择"      # 查询某个代理组当前出口 IP
+mihomo-cli exit-ip --url https://github.com # 查询 URL 按规则会走到的出口估算
 mihomo-cli rule test baidu.com             # 检查规则会走哪个策略
-mihomo-cli tun on                          # 仅 system service 模式可用，通过 daemon IPC 开启
-mihomo-cli tun --system status             # 显式查看 system TUN 状态
+mihomo-cli tun on                          # 开启 TUN；必要时自动引导安装 system service
+mihomo-cli tun status                      # 查看 TUN 状态
+mihomo-cli tun off                         # 关闭 TUN
 ```
 
-没有 root 权限时可用 `mihomo-cli install --user` 安装用户级服务；per-user 模式不能启用 TUN，此时更适合使用 `eval "$(mihomo-cli proxy on)"` 给当前 shell 设置代理。
+没有管理员权限时可用 `mihomo-cli install --user` 安装普通代理模式。`--system` 仍保留给脚本、排障或显式指定 system service context，日常命令通常不需要。
 
 ## 文档
 
@@ -75,8 +75,8 @@ mihomo-cli tun --system status             # 显式查看 system TUN 状态
 - **订阅自动转换**：自动识别并转换 vmess:// / base64 / Clash YAML 三种格式
 - **crossterm TUI 交互**：`select` 和 `config` 命令使用 crossterm 实现真正的键盘快捷键（j/k 导航、/ 过滤）
 - **零运行时依赖**：不依赖 curl、jq、python3、fzf 外部工具
-- **完善 CLI 体验**：clap 提供自动补全、模糊命令提示、`--help` 文档
-- **真正的跨平台**：macOS LaunchDaemon/LaunchAgent + Linux systemd system/user + Windows service/user process，统一命令接口
+- **完善 CLI 体验**：clap derive 提供类型化参数解析、`--help` 文档
+- **真正的跨平台**：macOS LaunchDaemon/LaunchAgent + Linux systemd system/user + Windows service/user process，统一命令接口；**Windows 为二等公民**（验证走 pub 仓库 CI runner）
 
 ## 构建
 
@@ -95,7 +95,11 @@ src/
 ├── mihomo_api.rs    Unix socket REST 客户端
 ├── config.rs        订阅管理 + 配置生成
 ├── installer.rs     核心二进制下载 + Geo 文件管理
-├── service.rs       系统服务管理 (systemd/LaunchDaemon)
+├── service.rs       系统服务执行层 + 提权 (systemd/LaunchDaemon)
+├── instance.rs      v3 Instance Model：路径矩阵 + 模式解析 + service plan
+├── daemon.rs        daemon 进程 (IPC + readiness + lifecycle 串行化)
+├── ipc.rs           daemon IPC 客户端
+├── lock.rs          并发锁
 ├── rules.rs         用户路由规则管理
 ├── dns.rs           DNS 路由策略管理
 ├── backup.rs        配置备份与恢复
@@ -147,13 +151,13 @@ E2E 测试位于 `tests/e2e/`，通过 `tests/e2e.rs` 接入 Cargo。当前覆�
 
 ## 延迟测试缓存和最快节点选择
 
-`mihomo-cli delay` 会通过当前运行态解析出的 system/per-user 实例调用 mihomo group delay API，按延迟排序输出，并默认将结果缓存到当前用户配置目录的 `delay-cache.json` 300 秒。通常自动检测；需要显式指定 system service 时使用 `--system`。`proxy`/`system-proxy`/`config`/`rule`/`dns`/`backup`/`restore` 同样支持 `--system` override。
+`mihomo-cli delay` 会通过当前运行态解析出的 system/per-user 实例调用 mihomo group delay API，按延迟排序输出，并默认将结果缓存到当前用户配置目录的 `delay-cache.json` 300 秒。通常自动检测；`--system` 仅作为脚本/排障时的显式 override。
 
 ```bash
-mihomo-cli delay --system --group "节点选择"
-mihomo-cli delay --system --refresh       # 忽略缓存，重新测试
-mihomo-cli delay --system --cache-ttl 60   # 只复用 60 秒内缓存
-mihomo-cli delay --system --fastest        # 自动选择测试成功的最快节点
+mihomo-cli delay --group "节点选择"
+mihomo-cli delay --refresh       # 忽略缓存，重新测试
+mihomo-cli delay --cache-ttl 60   # 只复用 60 秒内缓存
+mihomo-cli delay --fastest        # 自动选择测试成功的最快节点
 ```
 
 ## TUN 增强选项

@@ -1,5 +1,33 @@
 # Changelog
 
+## 2026-08-02
+
+### ✨ Features
+- **`select --node` 非交互切换** — `mihomo-cli select -g <group> --node <node>` 直接切换指定节点（无 `--node` 时仍为 TUI），便于脚本/CI 确定性切换
+- **system-proxy 支持** — reqwest 启用 system-proxy，订阅/geo/core 下载自动尊重 `HTTPS_PROXY`/`HTTP_PROXY` 环境变量（未设置则直连，与 curl 约定一致）
+
+### 🐛 Bug Fixes
+- **BUG-17** — `install` 复用旧 config 时不校正 controller endpoint，导致 System 模式 core 拒绝启动；修复：`[3/4]` 步骤对已存在 config 先校验 endpoint，不匹配则就地校正
+- **BUG-16** — macOS `stop` 误用 `launchctl bootout` 卸载 job，导致后续 `start` 失败；改用 `launchctl kill SIGTERM`（停进程不卸载，与 start 的 kickstart 对称）
+- **BUG-15** — `install --user` 写出的 start.sh 缺可执行权限（0644），launchd exec 报 EX_CONFIG；修复：非特权写入应用 planned mode
+- **BUG-14** — `mihomo_path()` Windows 路径缺 `\bin\` 段；改为委托 `instance::planned_paths` 单一事实来源
+- **BUG-13** — System 模式 InstanceLock 锁文件权限失败被误报为锁冲突；修复：CLI 移除文件锁，daemon 内 `OWNER_LIFECYCLE_LOCK` 串行化 lifecycle，readiness 迁入 daemon
+- **BUG-11/12** — XDG_RUNTIME_DIR 回退路径硬编码 UID 1000；修复：优先 /proc/self/loginuid，回退 `id -u`
+
+### 🔧 Refactoring
+- **`--proxy` 改名为 `--github-mirror`** — 原 flag 实为 geo 下载的 GitHub 镜像前缀，改名明确语义，不留兼容别名
+- **清理死代码** — 删除 mihomo_api 已验证零调用的死函数（endpoint_is_alive、probe_ip_fast 等）
+
+### 📚 Documentation
+- **文档与代码一致性审计** — 修复 USAGE/SPEC/ROADMAP/README/CHANGELOG 12 项过时描述（select --node、install 预检、Uninstall TUI、`--root`→`--system` 等）
+- **conn vs logs 用途区分** — 明确 `conn` 只显示瞬时活跃连接，历史连接（含已关闭连接的规则匹配）查 `logs`
+
+### 🧪 Validation
+- **M3 macOS 双模式 E2E 完成** — User + System 全生命周期、TUN on/off（utun 网卡真实创建）、真实代理访问（YouTube/Google Docs/OpenAI）、v3 互斥保护
+- **M4 Linux E2E 完成** — colima VM（Ubuntu 24.04 + systemd 255）User + System 全流程 + TUN
+
+---
+
 ## 2026-07-27 (v0.4.1)
 
 ### ✨ Features
