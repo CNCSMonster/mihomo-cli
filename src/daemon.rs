@@ -1739,15 +1739,18 @@ mod tests {
 
     #[test]
     fn command_line_parsers_handle_proc_and_ps_formats() {
-        assert_eq!(
-            parse_nul_cmdline(b"/usr/bin/mihomo\0-d\0/tmp/cfg\0"),
-            Some(vec![
-                "/usr/bin/mihomo".to_string(),
-                "-d".to_string(),
-                "/tmp/cfg".to_string()
-            ])
-        );
-        assert_eq!(parse_nul_cmdline(b""), None);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                parse_nul_cmdline(b"/usr/bin/mihomo\0-d\0/tmp/cfg\0"),
+                Some(vec![
+                    "/usr/bin/mihomo".to_string(),
+                    "-d".to_string(),
+                    "/tmp/cfg".to_string()
+                ])
+            );
+            assert_eq!(parse_nul_cmdline(b""), None);
+        }
 
         assert_eq!(
             parse_shell_words_lossy("/usr/local/bin/mihomo -d /tmp/cfg"),

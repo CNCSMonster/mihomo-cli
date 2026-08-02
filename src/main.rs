@@ -3758,7 +3758,16 @@ async fn cmd_install_instance(
             }
         }
         print_lines(format_install_service_installed());
-        if mode == instance::InstanceMode::System {
+        if skip_config {
+            // --skip-config: service installed but no config was generated, so
+            // the core cannot start yet. Do not wait for readiness (it would
+            // fail reading a missing config). User adds config then starts.
+            println!(
+                "  ⚠ Core not started (--skip-config: no config yet). \
+                 Add config at {} then run: mihomo-cli start",
+                ctx.paths.config_file.display()
+            );
+        } else if mode == instance::InstanceMode::System {
             wait_for_system_daemon_readiness().await?;
             start_system_core_via_daemon(&ctx).await?;
             wait_for_instance_readiness(&ctx).await?;

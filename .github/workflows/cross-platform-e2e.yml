@@ -42,7 +42,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mihomo-cli-${{ matrix.os }}
-          path: target/release/mihomo-cli
+          # Windows produces mihomo-cli.exe; unix produces mihomo-cli
+          path: |
+            target/release/mihomo-cli
+            target/release/mihomo-cli.exe
 
   unit-tests:
     name: Unit tests (${{ matrix.os }})
@@ -90,6 +93,10 @@ jobs:
       - name: Smoke test
         shell: bash
         run: |
+          # Windows artifact is mihomo-cli.exe; expose it as mihomo-cli too
+          if [ -f bin/mihomo-cli.exe ]; then
+            cp bin/mihomo-cli.exe bin/mihomo-cli
+          fi
           chmod +x bin/mihomo-cli 2>/dev/null || true
           mihomo-cli --version
           mihomo-cli version
@@ -159,6 +166,10 @@ jobs:
       - name: Smoke test
         shell: bash
         run: |
+          # Windows artifact is mihomo-cli.exe; expose it as mihomo-cli too
+          if [ -f bin/mihomo-cli.exe ]; then
+            cp bin/mihomo-cli.exe bin/mihomo-cli
+          fi
           chmod +x bin/mihomo-cli 2>/dev/null || true
           mihomo-cli --version
 
