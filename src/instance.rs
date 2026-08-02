@@ -2208,6 +2208,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // platform-specific path semantics
     fn macos_system_launchd_artifacts_use_system_binary_with_per_user_config() {
         let ctx = InstanceContext::planned(TargetOs::Macos, InstanceMode::System, &inputs());
         let artifacts = planned_macos_launchd_artifacts(&ctx).unwrap();
@@ -2240,6 +2241,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // platform-specific path semantics
     fn macos_user_launchd_artifacts_use_user_paths_and_private_runtime_dir() {
         let ctx = InstanceContext::planned(TargetOs::Macos, InstanceMode::User, &inputs());
         let artifacts = planned_macos_launchd_artifacts(&ctx).unwrap();
@@ -2257,6 +2259,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // platform-specific path semantics
     fn macos_system_install_plan_keeps_config_dir_user_owned() {
         let ctx = InstanceContext::planned(TargetOs::Macos, InstanceMode::System, &inputs());
         let plan = planned_macos_install_plan(&ctx).unwrap();
@@ -2308,6 +2311,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // platform-specific path semantics
     fn macos_user_install_plan_is_direct_and_uses_user_paths() {
         let ctx = InstanceContext::planned(TargetOs::Macos, InstanceMode::User, &inputs());
         let plan = planned_macos_install_plan(&ctx).unwrap();
@@ -2363,6 +2367,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // platform-specific path semantics
     fn linux_system_install_plan_matches_systemd_spec() {
         let ctx = InstanceContext::planned(TargetOs::Linux, InstanceMode::System, &inputs());
         let plan = planned_install_plan(&ctx).unwrap();
@@ -2411,6 +2416,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // platform-specific path semantics
     fn linux_user_install_plan_matches_systemd_user_spec() {
         let ctx = InstanceContext::planned(TargetOs::Linux, InstanceMode::User, &inputs());
         let plan = planned_install_plan(&ctx).unwrap();
@@ -2588,6 +2594,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // platform-specific path semantics
     fn uninstall_plans_remove_only_resolved_instance_paths() {
         let macos_root = InstanceContext::planned(TargetOs::Macos, InstanceMode::System, &inputs());
         let macos_user = InstanceContext::planned(TargetOs::Macos, InstanceMode::User, &inputs());
@@ -2939,6 +2946,7 @@ mod tests {
 
     // BUG-11 回归：XDG_RUNTIME_DIR 未设置时，Linux User 模式回退路径必须用真实 uid
     #[test]
+    #[cfg(unix)] // platform-specific path semantics
     fn g_bug11_linux_user_runtime_dir_falls_back_to_real_uid() {
         let mut inputs = PathInputs::for_tests();
         // 模拟容器/非 systemd 环境：XDG_RUNTIME_DIR 未设置
@@ -2961,6 +2969,7 @@ mod tests {
 
     // BUG-12 回归：配置生成侧的 socket 路径也必须用真实 uid（不硬编码 1000）
     #[test]
+    #[cfg(unix)] // platform-specific path semantics
     fn g_bug12_config_generated_endpoint_uses_real_uid() {
         let mut inputs = PathInputs::for_tests();
         inputs.xdg_runtime_dir = None;

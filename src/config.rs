@@ -2111,6 +2111,7 @@ external-controller-unix: /tmp/stale-user.sock
     }
 
     #[test]
+    #[cfg(unix)] // platform-specific path semantics
     fn test_generate_config_yaml_basic() {
         let sub_yaml: serde_yaml::Value = serde_yaml::from_str(
             r#"
@@ -2388,6 +2389,7 @@ proxies:
     }
 
     #[test]
+    #[cfg(unix)] // platform-specific path semantics
     fn test_merge_user_config_new_flow() {
         let tmp = TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());

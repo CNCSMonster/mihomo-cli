@@ -9400,6 +9400,7 @@ vmess://example"
     }
 
     #[test]
+    #[cfg(unix)] // platform-specific path semantics
     fn ensure_instance_controller_endpoint_repairs_config_for_selected_instance() {
         let temp = tempfile::tempdir().unwrap();
         let mut ctx = instance::InstanceContext::planned(

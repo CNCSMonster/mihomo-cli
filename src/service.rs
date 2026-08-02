@@ -938,8 +938,44 @@ fn windows_create_dir_elevated_script(path: &std::path::Path) -> String {
     )
 }
 
+/// Windows: is the current process running with elevated (Administrator) token?
+/// Used to skip the UAC prompt when already elevated (e.g. CI runners, admin shells).
+#[cfg(windows)]
+fn is_process_elevated() -> bool {
+    // `net session` succeeds only with an elevated token; fails for a
+    // non-elevated process even in an Administrators group.
+    std::process::Command::new("net.exe")
+        .args(["session"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 #[cfg(windows)]
 fn run_windows_elevated_powershell(script: &str) -> anyhow::Result<()> {
+    // Already elevated (CI runner / admin shell)? Run directly — UAC prompt
+    // would hang in non-interactive environments.
+    if is_process_elevated() {
+        let status = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ])
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()
+            .map_err(|e| anyhow::anyhow!("failed to run elevated command: {e}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        anyhow::bail!("elevated command failed")
+    }
     let plan = windows_elevated_powershell_plan(script);
     let status = std::process::Command::new(&plan.program)
         .args(&plan.args)
