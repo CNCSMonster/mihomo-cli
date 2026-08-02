@@ -202,9 +202,99 @@ async fn accept_one_pipe_connection(
 ) -> anyhow::Result<Option<tokio::net::windows::named_pipe::NamedPipeServer>> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
-    let server = ServerOptions::new().create(pipe_name)?;
+    // Build SDDL-restricted security attributes (SYSTEM + Admin + installer SID).
+    let mut sd_storage = windows_pipe_security_attributes()?;
+    let server = unsafe {
+        ServerOptions::new()
+            .first_pipe_instance(true)
+            .create_with_security_attributes_raw(
+                pipe_name,
+                sd_storage.as_mut_ptr(),
+            )?
+    };
     server.connect().await?;
     Ok(Some(server))
+}
+
+#[cfg(windows)]
+/// Build a SECURITY_ATTRIBUTES with an SDDL descriptor restricting pipe access
+/// to SYSTEM + Administrators + the installing user's SID.
+///
+/// `installer-sid` is written at install time; if absent the descriptor is
+/// SYSTEM-only (fail closed).
+///
+/// Returns a boxed descriptor plus the SECURITY_ATTRIBUTES that points into it.
+/// The Box keeps the descriptor alive for the caller's pipe creation.
+fn windows_pipe_security_attributes() -> anyhow::Result<windows_pipe_security::PipeSecurity> {
+    windows_pipe_security::build()
+}
+
+#[cfg(windows)]
+mod windows_pipe_security {
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows_sys::Win32::Security::{SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR};
+
+    /// Owns the SECURITY_DESCRIPTOR heap allocation referenced by the
+    /// SECURITY_ATTRIBUTES pointer.
+    pub struct PipeSecurity {
+        pub attributes: SECURITY_ATTRIBUTES,
+        _descriptor: Box<SECURITY_DESCRIPTOR>,
+    }
+
+    impl PipeSecurity {
+        pub fn as_mut_ptr(&mut self) -> *mut std::ffi::c_void {
+            &mut self.attributes as *mut _ as *mut std::ffi::c_void
+        }
+    }
+
+    pub fn build() -> anyhow::Result<PipeSecurity> {
+        let installer_sid = super::read_installer_sid().unwrap_or_default();
+        let sddl = if installer_sid.is_empty() {
+            // Fail closed: SYSTEM only.
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)".to_string()
+        } else {
+            format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{installer_sid})")
+        };
+
+        let mut sddl_wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut descriptor = Box::new(unsafe { std::mem::zeroed::<SECURITY_DESCRIPTOR>() });
+        let mut descriptor_ptr: *mut std::ffi::c_void =
+            &mut *descriptor as *mut SECURITY_DESCRIPTOR as *mut std::ffi::c_void;
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl_wide.as_ptr(),
+                1, // SDDL_REVISION_1
+                &mut descriptor_ptr,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            anyhow::bail!("ConvertStringSecurityDescriptorToSecurityDescriptorW failed");
+        }
+
+        let mut attributes: SECURITY_ATTRIBUTES = unsafe { std::mem::zeroed() };
+        attributes.nLength = std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
+        attributes.lpSecurityDescriptor =
+            &mut *descriptor as *mut SECURITY_DESCRIPTOR as *mut std::ffi::c_void;
+        attributes.bInheritHandle = 0;
+
+        Ok(PipeSecurity {
+            attributes,
+            _descriptor: descriptor,
+        })
+    }
+}
+
+#[cfg(windows)]
+/// Read the installer SID from `%ProgramData%\mihomo\installer-sid`.
+fn read_installer_sid() -> Option<String> {
+    let program_data =
+        std::env::var_os("ProgramData").map(std::path::PathBuf::from).unwrap_or_default();
+    let path = program_data.join("mihomo").join("installer-sid");
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(not(any(unix, windows)))]

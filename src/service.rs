@@ -758,6 +758,11 @@ pub fn windows_install_service(ctx: &crate::instance::InstanceContext) -> anyhow
         ServiceInstallCtx, ServiceLabel, ServiceManager, ServiceStartCtx,
     };
 
+    // Persist the installing user's SID — the daemon (running as SYSTEM) reads
+    // it at startup to build the pipe SDDL (it cannot query its own token for
+    // the installer's identity).
+    persist_installer_sid()?;
+
     let manager = <dyn ServiceManager>::native()
         .map_err(|e| anyhow::anyhow!("failed to get service manager: {e}"))?;
     let label: ServiceLabel = "mihomo"
@@ -792,6 +797,75 @@ pub fn windows_install_service(ctx: &crate::instance::InstanceContext) -> anyhow
         .start(ServiceStartCtx { label })
         .map_err(|e| anyhow::anyhow!("failed to start mihomo service: {e}"))?;
     Ok(())
+}
+
+#[cfg(windows)]
+/// Persist the installing user's SID to `%ProgramData%\mihomo\installer-sid`.
+///
+/// The daemon (SYSTEM) reads this at startup to build the pipe SDDL — it cannot
+/// query its own token for the installer's identity.
+fn persist_installer_sid() -> anyhow::Result<()> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            anyhow::bail!("OpenProcessToken failed");
+        }
+
+        // First call gets required size.
+        let mut size: u32 = 0;
+        GetTokenInformation(
+            token,
+            TokenUser,
+            std::ptr::null_mut(),
+            0,
+            &mut size,
+        );
+        let mut buffer = vec![0u8; size as usize];
+        if GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr() as *mut _,
+            size,
+            &mut size,
+        ) == 0
+        {
+            CloseHandle(token);
+            anyhow::bail!("GetTokenInformation(TokenUser) failed");
+        }
+        let token_user = &*(buffer.as_ptr() as *const TOKEN_USER);
+        let user_sid = token_user.User.Sid;
+
+        let mut sid_string_ptr: *mut u16 = std::ptr::null_mut();
+        if ConvertSidToStringSidW(user_sid, &mut sid_string_ptr) == 0 {
+            CloseHandle(token);
+            anyhow::bail!("ConvertSidToStringSidW failed");
+        }
+        let sid_string = {
+            let mut len = 0;
+            while *sid_string_ptr.add(len) != 0 {
+                len += 1;
+            }
+            String::from_utf16_lossy(std::slice::from_raw_parts(sid_string_ptr, len))
+        };
+        windows_sys::Win32::Foundation::LocalFree(sid_string_ptr as *mut _);
+        CloseHandle(token);
+
+        // Write to %ProgramData%\mihomo\installer-sid
+        let program_data = std::env::var_os("ProgramData")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\ProgramData"));
+        let dir = program_data.join("mihomo");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("installer-sid"), sid_string.as_bytes())?;
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
@@ -999,17 +1073,34 @@ fn windows_create_dir_elevated_script(path: &std::path::Path) -> String {
 
 /// Windows: is the current process running with elevated (Administrator) token?
 /// Used to skip the UAC prompt when already elevated (e.g. CI runners, admin shells).
+///
+/// Queries TokenElevation via GetTokenInformation (windows-sys) — more reliable
+/// than spawning `net session` (localization-independent, no subprocess).
 #[cfg(windows)]
 fn is_process_elevated() -> bool {
-    // `net session` succeeds only with an elevated token; fails for a
-    // non-elevated process even in an Administrators group.
-    std::process::Command::new("net.exe")
-        .args(["session"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut size: u32 = 0;
+        let ok = GetTokenInformation(
+            token,
+            windows_sys::Win32::Security::TokenElevation,
+            &mut elevation as *mut _ as *mut _,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut size,
+        ) != 0;
+        CloseHandle(token);
+        ok && elevation.TokenIsElevated != 0
+    }
 }
 
 #[cfg(windows)]
