@@ -171,12 +171,15 @@ jobs:
       - name: Smoke test
         shell: bash
         run: |
-          # Windows artifact is mihomo-cli.exe; expose it as mihomo-cli too
+          # Windows: binary is mihomo-cli.exe; export CLI as per-platform path.
           if [ -f bin/mihomo-cli.exe ]; then
-            cp bin/mihomo-cli.exe bin/mihomo-cli
+            echo "CLI=$PWD/bin/mihomo-cli.exe" >> "$GITHUB_ENV"
+            "$PWD/bin/mihomo-cli.exe" --version
+          else
+            chmod +x bin/mihomo-cli
+            echo "CLI=$PWD/bin/mihomo-cli" >> "$GITHUB_ENV"
+            bin/mihomo-cli --version
           fi
-          chmod +x bin/mihomo-cli 2>/dev/null || true
-          $CLI --version
 
       - name: System mode install
         shell: bash

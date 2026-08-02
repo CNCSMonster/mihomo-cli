@@ -1892,18 +1892,22 @@ mod tests {
     #[tokio::test]
     async fn restart_core_preflights_new_config_before_stopping_current_core() {
         let tmp = tempfile::TempDir::new().unwrap();
+        #[cfg(target_os = "macos")]
+        let config_path = PathBuf::from("/Users/alice/.config/mihomo/config.yaml");
+        #[cfg(not(target_os = "macos"))]
+        let config_path = PathBuf::from("/home/alice/.config/mihomo/config.yaml");
         let state = Arc::new(Mutex::new(DaemonState {
             core_running: true,
             core_child: None,
             core_pid: Some(4242),
             tun_enabled: false,
-            config_path: Some(PathBuf::from("/home/alice/.config/mihomo/config.yaml")),
+            config_path: Some(config_path.clone()),
             core_binary: Some(expected_system_core_binary_path()),
             api_endpoint: Some("/var/run/mihomo/mihomo.sock".to_string()),
             pid_file: tmp.path().join("core.pid"),
             core_log_file: tmp.path().join("mihomo.log"),
         }));
-        let missing_config = PathBuf::from("/home/alice/.config/mihomo/config.yaml");
+        let missing_config = config_path.clone();
 
         let response = process_command(
             DaemonCommand::RestartCore {
