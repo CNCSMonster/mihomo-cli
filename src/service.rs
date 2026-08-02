@@ -901,16 +901,14 @@ fn windows_elevated_powershell_plan(script: &str) -> WindowsElevatedCommandPlan 
 }
 
 fn windows_elevated_native_command_script(program: &str, args: &[String]) -> String {
-    let quoted_args = args
-        .iter()
-        .map(|arg| powershell_single_quote(arg))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "$p=Start-Process -FilePath {} -ArgumentList @({}) -Wait -PassThru; exit $p.ExitCode",
-        powershell_single_quote(program),
-        quoted_args
-    )
+    // Use the PowerShell call operator `&` so each argument is passed verbatim.
+    // Start-Process -ArgumentList would re-parse embedded quotes in args like
+    // `binPath= "C:\...\mihomo-cli.exe" daemon` and break sc.exe's binPath.
+    let mut parts = vec![format!("& '{}'", program.replace('\'', "''"))];
+    for arg in args {
+        parts.push(format!("'{}'", arg.replace('\'', "''")));
+    }
+    format!("{}; exit $LASTEXITCODE", parts.join(" "))
 }
 
 fn windows_copy_file_elevated_script(source: &std::path::Path, target: &std::path::Path) -> String {
@@ -1197,7 +1195,6 @@ pub fn run_instance_command(command: &crate::instance::PlannedCommand) -> anyhow
             return run_windows_elevated_powershell(&script);
         }
     }
-
     let status = std::process::Command::new(&command.program)
         .args(&command.args)
         .stdin(std::process::Stdio::inherit())
@@ -1968,9 +1965,11 @@ mod tests {
                 "binPath= C:\\Program Files\\mihomo\\mihomo-cli.exe daemon".to_string(),
             ],
         );
-        assert!(script.contains("Start-Process -FilePath 'sc.exe'"));
+        // Call operator preserves embedded quotes verbatim (Start-Process
+        // would re-parse them and break sc.exe binPath).
+        assert!(script.starts_with("& 'sc.exe'"));
         assert!(script.contains("'binPath= C:\\Program Files\\mihomo\\mihomo-cli.exe daemon'"));
-        assert!(script.contains("exit $p.ExitCode"));
+        assert!(script.contains("exit $LASTEXITCODE"));
 
         let plan = windows_elevated_powershell_plan(&script);
         assert_eq!(plan.program, "powershell.exe");
