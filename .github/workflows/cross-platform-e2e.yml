@@ -113,9 +113,10 @@ jobs:
         run: |
           # Preseed a minimal config at the platform config path.
           # Windows user mode uses a named-pipe controller; unix uses HTTP.
+          # NOTE: use %s printf to avoid \\ escaping eating backslashes.
           case "${{ matrix.os }}" in
             windows-latest) CFG_DIR="$APPDATA/mihomo"
-              printf 'mixed-port: 18789\nlog-level: info\nexternal-controller-pipe: \\.\\pipe\\mihomo-core\n' > "$CFG_DIR/config.yaml" ;;
+              printf 'mixed-port: 18789\nlog-level: info\nexternal-controller-pipe: %s\n' '\\.\pipe\mihomo-core' > "$CFG_DIR/config.yaml" ;;
             *) CFG_DIR="$HOME/.config/mihomo"
               mkdir -p "$CFG_DIR"
               printf 'mixed-port: 18789\nlog-level: info\nexternal-controller: 127.0.0.1:18790\n' > "$CFG_DIR/config.yaml" ;;
@@ -198,7 +199,7 @@ jobs:
           # Preseed a minimal config (Windows: named-pipe controller; unix: HTTP).
           case "${{ matrix.os }}" in
             windows-latest) CFG_DIR="$APPDATA/mihomo"
-              printf 'mixed-port: 18789\nlog-level: info\nexternal-controller-pipe: \\.\\pipe\\mihomo-core\n' > "$CFG_DIR/config.yaml" ;;
+              printf 'mixed-port: 18789\nlog-level: info\nexternal-controller-pipe: %s\n' '\\.\pipe\mihomo-core' > "$CFG_DIR/config.yaml" ;;
             *) CFG_DIR="$HOME/.config/mihomo"
               mkdir -p "$CFG_DIR"
               printf 'mixed-port: 18789\nlog-level: info\nexternal-controller: 127.0.0.1:18790\n' > "$CFG_DIR/config.yaml" ;;
@@ -224,9 +225,10 @@ jobs:
           $CLI uninstall --system --yes
           # N1c: after uninstall, status must report no service installed.
           # NOTE: "Mode: system service" is a label shown even when uninstalled;
-          # assert on the "no service" presence line instead.
-          $CLI status | grep -iE "no service is installed|No service"
-          if $CLI status | grep -iE "service is installed|installed service detection"; then
+          # "No service is installed." is the presence line we assert on.
+          OUT=$($CLI status)
+          echo "$OUT" | grep -iE "^[ ]*no service is installed"
+          if echo "$OUT" | grep -viE "no service" | grep -iE "service is installed|installed service detection"; then
             echo "ERROR: service still present after uninstall"
             exit 1
           fi
