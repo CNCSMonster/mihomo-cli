@@ -492,8 +492,25 @@ async fn process_windows_command(
     cmd: DaemonCommand,
     state: Arc<Mutex<WindowsDaemonState>>,
 ) -> DaemonResponse {
+    // Token auth (N1a): reject commands whose token does not match the
+    // server-side copy. Skipped when the server has no token (legacy install).
+    if let Some(server_token) = crate::ipc::windows_service_token() {
+        let client_token = match &cmd {
+            DaemonCommand::StartCore { token, .. }
+            | DaemonCommand::RestartCore { token, .. }
+            | DaemonCommand::EnableTun { token, .. }
+            | DaemonCommand::StopCore { token }
+            | DaemonCommand::DisableTun { token }
+            | DaemonCommand::GetStatus { token } => token.as_deref(),
+        };
+        if client_token != Some(server_token.as_str()) {
+            return DaemonResponse::Error {
+                message: "invalid or missing auth token".to_string(),
+            };
+        }
+    }
     match cmd {
-        DaemonCommand::GetStatus => {
+        DaemonCommand::GetStatus { .. } => {
             let mut s = state.lock().await;
             reap_exited_windows_core(&mut s);
             if let Some(tun_enabled) = read_tun_enabled_from_config(s.config_path.as_ref()) {
@@ -506,11 +523,11 @@ async fn process_windows_command(
                 config_path: s.config_path.clone(),
             }
         }
-        DaemonCommand::StartCore { config_path } => {
+        DaemonCommand::StartCore { config_path, .. } => {
             start_windows_core(state, config_path, expected_system_core_binary_path()).await
         }
-        DaemonCommand::StopCore => stop_windows_core(state).await,
-        DaemonCommand::RestartCore { config_path } => {
+        DaemonCommand::StopCore { .. } => stop_windows_core(state).await,
+        DaemonCommand::RestartCore { config_path, .. } => {
             let core_binary = expected_system_core_binary_path();
             if let Err(message) = preflight_system_core_start_request(&config_path, &core_binary) {
                 return DaemonResponse::Error { message };
@@ -527,6 +544,7 @@ async fn process_windows_command(
             config_path,
             stack,
             dns_hijack,
+            ..
         } => {
             if let Err(message) = validate_daemon_config_path_shape(&config_path) {
                 return DaemonResponse::Error { message };
@@ -540,7 +558,7 @@ async fn process_windows_command(
             )
             .await
         }
-        DaemonCommand::DisableTun => {
+        DaemonCommand::DisableTun { .. } => {
             let config_path = {
                 let s = state.lock().await;
                 s.config_path.clone()
@@ -939,7 +957,7 @@ async fn handle_connection(
     // single global mutex held for the *entire* operation — including core
     // spawn and readiness wait — so concurrent clients cannot interleave.
     // GetStatus is read-only and does not take the lifecycle lock.
-    let is_lifecycle = !matches!(cmd, DaemonCommand::GetStatus);
+    let is_lifecycle = !matches!(cmd, DaemonCommand::GetStatus { token: None });
     let response = if is_lifecycle {
         let lock = OWNER_LIFECYCLE_LOCK
             .get_or_init(|| tokio::sync::Mutex::new(()));
@@ -968,7 +986,7 @@ async fn process_command(
     peer_uid: Option<u32>,
 ) -> DaemonResponse {
     match cmd {
-        DaemonCommand::GetStatus => {
+        DaemonCommand::GetStatus { .. } => {
             let mut s = state.lock().await;
             reap_exited_core(&mut s);
             if let Some(tun_enabled) = read_tun_enabled_from_config(s.config_path.as_ref()) {
@@ -981,14 +999,14 @@ async fn process_command(
                 config_path: s.config_path.clone(),
             }
         }
-        DaemonCommand::StartCore { config_path } => {
+        DaemonCommand::StartCore { config_path, .. } => {
             if let Err(message) = validate_daemon_config_path_for_peer(&config_path, peer_uid) {
                 return DaemonResponse::Error { message };
             }
             start_core(state, config_path, expected_system_core_binary_path()).await
         }
-        DaemonCommand::StopCore => stop_core(state).await,
-        DaemonCommand::RestartCore { config_path } => {
+        DaemonCommand::StopCore { .. } => stop_core(state).await,
+        DaemonCommand::RestartCore { config_path, .. } => {
             if let Err(message) = validate_daemon_config_path_for_peer(&config_path, peer_uid) {
                 return DaemonResponse::Error { message };
             }
@@ -1008,6 +1026,7 @@ async fn process_command(
             config_path,
             stack,
             dns_hijack,
+            ..
         } => {
             if let Err(message) = validate_daemon_config_path_for_peer(&config_path, peer_uid) {
                 return DaemonResponse::Error { message };
@@ -1072,7 +1091,7 @@ async fn process_command(
                 },
             }
         }
-        DaemonCommand::DisableTun => {
+        DaemonCommand::DisableTun { .. } => {
             let api_endpoint = {
                 let mut s = state.lock().await;
                 reap_exited_core(&mut s);
@@ -2202,9 +2221,7 @@ mod tests {
         let missing_config = config_path.clone();
 
         let response = process_command(
-            DaemonCommand::RestartCore {
-                config_path: missing_config,
-            },
+            DaemonCommand::RestartCore { config_path: missing_config, token: None },
             Arc::clone(&state),
             Some(0),
         )
@@ -2493,17 +2510,15 @@ second
         let guard = lock.lock().await;
 
         // 持锁时，GetStatus 仍应立即执行（不取生命周期锁）
-        let cmd = DaemonCommand::GetStatus;
-        let is_lifecycle = !matches!(cmd, DaemonCommand::GetStatus);
+        let cmd = DaemonCommand::GetStatus { token: None };
+        let is_lifecycle = !matches!(cmd, DaemonCommand::GetStatus { token: None });
         assert!(!is_lifecycle, "GetStatus must not be a lifecycle command");
 
         drop(guard);
 
         // 生命周期命令（StartCore）应标记为需要锁
-        let cmd = DaemonCommand::StartCore {
-            config_path: PathBuf::from("/tmp/x/config.yaml"),
-        };
-        let is_lifecycle = !matches!(cmd, DaemonCommand::GetStatus);
+        let cmd = DaemonCommand::StartCore { config_path: PathBuf::from("/tmp/x/config.yaml"), token: None };
+        let is_lifecycle = !matches!(cmd, DaemonCommand::GetStatus { token: None });
         assert!(is_lifecycle, "StartCore must be a lifecycle command");
     }
 

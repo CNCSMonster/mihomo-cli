@@ -2670,9 +2670,10 @@ async fn cmd_tun_resolved(
                 config_path: resolved.ctx.paths.config_file.clone(),
                 stack: stack.as_ref().map(ToString::to_string),
                 dns_hijack: dns_hijack.clone(),
+                token: None,
             },
-            Some(TunAction::Off) => ipc::DaemonCommand::DisableTun,
-            Some(TunAction::Status) | None => ipc::DaemonCommand::GetStatus,
+            Some(TunAction::Off) => ipc::DaemonCommand::DisableTun { token: None },
+            Some(TunAction::Status) | None => ipc::DaemonCommand::GetStatus { token: None },
         };
         let resp = match ipc::send_command(&cmd).await {
             Ok(resp) => resp,
@@ -3149,13 +3150,9 @@ async fn cmd_lifecycle_instance_mode(
         }
 
         let cmd = match action {
-            instance::ServiceAction::Start => ipc::DaemonCommand::StartCore {
-                config_path: ctx.paths.config_file.clone(),
-            },
-            instance::ServiceAction::Stop => ipc::DaemonCommand::StopCore,
-            instance::ServiceAction::Restart => ipc::DaemonCommand::RestartCore {
-                config_path: ctx.paths.config_file.clone(),
-            },
+            instance::ServiceAction::Start => ipc::DaemonCommand::StartCore { config_path: ctx.paths.config_file.clone(), token: None },
+            instance::ServiceAction::Stop => ipc::DaemonCommand::StopCore { token: None },
+            instance::ServiceAction::Restart => ipc::DaemonCommand::RestartCore { config_path: ctx.paths.config_file.clone(), token: None },
             _ => return Err(anyhow::anyhow!("unsupported lifecycle action via IPC")),
         };
         let resp = ipc::send_command(&cmd).await?;
@@ -3239,9 +3236,7 @@ async fn cmd_lifecycle_instance_mode(
 }
 
 fn system_core_start_command(ctx: &instance::InstanceContext) -> ipc::DaemonCommand {
-    ipc::DaemonCommand::StartCore {
-        config_path: ctx.paths.config_file.clone(),
-    }
+    ipc::DaemonCommand::StartCore { config_path: ctx.paths.config_file.clone(), token: None }
 }
 
 async fn start_system_core_via_daemon(ctx: &instance::InstanceContext) -> anyhow::Result<()> {
@@ -3465,7 +3460,7 @@ async fn cmd_status_context_with_source(
                 "  Daemon IPC:    ✅ {}",
                 ipc::system_service_socket_path().display()
             );
-            match ipc::send_command(&ipc::DaemonCommand::GetStatus).await {
+            match ipc::send_command(&ipc::DaemonCommand::GetStatus { token: None }).await {
                 Ok(ipc::DaemonResponse::Status {
                     running,
                     tun_enabled,
@@ -5435,7 +5430,7 @@ async fn system_proxy_tun_active_message() -> Option<String> {
     if !ipc::is_daemon_running().await {
         return None;
     }
-    match ipc::send_command(&ipc::DaemonCommand::GetStatus).await {
+    match ipc::send_command(&ipc::DaemonCommand::GetStatus { token: None }).await {
         Ok(ipc::DaemonResponse::Status {
             tun_enabled: true, ..
         }) => Some(system_proxy_tun_active_message_text().to_string()),
@@ -8624,7 +8619,7 @@ vmess://example"
             &instance::PathInputs::for_tests(),
         );
         match system_core_start_command(&ctx) {
-            ipc::DaemonCommand::StartCore { config_path } => {
+            ipc::DaemonCommand::StartCore { config_path, .. } => {
                 assert_eq!(
                     config_path,
                     std::path::PathBuf::from("/Users/alice/.config/mihomo/config.yaml")

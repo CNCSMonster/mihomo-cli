@@ -762,6 +762,9 @@ pub fn windows_install_service(ctx: &crate::instance::InstanceContext) -> anyhow
     // it at startup to build the pipe SDDL (it cannot query its own token for
     // the installer's identity).
     persist_installer_sid()?;
+    // Generate + persist the daemon IPC auth token (N1a: double copy —
+    // server %ProgramData%\mihomo\service-token, client <config_dir>\service-client-token).
+    persist_service_token(ctx)?;
 
     let manager = <dyn ServiceManager>::native()
         .map_err(|e| anyhow::anyhow!("failed to get service manager: {e}"))?;
@@ -866,6 +869,32 @@ fn persist_installer_sid() -> anyhow::Result<()> {
         std::fs::write(dir.join("installer-sid"), sid_string.as_bytes())?;
         Ok(())
     }
+}
+
+#[cfg(windows)]
+/// Generate a 32-byte random token and persist it in two copies (N1a):
+/// - server: `%ProgramData%\mihomo\service-token` (daemon reads for validation)
+/// - client: `<config_dir>\service-client-token` (CLI reads to attach)
+fn persist_service_token(ctx: &crate::instance::InstanceContext) -> anyhow::Result<()> {
+    use rand::RngCore;
+
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let token = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+
+    let program_data = std::env::var_os("ProgramData")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\ProgramData"));
+    let server_dir = program_data.join("mihomo");
+    std::fs::create_dir_all(&server_dir)?;
+    std::fs::write(server_dir.join("service-token"), token.as_bytes())?;
+
+    std::fs::create_dir_all(&ctx.paths.config_dir)?;
+    std::fs::write(
+        ctx.paths.config_dir.join("service-client-token"),
+        token.as_bytes(),
+    )?;
+    Ok(())
 }
 
 #[cfg(windows)]

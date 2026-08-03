@@ -14,21 +14,46 @@ use std::path::PathBuf;
 #[serde(tag = "type", deny_unknown_fields)]
 pub enum DaemonCommand {
     /// Start the mihomo core with the given config.
-    StartCore { config_path: PathBuf },
+    StartCore {
+        config_path: PathBuf,
+        /// Windows-only auth token (None on unix — peer uid validation).
+        #[serde(default)]
+        token: Option<String>,
+    },
     /// Stop the mihomo core.
-    StopCore,
+    StopCore {
+        /// Windows-only auth token (None on unix — peer uid validation).
+        #[serde(default)]
+        token: Option<String>,
+    },
     /// Restart the mihomo core.
-    RestartCore { config_path: PathBuf },
+    RestartCore {
+        config_path: PathBuf,
+        /// Windows-only auth token (None on unix — peer uid validation).
+        #[serde(default)]
+        token: Option<String>,
+    },
     /// Enable TUN mode.
     EnableTun {
         config_path: PathBuf,
         stack: Option<String>,
         dns_hijack: Option<String>,
+        /// Windows-only auth token (None on unix — peer uid validation).
+        #[serde(default)]
+        token: Option<String>,
     },
     /// Disable TUN mode.
-    DisableTun,
+    DisableTun {
+        /// Windows-only auth token (None on unix — peer uid validation).
+        #[serde(default)]
+        token: Option<String>,
+    },
     /// Query daemon status.
-    GetStatus,
+    GetStatus {
+        /// Windows-only auth token (None on unix — peer uid validation).
+        #[serde(default)]
+        token: Option<String>,
+    },
 }
 
 /// Responses sent from Daemon → CLI.
@@ -46,6 +71,45 @@ pub enum DaemonResponse {
         core_pid: Option<u32>,
         config_path: Option<PathBuf>,
     },
+}
+
+/// Windows-only auth token for the CLI side of the daemon IPC.
+///
+/// Reads the client copy of the install-time generated token
+/// (`<config_dir>/service-client-token`). Returns None on unix or when the
+/// token file is absent (e.g. legacy installs) — daemon validates only when
+/// it has a server-side token to compare against.
+#[cfg(windows)]
+pub fn windows_client_token(config_dir: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(config_dir.join("service-client-token"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(not(windows))]
+pub fn windows_client_token(_config_dir: &std::path::Path) -> Option<String> {
+    None
+}
+
+/// Windows-only server-side token for daemon IPC validation.
+///
+/// Reads `%ProgramData%\mihomo\service-token` (written at install time).
+/// None when absent (legacy install / unix) — validation is skipped then.
+#[cfg(windows)]
+pub fn windows_service_token() -> Option<String> {
+    let program_data = std::env::var_os("ProgramData")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\ProgramData"));
+    std::fs::read_to_string(program_data.join("mihomo").join("service-token"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(not(windows))]
+pub fn windows_service_token() -> Option<String> {
+    None
 }
 
 /// IPC socket path for the system service.
@@ -152,6 +216,12 @@ pub async fn send_command(cmd: &DaemonCommand) -> anyhow::Result<DaemonResponse>
     use tokio::io::BufReader;
     use tokio::net::windows::named_pipe::ClientOptions;
 
+    // Attach the Windows client token (auth for the daemon). config_dir is the
+    // default user config directory; the client copy lives there.
+    let config_dir = crate::utils::AppPaths::from_system().config_dir().to_path_buf();
+    let token = windows_client_token(&config_dir);
+    let cmd = with_windows_token(cmd.clone(), token);
+
     let pipe_path = system_service_socket_path();
     let mut pipe = ClientOptions::new().open(&pipe_path).map_err(|e| {
         anyhow::anyhow!(
@@ -163,7 +233,7 @@ pub async fn send_command(cmd: &DaemonCommand) -> anyhow::Result<DaemonResponse>
         )
     })?;
 
-    write_json_message(&mut pipe, cmd).await?;
+    write_json_message(&mut pipe, &cmd).await?;
     let mut reader = BufReader::new(pipe);
     let read = async { read_json_message(&mut reader, "daemon response").await };
     tokio::time::timeout(std::time::Duration::from_secs(20), read)
@@ -175,6 +245,30 @@ pub async fn send_command(cmd: &DaemonCommand) -> anyhow::Result<DaemonResponse>
                  Check the service status."
             )
         })?
+}
+
+/// Inject the auth token into a cloned command (all variants carry `token`).
+#[cfg(windows)]
+fn with_windows_token(cmd: DaemonCommand, token: Option<String>) -> DaemonCommand {
+    use DaemonCommand::*;
+    match cmd {
+        StartCore { config_path, .. } => StartCore { config_path, token },
+        StopCore { .. } => StopCore { token },
+        RestartCore { config_path, .. } => RestartCore { config_path, token },
+        EnableTun {
+            config_path,
+            stack,
+            dns_hijack,
+            ..
+        } => EnableTun {
+            config_path,
+            stack,
+            dns_hijack,
+            token,
+        },
+        DisableTun { .. } => DisableTun { token },
+        GetStatus { .. } => GetStatus { token },
+    }
 }
 
 /// Send a command to the daemon and wait for a response.
@@ -216,27 +310,23 @@ mod tests {
 
     #[test]
     fn daemon_command_serialization() {
-        let cmd = DaemonCommand::GetStatus;
+        let cmd = DaemonCommand::GetStatus { token: None };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"type\":\"GetStatus\""));
 
         let deserialized: DaemonCommand = serde_json::from_str(&json).unwrap();
-        assert!(matches!(deserialized, DaemonCommand::GetStatus));
+        assert!(matches!(deserialized, DaemonCommand::GetStatus { token: None }));
     }
 
     #[test]
     fn daemon_start_restart_commands_do_not_accept_client_supplied_core_binary() {
-        let start = DaemonCommand::StartCore {
-            config_path: PathBuf::from("/home/alice/.config/mihomo/config.yaml"),
-        };
+        let start = DaemonCommand::StartCore { config_path: PathBuf::from("/home/alice/.config/mihomo/config.yaml"), token: None };
         let json = serde_json::to_string(&start).unwrap();
         assert!(json.contains("\"type\":\"StartCore\""));
         assert!(json.contains("config_path"));
         assert!(!json.contains("core_binary"));
 
-        let restart = DaemonCommand::RestartCore {
-            config_path: PathBuf::from("/home/alice/.config/mihomo/config.yaml"),
-        };
+        let restart = DaemonCommand::RestartCore { config_path: PathBuf::from("/home/alice/.config/mihomo/config.yaml"), token: None };
         let json = serde_json::to_string(&restart).unwrap();
         assert!(json.contains("\"type\":\"RestartCore\""));
         assert!(json.contains("config_path"));
@@ -294,13 +384,13 @@ mod tests {
     #[tokio::test]
     async fn length_prefixed_json_helpers_roundtrip() {
         let (mut client, mut server) = tokio::io::duplex(1024);
-        let cmd = DaemonCommand::GetStatus;
+        let cmd = DaemonCommand::GetStatus { token: None };
         let writer = tokio::spawn(async move { write_json_message(&mut client, &cmd).await });
         let decoded: DaemonCommand = read_json_message(&mut server, "daemon command")
             .await
             .unwrap();
         writer.await.unwrap().unwrap();
-        assert!(matches!(decoded, DaemonCommand::GetStatus));
+        assert!(matches!(decoded, DaemonCommand::GetStatus { token: None }));
     }
 
     #[tokio::test]
@@ -323,12 +413,10 @@ mod tests {
 
     #[test]
     fn start_core_command_roundtrip() {
-        let cmd = DaemonCommand::StartCore {
-            config_path: PathBuf::from("/home/user/.config/mihomo/config.yaml"),
-        };
+        let cmd = DaemonCommand::StartCore { config_path: PathBuf::from("/home/user/.config/mihomo/config.yaml"), token: None };
         let json = serde_json::to_string(&cmd).unwrap();
         let deserialized: DaemonCommand = serde_json::from_str(&json).unwrap();
-        if let DaemonCommand::StartCore { config_path } = deserialized {
+        if let DaemonCommand::StartCore { config_path, .. } = deserialized {
             assert_eq!(
                 config_path,
                 PathBuf::from("/home/user/.config/mihomo/config.yaml")
