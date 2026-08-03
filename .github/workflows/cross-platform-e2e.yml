@@ -106,11 +106,18 @@ jobs:
             bin/mihomo-cli version
           fi
 
-      # install --skip-config：非交互安装，跳过订阅配置步骤
-      # （CI 无真实订阅；config 留空，service 生命周期验证不受影响）
+      # install --skip-config + 预置最小 config（端口 7898 避开 runner 占用）：
+      # install 检测到 config 存在即跳过订阅交互，core 用 7898 启动。
       - name: User mode install
         shell: bash
         run: |
+          # Preseed a minimal config at the platform config path.
+          case "${{ matrix.os }}" in
+            windows-latest) CFG_DIR="$APPDATA/mihomo" ;;
+            *) CFG_DIR="$HOME/.config/mihomo" ;;
+          esac
+          mkdir -p "$CFG_DIR"
+          printf 'mixed-port: 7898\nlog-level: info\nexternal-controller: 127.0.0.1:9098\n' > "$CFG_DIR/config.yaml"
           $CLI install --user --skip-config
           echo "=== status after install ==="
           $CLI status
@@ -184,6 +191,13 @@ jobs:
       - name: System mode install
         shell: bash
         run: |
+          # Preseed a minimal config (port 7898 avoids runner conflicts).
+          case "${{ matrix.os }}" in
+            windows-latest) CFG_DIR="$APPDATA/mihomo" ;;
+            *) CFG_DIR="$HOME/.config/mihomo" ;;
+          esac
+          mkdir -p "$CFG_DIR"
+          printf 'mixed-port: 7898\nlog-level: info\nexternal-controller: 127.0.0.1:9098\n' > "$CFG_DIR/config.yaml"
           $CLI install --system --skip-config
           echo "=== status after install ==="
           $CLI status
