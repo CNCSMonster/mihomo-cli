@@ -122,12 +122,14 @@ jobs:
           echo "=== status after install ==="
           $CLI status
 
-      - name: User mode lifecycle (start/status/stop)
+      - name: User mode lifecycle (stop/start/status)
         shell: bash
         run: |
+          # install already started the core (API ready); verify stop → start cycle.
+          $CLI stop
+          $CLI status
           $CLI start
           $CLI status
-          $CLI stop
 
       - name: User mode uninstall
         shell: bash
@@ -204,12 +206,12 @@ jobs:
           # N1c: strong assertion — service must be installed (system service)
           $CLI status | grep -i "system service"
 
-      - name: System mode lifecycle (start/status/stop/start)
+      - name: System mode lifecycle (stop/start/status)
         shell: bash
         run: |
-          $CLI start
-          $CLI status
+          # install already started the core; verify stop → start cycle.
           $CLI stop
+          $CLI status
           $CLI start
           $CLI status
 
