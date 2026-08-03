@@ -113,19 +113,19 @@ jobs:
         run: |
           $CLI install --user --skip-config
           echo "=== status after install ==="
-          $CLI status || true
+          $CLI status
 
       - name: User mode lifecycle (start/status/stop)
         shell: bash
         run: |
-          $CLI start || true
-          $CLI status || true
-          $CLI stop || true
+          $CLI start
+          $CLI status
+          $CLI stop
 
       - name: User mode uninstall
         shell: bash
         run: |
-          $CLI uninstall --user --yes || true
+          $CLI uninstall --user --yes
 
       - name: Diagnostics
         if: always()
@@ -186,21 +186,28 @@ jobs:
         run: |
           $CLI install --system --skip-config
           echo "=== status after install ==="
-          $CLI status || true
+          $CLI status
+          # N1c: strong assertion — service must be installed (system service)
+          $CLI status | grep -i "system service"
 
       - name: System mode lifecycle (start/status/stop/start)
         shell: bash
         run: |
-          $CLI start || true
-          $CLI status || true
-          $CLI stop || true
-          $CLI start || true
-          $CLI status || true
+          $CLI start
+          $CLI status
+          $CLI stop
+          $CLI start
+          $CLI status
 
       - name: System mode uninstall
         shell: bash
         run: |
-          $CLI uninstall --system --yes || true
+          $CLI uninstall --system --yes
+          # N1c: after uninstall, no service may remain
+          if $CLI status | grep -i "system service"; then
+            echo "ERROR: service still present after uninstall"
+            exit 1
+          fi
 
       - name: Diagnostics
         if: always()

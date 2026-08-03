@@ -380,7 +380,38 @@ mod windows_service_entry {
         service_dispatcher::start(SERVICE_LABEL, ffi_service_main)
     }
 
+    /// Redirect stderr (and stdout) to `%ProgramData%\mihomo\mihomo.log` —
+    /// the SCM service process has no console (N1b).
+    fn redirect_stderr_to_log() {
+        use std::os::windows::io::AsRawHandle;
+
+        let program_data = std::env::var_os("ProgramData")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\ProgramData"));
+        let dir = program_data.join("mihomo");
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let log_path = dir.join("mihomo.log");
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            unsafe {
+                let _ = windows_sys::Win32::System::Console::SetStdHandle(
+                    windows_sys::Win32::System::Console::STD_ERROR_HANDLE,
+                    file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+                );
+            }
+        }
+    }
+
     fn service_main(_arguments: Vec<OsString>) {
+        // N1b: the SCM service has no console — redirect stderr to a log file
+        // so daemon diagnostics (pipe failures, core errors) are recoverable.
+        redirect_stderr_to_log();
+
         let stop = CancellationToken::new();
         let handler_stop = stop.clone();
 

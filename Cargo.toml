@@ -44,7 +44,7 @@ strip = true
 reqwest = { version = "0.12", default-features = false, features = ["native-tls", "json", "stream", "system-proxy"] }
 service-manager = "=0.11.0"
 windows-service = "=0.8.1"
-windows-sys = { version = "=0.60", features = ["Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_Foundation"] }
+windows-sys = { version = "=0.60", features = ["Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_Console", "Win32_Foundation"] }
 
 [target.'cfg(not(windows))'.dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "system-proxy"] }
