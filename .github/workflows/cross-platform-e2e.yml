@@ -106,18 +106,20 @@ jobs:
             bin/mihomo-cli version
           fi
 
-      # install --skip-config + 预置最小 config（端口 7898 避开 runner 占用）：
-      # install 检测到 config 存在即跳过订阅交互，core 用 7898 启动。
+      # install --skip-config + 预置最小 config（端口 18789 避开 runner 占用）：
+      # install 检测到 config 存在即跳过订阅交互，core 用 18789 启动。
       - name: User mode install
         shell: bash
         run: |
           # Preseed a minimal config at the platform config path.
+          # Windows user mode uses a named-pipe controller; unix uses HTTP.
           case "${{ matrix.os }}" in
-            windows-latest) CFG_DIR="$APPDATA/mihomo" ;;
-            *) CFG_DIR="$HOME/.config/mihomo" ;;
+            windows-latest) CFG_DIR="$APPDATA/mihomo"
+              printf 'mixed-port: 18789\nlog-level: info\nexternal-controller-pipe: \\.\\pipe\\mihomo-core\n' > "$CFG_DIR/config.yaml" ;;
+            *) CFG_DIR="$HOME/.config/mihomo"
+              mkdir -p "$CFG_DIR"
+              printf 'mixed-port: 18789\nlog-level: info\nexternal-controller: 127.0.0.1:18790\n' > "$CFG_DIR/config.yaml" ;;
           esac
-          mkdir -p "$CFG_DIR"
-          printf 'mixed-port: 18789\nlog-level: info\nexternal-controller: 127.0.0.1:18790\n' > "$CFG_DIR/config.yaml"
           $CLI install --user --skip-config
           echo "=== status after install ==="
           $CLI status
@@ -193,13 +195,14 @@ jobs:
       - name: System mode install
         shell: bash
         run: |
-          # Preseed a minimal config (port 7898 avoids runner conflicts).
+          # Preseed a minimal config (Windows: named-pipe controller; unix: HTTP).
           case "${{ matrix.os }}" in
-            windows-latest) CFG_DIR="$APPDATA/mihomo" ;;
-            *) CFG_DIR="$HOME/.config/mihomo" ;;
+            windows-latest) CFG_DIR="$APPDATA/mihomo"
+              printf 'mixed-port: 18789\nlog-level: info\nexternal-controller-pipe: \\.\\pipe\\mihomo-core\n' > "$CFG_DIR/config.yaml" ;;
+            *) CFG_DIR="$HOME/.config/mihomo"
+              mkdir -p "$CFG_DIR"
+              printf 'mixed-port: 18789\nlog-level: info\nexternal-controller: 127.0.0.1:18790\n' > "$CFG_DIR/config.yaml" ;;
           esac
-          mkdir -p "$CFG_DIR"
-          printf 'mixed-port: 18789\nlog-level: info\nexternal-controller: 127.0.0.1:18790\n' > "$CFG_DIR/config.yaml"
           $CLI install --system --skip-config
           echo "=== status after install ==="
           $CLI status
@@ -219,8 +222,11 @@ jobs:
         shell: bash
         run: |
           $CLI uninstall --system --yes
-          # N1c: after uninstall, no service may remain
-          if $CLI status | grep -i "system service"; then
+          # N1c: after uninstall, status must report no service installed.
+          # NOTE: "Mode: system service" is a label shown even when uninstalled;
+          # assert on the "no service" presence line instead.
+          $CLI status | grep -iE "no service is installed|No service"
+          if $CLI status | grep -iE "service is installed|installed service detection"; then
             echo "ERROR: service still present after uninstall"
             exit 1
           fi
