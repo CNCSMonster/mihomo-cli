@@ -1106,7 +1106,7 @@ fn windows_create_dir_elevated_script(path: &std::path::Path) -> String {
 /// Queries TokenElevation via GetTokenInformation (windows-sys) — more reliable
 /// than spawning `net session` (localization-independent, no subprocess).
 #[cfg(windows)]
-fn is_process_elevated() -> bool {
+pub(crate) fn is_process_elevated() -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::Security::{
         GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY,

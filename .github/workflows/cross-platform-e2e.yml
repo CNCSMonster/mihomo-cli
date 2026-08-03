@@ -117,7 +117,7 @@ jobs:
             *) CFG_DIR="$HOME/.config/mihomo" ;;
           esac
           mkdir -p "$CFG_DIR"
-          printf 'mixed-port: 7898\nlog-level: info\nexternal-controller: 127.0.0.1:9098\n' > "$CFG_DIR/config.yaml"
+          printf 'mixed-port: 18789\nlog-level: info\nexternal-controller: 127.0.0.1:18790\n' > "$CFG_DIR/config.yaml"
           $CLI install --user --skip-config
           echo "=== status after install ==="
           $CLI status
@@ -197,7 +197,7 @@ jobs:
             *) CFG_DIR="$HOME/.config/mihomo" ;;
           esac
           mkdir -p "$CFG_DIR"
-          printf 'mixed-port: 7898\nlog-level: info\nexternal-controller: 127.0.0.1:9098\n' > "$CFG_DIR/config.yaml"
+          printf 'mixed-port: 18789\nlog-level: info\nexternal-controller: 127.0.0.1:18790\n' > "$CFG_DIR/config.yaml"
           $CLI install --system --skip-config
           echo "=== status after install ==="
           $CLI status

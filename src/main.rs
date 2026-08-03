@@ -1892,6 +1892,15 @@ async fn cmd_autostart(
 
 #[cfg(target_os = "linux")]
 async fn set_autostart(mode: instance::InstanceMode, enable: bool) -> anyhow::Result<()> {
+    // N4b: system-mode autostart needs privilege; give a clear hint before
+    // the systemctl call fails with an opaque error.
+    if mode == instance::InstanceMode::System && unsafe { libc::geteuid() } != 0 {
+        anyhow::bail!(
+            "autostart for the system service requires root.\n  \
+             Run with sudo: sudo mihomo-cli autostart {} --system",
+            if enable { "on" } else { "off" }
+        );
+    }
     let mut cmd = std::process::Command::new("systemctl");
     if mode == instance::InstanceMode::User {
         cmd.arg("--user");
@@ -1921,6 +1930,14 @@ async fn query_autostart(mode: instance::InstanceMode) -> anyhow::Result<()> {
 
 #[cfg(target_os = "macos")]
 async fn set_autostart(mode: instance::InstanceMode, enable: bool) -> anyhow::Result<()> {
+    // N4b: system-domain launchctl needs root; hint before opaque failure.
+    if mode == instance::InstanceMode::System && unsafe { libc::geteuid() } != 0 {
+        anyhow::bail!(
+            "autostart for the system service requires root.\n  \
+             Run with sudo: sudo mihomo-cli autostart {} --system",
+            if enable { "on" } else { "off" }
+        );
+    }
     let domain = launchctl_domain(mode)?;
     let label = format!("{domain}/io.mihomo");
     let action = if enable { "enable" } else { "disable" };
@@ -1976,6 +1993,13 @@ fn launchctl_domain(mode: instance::InstanceMode) -> anyhow::Result<String> {
 async fn set_autostart(mode: instance::InstanceMode, enable: bool) -> anyhow::Result<()> {
     match mode {
         instance::InstanceMode::System => {
+            // N4b: sc config needs an elevated token; hint before opaque failure.
+            if !service::is_process_elevated() {
+                anyhow::bail!(
+                    "autostart for the system service requires an elevated (Administrator) shell.\n  \
+                     Run from an Administrator terminal."
+                );
+            }
             let start_type = if enable { "auto" } else { "demand" };
             let status = std::process::Command::new("sc.exe")
                 .args(["config", "mihomo", "start="])
@@ -4051,10 +4075,10 @@ async fn cmd_install_instance(
             }
         }
         print_lines(format_install_service_installed());
-        if skip_config {
-            // --skip-config: service installed but no config was generated, so
-            // the core cannot start yet. Do not wait for readiness (it would
-            // fail reading a missing config). User adds config then starts.
+        let config_file_exists = ctx.paths.config_file.exists();
+        if skip_config && !config_file_exists {
+            // --skip-config and no config yet: core cannot start. User adds
+            // config then starts.
             println!(
                 "  ⚠ Core not started (--skip-config: no config yet). \
                  Add config at {} then run: mihomo-cli start",
