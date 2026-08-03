@@ -116,6 +116,7 @@ jobs:
           # NOTE: use %s printf to avoid \\ escaping eating backslashes.
           case "${{ matrix.os }}" in
             windows-latest) CFG_DIR="$APPDATA/mihomo"
+              mkdir -p "$CFG_DIR"
               printf 'mixed-port: 18789\nlog-level: info\nexternal-controller-pipe: %s\n' '\\.\pipe\mihomo-core' > "$CFG_DIR/config.yaml" ;;
             *) CFG_DIR="$HOME/.config/mihomo"
               mkdir -p "$CFG_DIR"
@@ -199,6 +200,7 @@ jobs:
           # Preseed a minimal config (Windows: named-pipe controller; unix: HTTP).
           case "${{ matrix.os }}" in
             windows-latest) CFG_DIR="$APPDATA/mihomo"
+              mkdir -p "$CFG_DIR"
               printf 'mixed-port: 18789\nlog-level: info\nexternal-controller-pipe: %s\n' '\\.\pipe\mihomo-core' > "$CFG_DIR/config.yaml" ;;
             *) CFG_DIR="$HOME/.config/mihomo"
               mkdir -p "$CFG_DIR"
