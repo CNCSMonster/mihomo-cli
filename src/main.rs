@@ -6921,17 +6921,32 @@ fn cmd_uninstall_instance_mode(
 
     // 1. Stop service
     println!("Stopping service...");
-    for command in &plan.commands {
-        if command.privileged {
-            if let Some(invocation) = instance::privilege_invocation_plan(command.clone()) {
-                println!(
-                    "  Privilege required. Fallback: {}",
-                    invocation.manual_fallback
-                );
-            }
+    #[cfg(target_os = "windows")]
+    let service_removed = {
+        if mode == instance::InstanceMode::System {
+            // Windows system service: use service-manager (P1-4).
+            service::windows_uninstall_service()?;
+            println!("  Service removed");
+            true
+        } else {
+            false
         }
-        if let Err(err) = service::run_instance_command(command) {
-            eprintln!("  Warning: service command failed: {err}");
+    };
+    #[cfg(not(target_os = "windows"))]
+    let service_removed = false;
+    if !service_removed {
+        for command in &plan.commands {
+            if command.privileged {
+                if let Some(invocation) = instance::privilege_invocation_plan(command.clone()) {
+                    println!(
+                        "  Privilege required. Fallback: {}",
+                        invocation.manual_fallback
+                    );
+                }
+            }
+            if let Err(err) = service::run_instance_command(command) {
+                eprintln!("  Warning: service command failed: {err}");
+            }
         }
     }
 

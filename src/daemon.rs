@@ -170,13 +170,20 @@ pub async fn run_daemon(pipe_path: PathBuf, cancel: CancellationToken) -> anyhow
     let state = Arc::new(Mutex::new(WindowsDaemonState::default()));
     eprintln!("[mihomo-daemon] listening on {pipe_name}");
 
+    // first_pipe_instance only for the first create (P1-2).
+    let mut first_instance = true;
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
                 eprintln!("[mihomo-daemon] shutdown requested, exiting accept loop");
+                // Stop the managed core child before exiting — dropping the
+                // Child alone does NOT kill the process (P1-1).
+                let _ = stop_windows_core(Arc::clone(&state)).await;
                 return Ok(());
             }
-            accepted = accept_one_pipe_connection(&pipe_name) => {
+            accepted = accept_one_pipe_connection(&pipe_name, first_instance) => {
+                first_instance = false;
                 match accepted {
                     Ok(Some(server)) => {
                         let st = Arc::clone(&state);
@@ -199,6 +206,7 @@ pub async fn run_daemon(pipe_path: PathBuf, cancel: CancellationToken) -> anyhow
 #[cfg(windows)]
 async fn accept_one_pipe_connection(
     pipe_name: &str,
+    first_instance: bool,
 ) -> anyhow::Result<Option<tokio::net::windows::named_pipe::NamedPipeServer>> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
@@ -206,7 +214,10 @@ async fn accept_one_pipe_connection(
     let mut sd_storage = windows_pipe_security_attributes()?;
     let server = unsafe {
         ServerOptions::new()
-            .first_pipe_instance(true)
+            // FILE_FLAG_FIRST_PIPE_INSTANCE only on the first create: a
+            // subsequent instance would fail (ERROR_ACCESS_DENIED) while the
+            // first pipe name still exists (P1-2).
+            .first_pipe_instance(first_instance)
             .create_with_security_attributes_raw(
                 pipe_name,
                 sd_storage.as_mut_ptr(),
@@ -231,14 +242,16 @@ fn windows_pipe_security_attributes() -> anyhow::Result<windows_pipe_security::P
 
 #[cfg(windows)]
 mod windows_pipe_security {
+    use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
-    use windows_sys::Win32::Security::{SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR};
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 
-    /// Owns the SECURITY_DESCRIPTOR heap allocation referenced by the
-    /// SECURITY_ATTRIBUTES pointer.
+    /// Owns the SECURITY_DESCRIPTOR heap allocation (from
+    /// ConvertStringSecurityDescriptorToSecurityDescriptorW, LocalAlloc-based)
+    /// referenced by the SECURITY_ATTRIBUTES pointer. LocalFree on drop.
     pub struct PipeSecurity {
         pub attributes: SECURITY_ATTRIBUTES,
-        _descriptor: Box<SECURITY_DESCRIPTOR>,
+        descriptor_ptr: *mut std::ffi::c_void,
     }
 
     impl PipeSecurity {
@@ -247,14 +260,25 @@ mod windows_pipe_security {
         }
     }
 
+    impl Drop for PipeSecurity {
+        fn drop(&mut self) {
+            // SAFETY: descriptor_ptr was allocated by
+            // ConvertStringSecurityDescriptorToSecurityDescriptorW (LocalAlloc),
+            // so LocalFree is the matching deallocator.
+            unsafe {
+                LocalFree(self.descriptor_ptr);
+            }
+        }
+    }
+
     pub fn build() -> anyhow::Result<PipeSecurity> {
         let installer_sid = super::read_installer_sid().unwrap_or_default();
         let sddl = super::pipe_sddl_for_installer(&installer_sid);
 
         let mut sddl_wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
-        let mut descriptor = Box::new(unsafe { std::mem::zeroed::<SECURITY_DESCRIPTOR>() });
-        let mut descriptor_ptr: *mut std::ffi::c_void =
-            &mut *descriptor as *mut SECURITY_DESCRIPTOR as *mut std::ffi::c_void;
+        // The function allocates the SECURITY_DESCRIPTOR itself and writes the
+        // address into `descriptor_ptr` — do NOT pre-allocate.
+        let mut descriptor_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let ok = unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 sddl_wide.as_ptr(),
@@ -269,13 +293,12 @@ mod windows_pipe_security {
 
         let mut attributes: SECURITY_ATTRIBUTES = unsafe { std::mem::zeroed() };
         attributes.nLength = std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
-        attributes.lpSecurityDescriptor =
-            &mut *descriptor as *mut SECURITY_DESCRIPTOR as *mut std::ffi::c_void;
+        attributes.lpSecurityDescriptor = descriptor_ptr;
         attributes.bInheritHandle = 0;
 
         Ok(PipeSecurity {
             attributes,
-            _descriptor: descriptor,
+            descriptor_ptr,
         })
     }
 }
