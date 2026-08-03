@@ -408,9 +408,32 @@ Limitations:
         recover: bool,
     },
 
+    /// Control autostart (boot/login launch) for the current instance mode
+    Autostart {
+        /// Enable, disable, or query autostart state
+        #[arg(value_enum)]
+        action: AutostartAction,
+        /// Force the system service instance (advanced)
+        #[arg(long = "system", conflicts_with = "user")]
+        system: bool,
+        /// Force the per-user instance (advanced)
+        #[arg(short, long, conflicts_with = "system")]
+        user: bool,
+    },
+
     /// Show real-time status dashboard (TUI)
     #[command(visible_alias = "dash")]
     Dashboard,
+}
+
+#[derive(Clone, ValueEnum)]
+enum AutostartAction {
+    /// Enable autostart
+    On,
+    /// Disable autostart
+    Off,
+    /// Query autostart state
+    Status,
 }
 
 #[derive(ValueEnum, Clone)]
@@ -769,6 +792,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 // unix: launchd/systemd 管理生命周期，token 永不取消（保持现有行为）
                 daemon::run_daemon(sock_path, tokio_util::sync::CancellationToken::new()).await
             }
+        }
+        Command::Autostart { action, system, user } => {
+            cmd_autostart(action, system, user).await
         }
         Command::Dashboard => cmd_dashboard().await,
     }
@@ -1828,6 +1854,252 @@ async fn resolve_ready_api_client(
 }
 
 /// Real-time status dashboard (TUI)
+/// Control autostart (boot/login launch) for the current instance mode.
+///
+/// Three-platform matrix:
+/// - Linux system: systemctl enable/disable/is-enabled mihomo
+/// - Linux user:   systemctl --user enable/disable/is-enabled mihomo
+/// - macOS system: launchctl enable/disable/print system/io.mihomo
+/// - macOS user:   launchctl enable/disable/print gui/UID/io.mihomo
+/// - Windows system: sc config mihomo start= auto/demand + sc qc
+/// - Windows user:   registry Run key + .vbs hidden (ADR-17)
+async fn cmd_autostart(
+    action: AutostartAction,
+    system: bool,
+    user: bool,
+) -> anyhow::Result<()> {
+    let mode = match (system, user) {
+        (true, false) => instance::InstanceMode::System,
+        (false, true) => instance::InstanceMode::User,
+        (false, false) => {
+            // Auto-detect: use resolve_current_instance_context.
+            let resolved = resolve_current_instance_context(
+                false,
+                false,
+                instance::CommandIntent::ReadOnly,
+            )?;
+            resolved.ctx.mode
+        }
+        _ => unreachable!("clap conflicts_with"),
+    };
+
+    match action {
+        AutostartAction::On => set_autostart(mode, true).await,
+        AutostartAction::Off => set_autostart(mode, false).await,
+        AutostartAction::Status => query_autostart(mode).await,
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn set_autostart(mode: instance::InstanceMode, enable: bool) -> anyhow::Result<()> {
+    let mut cmd = std::process::Command::new("systemctl");
+    if mode == instance::InstanceMode::User {
+        cmd.arg("--user");
+    }
+    cmd.arg(if enable { "enable" } else { "disable" })
+        .arg("mihomo");
+    run_autostart_command(cmd, enable)
+}
+
+#[cfg(target_os = "linux")]
+async fn query_autostart(mode: instance::InstanceMode) -> anyhow::Result<()> {
+    let mut cmd = std::process::Command::new("systemctl");
+    if mode == instance::InstanceMode::User {
+        cmd.arg("--user");
+    }
+    cmd.arg("is-enabled").arg("mihomo");
+    let output = cmd.output()?;
+    let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let enabled = output.status.success() && state == "enabled";
+    println!(
+        "Autostart: {} ({})",
+        if enabled { "enabled" } else { "disabled" },
+        state
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn set_autostart(mode: instance::InstanceMode, enable: bool) -> anyhow::Result<()> {
+    let domain = launchctl_domain(mode)?;
+    let label = format!("{domain}/io.mihomo");
+    let action = if enable { "enable" } else { "disable" };
+    let status = std::process::Command::new("launchctl")
+        .arg(action)
+        .arg(&label)
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("launchctl {action} {label} failed");
+    }
+    println!(
+        "Autostart {} for {}",
+        if enable { "enabled" } else { "disabled" },
+        label
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn query_autostart(mode: instance::InstanceMode) -> anyhow::Result<()> {
+    let domain = launchctl_domain(mode)?;
+    let label = format!("{domain}/io.mihomo");
+    let output = std::process::Command::new("launchctl")
+        .arg("print")
+        .arg(&label)
+        .output()?;
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let enabled = stdout.contains("state = running") || stdout.contains("state = waiting");
+        println!(
+            "Autostart: {} ({})",
+            if enabled { "enabled" } else { "disabled" },
+            label
+        );
+    } else {
+        println!("Autostart: disabled (service not loaded)");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_domain(mode: instance::InstanceMode) -> anyhow::Result<String> {
+    match mode {
+        instance::InstanceMode::System => Ok("system".to_string()),
+        instance::InstanceMode::User => {
+            let uid = unsafe { libc::getuid() };
+            Ok(format!("gui/{uid}"))
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn set_autostart(mode: instance::InstanceMode, enable: bool) -> anyhow::Result<()> {
+    match mode {
+        instance::InstanceMode::System => {
+            let start_type = if enable { "auto" } else { "demand" };
+            let status = std::process::Command::new("sc.exe")
+                .args(["config", "mihomo", "start="])
+                .arg(start_type)
+                .status()?;
+            if !status.success() {
+                anyhow::bail!("sc config mihomo start= {start_type} failed");
+            }
+            println!(
+                "Autostart {} for system service",
+                if enable { "enabled" } else { "disabled" }
+            );
+            Ok(())
+        }
+        instance::InstanceMode::User => {
+            // Registry Run key + .vbs hidden launch
+            let vbs_path = std::env::var_os("APPDATA")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default()
+                .join("mihomo")
+                .join("autostart.vbs");
+            if enable {
+                std::fs::create_dir_all(vbs_path.parent().unwrap())?;
+                let cli_path = std::env::current_exe()?;
+                let vbs = format!(
+                    "Set shell = CreateObject(\"WScript.Shell\")\r\nshell.Run \"\"\"{}\"\" start\", 0, False\r\n",
+                    cli_path.display()
+                );
+                std::fs::write(&vbs_path, vbs)?;
+                let status = std::process::Command::new("reg.exe")
+                    .args([
+                        "ADD",
+                        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                        "/v",
+                        "mihomo-cli",
+                        "/t",
+                        "REG_SZ",
+                        "/d",
+                        &format!("wscript.exe //B //NoLogo \"{}\"", vbs_path.display()),
+                        "/f",
+                    ])
+                    .status()?;
+                if !status.success() {
+                    anyhow::bail!("reg ADD Run key failed");
+                }
+                println!("Autostart enabled for user mode (registry Run + .vbs)");
+            } else {
+                let _ = std::process::Command::new("reg.exe")
+                    .args([
+                        "DELETE",
+                        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                        "/v",
+                        "mihomo-cli",
+                        "/f",
+                    ])
+                    .status();
+                let _ = std::fs::remove_file(&vbs_path);
+                println!("Autostart disabled for user mode");
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn query_autostart(mode: instance::InstanceMode) -> anyhow::Result<()> {
+    match mode {
+        instance::InstanceMode::System => {
+            let output = std::process::Command::new("sc.exe")
+                .args(["qc", "mihomo"])
+                .output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let enabled = stdout.contains("AUTO_START");
+            println!(
+                "Autostart: {} (system service)",
+                if enabled { "enabled" } else { "disabled" }
+            );
+            Ok(())
+        }
+        instance::InstanceMode::User => {
+            let output = std::process::Command::new("reg.exe")
+                .args([
+                    "QUERY",
+                    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                    "/v",
+                    "mihomo-cli",
+                ])
+                .output()?;
+            let enabled = output.status.success();
+            println!(
+                "Autostart: {} (user mode registry Run)",
+                if enabled { "enabled" } else { "disabled" }
+            );
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+async fn set_autostart(_mode: instance::InstanceMode, _enable: bool) -> anyhow::Result<()> {
+    anyhow::bail!("autostart is not implemented on this platform")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+async fn query_autostart(_mode: instance::InstanceMode) -> anyhow::Result<()> {
+    anyhow::bail!("autostart is not implemented on this platform")
+}
+
+#[cfg(target_os = "linux")]
+fn run_autostart_command(mut cmd: std::process::Command, enable: bool) -> anyhow::Result<()> {
+    let status = cmd.status()?;
+    if !status.success() {
+        anyhow::bail!(
+            "systemctl {} mihomo failed",
+            if enable { "enable" } else { "disable" }
+        );
+    }
+    println!(
+        "Autostart {} for mihomo",
+        if enable { "enabled" } else { "disabled" }
+    );
+    Ok(())
+}
+
 async fn cmd_dashboard() -> anyhow::Result<()> {
     let resolved = resolve_current_instance_context(
         false,
@@ -7117,7 +7389,7 @@ mod cli_parse_tests {
                 .expect("subcommand from iterator should exist")
                 .render_help()
                 .to_string();
-            let may_expose_user = matches!(name.as_str(), "install" | "uninstall");
+            let may_expose_user = matches!(name.as_str(), "install" | "uninstall" | "autostart");
             let exposes_user_flag = help.contains("-u, --user ") || help.contains("    --user ");
             assert_eq!(
                 exposes_user_flag, may_expose_user,

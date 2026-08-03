@@ -249,12 +249,7 @@ mod windows_pipe_security {
 
     pub fn build() -> anyhow::Result<PipeSecurity> {
         let installer_sid = super::read_installer_sid().unwrap_or_default();
-        let sddl = if installer_sid.is_empty() {
-            // Fail closed: SYSTEM only.
-            "D:P(A;;GA;;;SY)(A;;GA;;;BA)".to_string()
-        } else {
-            format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{installer_sid})")
-        };
+        let sddl = super::pipe_sddl_for_installer(&installer_sid);
 
         let mut sddl_wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
         let mut descriptor = Box::new(unsafe { std::mem::zeroed::<SECURITY_DESCRIPTOR>() });
@@ -295,6 +290,20 @@ fn read_installer_sid() -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Build the pipe SDDL string restricting access to SYSTEM + Administrators +
+/// the installing user's SID. Empty/missing installer SID → fail closed
+/// (SYSTEM + Administrators only). Pure function for testability.
+fn pipe_sddl_for_installer(installer_sid: &str) -> String {
+    if installer_sid.trim().is_empty() {
+        "D:P(A;;GA;;;SY)(A;;GA;;;BA)".to_string()
+    } else {
+        format!(
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{})",
+            installer_sid.trim()
+        )
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1859,6 +1868,26 @@ async fn toggle_tun_via_core_api(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipe_sddl_restricts_to_system_admin_and_installer() {
+        let sddl = pipe_sddl_for_installer("S-1-5-21-1000-2000-3000-4000");
+        assert!(sddl.contains("SY"));
+        assert!(sddl.contains("BA"));
+        assert!(sddl.contains("S-1-5-21-1000-2000-3000-4000"));
+        assert!(sddl.starts_with("D:P("));
+    }
+
+    #[test]
+    fn pipe_sddl_fails_closed_without_installer_sid() {
+        // Empty/missing installer SID → SYSTEM + Administrators only.
+        let sddl = pipe_sddl_for_installer("");
+        assert!(sddl.contains("SY"));
+        assert!(sddl.contains("BA"));
+        assert!(!sddl.contains("(A;;GA;;;S-1-"));
+        let sddl_whitespace = pipe_sddl_for_installer("   ");
+        assert_eq!(sddl, sddl_whitespace);
+    }
 
     #[test]
     fn daemon_command_parser_rejects_unknown_legacy_fields_with_clear_error() {
