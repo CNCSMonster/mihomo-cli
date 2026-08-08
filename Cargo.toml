@@ -1,6 +1,6 @@
 [package]
 name = "mihomo-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Cross-platform setup & control CLI for Mihomo (Clash.Meta) proxy"
 repository = "https://github.com/CNCSMonster/mihomo-cli"
