@@ -4,6 +4,40 @@
 
 ---
 
+## 0.5.0 (2026-08-09)
+
+### 🔒 Security
+
+- **L1-L7 七层安全防护完整实施** — 完整实现七层安全防护体系并真机验证（kuku-remote macOS）
+  - **L1** TUN 操作强制 root 权限（CLI 自动 sudo + daemon peer UID 检查）
+  - **L2** TUN 配置隔离（TUN config 独立存储，per-user config 的系统级快照）
+  - **L3** Unix token 认证（root-only server token + per-user client token + 授权表）
+  - **L4** Socket 权限审计（维持 0o666，通过 L3 token + peer UID 授权）
+  - **L5** daemon 非 root 运行（ADR-21：daemon 以 `mihomo` 用户运行 + AmbientCapabilities）
+  - **L6** 符号链接攻击防护（`O_NOFOLLOW` + `symlink_metadata()` 检查）
+  - **L7** 日志脱敏 + 级别控制（`sanitize_url()` + `sanitize_sensitive()` + DEBUG 级别）
+- **install --system 自动初始化 token 和授权表** — 无需手动执行 `access grant`，install 流程自动生成 server token、client token 并授权当前用户
+- **access 命令 root 权限检查** — `access grant/revoke` 非 root 运行时给出清晰 sudo 指引
+- **uninstall --system 添加确认步骤** — 先确认用户意图，再要求 sudo 密码（UX 改进）
+
+### 🐛 Bug Fixes
+
+- **L6 符号链接防护丢失 sudo 提权** — 修复 L6 实施时丢失的 sudo 提权能力，恢复 `install_staged_file_privileged` 的特权写入
+- **install token 生成使用 PrivilegeExecutor 提权** — server token 和 authorized-clients.json 使用 `PrivilegeExecutor::write_file()` 提权写入
+- **install token 生成前未创建 auth 目录** — 先调用 `PrivilegeExecutor::ensure_dir()` 创建 `/var/lib/mihomo-cli/` 目录
+
+### ⚠️ Breaking Changes
+
+- **TUN 操作需要 root 权限** — `tun on/off` 现在需要 root 权限，CLI 会自动调用 sudo。普通用户执行时会提示输入密码
+- **版本号改为 0.0.0-dev** — dev 仓库版本号改为 mock 开发版本号，发版时由同步流程替换为真实版本号
+
+### 📚 Documentation
+
+- **ROADMAP.md** — 新增 BUG-21 到 BUG-26 记录，安全改进任务 L1-L7 全部标记完成
+- **SECURITY.md** — 场景 10 防护方案状态更新为已实施
+
+---
+
 ## 0.2.0 (2026-08-09)
 
 ### ⚠️ Breaking Changes

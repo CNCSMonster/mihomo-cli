@@ -881,7 +881,7 @@ fn persist_installer_sid() -> anyhow::Result<()> {
 
 /// Generate a 32-byte random token as 64 lowercase hex chars — the daemon IPC
 /// auth token. Pure function (cross-platform, testable).
-fn generate_auth_token() -> String {
+pub(crate) fn generate_auth_token() -> String {
     use rand::RngCore;
 
     let mut bytes = [0u8; 32];
@@ -1245,11 +1245,7 @@ pub fn install_staged_file_privileged(
 
     #[cfg(unix)]
     {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-        // 1. Reject symlinks to prevent symlink attacks
+        // 1. L6: Reject symlinks to prevent symlink attacks
         if let Ok(metadata) = path.symlink_metadata() {
             if metadata.file_type().is_symlink() {
                 anyhow::bail!(
@@ -1260,29 +1256,112 @@ pub fn install_staged_file_privileged(
             }
         }
 
-        // 2. Ensure parent directory exists with safe permissions (0o700)
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        // 2. Already root → write directly (O_NOFOLLOW + explicit permissions).
+        if is_root() {
+            return write_installed_file_direct(path, bytes, mode);
         }
 
-        // 3. Direct write with O_NOFOLLOW to prevent following symlinks
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .mode(mode as u32)
-            .open(path)?;
-
-        file.write_all(bytes)?;
-        drop(file);
-
-        // Explicitly set permissions (mode in OpenOptions only applies to new files)
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode as u32))?;
-
-        Ok(())
+        // 3. Non-root → stage in an O_NOFOLLOW-protected temp file, then
+        //    `sudo install` to the target (restores privilege escalation).
+        install_staged_file_privileged_non_root(path, bytes, mode)
     }
+}
+
+#[cfg(unix)]
+/// Direct write with O_NOFOLLOW, used when running as root. Also exercised
+/// directly by tests, which must never trigger a real sudo invocation.
+fn write_installed_file_direct(
+    path: &std::path::Path,
+    bytes: &[u8],
+    mode: u16,
+) -> anyhow::Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(mode as u32)
+        .open(path)?;
+
+    file.write_all(bytes)?;
+    drop(file);
+
+    // Explicitly set permissions (mode in OpenOptions only applies to new files)
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode as u32))?;
+
+    Ok(())
+}
+
+#[cfg(unix)]
+/// Non-root fallback: stage `bytes` in an O_NOFOLLOW-protected temp file
+/// (0o600), then install it at `path` via `sudo install -m <mode>`.
+fn install_staged_file_privileged_non_root(
+    path: &std::path::Path,
+    bytes: &[u8],
+    mode: u16,
+) -> anyhow::Result<()> {
+    let temp_path = temp_payload_path(path);
+    write_temp_payload(&temp_path, bytes)?;
+    let cleanup = TempFileCleanup(temp_path.clone());
+    let args: Vec<String> = privileged_install_args(&temp_path, mode, path);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let result = run_privileged(&arg_refs);
+    drop(cleanup);
+    result
+}
+
+#[cfg(unix)]
+/// Name of the staged temp file for a privileged write to `target`.
+fn temp_payload_path(target: &std::path::Path) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "mihomo-cli-privileged-write-{}-{}",
+        std::process::id(),
+        target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("payload")
+    ))
+}
+
+#[cfg(unix)]
+/// Write the staged payload with O_NOFOLLOW protection and owner-only mode.
+fn write_temp_payload(temp_path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(temp_path)?;
+    file.write_all(bytes)
+}
+
+#[cfg(unix)]
+/// Construct the `sudo install` argv for a staged privileged write.
+fn privileged_install_args(
+    temp_path: &std::path::Path,
+    mode: u16,
+    target: &std::path::Path,
+) -> Vec<String> {
+    vec![
+        "install".to_string(),
+        "-m".to_string(),
+        format!("{mode:o}"),
+        temp_path.display().to_string(),
+        target.display().to_string(),
+    ]
 }
 struct TempFileCleanup(std::path::PathBuf);
 
@@ -3262,7 +3341,15 @@ e"
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub").join("file.bin");
 
-        install_staged_file_privileged(&path, b"hello world", 0o755).unwrap();
+        if is_root() {
+            // Root: exercise the full privileged path (direct-write branch).
+            install_staged_file_privileged(&path, b"hello world", 0o755).unwrap();
+        } else {
+            // Non-root: the function would dispatch through sudo (tests must
+            // never trigger a real sudo invocation), so exercise the
+            // direct-write branch body via its helper instead.
+            write_installed_file_direct(&path, b"hello world", 0o755).unwrap();
+        }
 
         assert_eq!(std::fs::read(&path).unwrap(), b"hello world");
         assert_eq!(
@@ -3279,12 +3366,64 @@ e"
         let path = dir.path().join("existing");
         std::fs::write(&path, b"old content").unwrap();
 
-        install_staged_file_privileged(&path, b"new content", 0o600).unwrap();
+        if is_root() {
+            install_staged_file_privileged(&path, b"new content", 0o600).unwrap();
+        } else {
+            write_installed_file_direct(&path, b"new content", 0o600).unwrap();
+        }
 
         assert_eq!(std::fs::read(&path).unwrap(), b"new content");
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn privileged_install_args_form_sudo_install_command() {
+        let temp = std::path::Path::new("/tmp/mihomo-cli-privileged-write-1234-mihomo");
+        let target = std::path::Path::new("/usr/local/bin/mihomo-cli");
+        assert_eq!(
+            privileged_install_args(temp, 0o755, target),
+            vec![
+                "install".to_string(),
+                "-m".to_string(),
+                "755".to_string(),
+                "/tmp/mihomo-cli-privileged-write-1234-mihomo".to_string(),
+                "/usr/local/bin/mihomo-cli".to_string(),
+            ],
+            "non-root branch must build: sudo install -m <mode> <temp> <target>"
+        );
+        assert_eq!(
+            privileged_install_args(temp, 0o644, target)[2],
+            "644",
+            "mode must be formatted as a plain octal string"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_payload_file_is_0600_and_cleanup_removes_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let temp_path = dir.path().join("mihomo-cli-privileged-write-1234-payload");
+
+        write_temp_payload(&temp_path, b"payload bytes").unwrap();
+
+        assert_eq!(std::fs::read(&temp_path).unwrap(), b"payload bytes");
+        assert_eq!(
+            std::fs::metadata(&temp_path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "staged temp payload must be owner-only readable"
+        );
+
+        // Simulate the install step finishing: cleanup must remove the file.
+        let cleanup = TempFileCleanup(temp_path.clone());
+        drop(cleanup);
+        assert!(
+            !temp_path.exists(),
+            "staged temp payload must be cleaned up after install"
         );
     }
 }

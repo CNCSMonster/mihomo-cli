@@ -947,6 +947,19 @@ fn lookup_user(name: &str) -> anyhow::Result<(u32, u32, std::path::PathBuf)> {
 
 #[cfg(unix)]
 fn cmd_access(action: AccessAction) -> anyhow::Result<()> {
+    if matches!(
+        action,
+        AccessAction::Grant { .. } | AccessAction::Revoke { .. }
+    ) {
+        let euid = unsafe { libc::geteuid() };
+        if euid != 0 {
+            anyhow::bail!(
+                "access grant/revoke requires root privileges.\n  \
+                 Run with sudo: sudo mihomo-cli access grant --user <username>\n  \
+                 Or: sudo mihomo-cli access revoke --user <username>"
+            );
+        }
+    }
     let path = daemon::authorized_clients_path();
     let mut table = daemon::read_authorized_clients_from(&path)?;
     match action {
@@ -4888,6 +4901,62 @@ async fn cmd_install_instance(
             );
         } else if mode == instance::InstanceMode::System {
             wait_for_system_daemon_readiness().await?;
+            // Generate server/client tokens and authorize current user if not
+            // already done.  Without this the CLI cannot authenticate to the
+            // daemon over IPC and every request is rejected with "invalid or
+            // missing auth token".
+            #[cfg(unix)]
+            {
+                let auth_dir = daemon::authorized_clients_path()
+                    .parent()
+                    .unwrap()
+                    .to_path_buf();
+                let server_token_path = auth_dir.join("service-token");
+                let client_token_path =
+                    service::client_token_path_for_home(&dirs::home_dir().unwrap_or_default());
+                let authorized_clients_path = daemon::authorized_clients_path();
+
+                if !authorized_clients_path.exists() {
+                    // 0. Ensure auth directory exists (e.g., /var/lib/mihomo-cli)
+                    service::PrivilegeExecutor::ensure_dir(&auth_dir, 0o755)?;
+
+                    // 1. Server token (daemon-side) — needs root to write to system dir
+                    if !server_token_path.exists() {
+                        let server_token = service::generate_auth_token();
+                        service::PrivilegeExecutor::write_file(
+                            &server_token_path,
+                            server_token.as_bytes(),
+                            0o600,
+                        )?;
+                        println!("  ✅ Server token generated");
+                    }
+                    // 2. Client token (CLI-side, for current user) — user home, no privilege needed
+                    if !client_token_path.exists() {
+                        let _tok = service::generate_client_token_for_home(
+                            &dirs::home_dir().unwrap_or_default(),
+                        )?;
+                        println!("  ✅ Client token generated");
+                    }
+                    // 3. Authorize current user in the daemon's ACL — needs root to write to system dir
+                    let mut table = daemon::AuthorizedClients::default();
+                    let uid = unsafe { libc::getuid() };
+                    let user = dirs::home_dir()
+                        .and_then(|h| h.file_name().map(|n| n.to_string_lossy().to_string()))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let token = std::fs::read_to_string(&client_token_path)
+                        .map(|s| s.trim().to_string())?;
+                    table
+                        .clients
+                        .push(daemon::AuthorizedClient { user, uid, token });
+                    let table_json = serde_json::to_vec_pretty(&table)?;
+                    service::PrivilegeExecutor::write_file(
+                        &authorized_clients_path,
+                        &table_json,
+                        0o600,
+                    )?;
+                    println!("  ✅ Current user authorized for IPC access");
+                }
+            }
             start_system_core_via_daemon(&ctx).await?;
             wait_for_instance_readiness(&ctx).await?;
         } else {
@@ -8076,6 +8145,19 @@ fn cmd_uninstall_instance_mode(
             println!("  Config:  {} (kept)", ctx.paths.config_dir.display());
         }
         return Ok(());
+    }
+
+    // Confirm before executing
+    if !yes {
+        use dialoguer::Confirm;
+        if !Confirm::new()
+            .with_prompt(uninstall_prompt(all))
+            .default(false)
+            .interact()?
+        {
+            print_lines(format_uninstall_cancelled());
+            return Ok(());
+        }
     }
 
     // Execute removal
