@@ -54,6 +54,14 @@ pub enum DaemonCommand {
         #[serde(default)]
         token: Option<String>,
     },
+    /// Enable/disable core autostart (ADR-19: daemon owns the marker so the
+    /// root/sudo identity never skews the per-user config dir).
+    SetAutostart {
+        enabled: bool,
+        /// Windows-only auth token (None on unix — peer uid validation).
+        #[serde(default)]
+        token: Option<String>,
+    },
 }
 
 /// Responses sent from Daemon → CLI.
@@ -70,15 +78,13 @@ pub enum DaemonResponse {
         tun_enabled: bool,
         core_pid: Option<u32>,
         config_path: Option<PathBuf>,
+        /// Whether core autostart is enabled (ADR-19, daemon-owned marker).
+        #[serde(default)]
+        autostart_enabled: bool,
     },
 }
 
-/// Windows-only auth token for the CLI side of the daemon IPC.
-///
-/// Reads the client copy of the install-time generated token
-/// (`<config_dir>/service-client-token`). Returns None on unix or when the
-/// token file is absent (e.g. legacy installs) — daemon validates only when
-/// it has a server-side token to compare against.
+/// Read the per-user daemon IPC client token.
 #[cfg(windows)]
 pub fn windows_client_token(config_dir: &std::path::Path) -> Option<String> {
     std::fs::read_to_string(config_dir.join("service-client-token"))
@@ -87,9 +93,12 @@ pub fn windows_client_token(config_dir: &std::path::Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-#[cfg(not(windows))]
-pub fn windows_client_token(_config_dir: &std::path::Path) -> Option<String> {
-    None
+#[cfg(unix)]
+pub fn unix_client_token(config_dir: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(config_dir.join("service-token"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Windows-only server-side token for daemon IPC validation.
@@ -108,6 +117,7 @@ pub fn windows_service_token() -> Option<String> {
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)] // cross-platform symmetry stub; Windows builds use the real impl
 pub fn windows_service_token() -> Option<String> {
     None
 }
@@ -184,6 +194,12 @@ pub async fn send_command(cmd: &DaemonCommand) -> anyhow::Result<DaemonResponse>
     use tokio::io::BufReader;
     use tokio::net::UnixStream;
 
+    let config_dir = crate::utils::AppPaths::from_system()
+        .config_dir()
+        .to_path_buf();
+    let token = unix_client_token(&config_dir);
+    let cmd = with_ipc_token(cmd.clone(), token);
+
     let sock_path = system_service_socket_path();
     let mut stream = UnixStream::connect(&sock_path).await.map_err(|e| {
         anyhow::anyhow!(
@@ -195,7 +211,7 @@ pub async fn send_command(cmd: &DaemonCommand) -> anyhow::Result<DaemonResponse>
         )
     })?;
 
-    write_json_message(&mut stream, cmd).await?;
+    write_json_message(&mut stream, &cmd).await?;
 
     let mut reader = BufReader::new(stream);
     let read = async { read_json_message(&mut reader, "daemon response").await };
@@ -218,9 +234,11 @@ pub async fn send_command(cmd: &DaemonCommand) -> anyhow::Result<DaemonResponse>
 
     // Attach the Windows client token (auth for the daemon). config_dir is the
     // default user config directory; the client copy lives there.
-    let config_dir = crate::utils::AppPaths::from_system().config_dir().to_path_buf();
+    let config_dir = crate::utils::AppPaths::from_system()
+        .config_dir()
+        .to_path_buf();
     let token = windows_client_token(&config_dir);
-    let cmd = with_windows_token(cmd.clone(), token);
+    let cmd = with_ipc_token(cmd.clone(), token);
 
     let pipe_path = system_service_socket_path();
     let mut pipe = ClientOptions::new().open(&pipe_path).map_err(|e| {
@@ -248,8 +266,8 @@ pub async fn send_command(cmd: &DaemonCommand) -> anyhow::Result<DaemonResponse>
 }
 
 /// Inject the auth token into a cloned command (all variants carry `token`).
-#[cfg(windows)]
-fn with_windows_token(cmd: DaemonCommand, token: Option<String>) -> DaemonCommand {
+#[cfg(any(unix, windows))]
+fn with_ipc_token(cmd: DaemonCommand, token: Option<String>) -> DaemonCommand {
     use DaemonCommand::*;
     match cmd {
         StartCore { config_path, .. } => StartCore { config_path, token },
@@ -268,6 +286,7 @@ fn with_windows_token(cmd: DaemonCommand, token: Option<String>) -> DaemonComman
         },
         DisableTun { .. } => DisableTun { token },
         GetStatus { .. } => GetStatus { token },
+        SetAutostart { enabled, .. } => SetAutostart { enabled, token },
     }
 }
 
@@ -315,18 +334,27 @@ mod tests {
         assert!(json.contains("\"type\":\"GetStatus\""));
 
         let deserialized: DaemonCommand = serde_json::from_str(&json).unwrap();
-        assert!(matches!(deserialized, DaemonCommand::GetStatus { token: None }));
+        assert!(matches!(
+            deserialized,
+            DaemonCommand::GetStatus { token: None }
+        ));
     }
 
     #[test]
     fn daemon_start_restart_commands_do_not_accept_client_supplied_core_binary() {
-        let start = DaemonCommand::StartCore { config_path: PathBuf::from("/home/alice/.config/mihomo/config.yaml"), token: None };
+        let start = DaemonCommand::StartCore {
+            config_path: PathBuf::from("/home/alice/.config/mihomo/config.yaml"),
+            token: None,
+        };
         let json = serde_json::to_string(&start).unwrap();
         assert!(json.contains("\"type\":\"StartCore\""));
         assert!(json.contains("config_path"));
         assert!(!json.contains("core_binary"));
 
-        let restart = DaemonCommand::RestartCore { config_path: PathBuf::from("/home/alice/.config/mihomo/config.yaml"), token: None };
+        let restart = DaemonCommand::RestartCore {
+            config_path: PathBuf::from("/home/alice/.config/mihomo/config.yaml"),
+            token: None,
+        };
         let json = serde_json::to_string(&restart).unwrap();
         assert!(json.contains("\"type\":\"RestartCore\""));
         assert!(json.contains("config_path"));
@@ -363,6 +391,7 @@ mod tests {
             tun_enabled: false,
             core_pid: Some(1234),
             config_path: Some(PathBuf::from("/tmp/config.yaml")),
+            autostart_enabled: false,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let deserialized: DaemonResponse = serde_json::from_str(&json).unwrap();
@@ -413,7 +442,10 @@ mod tests {
 
     #[test]
     fn start_core_command_roundtrip() {
-        let cmd = DaemonCommand::StartCore { config_path: PathBuf::from("/home/user/.config/mihomo/config.yaml"), token: None };
+        let cmd = DaemonCommand::StartCore {
+            config_path: PathBuf::from("/home/user/.config/mihomo/config.yaml"),
+            token: None,
+        };
         let json = serde_json::to_string(&cmd).unwrap();
         let deserialized: DaemonCommand = serde_json::from_str(&json).unwrap();
         if let DaemonCommand::StartCore { config_path, .. } = deserialized {

@@ -49,10 +49,10 @@ pub fn save_policies_at(paths: &AppPaths, policies: &[DnsPolicy]) -> Result<()> 
 #   - domain: <domain>
 #     target: <system|IP>
 # Examples:
-#   - domain: ubtrobot.com
+#   - domain: internal.example.com
 #     target: system
 #   - domain: internal.corp
-#     target: 10.10.1.251
+#     target: 192.0.2.53
 
 ";
     crate::utils::atomic_write_file(
@@ -155,38 +155,38 @@ mod tests {
     fn test_add_and_list_policies() {
         let (_tmp, paths) = setup_test_paths();
 
-        add_policy_at(&paths, "ubtrobot.com", "10.10.1.251").unwrap();
-        add_policy_at(&paths, "internal.corp", "10.10.1.251").unwrap();
+        add_policy_at(&paths, "internal.example.com", "192.0.2.53").unwrap();
+        add_policy_at(&paths, "internal.corp", "192.0.2.53").unwrap();
 
         let list = list_policies_at(&paths).unwrap();
         assert_eq!(list.len(), 2);
-        assert_eq!(list[0].1.match_pattern, "+.ubtrobot.com");
-        assert_eq!(list[0].1.target, "10.10.1.251");
+        assert_eq!(list[0].1.match_pattern, "+.internal.example.com");
+        assert_eq!(list[0].1.target, "192.0.2.53");
         assert_eq!(list[1].1.match_pattern, "+.internal.corp");
-        assert_eq!(list[1].1.target, "10.10.1.251");
+        assert_eq!(list[1].1.target, "192.0.2.53");
     }
 
     #[test]
     fn test_add_dedup() {
         let (_tmp, paths) = setup_test_paths();
 
-        add_policy_at(&paths, "ubtrobot.com", "10.10.1.251").unwrap();
-        add_policy_at(&paths, "ubtrobot.com", "10.10.1.251").unwrap(); // overwrites
+        add_policy_at(&paths, "internal.example.com", "192.0.2.53").unwrap();
+        add_policy_at(&paths, "internal.example.com", "192.0.2.53").unwrap(); // overwrites
 
         let list = list_policies_at(&paths).unwrap();
         assert_eq!(list.len(), 1);
-        assert_eq!(list[0].1.target, "10.10.1.251");
+        assert_eq!(list[0].1.target, "192.0.2.53");
     }
 
     #[test]
     fn test_remove_by_match() {
         let (_tmp, paths) = setup_test_paths();
 
-        add_policy_at(&paths, "ubtrobot.com", "10.10.1.251").unwrap();
-        add_policy_at(&paths, "internal.corp", "10.10.1.251").unwrap();
+        add_policy_at(&paths, "internal.example.com", "192.0.2.53").unwrap();
+        add_policy_at(&paths, "internal.corp", "192.0.2.53").unwrap();
 
-        let removed = remove_policy_at(&paths, "+.ubtrobot.com").unwrap();
-        assert_eq!(removed, "+.ubtrobot.com");
+        let removed = remove_policy_at(&paths, "+.internal.example.com").unwrap();
+        assert_eq!(removed, "+.internal.example.com");
 
         let list = list_policies_at(&paths).unwrap();
         assert_eq!(list.len(), 1);
@@ -197,11 +197,11 @@ mod tests {
     fn test_remove_by_index() {
         let (_tmp, paths) = setup_test_paths();
 
-        add_policy_at(&paths, "ubtrobot.com", "10.10.1.251").unwrap();
-        add_policy_at(&paths, "internal.corp", "10.10.1.251").unwrap();
+        add_policy_at(&paths, "internal.example.com", "192.0.2.53").unwrap();
+        add_policy_at(&paths, "internal.corp", "192.0.2.53").unwrap();
 
         let removed = remove_policy_at(&paths, "1").unwrap();
-        assert_eq!(removed, "+.ubtrobot.com");
+        assert_eq!(removed, "+.internal.example.com");
 
         let list = list_policies_at(&paths).unwrap();
         assert_eq!(list.len(), 1);
@@ -212,7 +212,7 @@ mod tests {
     fn test_remove_out_of_range() {
         let (_tmp, paths) = setup_test_paths();
 
-        add_policy_at(&paths, "ubtrobot.com", "10.10.1.251").unwrap();
+        add_policy_at(&paths, "internal.example.com", "192.0.2.53").unwrap();
         assert!(remove_policy_at(&paths, "5").is_err());
         assert!(remove_policy_at(&paths, "nonexistent").is_err());
     }
@@ -344,5 +344,133 @@ mod template_tests {
         let policies = load_policies_at(&paths).unwrap();
         assert_eq!(policies.len(), 3);
         assert!(policies.iter().all(|p| p.target == "94.140.14.14"));
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct FakeIpFilterFile {
+    #[serde(default, rename = "fake-ip-filter")]
+    pub filters: Vec<String>,
+}
+
+pub fn normalize_fake_ip_filter_domain(domain: &str) -> Result<String> {
+    let trimmed = domain.trim().trim_end_matches('.');
+    if trimmed.is_empty() {
+        anyhow::bail!("domain cannot be empty");
+    }
+    let bare = trimmed
+        .strip_prefix("+.")
+        .or_else(|| trimmed.strip_prefix("*."))
+        .unwrap_or(trimmed);
+    if bare.is_empty() || bare.contains('/') || bare.contains(' ') {
+        anyhow::bail!("invalid domain: {domain}");
+    }
+    Ok(format!("+.{bare}"))
+}
+
+pub fn load_fake_ip_filters_at(paths: &AppPaths) -> Result<Vec<String>> {
+    let path = paths.dns_fake_ip_filter_path();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read: {}", path.display()))?;
+    let file: FakeIpFilterFile = serde_yaml::from_str(&content)
+        .with_context(|| "Failed to parse dns-fake-ip-filter.yaml")?;
+    Ok(file.filters)
+}
+
+pub fn save_fake_ip_filters_at(paths: &AppPaths, filters: &[String]) -> Result<()> {
+    let path = paths.dns_fake_ip_filter_path();
+    std::fs::create_dir_all(paths.config_dir())?;
+    let file = FakeIpFilterFile {
+        filters: filters.to_vec(),
+    };
+    let content = serde_yaml::to_string(&file)?;
+    let header = "# User-defined DNS fake-ip-filter entries\n# Entries are normalized to +.<domain> suffix match format.\n\n";
+    crate::utils::atomic_write_file(
+        &path.display().to_string(),
+        &format!("{}{}", header, content),
+    )?;
+    Ok(())
+}
+
+pub fn add_fake_ip_filter_at(paths: &AppPaths, domain: &str) -> Result<String> {
+    let normalized = normalize_fake_ip_filter_domain(domain)?;
+    let mut filters = load_fake_ip_filters_at(paths)?;
+    if !filters.iter().any(|f| f == &normalized) {
+        filters.push(normalized.clone());
+    }
+    save_fake_ip_filters_at(paths, &filters)?;
+    Ok(normalized)
+}
+
+pub fn remove_fake_ip_filter_at(paths: &AppPaths, domain: &str) -> Result<String> {
+    let normalized = normalize_fake_ip_filter_domain(domain)?;
+    let mut filters = load_fake_ip_filters_at(paths)?;
+    let before = filters.len();
+    filters.retain(|f| f != &normalized);
+    if filters.len() == before {
+        anyhow::bail!("No fake-ip-filter entry found for: {domain}");
+    }
+    save_fake_ip_filters_at(paths, &filters)?;
+    Ok(normalized)
+}
+
+pub fn list_fake_ip_filters_at(paths: &AppPaths) -> Result<Vec<(usize, String)>> {
+    Ok(load_fake_ip_filters_at(paths)?
+        .into_iter()
+        .enumerate()
+        .map(|(i, f)| (i + 1, f))
+        .collect())
+}
+
+#[cfg(test)]
+mod fake_ip_filter_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn setup() -> (TempDir, AppPaths) {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        (tmp, paths)
+    }
+
+    #[test]
+    fn normalizes_fake_ip_filter_domains() {
+        assert_eq!(
+            normalize_fake_ip_filter_domain("corp.example.com").unwrap(),
+            "+.corp.example.com"
+        );
+        assert_eq!(
+            normalize_fake_ip_filter_domain("*.corp.example.com").unwrap(),
+            "+.corp.example.com"
+        );
+        assert_eq!(
+            normalize_fake_ip_filter_domain("+.corp.example.com").unwrap(),
+            "+.corp.example.com"
+        );
+    }
+
+    #[test]
+    fn add_remove_list_and_dedup_fake_ip_filters() {
+        let (_tmp, paths) = setup();
+        add_fake_ip_filter_at(&paths, "corp.example.com").unwrap();
+        add_fake_ip_filter_at(&paths, "*.corp.example.com").unwrap();
+        add_fake_ip_filter_at(&paths, "+.dev.example.com").unwrap();
+        let list = list_fake_ip_filters_at(&paths).unwrap();
+        assert_eq!(
+            list,
+            vec![
+                (1, "+.corp.example.com".into()),
+                (2, "+.dev.example.com".into())
+            ]
+        );
+        let removed = remove_fake_ip_filter_at(&paths, "corp.example.com").unwrap();
+        assert_eq!(removed, "+.corp.example.com");
+        assert_eq!(
+            load_fake_ip_filters_at(&paths).unwrap(),
+            vec!["+.dev.example.com"]
+        );
     }
 }

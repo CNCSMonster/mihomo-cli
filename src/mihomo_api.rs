@@ -326,28 +326,49 @@ pub async fn wait_for_api_ready_at_endpoint(
 
 pub(crate) async fn list_proxies_with_client(client: &impl MihomoApiClient) -> anyhow::Result<()> {
     let data = client.get("/proxies").await?;
+    for line in format_proxy_list(&data)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+pub(crate) fn format_proxy_list(data: &Value) -> anyhow::Result<Vec<String>> {
     let proxies = data["proxies"]
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("no proxies"))?;
+    let group_names: std::collections::BTreeSet<&str> = proxies
+        .iter()
+        .filter_map(|(name, p)| {
+            p.get("all")
+                .and_then(|v| v.as_array())
+                .map(|_| name.as_str())
+        })
+        .collect();
     let mut pairs: Vec<(&String, &Value)> = proxies.iter().collect();
     pairs.sort_by_key(|(k, _)| *k);
+    let mut lines = Vec::new();
     for (name, p) in pairs {
         let ptype = p["type"].as_str().unwrap_or("?");
-        if !["Selector", "URLTest", "Fallback"].contains(&ptype) {
+        if p.get("all").and_then(|v| v.as_array()).is_none() {
             continue;
         }
         let now = p["now"].as_str().unwrap_or("-");
-        println!("[{ptype:8}] {name}  →  {now}");
+        lines.push(format!("[{ptype:12}] {name}  →  {now}"));
         if let Some(all) = p["all"].as_array() {
             for sub in all {
                 let s = sub.as_str().unwrap_or("");
                 if s != now {
-                    println!("          └ {s}");
+                    let member_kind = if group_names.contains(s) {
+                        "group"
+                    } else {
+                        "node"
+                    };
+                    lines.push(format!("              └ [{member_kind}] {s}"));
                 }
             }
         }
     }
-    Ok(())
+    Ok(lines)
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -1334,6 +1355,22 @@ mod api_client_tests {
             client.calls()[0].1,
             "/proxies/%E8%8A%82%E7%82%B9%E9%80%89%E6%8B%A9"
         );
+    }
+
+    #[test]
+    fn format_proxy_list_marks_group_and_node_members() {
+        let data = json!({
+            "proxies": {
+                "OpenAI": {"type": "Selector", "now": "US-01", "all": ["US-01", "Auto"]},
+                "Auto": {"type": "URLTest", "now": "US-02", "all": ["US-02", "US-01"]},
+                "US-01": {"type": "Shadowsocks"},
+                "US-02": {"type": "Shadowsocks"}
+            }
+        });
+        let lines = format_proxy_list(&data).unwrap();
+        assert!(lines.contains(&"[Selector    ] OpenAI  →  US-01".to_string()));
+        assert!(lines.contains(&"              └ [group] Auto".to_string()));
+        assert!(lines.iter().any(|l| l.contains("[node] US-01")));
     }
 
     #[tokio::test]

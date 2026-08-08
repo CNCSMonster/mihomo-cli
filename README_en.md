@@ -143,7 +143,7 @@ src/
 ├── config.rs        Subscription management + config generation
 ├── installer.rs     Core binary download + Geo file management
 ├── service.rs       Service execution + privilege layer (systemd/LaunchDaemon)
-├── instance.rs      v3 Instance Model: path matrix + mode resolution + service plans
+├── instance.rs      Instance Model: path matrix + mode resolution + service plans
 ├── daemon.rs        Daemon process (IPC + readiness + lifecycle serialization)
 ├── ipc.rs           Daemon IPC client
 ├── lock.rs          Concurrency locks

@@ -652,6 +652,14 @@ pub fn validate_binary_at(path: &std::path::Path) -> anyhow::Result<()> {
 }
 
 pub async fn download_mihomo_to(version: Option<&str>, bin_path: &Path) -> anyhow::Result<()> {
+    download_mihomo_to_with_mirror(version, bin_path, None).await
+}
+
+pub async fn download_mihomo_to_with_mirror(
+    version: Option<&str>,
+    bin_path: &Path,
+    github_mirror: Option<&str>,
+) -> anyhow::Result<()> {
     let target = MihomoTarget::current();
     let resolved_version = version.unwrap_or("v1.19.27");
     let part_path = format!("{}.part", bin_path.display());
@@ -661,7 +669,7 @@ pub async fn download_mihomo_to(version: Option<&str>, bin_path: &Path) -> anyho
         part_path,
         archive_ext: target.archive_ext,
     };
-    download_mihomo_with_plan(plan).await
+    download_mihomo_with_plan_and_mirror(plan, github_mirror).await
 }
 
 #[allow(dead_code)]
@@ -686,10 +694,13 @@ pub async fn download_mihomo(version: Option<&str>) -> anyhow::Result<()> {
         part_path: plan.part_path,
         archive_ext: plan.archive_ext,
     };
-    download_mihomo_with_plan(plan).await
+    download_mihomo_with_plan_and_mirror(plan, None).await
 }
 
-async fn download_mihomo_with_plan(plan: MihomoInstallPlan) -> anyhow::Result<()> {
+async fn download_mihomo_with_plan_and_mirror(
+    plan: MihomoInstallPlan,
+    github_mirror: Option<&str>,
+) -> anyhow::Result<()> {
     let bin_path = plan.bin_path.clone();
     if Path::new(&bin_path).exists() {
         println!("mihomo already installed at {bin_path}");
@@ -721,8 +732,8 @@ async fn download_mihomo_with_plan(plan: MihomoInstallPlan) -> anyhow::Result<()
     let parent = Path::new(&bin_path).parent().unwrap();
     std::fs::create_dir_all(parent)?;
 
-    // Download with resume + retry
-    let bytes = download_with_retry(&plan.url, &plan.part_path).await?;
+    // Download with resume + retry, falling back through GitHub mirrors.
+    let bytes = download_with_retry_fallback(&plan.url, github_mirror, &plan.part_path).await?;
 
     // Download complete — clean up .part immediately so a corrupt file
     // never lingers to poison the next resume attempt.
@@ -806,12 +817,30 @@ async fn download_with_retry_using<D: InstallerDownloader>(
     )
 }
 
-async fn download_with_retry(url: &str, part_path: &str) -> anyhow::Result<Vec<u8>> {
+async fn download_with_retry_fallback(
+    primary_url: &str,
+    github_mirror: Option<&str>,
+    part_path: &str,
+) -> anyhow::Result<Vec<u8>> {
     let client = crate::utils::http_client_builder()
         .timeout(Duration::from_secs(300))
         .build()?;
-    let mut downloader = ReqwestInstallerDownloader { client };
-    download_with_retry_using(&mut downloader, url, part_path, 3, true).await
+    let urls = github_asset_urls_with_mirrors(primary_url, github_mirror);
+    let mut last_error = String::new();
+    for url in urls {
+        let mut downloader = ReqwestInstallerDownloader {
+            client: client.clone(),
+        };
+        match download_with_retry_using(&mut downloader, &url, part_path, 3, true).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) => {
+                last_error = e.to_string();
+                eprintln!("  ⚠ Download from {url} failed: {last_error}");
+                let _ = std::fs::remove_file(part_path);
+            }
+        }
+    }
+    anyhow::bail!("Download failed from GitHub and mirrors: {last_error}")
 }
 
 async fn download_once(
@@ -921,9 +950,12 @@ fn build_mirrors(primary: &str) -> Vec<String> {
     ]
 }
 
-/// Return geo file mirror URLs with optional custom proxy at front.
+/// Return GitHub public asset URLs with optional custom proxy at front.
 /// Custom proxy is a base URL prepended to the primary GitHub URL.
-pub(crate) fn geo_urls_with_mirrors(primary: &str, github_mirror: Option<&str>) -> Vec<String> {
+pub(crate) fn github_asset_urls_with_mirrors(
+    primary: &str,
+    github_mirror: Option<&str>,
+) -> Vec<String> {
     let mut urls = vec![primary.to_string()];
     if let Some(proxy) = github_mirror {
         let base = if proxy.ends_with('/') {
@@ -1012,7 +1044,7 @@ pub async fn ensure_geo_files_in(dir_path: &std::path::Path, github_mirror: Opti
 
     for (name, primary_url) in [("geoip.metadb", GEOIP_URL), ("GeoSite.dat", GEOSITE_URL)] {
         let dest = format!("{dir}/{name}");
-        let urls = geo_urls_with_mirrors(primary_url, github_mirror);
+        let urls = github_asset_urls_with_mirrors(primary_url, github_mirror);
 
         if !download_geo_with_fallback(&client, &urls, &dest, gh_token.as_deref()).await {
             eprintln!("  ⚠ Failed to download {name} — mihomo will try at startup");
@@ -1313,11 +1345,6 @@ fn validate_geo_files(config_dir: &str) -> bool {
     let mihomo = crate::utils::mihomo_path();
     if !std::path::Path::new(&mihomo).exists() {
         crate::log!("mihomo binary not found, skipping geo validation");
-        return true;
-    }
-    let config_path = format!("{config_dir}/config.yaml");
-    if !std::path::Path::new(&config_path).exists() {
-        crate::log!("config.yaml not found, skipping geo validation");
         return true;
     }
     match std::process::Command::new(&mihomo)
@@ -1862,7 +1889,7 @@ mod target_tests {
 
     #[test]
     fn geo_mirror_plan_keeps_primary_first_then_fallbacks() {
-        let urls = geo_urls_with_mirrors(GEOIP_URL, None);
+        let urls = github_asset_urls_with_mirrors(GEOIP_URL, None);
         assert_eq!(urls[0], GEOIP_URL);
         assert!(urls
             .iter()
@@ -1878,7 +1905,7 @@ mod target_tests {
     #[test]
     fn geo_mirror_plan_accepts_custom_github_mirror() {
         let proxy = "https://gitproxy.example.com/";
-        let urls = geo_urls_with_mirrors(GEOIP_URL, Some(proxy));
+        let urls = github_asset_urls_with_mirrors(GEOIP_URL, Some(proxy));
         assert_eq!(urls[0], GEOIP_URL);
         // Custom proxy URL is inserted immediately after primary
         assert_eq!(
@@ -1894,11 +1921,26 @@ mod target_tests {
     #[test]
     fn geo_mirror_plan_handles_proxy_without_trailing_slash() {
         let proxy = "https://gh.accelerator.io";
-        let urls = geo_urls_with_mirrors(GEOIP_URL, Some(proxy));
+        let urls = github_asset_urls_with_mirrors(GEOIP_URL, Some(proxy));
         assert_eq!(
             urls[1],
             "https://gh.accelerator.io/https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb"
         );
+    }
+
+    #[test]
+    fn core_mirror_plan_accepts_custom_github_mirror() {
+        let target = MihomoTarget::resolve("linux", "x86_64");
+        let primary = target.download_url("v1.2.3");
+        let urls = github_asset_urls_with_mirrors(&primary, Some("https://gitproxy.example.com"));
+        assert_eq!(urls[0], primary);
+        assert_eq!(
+            urls[1],
+            "https://gitproxy.example.com/https://github.com/MetaCubeX/mihomo/releases/download/v1.2.3/mihomo-linux-amd64-v1.2.3.gz"
+        );
+        assert!(urls
+            .iter()
+            .any(|u| u.starts_with("https://ghproxy.com/https://github.com/")));
     }
 
     #[test]
@@ -2087,8 +2129,14 @@ mod target_tests {
         let geosite = tmp.path().join("GeoSite.dat");
         // Use sparse files: set_len creates a file with the declared size
         {
-            std::fs::File::create(&geoip).unwrap().set_len(9_000_000).unwrap();
-            std::fs::File::create(&geosite).unwrap().set_len(3_000_000).unwrap();
+            std::fs::File::create(&geoip)
+                .unwrap()
+                .set_len(9_000_000)
+                .unwrap();
+            std::fs::File::create(&geosite)
+                .unwrap()
+                .set_len(3_000_000)
+                .unwrap();
         }
         assert!(geo_files_have_minimum_size(tmp.path()));
     }
@@ -2108,7 +2156,10 @@ mod target_tests {
     fn geo_files_are_valid_rejects_missing_files() {
         let tmp = tempfile::tempdir().unwrap();
         // No files at all
-        assert!(!geo_files_are_valid(tmp.path(), std::path::Path::new("/nonexistent/mihomo")));
+        assert!(!geo_files_are_valid(
+            tmp.path(),
+            std::path::Path::new("/nonexistent/mihomo")
+        ));
     }
 
     #[test]
@@ -2128,6 +2179,9 @@ mod target_tests {
             .set_len(3_000_000)
             .unwrap();
         std::fs::write(tmp.path().join("GeoSite.dat"), b"<html>404</html>").unwrap();
-        assert!(!geo_files_are_valid(tmp.path(), std::path::Path::new("/nonexistent/mihomo")));
+        assert!(!geo_files_are_valid(
+            tmp.path(),
+            std::path::Path::new("/nonexistent/mihomo")
+        ));
     }
 }

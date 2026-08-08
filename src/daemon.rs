@@ -1,15 +1,16 @@
 //! System service daemon for mihomo-cli.
 //!
-//! Runs as root (via systemd system service), listens on a Unix socket,
-//! and handles privileged operations on behalf of the unprivileged CLI.
+//! Runs as the dedicated non-root `mihomo` service user where supported, listens on a Unix socket,
+//! and manages the core with service-manager-granted capabilities.
 //!
 //! The daemon is started by `mihomo-cli install --system` and managed by
 //! the system's service manager (systemd/launchd/Windows Service).
 
-#[cfg(any(unix, windows))]
-use crate::ipc::{DaemonCommand, DaemonResponse};
 #[cfg(unix)]
 use crate::instance::ApiEndpoint;
+use crate::instance::{SystemPaths, TargetOs};
+#[cfg(any(unix, windows))]
+use crate::ipc::{DaemonCommand, DaemonResponse};
 #[cfg(unix)]
 use crate::mihomo_api;
 use std::path::PathBuf;
@@ -133,6 +134,82 @@ fn validate_daemon_config_path_for_peer(
     validate_daemon_config_path_shape(config_path)
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct AuthorizedClient {
+    pub user: String,
+    pub uid: u32,
+    pub token: String,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default, PartialEq, Eq)]
+pub(crate) struct AuthorizedClients {
+    pub clients: Vec<AuthorizedClient>,
+}
+
+#[cfg(unix)]
+pub(crate) fn authorized_clients_path() -> PathBuf {
+    std::env::var_os("MIHOMO_CLI_AUTHORIZED_CLIENTS_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/lib/mihomo-cli/authorized-clients.json"))
+}
+
+#[cfg(unix)]
+pub(crate) fn read_authorized_clients_from(
+    path: &std::path::Path,
+) -> anyhow::Result<AuthorizedClients> {
+    if !path.exists() {
+        return Ok(AuthorizedClients::default());
+    }
+    let text = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&text)?)
+}
+
+#[cfg(unix)]
+pub(crate) fn write_authorized_clients_to(
+    path: &std::path::Path,
+    table: &AuthorizedClients,
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(table)?)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn validate_client_token_for_peer(
+    token: Option<&str>,
+    peer_uid: Option<u32>,
+) -> Result<(), String> {
+    if peer_uid == Some(0) {
+        return Ok(());
+    }
+    let token = token.ok_or_else(|| "invalid or missing auth token".to_string())?;
+    let uid = peer_uid.ok_or_else(|| "cannot determine IPC peer uid".to_string())?;
+    let table = read_authorized_clients_from(&authorized_clients_path())
+        .map_err(|e| format!("cannot read authorized clients: {e}"))?;
+    fn ct_eq(a: &str, b: &str) -> bool {
+        let ab = a.as_bytes();
+        let bb = b.as_bytes();
+        let mut diff = ab.len() ^ bb.len();
+        for i in 0..ab.len().max(bb.len()) {
+            let x = *ab.get(i).unwrap_or(&0);
+            let y = *bb.get(i).unwrap_or(&0);
+            diff |= (x ^ y) as usize;
+        }
+        diff == 0
+    }
+    match table.clients.iter().find(|c| ct_eq(&c.token, token)) {
+        Some(c) if c.uid == uid => Ok(()),
+        Some(_) => Err("auth token does not belong to IPC peer uid".to_string()),
+        None => Err("invalid or missing auth token".to_string()),
+    }
+}
+
 #[cfg(any(unix, windows))]
 pub(crate) fn expected_system_core_binary_path() -> PathBuf {
     if cfg!(target_os = "macos") {
@@ -218,10 +295,7 @@ async fn accept_one_pipe_connection(
             // subsequent instance would fail (ERROR_ACCESS_DENIED) while the
             // first pipe name still exists (P1-2).
             .first_pipe_instance(first_instance)
-            .create_with_security_attributes_raw(
-                pipe_name,
-                sd_storage.as_mut_ptr(),
-            )?
+            .create_with_security_attributes_raw(pipe_name, sd_storage.as_mut_ptr())?
     };
     server.connect().await?;
     Ok(Some(server))
@@ -275,7 +349,7 @@ mod windows_pipe_security {
         let installer_sid = super::read_installer_sid().unwrap_or_default();
         let sddl = super::pipe_sddl_for_installer(&installer_sid);
 
-        let mut sddl_wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+        let sddl_wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
         // The function allocates the SECURITY_DESCRIPTOR itself and writes the
         // address into `descriptor_ptr` — do NOT pre-allocate.
         let mut descriptor_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -306,8 +380,9 @@ mod windows_pipe_security {
 #[cfg(windows)]
 /// Read the installer SID from `%ProgramData%\mihomo\installer-sid`.
 fn read_installer_sid() -> Option<String> {
-    let program_data =
-        std::env::var_os("ProgramData").map(std::path::PathBuf::from).unwrap_or_default();
+    let program_data = std::env::var_os("ProgramData")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
     let path = program_data.join("mihomo").join("installer-sid");
     std::fs::read_to_string(path)
         .ok()
@@ -318,6 +393,7 @@ fn read_installer_sid() -> Option<String> {
 /// Build the pipe SDDL string restricting access to SYSTEM + Administrators +
 /// the installing user's SID. Empty/missing installer SID → fail closed
 /// (SYSTEM + Administrators only). Pure function for testability.
+#[cfg(any(windows, test))]
 fn pipe_sddl_for_installer(installer_sid: &str) -> String {
     if installer_sid.trim().is_empty() {
         "D:P(A;;GA;;;SY)(A;;GA;;;BA)".to_string()
@@ -330,7 +406,7 @@ fn pipe_sddl_for_installer(installer_sid: &str) -> String {
 }
 
 #[cfg(not(any(unix, windows)))]
-pub async fn run_daemon(_socket_path: PathBuf) -> anyhow::Result<()> {
+pub async fn run_daemon(_socket_path: PathBuf, _cancel: CancellationToken) -> anyhow::Result<()> {
     anyhow::bail!("system service daemon is not implemented on this platform")
 }
 
@@ -525,20 +601,17 @@ async fn process_windows_command(
 ) -> DaemonResponse {
     // Token auth (N1a): reject commands whose token does not match the
     // server-side copy. Skipped when the server has no token (legacy install).
-    if let Some(server_token) = crate::ipc::windows_service_token() {
-        let client_token = match &cmd {
-            DaemonCommand::StartCore { token, .. }
-            | DaemonCommand::RestartCore { token, .. }
-            | DaemonCommand::EnableTun { token, .. }
-            | DaemonCommand::StopCore { token }
-            | DaemonCommand::DisableTun { token }
-            | DaemonCommand::GetStatus { token } => token.as_deref(),
-        };
-        if client_token != Some(server_token.as_str()) {
-            return DaemonResponse::Error {
-                message: "invalid or missing auth token".to_string(),
-            };
-        }
+    let client_token = match &cmd {
+        DaemonCommand::StartCore { token, .. }
+        | DaemonCommand::RestartCore { token, .. }
+        | DaemonCommand::EnableTun { token, .. }
+        | DaemonCommand::StopCore { token }
+        | DaemonCommand::DisableTun { token }
+        | DaemonCommand::GetStatus { token }
+        | DaemonCommand::SetAutostart { token, .. } => token.as_deref(),
+    };
+    if let Err(message) = validate_client_token_for_peer(client_token, peer_uid) {
+        return DaemonResponse::Error { message };
     }
     match cmd {
         DaemonCommand::GetStatus { .. } => {
@@ -552,6 +625,39 @@ async fn process_windows_command(
                 tun_enabled: s.tun_enabled,
                 core_pid: s.core_pid,
                 config_path: s.config_path.clone(),
+                autostart_enabled: daemon_config_dir().join("autostart").exists(),
+            }
+        }
+        // ADR-19: daemon owns the autostart marker.
+        DaemonCommand::SetAutostart { enabled, .. } => {
+            let marker = daemon_config_dir().join("autostart");
+            let result: std::io::Result<()> = if enabled {
+                let dir_result = marker
+                    .parent()
+                    .map(std::fs::create_dir_all)
+                    .unwrap_or(Ok(()));
+                match dir_result {
+                    Ok(()) => std::fs::write(&marker, b"enabled\n"),
+                    Err(e) => Err(e),
+                }
+            } else {
+                match std::fs::remove_file(&marker) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(e),
+                }
+            };
+            match result {
+                Ok(()) => DaemonResponse::Success {
+                    message: if enabled {
+                        "core autostart enabled".to_string()
+                    } else {
+                        "core autostart disabled".to_string()
+                    },
+                },
+                Err(e) => DaemonResponse::Error {
+                    message: format!("failed to update autostart marker: {e}"),
+                },
             }
         }
         DaemonCommand::StartCore { config_path, .. } => {
@@ -860,6 +966,29 @@ impl Default for DaemonState {
     }
 }
 
+/// The daemon's authoritative system paths (ADR-18/19).
+///
+/// Returns the SystemPaths for the current OS. The daemon uses these
+/// paths for config, autostart markers, and runtime files.
+/// Must NOT resolve via the daemon's own getpwuid home (root would get /root).
+#[allow(dead_code)]
+fn daemon_system_paths() -> SystemPaths {
+    // Detect the real target OS at runtime
+    #[cfg(target_os = "linux")]
+    let os = TargetOs::Linux;
+    #[cfg(target_os = "macos")]
+    let os = TargetOs::Macos;
+    #[cfg(target_os = "windows")]
+    let os = TargetOs::Windows;
+
+    SystemPaths::for_os(os)
+}
+
+/// The daemon's authoritative config directory (ADR-22 single source of truth).
+fn daemon_config_dir() -> std::path::PathBuf {
+    dirs::home_dir().unwrap_or_default().join(".config/mihomo")
+}
+
 #[cfg(unix)]
 /// Run the daemon main loop.
 ///
@@ -897,6 +1026,29 @@ pub async fn run_daemon(socket_path: PathBuf, cancel: CancellationToken) -> anyh
         }
     }
     let state = Arc::new(Mutex::new(initial_state));
+
+    // ADR-19: if core autostart is enabled, start the core automatically on
+    // daemon startup (e.g. boot). The marker is daemon-owned at the
+    // authoritative config dir — NOT the CLI's possibly-root-resolved home.
+    let autostart_marker = daemon_config_dir().join("autostart");
+    if autostart_marker.exists() {
+        let config_path = daemon_config_dir().join("config.yaml");
+        if config_path.exists() {
+            eprintln!("[mihomo-daemon] autostart marker present; starting core");
+            let core_binary =
+                crate::instance::planned_current_context(crate::instance::InstanceMode::System)
+                    .map(|ctx| ctx.paths.core_binary.clone())
+                    .unwrap_or_else(|| std::path::PathBuf::from(crate::utils::mihomo_path()));
+            let resp = start_core(Arc::clone(&state), config_path, core_binary).await;
+            if let DaemonResponse::Error { message } = &resp {
+                eprintln!("[mihomo-daemon] autostart core failed: {message}");
+            }
+        } else {
+            eprintln!(
+                "[mihomo-daemon] autostart marker present but no config.yaml; skipping core start"
+            );
+        }
+    }
 
     eprintln!("[mihomo-daemon] listening on {}", socket_path.display());
 
@@ -990,8 +1142,7 @@ async fn handle_connection(
     // GetStatus is read-only and does not take the lifecycle lock.
     let is_lifecycle = !matches!(cmd, DaemonCommand::GetStatus { token: None });
     let response = if is_lifecycle {
-        let lock = OWNER_LIFECYCLE_LOCK
-            .get_or_init(|| tokio::sync::Mutex::new(()));
+        let lock = OWNER_LIFECYCLE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
         let _guard = lock.lock().await;
         process_command(cmd, state, peer_uid).await
     } else {
@@ -1010,12 +1161,42 @@ fn parse_daemon_command(bytes: &[u8]) -> Result<DaemonCommand, String> {
 }
 
 #[cfg(unix)]
-/// Process a daemon command and return a response.
+/// Only root (uid 0) may toggle TUN on/off.
+fn validate_tun_peer_is_root(peer_uid: Option<u32>) -> Result<(), String> {
+    match peer_uid {
+        Some(0) => Ok(()),
+        Some(_) => Err("TUN on/off requires root privileges".to_string()),
+        None => {
+            Err("TUN on/off requires root privileges; cannot determine IPC peer uid".to_string())
+        }
+    }
+}
+
 async fn process_command(
     cmd: DaemonCommand,
     state: Arc<Mutex<DaemonState>>,
     peer_uid: Option<u32>,
 ) -> DaemonResponse {
+    let client_token = match &cmd {
+        DaemonCommand::StartCore { token, .. }
+        | DaemonCommand::RestartCore { token, .. }
+        | DaemonCommand::EnableTun { token, .. }
+        | DaemonCommand::StopCore { token }
+        | DaemonCommand::DisableTun { token }
+        | DaemonCommand::GetStatus { token }
+        | DaemonCommand::SetAutostart { token, .. } => token.as_deref(),
+    };
+    if let Err(message) = validate_client_token_for_peer(client_token, peer_uid) {
+        return DaemonResponse::Error { message };
+    }
+    if matches!(
+        cmd,
+        DaemonCommand::EnableTun { .. } | DaemonCommand::DisableTun { .. }
+    ) {
+        if let Err(message) = validate_tun_peer_is_root(peer_uid) {
+            return DaemonResponse::Error { message };
+        }
+    }
     match cmd {
         DaemonCommand::GetStatus { .. } => {
             let mut s = state.lock().await;
@@ -1028,6 +1209,41 @@ async fn process_command(
                 tun_enabled: s.tun_enabled,
                 core_pid: s.core_pid,
                 config_path: s.config_path.clone(),
+                autostart_enabled: daemon_config_dir().join("autostart").exists(),
+            }
+        }
+        // ADR-19: daemon owns the autostart marker (its config_dir is the
+        // authoritative per-user path — the CLI under sudo would resolve a
+        // different home).
+        DaemonCommand::SetAutostart { enabled, .. } => {
+            let marker = daemon_config_dir().join("autostart");
+            let result: std::io::Result<()> = if enabled {
+                let dir_result = marker
+                    .parent()
+                    .map(std::fs::create_dir_all)
+                    .unwrap_or(Ok(()));
+                match dir_result {
+                    Ok(()) => std::fs::write(&marker, b"enabled\n"),
+                    Err(e) => Err(e),
+                }
+            } else {
+                match std::fs::remove_file(&marker) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(e),
+                }
+            };
+            match result {
+                Ok(()) => DaemonResponse::Success {
+                    message: if enabled {
+                        "core autostart enabled".to_string()
+                    } else {
+                        "core autostart disabled".to_string()
+                    },
+                },
+                Err(e) => DaemonResponse::Error {
+                    message: format!("failed to update autostart marker: {e}"),
+                },
             }
         }
         DaemonCommand::StartCore { config_path, .. } => {
@@ -1678,8 +1894,7 @@ async fn start_core(
                             .map(PathBuf::from)
                             .unwrap_or_else(|| PathBuf::from(&api_endpoint)),
                     );
-                    let ready =
-                        mihomo_api::wait_for_api_ready_at_endpoint(&endpoint, 15).await;
+                    let ready = mihomo_api::wait_for_api_ready_at_endpoint(&endpoint, 15).await;
                     if !ready {
                         // Core spawned but did not become ready; kill it and report failure.
                         let _ = s.core_child.take();
@@ -1941,6 +2156,128 @@ async fn toggle_tun_via_core_api(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_tun_peer_uid_requires_root() {
+        assert!(validate_tun_peer_is_root(Some(0)).is_ok());
+        assert!(validate_tun_peer_is_root(Some(1000)).is_err());
+        assert!(validate_tun_peer_is_root(None)
+            .unwrap_err()
+            .contains("cannot determine IPC peer uid"));
+    }
+
+    #[test]
+    fn authorized_clients_table_roundtrip_sets_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("authorized-clients.json");
+        let table = AuthorizedClients {
+            clients: vec![AuthorizedClient {
+                user: "alice".into(),
+                uid: 1000,
+                token: "tok".into(),
+            }],
+        };
+        write_authorized_clients_to(&path, &table).unwrap();
+        assert_eq!(read_authorized_clients_from(&path).unwrap(), table);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn validate_client_token_checks_token_and_peer_uid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("authorized-clients.json");
+        write_authorized_clients_to(
+            &path,
+            &AuthorizedClients {
+                clients: vec![AuthorizedClient {
+                    user: "alice".into(),
+                    uid: 1000,
+                    token: "tok".into(),
+                }],
+            },
+        )
+        .unwrap();
+        let old = std::env::var_os("MIHOMO_CLI_AUTHORIZED_CLIENTS_PATH");
+        unsafe {
+            std::env::set_var("MIHOMO_CLI_AUTHORIZED_CLIENTS_PATH", &path);
+        }
+        assert!(validate_client_token_for_peer(Some("tok"), Some(1000)).is_ok());
+        assert!(validate_client_token_for_peer(Some("tok"), Some(1001)).is_err());
+        assert!(validate_client_token_for_peer(Some("bad"), Some(1000)).is_err());
+        if let Some(v) = old {
+            unsafe {
+                std::env::set_var("MIHOMO_CLI_AUTHORIZED_CLIENTS_PATH", v);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("MIHOMO_CLI_AUTHORIZED_CLIENTS_PATH");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn process_command_rejects_unauthorized_client_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("authorized-clients.json");
+        write_authorized_clients_to(&path, &AuthorizedClients { clients: vec![] }).unwrap();
+        let old = std::env::var_os("MIHOMO_CLI_AUTHORIZED_CLIENTS_PATH");
+        unsafe {
+            std::env::set_var("MIHOMO_CLI_AUTHORIZED_CLIENTS_PATH", &path);
+        }
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        let response = process_command(
+            DaemonCommand::GetStatus {
+                token: Some("bad".into()),
+            },
+            state,
+            Some(1000),
+        )
+        .await;
+        assert!(matches!(response, DaemonResponse::Error { .. }));
+        if let Some(v) = old {
+            unsafe {
+                std::env::set_var("MIHOMO_CLI_AUTHORIZED_CLIENTS_PATH", v);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("MIHOMO_CLI_AUTHORIZED_CLIENTS_PATH");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_command_rejects_enable_tun_from_non_root_peer() {
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        let response = process_command(
+            DaemonCommand::EnableTun {
+                config_path: PathBuf::from("/home/alice/.config/mihomo/config.yaml"),
+                stack: None,
+                dns_hijack: None,
+                token: None,
+            },
+            state,
+            Some(1000),
+        )
+        .await;
+
+        assert!(matches!(response, DaemonResponse::Error { .. }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_command_rejects_disable_tun_from_non_root_peer() {
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        let response =
+            process_command(DaemonCommand::DisableTun { token: None }, state, Some(1000)).await;
+
+        assert!(matches!(response, DaemonResponse::Error { .. }));
+    }
 
     #[test]
     fn pipe_sddl_restricts_to_system_admin_and_installer() {
@@ -2252,7 +2589,10 @@ mod tests {
         let missing_config = config_path.clone();
 
         let response = process_command(
-            DaemonCommand::RestartCore { config_path: missing_config, token: None },
+            DaemonCommand::RestartCore {
+                config_path: missing_config,
+                token: None,
+            },
             Arc::clone(&state),
             Some(0),
         )
@@ -2376,10 +2716,7 @@ external-controller: 127.0.0.1:9090
         let valid = "/Users/alice/.config/mihomo/config.yaml";
         #[cfg(not(target_os = "macos"))]
         let valid = "/home/alice/.config/mihomo/config.yaml";
-        assert!(validate_daemon_config_path_shape(std::path::Path::new(
-            valid
-        ))
-        .is_ok());
+        assert!(validate_daemon_config_path_shape(std::path::Path::new(valid)).is_ok());
         // The other platform's path shape must be rejected.
         let platform_other_home = if cfg!(target_os = "macos") {
             "/home/alice/.config/mihomo/config.yaml"
@@ -2500,7 +2837,10 @@ second
     fn cmdline_matching_requires_core_binary_identity_when_available() {
         let metadata = sample_metadata(1234);
         assert!(cmdline_matches_core_metadata(
-            &[metadata.core_binary.to_string_lossy().to_string(), "-d".to_string()],
+            &[
+                metadata.core_binary.to_string_lossy().to_string(),
+                "-d".to_string()
+            ],
             &metadata
         ));
         assert!(!cmdline_matches_core_metadata(
@@ -2536,8 +2876,7 @@ second
     async fn lifecycle_lock_serializes_lifecycle_but_not_status() {
         // 两个并发任务：一个持锁（模拟生命周期操作），一个 GetStatus
         // GetStatus 不经过生命周期锁 → 不阻塞
-        let lock = OWNER_LIFECYCLE_LOCK
-            .get_or_init(|| tokio::sync::Mutex::new(()));
+        let lock = OWNER_LIFECYCLE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
         let guard = lock.lock().await;
 
         // 持锁时，GetStatus 仍应立即执行（不取生命周期锁）
@@ -2548,7 +2887,10 @@ second
         drop(guard);
 
         // 生命周期命令（StartCore）应标记为需要锁
-        let cmd = DaemonCommand::StartCore { config_path: PathBuf::from("/tmp/x/config.yaml"), token: None };
+        let cmd = DaemonCommand::StartCore {
+            config_path: PathBuf::from("/tmp/x/config.yaml"),
+            token: None,
+        };
         let is_lifecycle = !matches!(cmd, DaemonCommand::GetStatus { token: None });
         assert!(is_lifecycle, "StartCore must be a lifecycle command");
     }

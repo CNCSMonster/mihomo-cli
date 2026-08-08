@@ -27,6 +27,33 @@ mihomo-cli tun on
 
 ---
 
+## AI/脚本 JSON 输出（第一阶段）
+
+`mihomo-cli` 提供全局 `--json` flag。JSON 模式下 stdout 只输出统一 envelope，不混入 emoji、TUI 或进度文本；诊断/错误细节后续会继续迁移到结构化字段。
+
+当前第一批已对齐的低风险命令：
+
+```bash
+mihomo-cli --json version
+mihomo-cli --json status
+mihomo-cli --json config --validate
+```
+
+统一 envelope 字段：
+
+```json
+{
+  "ok": true,
+  "command": "status",
+  "data": {},
+  "warnings": [],
+  "error": null,
+  "meta": { "schema_version": 1, "cli_version": "..." }
+}
+```
+
+人类默认输出保持不变；更多命令的 `--json` 支持见 ROADMAP。
+
 ## 安装位置说明
 
 使用源码安装时：
@@ -55,10 +82,12 @@ cargo install --path .
 
 ```bash
 mihomo-cli install              # 交互式选择：普通代理模式 / TUN 全机模式
-mihomo-cli install --user       # 非交互式安装普通代理模式（无需 sudo）
-mihomo-cli install --system     # 非交互式安装 system service（高级/脚本/排障）
+mihomo-cli install --user       # 显式安装普通代理模式（无需 sudo）
+mihomo-cli install --system     # 显式安装 system service（高级/脚本/排障）
+mihomo-cli install --user --skip-config --yes    # 非交互：安装 user service，跳过订阅交互和确认
+mihomo-cli install --system --skip-config --yes  # 非交互：安装 system service，跳过订阅交互和确认
 mihomo-cli install --force      # 强制重新安装
-mihomo-cli install --github-mirror https://ghproxy.com/  # geo 下载走 GitHub 镜像（大陆网络加速）
+mihomo-cli install --github-mirror https://ghproxy.com/  # core/geo 下载走 GitHub 镜像（大陆网络加速）
 ```
 
 **安装步骤：**
@@ -68,11 +97,21 @@ mihomo-cli install --github-mirror https://ghproxy.com/  # geo 下载走 GitHub 
 3. 配置订阅链接（交互式输入）并生成当前用户的 `~/.config/mihomo/config.yaml`
 4. 安装服务（systemd/LaunchDaemon 或 user service）
 
-> 💡 `--github-mirror`：geo 数据（geoip/geosite）下载的 GitHub 镜像前缀。国内网络直连 GitHub 慢时可指定镜像站（如 `https://ghproxy.com/`）；仅影响 geo 下载，订阅下载不走此镜像。
+> 💡 `--github-mirror`：Mihomo core 二进制和 geo 数据（geoip/geosite）等 GitHub public assets 下载的镜像前缀。国内网络直连 GitHub 慢时可指定镜像站（如 `https://ghproxy.com/`）；不影响订阅下载。
 
 ---
 
 #### `config` (alias: `c`)
+
+多订阅语义：
+
+- `config --refresh` 访问远端 URL，刷新当前 active subscription 的本地缓存，并重新生成/校验 `config.yaml`。
+- `config --refresh-all` 刷新所有已保存订阅缓存，但最终 `config.yaml` 仍由 active subscription 生成。
+- `config --switch <id>` 切换 active subscription，并重新生成/校验 `config.yaml`；切换使用本地订阅缓存，通常不需要访问远端 URL。
+- 配置变更在生成并校验 `config.yaml` 后会尝试热重载运行中的 core；热重载失败时会明确提示执行 `mihomo-cli restart`。
+- `rules.yaml`、`dns-policy.yaml`、`dns-fake-ip-filter.yaml`、`override.yaml` 会叠加到 active subscription 之上。
+- 配置写入/生成成功不一定表示运行中的 mihomo core 已经使用新配置；如输出未明确提示 reload 成功，请执行 `mihomo-cli restart`。
+
 
 管理订阅和配置。无参数时启动交互式 TUI 界面。
 
@@ -94,6 +133,10 @@ mihomo-cli config --info <ID>             # 查看指定订阅信息
 # 刷新订阅
 mihomo-cli config --refresh               # 刷新活跃订阅
 mihomo-cli config --refresh-all           # 刷新所有订阅
+
+# 离线 fetch（只写指定输出文件，不修改本机 mihomo 状态）
+mihomo-cli config fetch '<url>' -o config.yaml
+mihomo-cli config fetch '<url>' -o config.yaml --user-agent "clash/v1.0.0"
 
 # UA 探测与设置
 mihomo-cli config --probe '<url>'         # 探测候选 UA 返回格式（不写文件）
@@ -126,6 +169,16 @@ mihomo-cli config -y                      # 跳过确认提示
 - `vmess://` 链接
 - Base64 编码的节点列表
 - Clash YAML 订阅
+
+**`fetch` 说明：**
+
+`mihomo-cli config fetch '<subscription-url>' -o config.yaml` 会复用订阅下载能力（UA 协商、`flag=clashmeta`、Clash YAML/base64/vmess/raw 识别与转换、YAML 结构校验），仅把可导入的 Clash YAML 写到 `-o/--output` 指定文件。它不会修改本机 `~/.config/mihomo/`、`subscriptions/`、`active`、`rules.yaml` 等状态。
+
+输出文件可能包含私有节点和 token，请按敏感文件处理。复制到目标机器后可执行：
+
+```bash
+mihomo-cli config --import config.yaml
+```
 
 **`--import` 说明：**
 
@@ -168,10 +221,11 @@ mihomo-cli update
 
 #### `upgrade`
 
-检查 GitHub 上最新 mihomo core 版本，并交互式升级。
+检查 GitHub 上最新 mihomo core 版本，并升级 Mihomo core。
 
 ```bash
-mihomo-cli upgrade
+mihomo-cli upgrade        # 交互确认后升级
+mihomo-cli upgrade --yes  # 非交互：跳过确认直接升级
 ```
 
 ---
@@ -200,7 +254,7 @@ mihomo-cli dashboard    # 或 mihomo-cli dash
 
 #### `start`
 
-启动 mihomo 服务。v3 自动检测当前实例模式（system service / per-user），无需指定模式。
+启动 mihomo 服务。自动检测当前实例模式（system service / per-user），无需指定模式。
 
 ```bash
 mihomo-cli start                # 启动当前实例（自动检测模式）
@@ -312,12 +366,41 @@ mihomo-cli delay --fastest        # 自动选择测试成功的最快节点
 
 ---
 
+#### `autostart`
+
+控制开机自启（boot/login 启动）。**默认不开机自启**（ADR-17）——安装后需显式开启。
+
+```bash
+mihomo-cli autostart on              # 开启开机自启（当前实例模式）
+mihomo-cli autostart off             # 关闭开机自启
+mihomo-cli autostart status          # 查询自启状态
+mihomo-cli autostart on --system     # 指定 system 模式
+mihomo-cli autostart on --user       # 指定 user 模式
+```
+
+**各平台机制：**
+
+| 平台/模式 | on | off | status |
+|-----------|-----|------|--------|
+| Linux system | `systemctl enable mihomo` | `systemctl disable` | `systemctl is-enabled` |
+| Linux user | `systemctl --user enable` | `systemctl --user disable` | `systemctl --user is-enabled` |
+| macOS system | `launchctl enable system/io.mihomo` | `launchctl disable` | `launchctl print` |
+| macOS user | `launchctl enable gui/UID/io.mihomo` | `launchctl disable` | `launchctl print` |
+| Windows system | `sc config mihomo start= auto` | `start= demand` | `sc qc` |
+| Windows user | 注册表 Run 键 + .vbs 隐藏 | 删除 Run 值 | `reg query` |
+
+> 💡 Windows user 模式用注册表 Run 键 + `.vbs` 脚本隐藏窗口（登录静默启动，无黑色控制台窗口），
+> 不易被误删。默认不开机自启，`autostart on` 显式开启。
+
+---
+
 #### `tun`
 
 开关 TUN 透明代理模式。
 
 ```bash
-mihomo-cli tun on                  # 开启 system service TUN（per-user 模式会失败并提示）
+mihomo-cli tun on                  # 开启 system service TUN；必要时交互引导安装 system service
+mihomo-cli tun on --yes            # 非交互：需要安装/切换 system service 时跳过确认
 mihomo-cli tun off                 # 关闭 system service TUN
 mihomo-cli tun status              # 自动检测并查看 TUN 状态
 mihomo-cli tun on --stack gvisor   # 使用 gvisor 栈
@@ -330,6 +413,7 @@ mihomo-cli tun on --dns-hijack any:53 # 指定 DNS 劫持目标
 |------|------|
 | `--stack <system\|gvisor\|mixed>` | TUN 栈选择 |
 | `--dns-hijack [TARGET]` | 启用 DNS 劫持，不带值默认 `any:53` |
+| `-y, --yes` | 非交互确认；需要安装/切换 system service 时直接执行 |
 
 > ⚠️ TUN 模式需要 system service。日常直接运行 `mihomo-cli tun on`；如果尚未安装 system service，CLI 会交互引导安装并请求一次管理员密码。system-proxy 在 TUN 已开启时通常无效，CLI 会给出 warning。
 
@@ -377,12 +461,16 @@ mihomo-cli ip            # 兼容：当前 mihomo 访问 IP echo 服务的出口
 
 #### `proxy`
 
-输出 shell 代理环境变量（配合 `eval` 使用）。
+输出 shell 代理环境变量（配合 `eval` 使用）。这是 terminal-only proxy helper，不是 service lifecycle：`proxy on/off` 不会启动或停止 mihomo；启动/停止服务请使用 `start` / `stop` / `restart`。
 
 ```bash
-eval "$(mihomo-cli proxy on)"          # 设置 http_proxy / https_proxy（自动检测实例）
-eval "$(mihomo-cli proxy off)"         # 取消代理
+mihomo-cli start                       # 先确保 mihomo 正在运行
+eval "$(mihomo-cli proxy on)"          # 将 http_proxy / https_proxy 应用到当前 shell
+curl https://example.com               # 当前 shell 中的命令走代理
+eval "$(mihomo-cli proxy off)"         # 清理当前 shell 的代理环境变量
 ```
+
+不提供 `proxy exec`；如只想临时代理单条命令，可由用户自行设置 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量。无 root/admin 或不希望影响全机网络时可使用本方式；默认推荐路径仍是 TUN。
 
 ---
 
@@ -523,18 +611,45 @@ mihomo-cli rule test 192.168.1.1
 
 ```bash
 # DNS 策略管理
-mihomo-cli dns policy add ubtrobot.com 10.10.1.251           # 添加策略
-mihomo-cli dns policy add corp.com 10.10.1.251,10.10.1.120   # 多个 DNS 服务器
+mihomo-cli dns policy add internal.example.com 192.0.2.53           # 添加策略
+
+
+### DNS fake-ip-filter 管理
+
+在 `enhanced-mode: fake-ip` 下，内网/VPN 域名如果需要真实 DNS 结果，可用独立源文件 `dns-fake-ip-filter.yaml` 管理 `dns.fake-ip-filter`，再由 CLI 生成合并到 `config.yaml`：
+
+```bash
+mihomo-cli dns fake-ip-filter add corp.example.com     # 保存为 +.corp.example.com
+mihomo-cli dns fake-ip-filter add '*.corp.example.com' # 同样规范化为 +.corp.example.com
+mihomo-cli dns fake-ip-filter list
+mihomo-cli dns fake-ip-filter remove corp.example.com
+```
+
+修改会重新合并并校验配置；为确保 DNS/fake-ip 行为可靠生效，请执行：
+
+```bash
+mihomo-cli restart
+```
+
+公司内网场景通常需要三者配合：
+
+```bash
+mihomo-cli dns fake-ip-filter add corp.example.com
+mihomo-cli dns policy add corp.example.com system
+mihomo-cli rule add DOMAIN-SUFFIX,corp.example.com,DIRECT
+mihomo-cli restart
+```
+mihomo-cli dns policy add corp.com 192.0.2.53,192.0.2.54   # 多个 DNS 服务器
 mihomo-cli dns policy list                                  # 列出当前实例策略 (alias: ls)
 mihomo-cli dns policy remove 1                              # 按索引删除 (alias: rm)
-mihomo-cli dns policy remove ubtrobot.com                   # 按域名删除
+mihomo-cli dns policy remove internal.example.com                   # 按域名删除
 
 # DNS 状态
 mihomo-cli dns status                                       # 查看当前实例 DNS 配置
 
 # DNS 模板
 mihomo-cli dns template list                                       # 列出可用模板
-mihomo-cli dns template apply company --domain corp.example.com --target 10.10.1.251
+mihomo-cli dns template apply company --domain corp.example.com --target 192.0.2.53
 mihomo-cli dns template apply ads                           # 应用广告过滤模板
 ```
 
@@ -546,6 +661,22 @@ mihomo-cli dns template apply ads                           # 应用广告过滤
 | `ads` | 将常见广告/追踪域名路由到过滤 DNS |
 
 ---
+
+
+### 恢复直连 / 关闭 mihomo-cli 的影响
+
+`mihomo-cli stop` 只停止 mihomo core/service，不会也不能清理所有外部环境状态。按层级分别关闭：
+
+```bash
+mihomo-cli status              # 查看当前实例，并显示关闭提示
+mihomo-cli tun status          # 查看 TUN 是否启用
+mihomo-cli tun off             # 关闭 TUN
+mihomo-cli system-proxy off    # 关闭 OS system proxy
+eval "$(mihomo-cli proxy off)" # 清理当前 shell env proxy
+mihomo-cli stop                # 如需停止 core/service
+```
+
+如果曾在 shell 中执行过 `eval "$(mihomo-cli proxy on)"`，只能在同一个 shell 中执行 `eval "$(mihomo-cli proxy off)"` 或重新打开 shell；子进程无法修改父 shell 环境变量。
 
 #### `backup` / `restore`
 
@@ -575,7 +706,7 @@ mihomo-cli restore /path/to/backup --yes    # 跳过确认
 
 ### override.yaml
 
-`~/.config/mihomo/override.yaml` 支持任意字段覆盖，在订阅内容之后、用户规则之前合并。可直接编辑文件，也可用 `override` 命令管理；命令默认自动检测当前实例，`--system` 仅用于脚本/排障：
+`~/.config/mihomo/override.yaml` 是高级配置覆盖文件。它用于覆盖普通 Mihomo 配置字段；日常操作优先使用 `config` / `rule` / `dns` / `select` 等命令，不推荐直接编辑 YAML。可直接编辑文件，也可用 `override` 命令管理；命令默认自动检测当前实例，`--system` 仅用于脚本/排障：
 
 ```bash
 mihomo-cli override path
@@ -597,12 +728,12 @@ dns:
   enhanced-mode: redir-host
 ```
 
-**合并顺序：** 订阅内容 → `override.yaml` → 用户规则 → DNS 策略 → controller 注入
+**合并顺序：** active subscription cache → 用户规则 → DNS policy → DNS fake-ip-filter → 默认端口/controller 注入 → `override.yaml` → controller 再注入
 
 **合并语义：**
 - YAML map 递归合并
 - list 和 scalar 直接替换
-- runtime controller 字段会在 override 后重新注入
+- runtime controller 字段由 `mihomo-cli` 管理，会在 override 后重新注入；不要通过 override 修改 `external-controller*`、API socket/pipe 或 controller secret
 
 ---
 

@@ -560,6 +560,128 @@ fn validate_cidr(s: &str, ipv6: bool) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SelectionStateFile {
+    #[serde(default)]
+    pub selections: std::collections::BTreeMap<String, String>,
+}
+
+pub fn load_selection_state_at(
+    paths: &AppPaths,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let path = paths.selection_state_path();
+    if !path.exists() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read selection state: {}", path.display()))?;
+    let state: SelectionStateFile =
+        serde_yaml::from_str(&content).with_context(|| "Failed to parse selection-state.yaml")?;
+    Ok(state.selections)
+}
+
+pub fn save_selection_state_at(
+    paths: &AppPaths,
+    selections: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    std::fs::create_dir_all(paths.config_dir())?;
+    let state = SelectionStateFile {
+        selections: selections.clone(),
+    };
+    let content = serde_yaml::to_string(&state)?;
+    crate::utils::atomic_write_file(
+        &paths.selection_state_path().display().to_string(),
+        &format!("# Last selections made by mihomo-cli; used only for drift warnings.\n{content}"),
+    )?;
+    Ok(())
+}
+
+pub fn remember_selection_at(paths: &AppPaths, group: &str, node: &str) -> Result<()> {
+    let mut selections = load_selection_state_at(paths)?;
+    selections.insert(group.to_string(), node.to_string());
+    save_selection_state_at(paths, &selections)
+}
+
+pub fn selection_drift_warnings_at(paths: &AppPaths) -> Result<Vec<String>> {
+    let selections = load_selection_state_at(paths)?;
+    if selections.is_empty() {
+        return Ok(Vec::new());
+    }
+    let config_path = paths.config_path();
+    let content = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
+    selection_drift_warnings_in_config(&content, &selections)
+}
+
+pub fn selection_drift_warnings_in_config(
+    config_content: &str,
+    selections: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<String>> {
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str(config_content).with_context(|| "Failed to parse config.yaml")?;
+    let groups = yaml
+        .get("proxy-groups")
+        .and_then(|v| v.as_sequence())
+        .ok_or_else(|| anyhow::anyhow!("config.yaml does not contain proxy-groups"))?;
+    let mut members =
+        std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+    for group in groups {
+        let Some(name) = group.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let set = group
+            .get("proxies")
+            .and_then(|v| v.as_sequence())
+            .map(|seq| {
+                seq.iter()
+                    .filter_map(|v| v.as_str().map(ToString::to_string))
+                    .collect::<std::collections::BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        members.insert(name.to_string(), set);
+    }
+    let mut warnings = Vec::new();
+    for (group, selected) in selections {
+        match members.get(group) {
+            None => warnings.push(format!(
+                "Warning: selected group `{group}` is not available in current proxy groups."
+            )),
+            Some(nodes) if !nodes.contains(selected) => warnings.push(format!(
+                "Warning: selected node `{selected}` is not available in group `{group}`."
+            )),
+            Some(_) => {}
+        }
+    }
+    Ok(warnings)
+}
+
+/// Extract the policy/target token from a Clash rule string.
+pub fn rule_policy(rule: &str) -> Option<&str> {
+    let parts: Vec<&str> = rule.split(',').map(str::trim).collect();
+    if parts.first()?.eq_ignore_ascii_case("MATCH") {
+        parts.get(1).copied()
+    } else {
+        parts.get(2).copied()
+    }
+}
+
+/// Warn when a rule points at a policy/group not present in the current config.
+/// This intentionally reports facts only; it never rewrites user rules.
+pub fn rule_policy_warnings_at(paths: &AppPaths, rules: &[String]) -> Result<Vec<String>> {
+    let policies = available_policies_at(paths)?;
+    let mut warnings = Vec::new();
+    for rule in rules {
+        if let Some(policy) = rule_policy(rule) {
+            if !policies.iter().any(|p| p == policy) {
+                warnings.push(format!(
+                    "Warning: rule target `{policy}` is not available in current proxy groups/policies. Rule: {rule}"
+                ));
+            }
+        }
+    }
+    Ok(warnings)
+}
+
 pub fn available_policies_at(paths: &AppPaths) -> Result<Vec<String>> {
     let mut policies = vec![
         "DIRECT".to_string(),
@@ -657,6 +779,28 @@ mod validation_tests {
     }
 
     #[test]
+    fn selection_drift_reports_missing_group_and_node() {
+        let mut selections = std::collections::BTreeMap::new();
+        selections.insert("OpenAI".to_string(), "US-01".to_string());
+        selections.insert("Netflix".to_string(), "JP-01".to_string());
+        let config = r#"
+proxy-groups:
+  - name: OpenAI
+    type: select
+    proxies:
+      - US-02
+"#;
+        let warnings = selection_drift_warnings_in_config(config, &selections).unwrap();
+        assert!(warnings.contains(
+            &"Warning: selected node `US-01` is not available in group `OpenAI`.".to_string()
+        ));
+        assert!(warnings.contains(
+            &"Warning: selected group `Netflix` is not available in current proxy groups."
+                .to_string()
+        ));
+    }
+
+    #[test]
     fn available_policies_includes_builtins_and_proxy_groups_without_duplicates() {
         let tmp = TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());
@@ -723,15 +867,6 @@ pub fn test_rule_match_in_config(config_content: &str, target: &str) -> Result<O
     }
 
     Ok(None)
-}
-
-fn rule_policy(rule: &str) -> Option<&str> {
-    let parts: Vec<&str> = rule.split(',').map(str::trim).collect();
-    if parts.first()?.eq_ignore_ascii_case("MATCH") {
-        parts.get(1).copied()
-    } else {
-        parts.get(2).copied()
-    }
 }
 
 fn rule_matches_target(rule: &str, target: &str) -> Result<bool> {

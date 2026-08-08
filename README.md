@@ -9,6 +9,22 @@
 
 ---
 
+## 核心工作流（Agent 必读）
+
+### 设计方案前，强制先读 CONTEXT.md
+
+**所有 agent（包括 AI 助手）在设计方案或回答领域问题前，必须先读 `CONTEXT.md`**——特别是"代理/网络"、"实例模式"、"文件路径约定"等部分。
+
+**原因**：避免基于错误知识设计。例如：系统代理（L7 应用层）和 TUN（L3 网络层）是两种不同的代理机制，混淆会导致设计错误。
+
+**流程**：
+1. **设计方案前**：读 CONTEXT.md 确认领域知识
+2. **发现 CONTEXT.md 不完整**：立即补充，不要等用户指出
+3. **不确定时**：用 tavily 搜索确认，不要基于猜测回答
+4. **plan mode 下**：第一步读 CONTEXT.md，作为强制流程
+
+---
+
 mihomo-cli 是一个用 Rust 编写的 Mihomo（Clash.Meta）命令行工具。它将 **安装部署** 和 **日常控制** 合二为一，提供 crossterm TUI 交互节点选择（j/k 导航 + / 过滤）、TUN 模式开关、vmess 订阅自动转换等功能，macOS、Linux 和 Windows 通用。
 
 ## 安装
@@ -47,9 +63,11 @@ mihomo-cli rule test baidu.com             # 检查规则会走哪个策略
 mihomo-cli tun on                          # 开启 TUN；必要时自动引导安装 system service
 mihomo-cli tun status                      # 查看 TUN 状态
 mihomo-cli tun off                         # 关闭 TUN
+mihomo-cli autostart on                    # 开启开机自启（默认关闭，显式开启）
+mihomo-cli autostart status                # 查询自启状态
 ```
 
-没有管理员权限时可用 `mihomo-cli install --user` 安装普通代理模式。`--system` 仍保留给脚本、排障或显式指定 system service context，日常命令通常不需要。
+没有管理员权限时可用 `mihomo-cli install --user` 安装普通代理模式。`--system` 仍保留给脚本、排障或显式指定 system service context，日常命令通常不需要。开机自启默认关闭（ADR-17），需 `mihomo-cli autostart on` 显式开启。
 
 ## 文档
 
@@ -96,7 +114,7 @@ src/
 ├── config.rs        订阅管理 + 配置生成
 ├── installer.rs     核心二进制下载 + Geo 文件管理
 ├── service.rs       系统服务执行层 + 提权 (systemd/LaunchDaemon)
-├── instance.rs      v3 Instance Model：路径矩阵 + 模式解析 + service plan
+├── instance.rs      Instance Model：路径矩阵 + 模式解析 + service plan
 ├── daemon.rs        daemon 进程 (IPC + readiness + lifecycle 串行化)
 ├── ipc.rs           daemon IPC 客户端
 ├── lock.rs          并发锁

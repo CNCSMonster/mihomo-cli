@@ -374,6 +374,63 @@ impl SubscriptionFetcher for ReqwestSubscriptionFetcher {
 }
 
 /// Backward-compatible helper. Auto mode tries a bounded Clash-UA set and stops at first YAML.
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchSubscriptionReport {
+    pub output_path: std::path::PathBuf,
+    pub is_clash_yaml: bool,
+    pub proxy_count: usize,
+    pub proxy_group_count: usize,
+    pub rule_count: usize,
+}
+
+pub async fn fetch_subscription_to_file(
+    url: &str,
+    output_path: &std::path::Path,
+    user_agent: Option<&str>,
+) -> anyhow::Result<FetchSubscriptionReport> {
+    let result = download_sub_with_user_agent(url, user_agent)
+        .await
+        .map_err(|e| anyhow::anyhow!("Cannot reach subscription URL.\n  {e}"))?;
+    fetch_subscription_content_to_file(result, output_path)
+}
+
+fn fetch_subscription_content_to_file(
+    result: DownloadResult,
+    output_path: &std::path::Path,
+) -> anyhow::Result<FetchSubscriptionReport> {
+    let yaml_content = if result.is_clash_yaml {
+        result.content
+    } else {
+        crate::log!("Converting subscription format (vmess/base64/raw → Clash YAML)...");
+        convert_vmess_to_clash(&result.content)?
+    };
+
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str(&yaml_content).context("Subscription content is not valid YAML")?;
+    validate_subscription_yaml(&yaml)?;
+
+    if let Some(parent) = output_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    utils::atomic_write_file(&output_path.display().to_string(), &yaml_content)?;
+
+    Ok(FetchSubscriptionReport {
+        output_path: output_path.to_path_buf(),
+        is_clash_yaml: result.is_clash_yaml,
+        proxy_count: count_sequence_field(&yaml, "proxies"),
+        proxy_group_count: count_sequence_field(&yaml, "proxy-groups"),
+        rule_count: count_sequence_field(&yaml, "rules"),
+    })
+}
+
+fn count_sequence_field(yaml: &serde_yaml::Value, key: &str) -> usize {
+    yaml.get(key)
+        .and_then(|v| v.as_sequence())
+        .map(|seq| seq.len())
+        .unwrap_or(0)
+}
+
 pub async fn download_sub_smart(url: &str) -> anyhow::Result<(String, bool)> {
     let result = download_sub_with_user_agent(url, None).await?;
     Ok((result.content, result.is_clash_yaml))
@@ -609,7 +666,11 @@ fn subscription_network_error(
         .map(|first| format!("first UA attempt: {first}; final retry: {error}"))
         .unwrap_or(error);
     crate::log!("Network error: {detail}");
-    crate::log!("Is the URL reachable? Try: curl -I '{}'", url);
+    crate::log!(
+        "Is the URL reachable? Try: curl -I '{}'",
+        utils::sanitize_url(url)
+    );
+    let sanitized = utils::sanitize_url(url);
     anyhow::anyhow!(
         "Network error: {detail}\n\n\
          Possible causes:\n  \
@@ -621,10 +682,10 @@ fn subscription_network_error(
            → Or manually: export http_proxy=http://127.0.0.1:PORT\n  \
          - TUN mode is intercepting traffic (try: mihomo-cli tun off)\n\n\
          Verify the URL is reachable:\n  \
-         curl -I '{url}'\n\n\
+         curl -I '{sanitized}'\n\n\
          Workaround (if DNS is polluted):\n  \
          1. Download config on another machine:\n  \
-            curl --doh-url https://dns.alidns.com/dns-query -o config.yaml '{url}'\n  \
+            curl --doh-url https://dns.alidns.com/dns-query -o config.yaml '{sanitized}'\n  \
          2. Transfer to this machine and import:\n  \
             mihomo-cli config --import config.yaml"
     )
@@ -701,7 +762,7 @@ dns:
   enable: true
   listen: 127.0.0.1:1053
   default-nameserver:
-    - 114.114.114.114
+    - 198.51.100.53
     - 223.5.5.5
   enhanced-mode: fake-ip
   fake-ip-range: 28.0.0.1/8
@@ -1130,19 +1191,21 @@ pub fn generate_config_yaml(
     dns_policies: &[crate::dns::DnsPolicy],
     rule_position: crate::rules::RulePosition,
 ) -> anyhow::Result<String> {
-    generate_config_yaml_for_endpoint(
+    generate_config_yaml_with_fake_ip_filters_for_endpoint(
         sub_yaml,
         user_rules,
         dns_policies,
+        &[],
         rule_position,
         &current_api_endpoint(),
     )
 }
 
-pub fn generate_config_yaml_for_endpoint(
+pub fn generate_config_yaml_with_fake_ip_filters_for_endpoint(
     sub_yaml: &serde_yaml::Value,
     user_rules: &[String],
     dns_policies: &[crate::dns::DnsPolicy],
+    fake_ip_filters: &[String],
     rule_position: crate::rules::RulePosition,
     endpoint: &ApiEndpoint,
 ) -> anyhow::Result<String> {
@@ -1226,6 +1289,33 @@ pub fn generate_config_yaml_for_endpoint(
         dns_map.insert(
             serde_yaml::Value::String("nameserver-policy".to_string()),
             serde_yaml::Value::Mapping(ns_policy),
+        );
+    }
+
+    // 2.1. Merge dns.fake-ip-filter
+    if !fake_ip_filters.is_empty() {
+        let dns = config_map
+            .entry(serde_yaml::Value::String("dns".to_string()))
+            .or_insert(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+
+        let dns_map = dns
+            .as_mapping_mut()
+            .ok_or_else(|| anyhow::anyhow!("dns is not a mapping"))?;
+
+        let mut merged = dns_map
+            .get("fake-ip-filter")
+            .and_then(|v| v.as_sequence())
+            .cloned()
+            .unwrap_or_default();
+        for filter in fake_ip_filters {
+            let value = serde_yaml::Value::String(filter.clone());
+            if !merged.contains(&value) {
+                merged.push(value);
+            }
+        }
+        dns_map.insert(
+            serde_yaml::Value::String("fake-ip-filter".to_string()),
+            serde_yaml::Value::Sequence(merged),
         );
     }
 
@@ -1399,12 +1489,19 @@ pub fn merge_user_config_at_endpoint(
             Vec::new()
         };
 
+        let fake_ip_filters = if paths.dns_fake_ip_filter_path().exists() {
+            crate::dns::load_fake_ip_filters_at(paths).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         let position = rules::get_position_at(paths).unwrap_or(RulePosition::Front);
 
-        let config_content = generate_config_yaml_for_endpoint(
+        let config_content = generate_config_yaml_with_fake_ip_filters_for_endpoint(
             &sub_yaml,
             &user_rules,
             &dns_policies,
+            &fake_ip_filters,
             position,
             endpoint,
         )?;
@@ -1605,6 +1702,28 @@ mod tests {
             status: 200,
             body: body.to_string(),
         })
+    }
+
+    #[tokio::test]
+    async fn fetch_subscription_to_file_writes_only_requested_output() {
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("nested/config.yaml");
+        let report = fetch_subscription_content_to_file(
+            DownloadResult {
+                content: "proxies:\n  - name: direct\n    type: direct\nproxy-groups: []\nrules:\n  - MATCH,DIRECT\n".to_string(),
+                is_clash_yaml: true,
+            },
+            &out,
+        )
+        .unwrap();
+
+        assert!(out.exists());
+        assert_eq!(report.proxy_count, 1);
+        assert_eq!(report.proxy_group_count, 0);
+        assert_eq!(report.rule_count, 1);
+        assert!(!tmp.path().join("subscriptions").exists());
+        assert!(!tmp.path().join("active").exists());
+        assert!(!tmp.path().join("rules.yaml").exists());
     }
 
     #[tokio::test]
@@ -1871,8 +1990,9 @@ external-controller: 127.0.0.1:9090
         let endpoint =
             ApiEndpoint::UnixSocket(std::path::PathBuf::from("/var/run/mihomo/mihomo.sock"));
 
-        let generated = generate_config_yaml_for_endpoint(
+        let generated = generate_config_yaml_with_fake_ip_filters_for_endpoint(
             &sub_yaml,
+            &[],
             &[],
             &[],
             crate::rules::RulePosition::Front,
@@ -2217,6 +2337,44 @@ rules:
     }
 
     #[test]
+    fn test_generate_config_yaml_with_fake_ip_filters() {
+        let sub_yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+dns:
+  enhanced-mode: fake-ip
+  fake-ip-filter:
+    - geosite:private
+rules:
+  - MATCH,DIRECT
+"#,
+        )
+        .unwrap();
+        let result = generate_config_yaml_with_fake_ip_filters_for_endpoint(
+            &sub_yaml,
+            &[],
+            &[],
+            &[
+                "+.corp.example.com".to_string(),
+                "geosite:private".to_string(),
+            ],
+            crate::rules::RulePosition::Front,
+            &crate::instance::ApiEndpoint::UnixSocket(std::path::PathBuf::from("/tmp/test.sock")),
+        )
+        .unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&result).unwrap();
+        let filters = parsed["dns"]["fake-ip-filter"].as_sequence().unwrap();
+        assert!(filters.contains(&serde_yaml::Value::String("geosite:private".to_string())));
+        assert!(filters.contains(&serde_yaml::Value::String("+.corp.example.com".to_string())));
+        assert_eq!(
+            filters
+                .iter()
+                .filter(|v| v.as_str() == Some("geosite:private"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn test_generate_config_yaml_with_dns_policies() {
         let sub_yaml: serde_yaml::Value = serde_yaml::from_str(
             r#"
@@ -2235,7 +2393,7 @@ dns:
             },
             crate::dns::DnsPolicy {
                 match_pattern: "internal.corp".to_string(),
-                target: "10.10.1.251,114.114.114.114".to_string(),
+                target: "192.0.2.53,198.51.100.53".to_string(),
             },
         ];
 

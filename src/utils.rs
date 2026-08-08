@@ -33,7 +33,10 @@ impl AppPaths {
     ///
     /// v3 must not use this for mode resolution. It is exposed only so cleanup
     /// paths can remove stale `.service-mode` files left by older releases.
-    #[deprecated(since = "0.2.0", note = "v1/v2 legacy marker; cleanup only, never mode resolution. Use InstanceContext instead")]
+    #[deprecated(
+        since = "0.2.0",
+        note = "v1/v2 legacy marker; cleanup only, never mode resolution. Use InstanceContext instead"
+    )]
     pub fn legacy_service_mode_path(&self) -> PathBuf {
         self.config_dir.join(".service-mode")
     }
@@ -50,12 +53,20 @@ impl AppPaths {
         self.config_dir.join("dns-policy.yaml")
     }
 
+    pub fn dns_fake_ip_filter_path(&self) -> PathBuf {
+        self.config_dir.join("dns-fake-ip-filter.yaml")
+    }
+
     pub fn override_path(&self) -> PathBuf {
         self.config_dir.join("override.yaml")
     }
 
     pub fn delay_cache_path(&self) -> PathBuf {
         self.config_dir.join("delay-cache.json")
+    }
+
+    pub fn selection_state_path(&self) -> PathBuf {
+        self.config_dir.join("selection-state.yaml")
     }
 
     // ── Multi-subscription paths ──
@@ -188,7 +199,10 @@ pub fn config_path() -> String {
 }
 
 /// Deprecated v1/v2 mode marker path; cleanup only, never mode resolution.
-#[deprecated(since = "0.2.0", note = "v1/v2 legacy marker; cleanup only. Use InstanceContext instead")]
+#[deprecated(
+    since = "0.2.0",
+    note = "v1/v2 legacy marker; cleanup only. Use InstanceContext instead"
+)]
 pub fn legacy_service_mode_path() -> String {
     #[allow(deprecated)]
     AppPaths::from_system()
@@ -260,6 +274,94 @@ pub fn combine_output(o: &std::process::Output) -> String {
     combined
 }
 
+// ── Log sanitization ──
+
+/// Sensitive URL query parameter names (case-insensitive partial match).
+const SENSITIVE_QUERY_PARAMS: &[&str] = &[
+    "token",
+    "key",
+    "secret",
+    "password",
+    "auth",
+    "apikey",
+    "api_key",
+    "access_token",
+    "refresh_token",
+    "sub_key",
+    "sub-key",
+    "subscription_key",
+    "subscription-key",
+    "sign",
+];
+
+/// Sanitize a URL by masking the values of sensitive query parameters.
+///
+/// - `?token=abc123` → `?token=***`
+/// - `?api_key=xyz` → `?api_key=***`
+/// - Non-sensitive params (e.g. `?format=clash`) are left intact.
+/// - URLs without a query string are returned as-is.
+pub fn sanitize_url(url: &str) -> String {
+    // Fast path: no query string at all
+    let q_pos = match url.find('?') {
+        Some(p) => p,
+        None => return url.to_string(),
+    };
+
+    let (prefix, query_and_frag) = url.split_at(q_pos + 1); // includes '?'
+    let (query, fragment) = match query_and_frag.find('#') {
+        Some(p) => (&query_and_frag[..p], &query_and_frag[p..]),
+        None => (query_and_frag, ""),
+    };
+
+    let sanitized_pairs: Vec<String> = query
+        .split('&')
+        .map(|pair| {
+            if let Some(eq_pos) = pair.find('=') {
+                let name = &pair[..eq_pos];
+                if SENSITIVE_QUERY_PARAMS
+                    .iter()
+                    .any(|sp| sp.eq_ignore_ascii_case(name))
+                {
+                    return format!("{name}=***");
+                }
+            }
+            pair.to_string()
+        })
+        .collect();
+
+    format!("{}{}{}", prefix, sanitized_pairs.join("&"), fragment)
+}
+
+/// Sanitize a generic string by masking values after sensitive key patterns.
+///
+/// Matches patterns like:
+/// - `password: xxx` → `password: ***`
+/// - `secret=xxx` → `secret=***`
+/// - `token "xxx"` → `token "***"`
+///
+/// This is a best-effort heuristic for log messages, not a full parser.
+#[allow(dead_code)] // Public API used by `log_debug_sensitive!` macro
+pub fn sanitize_sensitive(s: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+
+    let re = RE.get_or_init(|| {
+        // Match: sensitive_word followed by optional separator (: = space) then a quoted or unquoted value
+        regex::Regex::new(
+            r#"(?i)(token|password|passwd|secret|api[_-]?key|auth|authorization)\s*[:=]\s*(?:"([^"]*)"|'([^']*)'|(\S+))"#,
+        )
+        .expect("valid regex")
+    });
+
+    re.replace_all(s, |caps: &regex::Captures| {
+        let key = &caps[1];
+        // One of groups 2/3/4 captured the value
+        let _ = caps.get(2).or_else(|| caps.get(3)).or_else(|| caps.get(4));
+        format!("{key}=***")
+    })
+    .into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,15 +407,127 @@ mod tests {
         unsafe {
             std::env::remove_var("MIHOMO_CLI_MIHOMO_PATH");
         }
-        let expected = crate::instance::planned_current_context(
-            crate::instance::InstanceMode::User,
-        )
-        .map(|ctx| ctx.paths.core_binary.display().to_string())
-        .unwrap_or_default();
+        let expected =
+            crate::instance::planned_current_context(crate::instance::InstanceMode::User)
+                .map(|ctx| ctx.paths.core_binary.display().to_string())
+                .unwrap_or_default();
         assert_eq!(
             mihomo_path(),
             expected,
             "mihomo_path() must delegate to instance planned_paths (BUG-14)"
         );
+    }
+
+    // ── sanitize_url tests ──
+
+    #[test]
+    fn sanitize_url_masks_token_param() {
+        let url = "https://example.com/sub?token=abc123&format=clash";
+        assert_eq!(
+            sanitize_url(url),
+            "https://example.com/sub?token=***&format=clash"
+        );
+    }
+
+    #[test]
+    fn sanitize_url_masks_api_key() {
+        let url = "https://example.com/api?key=secret_value&page=1";
+        assert_eq!(sanitize_url(url), "https://example.com/api?key=***&page=1");
+    }
+
+    #[test]
+    fn sanitize_url_masks_password_param() {
+        let url = "https://example.com/login?user=admin&password=hunter2";
+        assert_eq!(
+            sanitize_url(url),
+            "https://example.com/login?user=admin&password=***"
+        );
+    }
+
+    #[test]
+    fn sanitize_url_masks_multiple_sensitive_params() {
+        let url = "https://example.com/api?token=t1&api_key=k2&safe=yes";
+        assert_eq!(
+            sanitize_url(url),
+            "https://example.com/api?token=***&api_key=***&safe=yes"
+        );
+    }
+
+    #[test]
+    fn sanitize_url_handles_no_query_string() {
+        let url = "https://example.com/config.yaml";
+        assert_eq!(sanitize_url(url), url);
+    }
+
+    #[test]
+    fn sanitize_url_handles_empty_query() {
+        let url = "https://example.com/?";
+        assert_eq!(sanitize_url(url), url);
+    }
+
+    #[test]
+    fn sanitize_url_preserves_fragment() {
+        let url = "https://example.com/sub?token=secret#section";
+        assert_eq!(
+            sanitize_url(url),
+            "https://example.com/sub?token=***#section"
+        );
+    }
+
+    #[test]
+    fn sanitize_url_case_insensitive_param_names() {
+        let url = "https://example.com/sub?TOKEN=abc&ApiKey=xyz";
+        assert_eq!(
+            sanitize_url(url),
+            "https://example.com/sub?TOKEN=***&ApiKey=***"
+        );
+    }
+
+    #[test]
+    fn sanitize_url_subscription_key() {
+        let url = "https://example.com/sub?sub_key=mysub&sub-key=mysub2";
+        assert_eq!(
+            sanitize_url(url),
+            "https://example.com/sub?sub_key=***&sub-key=***"
+        );
+    }
+
+    #[test]
+    fn sanitize_url_preserves_token_in_path() {
+        // Only query params are masked, not path segments
+        let url = "https://example.com/token/abc?format=clash";
+        assert_eq!(sanitize_url(url), url);
+    }
+
+    // ── sanitize_sensitive tests ──
+
+    #[test]
+    fn sanitize_sensitive_masks_password_colon() {
+        let msg = "connect failed: password: hunter2";
+        assert_eq!(sanitize_sensitive(msg), "connect failed: password=***");
+    }
+
+    #[test]
+    fn sanitize_sensitive_masks_secret_equals() {
+        let msg = "config loaded secret=mysecret";
+        assert_eq!(sanitize_sensitive(msg), "config loaded secret=***");
+    }
+
+    #[test]
+    fn sanitize_sensitive_masks_quoted_value() {
+        let msg = r#"auth: "bearer_token_123" ok"#;
+        assert_eq!(sanitize_sensitive(msg), "auth=*** ok");
+    }
+
+    #[test]
+    fn sanitize_sensitive_leaves_normal_text() {
+        let msg = "subscription refreshed successfully";
+        assert_eq!(sanitize_sensitive(msg), msg);
+    }
+
+    #[test]
+    fn sanitize_sensitive_masks_api_key() {
+        let msg = "api_key: sk-1234567890abcdef";
+        assert_eq!(sanitize_sensitive(msg), "api_key=***");
     }
 }

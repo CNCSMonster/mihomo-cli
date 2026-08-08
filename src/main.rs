@@ -11,6 +11,17 @@ macro_rules! log {
     };
 }
 
+/// Debug-level log for sensitive operations (token reads, config import, etc.).
+/// Only visible when `-v` is set. Use `sanitize_url`/`sanitize_sensitive` before logging.
+#[macro_export]
+macro_rules! log_debug_sensitive {
+    ($($arg:tt)*) => {
+        if $crate::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("[DEBUG] {}", $crate::utils::sanitize_sensitive(&format!($($arg)*)));
+        }
+    };
+}
+
 pub static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 mod backup;
@@ -36,11 +47,18 @@ struct Cli {
     #[arg(short, long, global = true)]
     verbose: bool,
 
+    /// Output a machine-readable JSON envelope on stdout
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Subcommand)]
+// Parsed once at process startup. Keeping the clap derive command tree readable
+// is more valuable here than boxing the largest variant to save a few hundred bytes.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Install mihomo binary and configure subscription
     #[command(visible_alias = "i")]
@@ -57,13 +75,16 @@ enum Command {
         /// Install a specific mihomo core version (e.g. v1.19.27)
         #[arg(long)]
         version: Option<String>,
-        /// GitHub mirror base URL prepended to GitHub downloads (geo data)
+        /// GitHub mirror base URL prepended to GitHub public asset downloads (core and geo data)
         /// e.g. https://ghproxy.com/
         #[arg(long = "github-mirror")]
         github_mirror: Option<String>,
         /// Skip the interactive subscription setup step (non-interactive installs)
         #[arg(long = "skip-config")]
         skip_config: bool,
+        /// Assume yes for install prompts (currently: service install confirmation)
+        #[arg(short, long)]
+        yes: bool,
     },
 
     /// Check for and install the latest mihomo core version
@@ -71,6 +92,9 @@ enum Command {
         /// Force the system service instance (advanced/debugging)
         #[arg(long = "system")]
         system: bool,
+        /// Skip confirmation prompt and proceed with upgrade
+        #[arg(short, long)]
+        yes: bool,
     },
 
     /// Show mihomo-cli build information and current mihomo core version
@@ -83,6 +107,8 @@ enum Command {
     /// Interactive subscription TUI, or use flags to manage subscriptions (add/remove/refresh/validate)
     #[command(visible_alias = "c")]
     Config {
+        #[command(subcommand)]
+        command: Option<ConfigSubcommand>,
         /// Force the system service instance for validation/reload (advanced/debugging)
         #[arg(long = "system")]
         system: bool,
@@ -256,6 +282,9 @@ enum Command {
         /// Enable DNS hijack, optionally with a target such as any:53
         #[arg(long = "dns-hijack", num_args = 0..=1, default_missing_value = "any:53")]
         dns_hijack: Option<String>,
+        /// Assume yes for TUN mode setup prompts
+        #[arg(short, long)]
+        yes: bool,
     },
 
     /// View active connections (use --flush to close all)
@@ -314,12 +343,15 @@ enum Command {
     },
 
     /// Set or unset OS system proxy
-    #[command(name = "system-proxy", after_help = "\
+    #[command(
+        name = "system-proxy",
+        after_help = "\
 Limitations:
   Linux: only GNOME (gsettings). Headless/server/KDE/other DE → use HTTP_PROXY env var or TUN mode.
   Only affects apps that read OS system proxy settings (GTK/GNOME apps, some browsers).
   CLI tools (curl, wget, codex) typically need HTTP_PROXY/HTTPS_PROXY env vars instead.
-  Redundant when TUN mode is active (TUN already captures all traffic).")]
+  Redundant when TUN mode is active (TUN already captures all traffic)."
+    )]
     SystemProxy {
         /// Force the system service instance (advanced/debugging)
         #[arg(long = "system")]
@@ -336,6 +368,13 @@ Limitations:
         /// Show detailed service/config paths
         #[arg(long)]
         verbose: bool,
+    },
+
+    /// Set or display the preferred instance mode (system/user/auto)
+    Use {
+        /// Mode to set: system, user, auto, or status (show current)
+        #[arg(value_enum)]
+        mode: Option<UseMode>,
     },
 
     /// View mihomo log file
@@ -400,6 +439,15 @@ Limitations:
         yes: bool,
     },
 
+    /// Manage Unix system daemon client access
+    Access {
+        /// Force the system service instance (advanced/debugging)
+        #[arg(long = "system")]
+        system: bool,
+        #[command(subcommand)]
+        action: AccessAction,
+    },
+
     /// Run as system service daemon (internal, used by systemd/launchd)
     #[command(hide = true)]
     Daemon {
@@ -426,6 +474,24 @@ Limitations:
     Dashboard,
 }
 
+#[derive(Subcommand, Clone)]
+enum AccessAction {
+    /// Authorize a local user to access the system daemon
+    Grant {
+        #[arg(long)]
+        user: String,
+    },
+    /// Revoke a local user's daemon access
+    Revoke {
+        #[arg(long)]
+        user: String,
+    },
+    /// List authorized users
+    List,
+    /// Show current user's authorization status
+    Status,
+}
+
 #[derive(Clone, ValueEnum)]
 enum AutostartAction {
     /// Enable autostart
@@ -433,6 +499,18 @@ enum AutostartAction {
     /// Disable autostart
     Off,
     /// Query autostart state
+    Status,
+}
+
+#[derive(Clone, ValueEnum)]
+enum UseMode {
+    /// Prefer system service instance
+    System,
+    /// Prefer per-user instance
+    User,
+    /// Auto: use system if installed, otherwise user (default)
+    Auto,
+    /// Show current mode preference
     Status,
 }
 
@@ -541,6 +619,11 @@ enum DnsAction {
         #[command(subcommand)]
         action: DnsPolicyAction,
     },
+    /// Manage DNS fake-ip-filter entries
+    FakeIpFilter {
+        #[command(subcommand)]
+        action: DnsFakeIpFilterAction,
+    },
     /// Show current DNS configuration
     Status,
     /// List or apply common DNS policy templates
@@ -561,7 +644,7 @@ enum DnsTemplateAction {
         /// Internal domain for company template, e.g. corp.example.com
         #[arg(long)]
         domain: Option<String>,
-        /// DNS target for company template, e.g. 10.10.1.251
+        /// DNS target for company template, e.g. 192.0.2.53
         #[arg(long)]
         target: Option<String>,
     },
@@ -587,13 +670,25 @@ enum OverrideAction {
 }
 
 #[derive(Subcommand, Clone)]
+enum DnsFakeIpFilterAction {
+    /// Add a fake-ip-filter domain
+    Add { domain: String },
+    /// List fake-ip-filter entries
+    #[command(visible_alias = "ls")]
+    List,
+    /// Remove a fake-ip-filter domain
+    #[command(visible_alias = "rm")]
+    Remove { domain: String },
+}
+
+#[derive(Subcommand, Clone)]
 enum DnsPolicyAction {
     /// Add a DNS policy (domain → DNS target)
     Add {
-        /// Domain suffix pattern (e.g. ubtrobot.com)
+        /// Domain suffix pattern (e.g. internal.example.com)
         #[arg(value_name = "MATCH")]
         match_pattern: String,
-        /// DNS target: "system" for system DNS, or IP address (e.g. 10.10.1.251)
+        /// DNS target: "system" for system DNS, or IP address (e.g. 192.0.2.53)
         #[arg(value_name = "TARGET")]
         target: String,
     },
@@ -643,6 +738,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         version: None,
         github_mirror: None,
         skip_config: false,
+        yes: false,
     }) {
         Command::Install {
             system,
@@ -651,6 +747,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             version,
             github_mirror,
             skip_config,
+            yes,
         } => {
             cmd_install_entry(
                 system,
@@ -659,12 +756,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 version.as_deref(),
                 github_mirror.as_deref(),
                 skip_config,
+                yes,
             )
             .await
         }
-        Command::Upgrade { system } => cmd_upgrade(system, false).await,
-        Command::Version { system } => cmd_version(system, false).await,
+        Command::Upgrade { system, yes } => cmd_upgrade(system, false, yes).await,
+        Command::Version { system } => cmd_version(system, false, cli.json).await,
         Command::Config {
+            command,
             system,
             url,
             fix,
@@ -686,6 +785,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             no_activate,
         } => {
             cmd_config(ConfigCmd {
+                command,
                 url,
                 fix,
                 system,
@@ -706,6 +806,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 set_ua,
                 activate,
                 no_activate,
+                json: cli.json,
             })
             .await
         }
@@ -723,7 +824,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             if legacy_root_leftovers {
                 cmd_uninstall_legacy_root_leftovers(dry_run)
             } else {
-                cmd_uninstall_resolved(system, user, all, remove_binary, remove_config, remove_geo, yes, dry_run)
+                cmd_uninstall_resolved(
+                    system,
+                    user,
+                    all,
+                    remove_binary,
+                    remove_config,
+                    remove_geo,
+                    yes,
+                    dry_run,
+                )
             }
         }
         Command::Update { system } => cmd_update(system, false).await,
@@ -736,9 +846,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Restart { system } => {
             cmd_lifecycle_resolved(system, false, instance::ServiceAction::Restart).await
         }
-        Command::Select { system, group, node } => {
-            cmd_select_resolved(system, false, group, node).await
-        }
+        Command::Select {
+            system,
+            group,
+            node,
+        } => cmd_select_resolved(system, false, group, node).await,
         Command::List { system } => cmd_list_resolved(system, false).await,
         Command::Delay {
             system,
@@ -752,7 +864,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             action,
             stack,
             dns_hijack,
-        } => cmd_tun_resolved(system, false, action, stack, dns_hijack).await,
+            yes,
+        } => {
+            let opts = TunResolvedOptions {
+                system,
+                user: false,
+                action,
+                stack,
+                dns_hijack,
+                yes,
+            };
+            cmd_tun_resolved(opts).await
+        }
         Command::Connections { system, flush } => {
             cmd_connections_resolved(system, false, flush).await
         }
@@ -771,8 +894,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             if verbose {
                 VERBOSE.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            cmd_status_resolved(system, false).await
+            cmd_status_resolved_json(system, false, cli.json).await
         }
+        Command::Use { mode } => cmd_use(mode).await,
         Command::Logs {
             system,
             tail,
@@ -784,6 +908,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Override { system, action } => cmd_override(system, false, action).await,
         Command::Backup { system, output } => cmd_backup(system, false, output),
         Command::Restore { system, path, yes } => cmd_restore(system, false, &path, yes),
+        Command::Access { action, .. } => cmd_access(action),
         Command::Daemon { recover } => {
             let sock_path = ipc::system_service_socket_path();
             if recover {
@@ -793,11 +918,111 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 daemon::run_daemon(sock_path, tokio_util::sync::CancellationToken::new()).await
             }
         }
-        Command::Autostart { action, system, user } => {
-            cmd_autostart(action, system, user).await
-        }
+        Command::Autostart {
+            action,
+            system,
+            user,
+        } => cmd_autostart(action, system, user).await,
         Command::Dashboard => cmd_dashboard().await,
     }
+}
+
+#[cfg(unix)]
+fn lookup_user(name: &str) -> anyhow::Result<(u32, u32, std::path::PathBuf)> {
+    use std::ffi::CString;
+    let c = CString::new(name)?;
+    unsafe {
+        let pwd = libc::getpwnam(c.as_ptr());
+        if pwd.is_null() {
+            anyhow::bail!("user not found: {name}");
+        }
+        let uid = (*pwd).pw_uid;
+        let gid = (*pwd).pw_gid;
+        let home = std::ffi::CStr::from_ptr((*pwd).pw_dir)
+            .to_string_lossy()
+            .into_owned();
+        Ok((uid, gid, std::path::PathBuf::from(home)))
+    }
+}
+
+#[cfg(unix)]
+fn cmd_access(action: AccessAction) -> anyhow::Result<()> {
+    let path = daemon::authorized_clients_path();
+    let mut table = daemon::read_authorized_clients_from(&path)?;
+    match action {
+        AccessAction::Grant { user } => {
+            let (uid, gid, home) = lookup_user(&user)?;
+            let token_path = service::client_token_path_for_home(&home);
+            if let Some(dir) = token_path.parent() {
+                std::fs::create_dir_all(dir)?;
+                unsafe {
+                    libc::chown(
+                        dir.as_os_str().as_encoded_bytes().as_ptr() as *const i8,
+                        uid,
+                        gid,
+                    );
+                }
+            }
+            let token = service::generate_client_token_for_home(&home)?;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600))?;
+            unsafe {
+                libc::chown(
+                    token_path.as_os_str().as_encoded_bytes().as_ptr() as *const i8,
+                    uid,
+                    gid,
+                );
+            }
+            table.clients.retain(|c| c.user != user && c.uid != uid);
+            table.clients.push(daemon::AuthorizedClient {
+                user: user.clone(),
+                uid,
+                token,
+            });
+            daemon::write_authorized_clients_to(&path, &table)?;
+            println!("granted access to {user} (uid {uid})");
+        }
+        AccessAction::Revoke { user } => {
+            let before = table.clients.len();
+            table.clients.retain(|c| c.user != user);
+            daemon::write_authorized_clients_to(&path, &table)?;
+            println!(
+                "revoked access for {user} ({} removed); any existing client token is now invalid",
+                before - table.clients.len()
+            );
+        }
+        AccessAction::List => {
+            for c in table.clients {
+                println!("{}	{}", c.user, c.uid);
+            }
+        }
+        AccessAction::Status => {
+            let uid = unsafe { libc::getuid() };
+            let client = table.clients.iter().find(|c| c.uid == uid);
+            let token_path =
+                service::client_token_path_for_home(&dirs::home_dir().unwrap_or_default());
+            let token = std::fs::read_to_string(&token_path)
+                .ok()
+                .map(|s| s.trim().to_string());
+            let ok = client
+                .zip(token.as_deref())
+                .map(|(c, t)| c.token == t)
+                .unwrap_or(false);
+            println!(
+                "{} (authorized_table={}, token_file_readable={}, token_matches={})",
+                if ok { "authorized" } else { "not authorized" },
+                client.is_some(),
+                token.is_some(),
+                ok
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn cmd_access(_action: AccessAction) -> anyhow::Result<()> {
+    anyhow::bail!("access commands are currently supported on Unix system daemon only")
 }
 
 #[allow(dead_code)]
@@ -943,13 +1168,10 @@ fn current_instance_inventory() -> instance::InstanceInventory {
     let user_service_installed = user_ctx
         .as_ref()
         .map(|ctx| match ctx.os {
-            instance::TargetOs::Windows => instance::windows_user_install_marker(ctx)
-                .is_some_and(|marker| marker.exists()),
-            _ => ctx
-                .paths
-                .service_file
-                .as_ref()
-                .is_some_and(|p| p.exists()),
+            instance::TargetOs::Windows => {
+                instance::windows_user_install_marker(ctx).is_some_and(|marker| marker.exists())
+            }
+            _ => ctx.paths.service_file.as_ref().is_some_and(|p| p.exists()),
         })
         .unwrap_or(false);
     let user_payload = user_ctx
@@ -1230,7 +1452,7 @@ fn current_user_context_with_config_dir(
     let mut ctx = instance::planned_current_context(instance::InstanceMode::User)?;
     let runtime_dir = config_dir.join("run");
     ctx.paths.config_dir = config_dir.clone();
-    ctx.paths.config_file = config_dir.join("config.yaml");
+    ctx.paths.intent_config_file = config_dir.join("config.yaml");
     ctx.paths.start_script = ctx.paths.start_script.map(|_| config_dir.join("start.sh"));
     if matches!(ctx.os, instance::TargetOs::Windows) {
         ctx.paths.runtime_dir = None;
@@ -1357,6 +1579,72 @@ pub(crate) fn resolve_environment_for_intent(
     env: &EnvironmentState,
     intent: UserIntent,
 ) -> RuntimeFirstModeResolution {
+    // Check runtime presence first (before settings)
+    if request == instance::ModeRequest::Unspecified {
+        match (env.runtime.system, env.runtime.user) {
+            (true, false) => {
+                return RuntimeFirstModeResolution::Resolved {
+                    mode: instance::InstanceMode::System,
+                    source: instance::ResolutionSource::RuntimePresence,
+                }
+            }
+            (false, true) => {
+                return RuntimeFirstModeResolution::Resolved {
+                    mode: instance::InstanceMode::User,
+                    source: instance::ResolutionSource::RuntimePresence,
+                }
+            }
+            (true, true) if intent != UserIntent::Install => {
+                return RuntimeFirstModeResolution::RuntimeConflict
+            }
+            _ => {}
+        }
+    }
+
+    // TUN-specific checks (before settings)
+    if matches!(intent, UserIntent::TunOn | UserIntent::TunOff) {
+        if request == instance::ModeRequest::Unspecified
+            && !env.runtime.system
+            && !env.installed.system
+        {
+            if matches!(intent, UserIntent::TunOn) && (env.runtime.user || env.installed.user) {
+                return RuntimeFirstModeResolution::NeedsSystemSwitch {
+                    user_running: env.runtime.user,
+                    user_installed: env.installed.user,
+                };
+            }
+            return RuntimeFirstModeResolution::NeedsSystemInstall {
+                reason: "TUN requires the privileged system service".to_string(),
+            };
+        }
+        if matches!(
+            request,
+            instance::ModeRequest::Unspecified | instance::ModeRequest::ExplicitSystem
+        ) && env.installed.system
+            && !env.runtime.system
+        {
+            return RuntimeFirstModeResolution::NeedsSystemDaemonRecovery {
+                reason: "system service is installed but daemon IPC is unavailable".to_string(),
+            };
+        }
+    }
+
+    // S5: if no explicit flag and no runtime, check settings.json
+    let request = if request == instance::ModeRequest::Unspecified {
+        let settings = instance::UserSettings::load();
+        match settings.resolve_mode(&env.installed) {
+            Some(instance::InstanceMode::System) if intent != UserIntent::Install => {
+                instance::ModeRequest::ExplicitSystem
+            }
+            Some(instance::InstanceMode::User) if intent != UserIntent::Install => {
+                instance::ModeRequest::ExplicitUser
+            }
+            _ => request, // auto or no service installed
+        }
+    } else {
+        request
+    };
+
     if request == instance::ModeRequest::Unspecified {
         match (env.runtime.system, env.runtime.user) {
             (true, false) => {
@@ -1570,7 +1858,7 @@ async fn prompt_install_for_start() -> anyhow::Result<bool> {
     println!("No mihomo service is installed yet.");
     println!("Start needs an installed service/core first.");
     println!();
-    cmd_install_entry(false, false, false, None, None, false).await?;
+    cmd_install_entry(false, false, false, None, None, false, false).await?;
     Ok(true)
 }
 
@@ -1610,8 +1898,10 @@ async fn cmd_lifecycle_resolved(
 
     // Check for daemon crash recovery scenario:
     // System service is installed, daemon IPC is dead, but core might still be running
-    if matches!(action, instance::ServiceAction::Start | instance::ServiceAction::Restart)
-        && !system
+    if matches!(
+        action,
+        instance::ServiceAction::Start | instance::ServiceAction::Restart
+    ) && !system
         && !user
     {
         let installed = current_service_presence();
@@ -1745,6 +2035,125 @@ fn format_no_instance_status() -> Vec<String> {
     ]
 }
 
+async fn cmd_use(mode: Option<UseMode>) -> anyhow::Result<()> {
+    use instance::UserSettings;
+
+    let services = current_service_presence();
+
+    match mode {
+        None | Some(UseMode::Status) => {
+            // Show current settings
+            instance::print_settings_status(&services);
+            Ok(())
+        }
+        Some(mode_value) => {
+            let mut settings = UserSettings::load();
+            settings.mode = match mode_value {
+                UseMode::System => "system".to_string(),
+                UseMode::User => "user".to_string(),
+                UseMode::Auto => "auto".to_string(),
+                UseMode::Status => unreachable!(),
+            };
+            settings.save()?;
+
+            println!("Mode preference set to: {}", settings.mode);
+
+            // Show warning if setting to system but not installed
+            if settings.mode == "system" && !services.system {
+                println!("⚠ System service is not installed.");
+                println!("  Run `mihomo-cli install --system` to install it first.");
+            }
+            if settings.mode == "user" && !services.user {
+                println!("⚠ Per-user service is not installed.");
+                println!("  Run `mihomo-cli install` to install it first.");
+            }
+
+            // Show resolved mode
+            if let Some(resolved) = settings.resolve_mode(&services) {
+                println!("Effective mode: {resolved:?}");
+            }
+
+            Ok(())
+        }
+    }
+}
+
+async fn cmd_status_resolved_json(system: bool, user: bool, json: bool) -> anyhow::Result<()> {
+    if json {
+        return cmd_status_json(system, user).await;
+    }
+    cmd_status_resolved(system, user).await
+}
+
+async fn cmd_status_json(system: bool, user: bool) -> anyhow::Result<()> {
+    if !system && !user {
+        if let Some(legacy) = current_legacy_root_service() {
+            return print_json_envelope(
+                "status",
+                serde_json::json!({
+                    "state": "legacy_root_service_detected",
+                    "legacy_root_service": { "service_file": legacy.service_file, "referenced_paths": legacy.referenced_paths }
+                }),
+                Vec::new(),
+            );
+        }
+        if status_has_no_instance(
+            system,
+            user,
+            current_service_presence(),
+            current_runtime_presence(),
+        ) {
+            return print_json_envelope(
+                "status",
+                serde_json::json!({ "state": "no_instance" }),
+                Vec::new(),
+            );
+        }
+    }
+    let resolved =
+        resolve_current_instance_context(system, user, instance::CommandIntent::ReadOnly)?;
+    let ctx = resolved.ctx;
+    let plan = instance::planned_status_diagnostics(&ctx);
+    let mut daemon = serde_json::Value::Null;
+    let mut core = serde_json::json!({ "api_reachable": false });
+    if ctx.mode == instance::InstanceMode::System {
+        let daemon_running = ipc::is_daemon_running().await;
+        daemon = serde_json::json!({ "running": daemon_running, "socket": ipc::system_service_socket_path() });
+        if daemon_running {
+            if let Ok(ipc::DaemonResponse::Status {
+                running,
+                tun_enabled,
+                core_pid,
+                config_path,
+                ..
+            }) = ipc::send_command(&ipc::DaemonCommand::GetStatus { token: None }).await
+            {
+                core = serde_json::json!({ "running": running, "tun_enabled": tun_enabled, "pid": core_pid, "active_config": config_path });
+            }
+        }
+    } else {
+        let api_reachable = mihomo_api::api_get_at_endpoint(&ctx.paths.api_endpoint, "/configs")
+            .await
+            .is_ok();
+        core = serde_json::json!({ "api_reachable": api_reachable });
+    }
+    print_json_envelope(
+        "status",
+        serde_json::json!({
+            "mode": instance_mode_label(plan.mode),
+            "resolved_by": resolution_source_label(resolved.source),
+            "config": { "path": plan.config_file, "exists": plan.config_file.exists() },
+            "api_endpoint": status_endpoint_label(&plan.expected_endpoint),
+            "service": status_service_label(&plan.service),
+            "binary": { "path": plan.binary, "exists": plan.binary.exists() },
+            "daemon": daemon,
+            "core": core,
+            "logs": plan.log_file,
+        }),
+        Vec::new(),
+    )
+}
+
 async fn cmd_status_resolved(system: bool, user: bool) -> anyhow::Result<()> {
     if !system && !user {
         if let Some(legacy) = current_legacy_root_service() {
@@ -1797,7 +2206,15 @@ fn cmd_uninstall_resolved(
     }
 
     let mode = resolve_current_mode(system, user, instance::CommandIntent::UninstallLike)?;
-    cmd_uninstall_instance_mode(mode, all, remove_binary, remove_config, remove_geo, yes, dry_run)
+    cmd_uninstall_instance_mode(
+        mode,
+        all,
+        remove_binary,
+        remove_config,
+        remove_geo,
+        yes,
+        dry_run,
+    )
 }
 
 fn api_requires_running_instance_message(ctx: &instance::InstanceContext) -> String {
@@ -1863,21 +2280,14 @@ async fn resolve_ready_api_client(
 /// - macOS user:   launchctl enable/disable/print gui/UID/io.mihomo
 /// - Windows system: sc config mihomo start= auto/demand + sc qc
 /// - Windows user:   registry Run key + .vbs hidden (ADR-17)
-async fn cmd_autostart(
-    action: AutostartAction,
-    system: bool,
-    user: bool,
-) -> anyhow::Result<()> {
+async fn cmd_autostart(action: AutostartAction, system: bool, user: bool) -> anyhow::Result<()> {
     let mode = match (system, user) {
         (true, false) => instance::InstanceMode::System,
         (false, true) => instance::InstanceMode::User,
         (false, false) => {
             // Auto-detect: use resolve_current_instance_context.
-            let resolved = resolve_current_instance_context(
-                false,
-                false,
-                instance::CommandIntent::ReadOnly,
-            )?;
+            let resolved =
+                resolve_current_instance_context(false, false, instance::CommandIntent::ReadOnly)?;
             resolved.ctx.mode
         }
         _ => unreachable!("clap conflicts_with"),
@@ -1892,14 +2302,32 @@ async fn cmd_autostart(
 
 #[cfg(target_os = "linux")]
 async fn set_autostart(mode: instance::InstanceMode, enable: bool) -> anyhow::Result<()> {
-    // N4b: system-mode autostart needs privilege; give a clear hint before
-    // the systemctl call fails with an opaque error.
-    if mode == instance::InstanceMode::System && unsafe { libc::geteuid() } != 0 {
-        anyhow::bail!(
-            "autostart for the system service requires root.\n  \
-             Run with sudo: sudo mihomo-cli autostart {} --system",
-            if enable { "on" } else { "off" }
-        );
+    // ADR-19: Linux system autostart controls whether the daemon auto-starts
+    // the core at boot — NOT the daemon unit itself (which must stay enabled
+    // as infrastructure). We write/remove a per-user marker file; the daemon
+    // reads it on startup.
+    if mode == instance::InstanceMode::System {
+        if unsafe { libc::geteuid() } != 0 {
+            anyhow::bail!(
+                "autostart for the system service requires root.\n  \
+                 Run with sudo: sudo mihomo-cli autostart {} --system",
+                if enable { "on" } else { "off" }
+            );
+        }
+        // ADR-19: daemon owns the autostart marker (its config_dir is the
+        // authoritative per-user path; the CLI under sudo would resolve a
+        // different home). Ask the daemon via IPC.
+        match ipc::send_command(&ipc::DaemonCommand::SetAutostart {
+            enabled: enable,
+            token: None,
+        })
+        .await?
+        {
+            ipc::DaemonResponse::Success { message } => println!("{message}"),
+            ipc::DaemonResponse::Error { message } => anyhow::bail!("{message}"),
+            _ => anyhow::bail!("unexpected daemon response"),
+        }
+        return Ok(());
     }
     let mut cmd = std::process::Command::new("systemctl");
     if mode == instance::InstanceMode::User {
@@ -1912,6 +2340,22 @@ async fn set_autostart(mode: instance::InstanceMode, enable: bool) -> anyhow::Re
 
 #[cfg(target_os = "linux")]
 async fn query_autostart(mode: instance::InstanceMode) -> anyhow::Result<()> {
+    if mode == instance::InstanceMode::System {
+        // ADR-19: ask the daemon (it owns the marker at the authoritative path).
+        let enabled =
+            match ipc::send_command(&ipc::DaemonCommand::GetStatus { token: None }).await? {
+                ipc::DaemonResponse::Status {
+                    autostart_enabled, ..
+                } => autostart_enabled,
+                ipc::DaemonResponse::Error { message } => anyhow::bail!("{message}"),
+                _ => false,
+            };
+        println!(
+            "Autostart: {} (system core)",
+            if enabled { "enabled" } else { "disabled" }
+        );
+        return Ok(());
+    }
     let mut cmd = std::process::Command::new("systemctl");
     if mode == instance::InstanceMode::User {
         cmd.arg("--user");
@@ -1938,8 +2382,31 @@ async fn set_autostart(mode: instance::InstanceMode, enable: bool) -> anyhow::Re
             if enable { "on" } else { "off" }
         );
     }
+    let ctx = resolved_ctx_for_autostart(mode)?;
     let domain = launchctl_domain(mode)?;
     let label = format!("{domain}/io.mihomo");
+
+    // 1. Rewrite the plist RunAtLoad flag (ADR-17: autostart ⇔ RunAtLoad).
+    //    Replace both canonical forms (no-space) to avoid leaving an
+    //    invalid `<false />` with a space (breaks plist XML parsing).
+    let plist = read_plist_for_autostart(&ctx)?;
+    let desired = format!(
+        "<key>RunAtLoad</key><{}/>",
+        if enable { "true" } else { "false" }
+    );
+    let new_plist = plist
+        .replace("<key>RunAtLoad</key><true/>", &desired)
+        .replace("<key>RunAtLoad</key><false/>", &desired)
+        .replace("<key>RunAtLoad</key><true />", &desired)
+        .replace("<key>RunAtLoad</key><false />", &desired);
+    let service_file = ctx
+        .paths
+        .service_file
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no launchd plist for this instance"))?;
+    std::fs::write(service_file, new_plist.as_bytes())?;
+
+    // 2. Enable/disable via launchctl (override survives reboots).
     let action = if enable { "enable" } else { "disable" };
     let status = std::process::Command::new("launchctl")
         .arg(action)
@@ -1948,6 +2415,34 @@ async fn set_autostart(mode: instance::InstanceMode, enable: bool) -> anyhow::Re
     if !status.success() {
         anyhow::bail!("launchctl {action} {label} failed");
     }
+
+    // 3. Re-load the plist so the new RunAtLoad takes effect.
+    //    - enabling: bootstrap (enable clears any prior disable override that
+    //      would otherwise make bootstrap fail with EIO)
+    //    - disabling: do NOT re-bootstrap — a fresh disable override blocks
+    //      bootstrap; the service stays loaded so `start` still works, and the
+    //      disable override prevents autostart on next login.
+    if enable {
+        if let Some(plist) = &ctx.paths.service_file {
+            // Ensure loaded: bootstrap only if not already loaded (bootout is
+            // unnecessary and can race; enable already cleared the override).
+            let loaded = std::process::Command::new("launchctl")
+                .args(["print", &label])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !loaded {
+                let _ = std::process::Command::new("launchctl")
+                    .args([
+                        "bootstrap",
+                        &domain_parent_macos(&domain),
+                        &plist.display().to_string(),
+                    ])
+                    .status();
+            }
+        }
+    }
+
     println!(
         "Autostart {} for {}",
         if enable { "enabled" } else { "disabled" },
@@ -1957,25 +2452,92 @@ async fn set_autostart(mode: instance::InstanceMode, enable: bool) -> anyhow::Re
 }
 
 #[cfg(target_os = "macos")]
+fn domain_parent_macos(domain: &str) -> &str {
+    domain.rsplit_once('/').map(|(p, _)| p).unwrap_or(domain)
+}
+
+#[cfg(target_os = "macos")]
+fn resolved_ctx_for_autostart(
+    mode: instance::InstanceMode,
+) -> anyhow::Result<instance::InstanceContext> {
+    instance::planned_current_context(mode)
+        .ok_or_else(|| anyhow::anyhow!("unsupported OS for autostart"))
+}
+
+#[cfg(target_os = "macos")]
+fn read_plist_for_autostart(ctx: &instance::InstanceContext) -> anyhow::Result<String> {
+    let plist = ctx
+        .paths
+        .service_file
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no launchd plist for this instance"))?;
+    std::fs::read_to_string(plist).map_err(|e| anyhow::anyhow!("failed to read plist: {e}"))
+}
+
+#[cfg(target_os = "macos")]
 async fn query_autostart(mode: instance::InstanceMode) -> anyhow::Result<()> {
     let domain = launchctl_domain(mode)?;
     let label = format!("{domain}/io.mihomo");
-    let output = std::process::Command::new("launchctl")
-        .arg("print")
-        .arg(&label)
-        .output()?;
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let enabled = stdout.contains("state = running") || stdout.contains("state = waiting");
-        println!(
-            "Autostart: {} ({})",
-            if enabled { "enabled" } else { "disabled" },
-            label
-        );
+
+    // 1. launchctl disable/enable override (print-disabled lists services with
+    //    an explicit override state).
+    let disabled_out = std::process::Command::new("launchctl")
+        .args(["print-disabled", &domain])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    let override_disabled = disabled_out.contains(&format!("\"io.mihomo\" => disabled"));
+
+    // 2. plist RunAtLoad as the fallback (no override set → install default).
+    let ctx = resolved_ctx_for_autostart(mode).ok();
+    let run_at_load = ctx
+        .and_then(|c| read_plist_for_autostart(&c).ok())
+        .map(|plist| plist.contains("<key>RunAtLoad</key><true/>"))
+        .unwrap_or(false);
+
+    let enabled = if override_disabled {
+        // A disable override forces no-autostart even if RunAtLoad=true.
+        false
     } else {
-        println!("Autostart: disabled (service not loaded)");
-    }
+        // Otherwise autostart is driven by the plist RunAtLoad flag. An
+        // `enabled` override only permits loading; it does NOT mean autostart.
+        run_at_load
+    };
+    println!(
+        "Autostart: {} ({label})",
+        if enabled { "enabled" } else { "disabled" }
+    );
     Ok(())
+}
+
+/// Parse `launchctl print <domain>/<label>` output to decide autostart state.
+///
+/// - print failing (non-zero exit) → service not loaded → disabled
+/// - loaded output contains `state = running|waiting|not running` → enabled
+///   (loaded means launchd will start it at boot/login, regardless of the
+///   *current* running state)
+/// - output contains `state = disabled` / `disabled = true` → disabled
+/// - otherwise → None (output shape unrecognized; Apple warns the print
+///   output is not an API and may change across releases)
+///
+/// Pure function — N4a makes the parsing testable without a real macOS.
+/// (Kept for tests; autostart status now prefers `print-disabled` override.)
+#[cfg(any(target_os = "macos", test))]
+fn macos_launchctl_print_indicates_enabled(exit_success: bool, stdout: &str) -> Option<bool> {
+    if !exit_success {
+        return Some(false);
+    }
+    if stdout.contains("state = disabled") || stdout.contains("disabled = true") {
+        return Some(false);
+    }
+    if stdout.contains("state = running")
+        || stdout.contains("state = waiting")
+        || stdout.contains("state = not running")
+    {
+        return Some(true);
+    }
+    None
 }
 
 #[cfg(target_os = "macos")]
@@ -2125,11 +2687,8 @@ fn run_autostart_command(mut cmd: std::process::Command, enable: bool) -> anyhow
 }
 
 async fn cmd_dashboard() -> anyhow::Result<()> {
-    let resolved = resolve_current_instance_context(
-        false,
-        false,
-        instance::CommandIntent::ReadOnly,
-    )?;
+    let resolved =
+        resolve_current_instance_context(false, false, instance::CommandIntent::ReadOnly)?;
     let endpoint = &resolved.ctx.paths.api_endpoint;
     let client = mihomo_api::EndpointMihomoApiClient::new(endpoint.clone());
 
@@ -2191,9 +2750,9 @@ async fn cmd_dashboard() -> anyhow::Result<()> {
                         .iter()
                         .filter(|(_, v)| v.get("type").and_then(|t| t.as_str()) == Some("Selector"))
                         .filter_map(|(name, v)| {
-                            v.get("now").and_then(|n| n.as_str()).map(|now| {
-                                format!("{} → {}", name, now)
-                            })
+                            v.get("now")
+                                .and_then(|n| n.as_str())
+                                .map(|now| format!("{} → {}", name, now))
                         })
                         .collect::<Vec<_>>()
                         .join("\n  ")
@@ -2201,21 +2760,28 @@ async fn cmd_dashboard() -> anyhow::Result<()> {
                 .unwrap_or_else(|| "no active group".to_string());
 
             // Render
-            write!(
-                stdout,
-                "{}{}",
-                Clear(ClearType::All),
-                MoveTo(0, 0)
-            )?;
+            write!(stdout, "{}{}", Clear(ClearType::All), MoveTo(0, 0))?;
             writeln!(stdout, "╔══════════════════════════════════════════╗")?;
             writeln!(stdout, "║        mihomo-cli  Dashboard             ║")?;
             writeln!(stdout, "╠══════════════════════════════════════════╣")?;
             writeln!(stdout, "║  Mode:        {:<25} ║", mode)?;
-            writeln!(stdout, "║  TUN:         {:<25} ║", if tun { "✅ enabled" } else { "❌ disabled" })?;
+            writeln!(
+                stdout,
+                "║  TUN:         {:<25} ║",
+                if tun { "✅ enabled" } else { "❌ disabled" }
+            )?;
             writeln!(stdout, "║  Mixed port:  {:<25} ║", mixed_port)?;
             writeln!(stdout, "║  Connections: {:<25} ║", conn_count)?;
-            writeln!(stdout, "║  Upload:      {:<25} ║", format_bytes(upload_total))?;
-            writeln!(stdout, "║  Download:    {:<25} ║", format_bytes(download_total))?;
+            writeln!(
+                stdout,
+                "║  Upload:      {:<25} ║",
+                format_bytes(upload_total)
+            )?;
+            writeln!(
+                stdout,
+                "║  Download:    {:<25} ║",
+                format_bytes(download_total)
+            )?;
             writeln!(stdout, "╠══════════════════════════════════════════╣")?;
             writeln!(stdout, "║  Proxy Group:                           ║")?;
             writeln!(stdout, "  {}", current_group)?;
@@ -2285,16 +2851,26 @@ async fn cmd_select_resolved(
     group: Option<String>,
     node: Option<String>,
 ) -> anyhow::Result<()> {
+    if node.is_none() && !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "select requires --node in non-interactive mode.\n  Run: mihomo-cli select --group <GROUP> --node <NODE>"
+        );
+    }
+    let resolved =
+        resolve_current_instance_context(system, user, instance::CommandIntent::Mutating)?;
     let client = resolve_ready_api_client(system, user, instance::CommandIntent::Mutating).await?;
     match node {
         // Non-interactive CLI: switch group to a specific node.
         Some(node_name) => {
             let group_name = group.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "--node requires --group (the proxy group that contains the node)"
-                )
+                anyhow::anyhow!("--node requires --group (the proxy group that contains the node)")
             })?;
             mihomo_api::select_proxy_with_client(&client, &group_name, &node_name).await?;
+            crate::rules::remember_selection_at(
+                &utils::AppPaths::new(resolved.ctx.paths.config_dir.clone()),
+                &group_name,
+                &node_name,
+            )?;
             println!("Switched {group_name} → {node_name}");
             Ok(())
         }
@@ -2329,15 +2905,25 @@ async fn cmd_delay_resolved(
 }
 
 fn ensure_instance_controller_endpoint(ctx: &instance::InstanceContext) -> anyhow::Result<()> {
-    let content = std::fs::read_to_string(&ctx.paths.config_file).map_err(|e| {
+    // ADR-22: repair the single source-of-truth intent config only.
+    let repair_path = if ctx.paths.intent_config_file.exists() {
+        &ctx.paths.intent_config_file
+    } else {
+        // No config has been imported/generated yet. Let the downstream start
+        // path produce the canonical "config not found" error instead of
+        // failing early in endpoint repair.
+        return Ok(());
+    };
+
+    let content = std::fs::read_to_string(repair_path).map_err(|e| {
         anyhow::anyhow!(
             "cannot read config for endpoint repair: {} ({e})",
-            ctx.paths.config_file.display()
+            repair_path.display()
         )
     })?;
     let fixed = config::ensure_controller_for_endpoint(&content, &ctx.paths.api_endpoint)?;
     if fixed != content {
-        write_instance_text_file(ctx, &ctx.paths.config_file, &fixed, 0o644)?;
+        write_instance_text_file(ctx, repair_path, &fixed, 0o644)?;
     }
     Ok(())
 }
@@ -2348,10 +2934,10 @@ fn set_instance_tun_config(
     stack: Option<&TunStack>,
     dns_hijack: Option<&str>,
 ) -> anyhow::Result<()> {
-    let content = std::fs::read_to_string(&ctx.paths.config_file).map_err(|e| {
+    let content = std::fs::read_to_string(&ctx.paths.intent_config_file).map_err(|e| {
         anyhow::anyhow!(
             "cannot read config for TUN update: {} ({e})",
-            ctx.paths.config_file.display()
+            ctx.paths.intent_config_file.display()
         )
     })?;
     let mut doc: serde_yaml::Value = serde_yaml::from_str(&content)?;
@@ -2385,10 +2971,20 @@ fn set_instance_tun_config(
     }
     write_instance_text_file(
         ctx,
-        &ctx.paths.config_file,
+        &ctx.paths.intent_config_file,
         &serde_yaml::to_string(&doc)?,
         0o644,
     )
+}
+
+fn prepare_tun_config_snapshot(ctx: &instance::InstanceContext) -> anyhow::Result<()> {
+    let content = std::fs::read(&ctx.paths.intent_config_file).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot read per-user config for TUN: {} ({e})",
+            ctx.paths.intent_config_file.display()
+        )
+    })?;
+    write_instance_bytes_file(ctx, &ctx.paths.tun_config_file, &content, 0o644)
 }
 
 fn tun_user_intent(action: Option<&TunAction>) -> UserIntent {
@@ -2408,6 +3004,16 @@ fn tun_action_intent(action: Option<&TunAction>) -> instance::CommandIntent {
 
 fn tun_action_uses_daemon_status(action: Option<&TunAction>) -> bool {
     matches!(action, Some(TunAction::Status) | None)
+}
+
+fn read_tun_enabled_from_config(config_path: &std::path::Path) -> anyhow::Result<bool> {
+    let content = std::fs::read_to_string(config_path)?;
+    let config: serde_yaml::Value = serde_yaml::from_str(&content)?;
+    Ok(config
+        .get("tun")
+        .and_then(|tun| tun.get("enable"))
+        .and_then(|enable| enable.as_bool())
+        .unwrap_or(false))
 }
 
 fn tun_requires_system_service_install_message() -> &'static str {
@@ -2455,6 +3061,27 @@ fn should_switch_user_to_system_for_tun_answer(answer: &str) -> bool {
     answer == "y" || answer == "yes"
 }
 
+fn should_update_existing_tun_answer(answer: &str) -> bool {
+    let answer = answer.trim().to_lowercase();
+    answer == "y" || answer == "yes"
+}
+
+fn confirm_update_existing_tun(yes: bool) -> anyhow::Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "TUN is already enabled. Re-run with --yes to update TUN config in non-interactive mode."
+        );
+    }
+    print!("TUN is already enabled. Update TUN config? [y/N] ");
+    std::io::Write::flush(&mut std::io::stdout())?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    Ok(should_update_existing_tun_answer(&input))
+}
+
 fn uninstall_user_service_artifacts_for_tun_switch() -> anyhow::Result<()> {
     let ctx = instance::planned_current_context(instance::InstanceMode::User)
         .ok_or_else(|| anyhow::anyhow!("Unsupported OS for per-user service cleanup"))?;
@@ -2476,7 +3103,21 @@ async fn prompt_switch_user_to_system_for_tun(
     user_running: bool,
     user_installed: bool,
     github_mirror: Option<&str>,
+    yes: bool,
 ) -> anyhow::Result<bool> {
+    if yes {
+        uninstall_user_service_artifacts_for_tun_switch()?;
+        cmd_install_instance(
+            instance::InstanceMode::System,
+            true,
+            None,
+            github_mirror,
+            false,
+            true,
+        )
+        .await?;
+        return Ok(true);
+    }
     if !std::io::stdin().is_terminal() {
         anyhow::bail!(
             "TUN requires the privileged system service, but a per-user instance is present.
@@ -2498,11 +3139,34 @@ async fn prompt_switch_user_to_system_for_tun(
         return Ok(false);
     }
     uninstall_user_service_artifacts_for_tun_switch()?;
-    cmd_install_instance(instance::InstanceMode::System, true, None, github_mirror, false).await?;
+    cmd_install_instance(
+        instance::InstanceMode::System,
+        true,
+        None,
+        github_mirror,
+        false,
+        false,
+    )
+    .await?;
     Ok(true)
 }
 
-async fn prompt_install_system_service_for_tun(github_mirror: Option<&str>) -> anyhow::Result<bool> {
+async fn prompt_install_system_service_for_tun(
+    github_mirror: Option<&str>,
+    yes: bool,
+) -> anyhow::Result<bool> {
+    if yes {
+        cmd_install_instance(
+            instance::InstanceMode::System,
+            true,
+            None,
+            github_mirror,
+            false,
+            true,
+        )
+        .await?;
+        return Ok(true);
+    }
     if !std::io::stdin().is_terminal() {
         anyhow::bail!(tun_requires_system_service_install_message());
     }
@@ -2516,7 +3180,15 @@ async fn prompt_install_system_service_for_tun(github_mirror: Option<&str>) -> a
         println!("  Cancelled.");
         return Ok(false);
     }
-    cmd_install_instance(instance::InstanceMode::System, true, None, github_mirror, false).await?;
+    cmd_install_instance(
+        instance::InstanceMode::System,
+        true,
+        None,
+        github_mirror,
+        false,
+        false,
+    )
+    .await?;
     Ok(true)
 }
 
@@ -2569,15 +3241,56 @@ fn system_tun_requires_daemon_message(
     }
 }
 
-async fn cmd_tun_resolved(
+struct TunResolvedOptions {
     system: bool,
     user: bool,
     action: Option<TunAction>,
     stack: Option<TunStack>,
     dns_hijack: Option<String>,
-) -> anyhow::Result<()> {
+    yes: bool,
+}
+
+fn is_tun_privileged_action(action: Option<&TunAction>) -> bool {
+    matches!(action, Some(TunAction::On) | Some(TunAction::Off))
+}
+
+#[cfg(unix)]
+fn is_current_process_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(not(unix))]
+fn is_current_process_root() -> bool {
+    true
+}
+
+fn sudo_reexec_command(args: &[String]) -> std::process::Command {
+    let mut command = std::process::Command::new("sudo");
+    command.args(args);
+    command
+}
+
+fn maybe_sudo_reexec_for_tun(action: Option<&TunAction>) -> anyhow::Result<()> {
+    if is_tun_privileged_action(action) && !is_current_process_root() {
+        let args: Vec<String> = std::env::args().collect();
+        let status = sudo_reexec_command(&args).status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+async fn cmd_tun_resolved(opts: TunResolvedOptions) -> anyhow::Result<()> {
+    let TunResolvedOptions {
+        system,
+        user,
+        action,
+        stack,
+        dns_hijack,
+        yes,
+    } = opts;
+    maybe_sudo_reexec_for_tun(action.as_ref())?;
     let intent = tun_action_intent(action.as_ref());
-    if matches!(action, Some(TunAction::On) | Some(TunAction::Off)) {
+    if is_tun_privileged_action(action.as_ref()) {
         let request = mode_request_from_flags(system, user);
         let env = current_environment_state();
         match resolve_environment_for_intent(request, &env, tun_user_intent(action.as_ref())) {
@@ -2585,14 +3298,15 @@ async fn cmd_tun_resolved(
                 user_running,
                 user_installed,
             } => {
-                if !prompt_switch_user_to_system_for_tun(user_running, user_installed, None).await?
+                if !prompt_switch_user_to_system_for_tun(user_running, user_installed, None, yes)
+                    .await?
                 {
                     return Ok(());
                 }
             }
             RuntimeFirstModeResolution::NeedsSystemInstall { .. } => {
                 if matches!(action, Some(TunAction::On)) && !system && !user {
-                    if !prompt_install_system_service_for_tun(None).await? {
+                    if !prompt_install_system_service_for_tun(None, yes).await? {
                         return Ok(());
                     }
                 } else {
@@ -2667,7 +3381,7 @@ async fn cmd_tun_resolved(
         let tun_config_snapshot = if resolved.ctx.mode == instance::InstanceMode::System
             && matches!(action, Some(TunAction::On) | Some(TunAction::Off))
         {
-            Some(snapshot_file(&resolved.ctx.paths.config_file)?)
+            Some(snapshot_file(&resolved.ctx.paths.intent_config_file)?)
         } else {
             None
         };
@@ -2675,6 +3389,14 @@ async fn cmd_tun_resolved(
         if resolved.ctx.mode == instance::InstanceMode::System {
             match action {
                 Some(TunAction::On) => {
+                    if resolved.ctx.paths.intent_config_file.exists()
+                        && read_tun_enabled_from_config(&resolved.ctx.paths.intent_config_file)
+                            .unwrap_or(false)
+                        && !confirm_update_existing_tun(yes)?
+                    {
+                        println!("  Cancelled.");
+                        return Ok(());
+                    }
                     ensure_instance_controller_endpoint(&resolved.ctx)?;
                     set_instance_tun_config(
                         &resolved.ctx,
@@ -2682,6 +3404,7 @@ async fn cmd_tun_resolved(
                         stack.as_ref(),
                         dns_hijack.as_deref(),
                     )?;
+                    prepare_tun_config_snapshot(&resolved.ctx)?;
                 }
                 Some(TunAction::Off) => {
                     set_instance_tun_config(&resolved.ctx, false, None, None)?;
@@ -2691,7 +3414,7 @@ async fn cmd_tun_resolved(
         }
         let cmd = match action {
             Some(TunAction::On) => ipc::DaemonCommand::EnableTun {
-                config_path: resolved.ctx.paths.config_file.clone(),
+                config_path: resolved.ctx.paths.tun_config_file.clone(),
                 stack: stack.as_ref().map(ToString::to_string),
                 dns_hijack: dns_hijack.clone(),
                 token: None,
@@ -2703,7 +3426,7 @@ async fn cmd_tun_resolved(
             Ok(resp) => resp,
             Err(err) => {
                 if let Some(snapshot) = tun_config_snapshot {
-                    restore_file_snapshot(&resolved.ctx.paths.config_file, snapshot)?;
+                    restore_file_snapshot(&resolved.ctx.paths.intent_config_file, snapshot)?;
                 }
                 return Err(err);
             }
@@ -2715,7 +3438,7 @@ async fn cmd_tun_resolved(
             }
             ipc::DaemonResponse::Error { message } => {
                 if let Some(snapshot) = tun_config_snapshot {
-                    restore_file_snapshot(&resolved.ctx.paths.config_file, snapshot)?;
+                    restore_file_snapshot(&resolved.ctx.paths.intent_config_file, snapshot)?;
                 }
                 anyhow::bail!("daemon error: {message}");
             }
@@ -2724,6 +3447,7 @@ async fn cmd_tun_resolved(
                 tun_enabled,
                 core_pid,
                 config_path,
+                ..
             } => {
                 println!("System daemon: running");
                 println!("Core running: {running}");
@@ -3146,6 +3870,10 @@ async fn cmd_lifecycle_instance(
     cmd_lifecycle_instance_mode(mode, action).await
 }
 
+fn lifecycle_system_config_path(ctx: &instance::InstanceContext) -> std::path::PathBuf {
+    ctx.paths.intent_config_file.clone()
+}
+
 async fn cmd_lifecycle_instance_mode(
     mode: instance::InstanceMode,
     action: instance::ServiceAction,
@@ -3174,9 +3902,15 @@ async fn cmd_lifecycle_instance_mode(
         }
 
         let cmd = match action {
-            instance::ServiceAction::Start => ipc::DaemonCommand::StartCore { config_path: ctx.paths.config_file.clone(), token: None },
+            instance::ServiceAction::Start => ipc::DaemonCommand::StartCore {
+                config_path: lifecycle_system_config_path(&ctx),
+                token: None,
+            },
             instance::ServiceAction::Stop => ipc::DaemonCommand::StopCore { token: None },
-            instance::ServiceAction::Restart => ipc::DaemonCommand::RestartCore { config_path: ctx.paths.config_file.clone(), token: None },
+            instance::ServiceAction::Restart => ipc::DaemonCommand::RestartCore {
+                config_path: lifecycle_system_config_path(&ctx),
+                token: None,
+            },
             _ => return Err(anyhow::anyhow!("unsupported lifecycle action via IPC")),
         };
         let resp = ipc::send_command(&cmd).await?;
@@ -3198,7 +3932,7 @@ async fn cmd_lifecycle_instance_mode(
 
     // Phase 5: 启动前检查 TCP 端口是否被占用
     if matches!(action, instance::ServiceAction::Start) {
-        if let Some(port) = read_mixed_port_from_config(&ctx.paths.config_file) {
+        if let Some(port) = read_mixed_port_from_config(&ctx.paths.intent_config_file) {
             if is_tcp_port_in_use(port) {
                 anyhow::bail!(
                     "端口 {port} 已被占用\n  \
@@ -3260,7 +3994,10 @@ async fn cmd_lifecycle_instance_mode(
 }
 
 fn system_core_start_command(ctx: &instance::InstanceContext) -> ipc::DaemonCommand {
-    ipc::DaemonCommand::StartCore { config_path: ctx.paths.config_file.clone(), token: None }
+    ipc::DaemonCommand::StartCore {
+        config_path: ctx.paths.intent_config_file.clone(),
+        token: None,
+    }
 }
 
 async fn start_system_core_via_daemon(ctx: &instance::InstanceContext) -> anyhow::Result<()> {
@@ -3352,10 +4089,10 @@ async fn wait_for_instance_readiness(ctx: &instance::InstanceContext) -> anyhow:
 }
 
 fn verify_config_endpoint(ctx: &instance::InstanceContext) -> anyhow::Result<()> {
-    let content = std::fs::read_to_string(&ctx.paths.config_file).map_err(|e| {
+    let content = std::fs::read_to_string(&ctx.paths.intent_config_file).map_err(|e| {
         anyhow::anyhow!(
             "cannot read config for readiness check: {} ({e})",
-            ctx.paths.config_file.display()
+            ctx.paths.intent_config_file.display()
         )
     })?;
     let expected_line = ctx.paths.api_endpoint.controller_line();
@@ -3365,7 +4102,7 @@ fn verify_config_endpoint(ctx: &instance::InstanceContext) -> anyhow::Result<()>
     anyhow::bail!(
         "config endpoint does not match selected instance.\n  Expected: {}\n  Config: {}\n  Fix: {}",
         expected_line,
-        ctx.paths.config_file.display(),
+        ctx.paths.intent_config_file.display(),
         config_fix_command_for_mode(ctx.mode)
     )
 }
@@ -3477,6 +4214,10 @@ async fn cmd_status_context_with_source(
             status_endpoint_label(&plan.expected_endpoint)
         );
     }
+    println!("  System proxy: use `mihomo-cli system-proxy off` to disable OS proxy settings");
+    println!(
+        "  Shell proxy:  use `eval \"$(mihomo-cli proxy off)\"` to clear env proxy in this shell"
+    );
 
     if ctx.mode == instance::InstanceMode::System {
         if ipc::is_daemon_running().await {
@@ -3490,6 +4231,7 @@ async fn cmd_status_context_with_source(
                     tun_enabled,
                     core_pid,
                     config_path,
+                    ..
                 }) => {
                     println!(
                         "  Core running:  {}",
@@ -3777,12 +4519,18 @@ async fn cmd_install_entry(
     version: Option<&str>,
     github_mirror: Option<&str>,
     skip_config: bool,
+    yes: bool,
 ) -> anyhow::Result<()> {
     let mode = if system {
         instance::InstanceMode::System
     } else if user {
         instance::InstanceMode::User
     } else {
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!(
+                "install requires an explicit instance mode in non-interactive mode.\n  Run: mihomo-cli install --user [--skip-config] [-y]\n  Or:  mihomo-cli install --system [--skip-config] [-y]"
+            );
+        }
         print_lines(format_install_mode_prompt());
         print!("Choice [1/2] (default: 1): ");
         use std::io::Write;
@@ -3797,7 +4545,7 @@ async fn cmd_install_entry(
             instance::InstanceMode::User
         }
     };
-    cmd_install_instance(mode, force, version, github_mirror, skip_config).await
+    cmd_install_instance(mode, force, version, github_mirror, skip_config, yes).await
 }
 
 fn install_mode_conflict_message(
@@ -3827,6 +4575,7 @@ async fn cmd_install_instance(
     version: Option<&str>,
     github_mirror: Option<&str>,
     skip_config: bool,
+    yes: bool,
 ) -> anyhow::Result<()> {
     let ctx = instance::planned_current_context(mode)
         .ok_or_else(|| anyhow::anyhow!("Unsupported OS for instance install"))?;
@@ -3855,7 +4604,7 @@ async fn cmd_install_instance(
     println!("{}", format_install_instance_header(mode, ctx.os));
     println!("Resolved instance paths:");
     println!("  Binary:   {}", ctx.paths.core_binary.display());
-    println!("  Config:   {}", ctx.paths.config_file.display());
+    println!("  Config:   {}", ctx.paths.intent_config_file.display());
     println!(
         "  Endpoint: {}",
         status_endpoint_label(&ctx.paths.api_endpoint)
@@ -3864,7 +4613,7 @@ async fn cmd_install_instance(
     // Pre-flight: check each component, skip valid ones (unless --force)
     let binary_valid = installer::validate_binary_at(&ctx.paths.core_binary).is_ok();
     let service_exists = plan.files.iter().all(|f| f.path.exists());
-    let config_exists = ctx.paths.config_file.exists();
+    let config_exists = ctx.paths.intent_config_file.exists();
     let geo_valid = installer::geo_files_are_valid(&ctx.paths.config_dir, &ctx.paths.core_binary);
 
     if !force && binary_valid && service_exists && config_exists && geo_valid {
@@ -3930,15 +4679,19 @@ async fn cmd_install_instance(
                     .file_name()
                     .unwrap_or_else(|| std::ffi::OsStr::new("mihomo")),
             );
-            installer::download_mihomo_to(version, &staged_bin)
+            installer::download_mihomo_to_with_mirror(version, &staged_bin, github_mirror)
                 .await
                 .map_err(|e| anyhow::anyhow!(install_download_error(&e.to_string())))?;
             let bin_bytes = std::fs::read(&staged_bin)?;
             service::PrivilegeExecutor::write_file(&ctx.paths.core_binary, &bin_bytes, 0o755)?;
         } else {
-            installer::download_mihomo_to(version, &ctx.paths.core_binary)
-                .await
-                .map_err(|e| anyhow::anyhow!(install_download_error(&e.to_string())))?;
+            installer::download_mihomo_to_with_mirror(
+                version,
+                &ctx.paths.core_binary,
+                github_mirror,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(install_download_error(&e.to_string())))?;
         }
         println!("  Installed to {}", ctx.paths.core_binary.display());
     }
@@ -3994,8 +4747,7 @@ async fn cmd_install_instance(
                     instance::ConfigMutationKind::FixRuntimeController,
                 );
                 let paths = utils::AppPaths::new(mutation.config_dir.clone());
-                let mihomo_path =
-                    std::path::PathBuf::from(&mutation.validate_command.program);
+                let mihomo_path = std::path::PathBuf::from(&mutation.validate_command.program);
                 let fixed = config::fix_existing_config_at_endpoint(
                     &paths,
                     Some(&mihomo_path),
@@ -4003,7 +4755,11 @@ async fn cmd_install_instance(
                 )?;
                 println!(
                     "  ⚠ Present but controller endpoint mismatched; {}",
-                    if fixed { "fixed in place" } else { "already aligned" }
+                    if fixed {
+                        "fixed in place"
+                    } else {
+                        "already aligned"
+                    }
                 );
                 true
             }
@@ -4017,9 +4773,7 @@ async fn cmd_install_instance(
 
     println!();
     print_lines(format_install_step("[4/4] Geo data files..."));
-    if !config_ok {
-        println!("  Skipped because config is pending");
-    } else if !force && geo_valid {
+    if !force && geo_valid {
         println!("  ✅ Already valid, skipped");
     } else {
         let geo_stage = tempfile::tempdir()?;
@@ -4045,15 +4799,24 @@ async fn cmd_install_instance(
         return Ok(());
     }
 
-    print_lines(format_install_service_prompt(install_mode_label(
-        mode == instance::InstanceMode::User,
-    )));
-    print!("Choice [Y/n]: ");
-    use std::io::Write;
-    std::io::stdout().flush()?;
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    if should_install_service_answer(&input) {
+    let install_service = if yes {
+        true
+    } else if std::io::stdin().is_terminal() {
+        print_lines(format_install_service_prompt(install_mode_label(
+            mode == instance::InstanceMode::User,
+        )));
+        print!("Choice [Y/n]: ");
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        should_install_service_answer(&input)
+    } else {
+        anyhow::bail!(
+            "install service confirmation requires a TTY. Re-run with -y/--yes to install service artifacts, or use --skip-config only after choosing an explicit mode."
+        );
+    };
+    if install_service {
         #[cfg(target_os = "windows")]
         let via_service_manager = mode == instance::InstanceMode::System;
         #[cfg(not(target_os = "windows"))]
@@ -4065,7 +4828,46 @@ async fn cmd_install_instance(
             #[cfg(target_os = "windows")]
             service::windows_install_service(&ctx)?;
         } else {
+            // macOS: the install plan's `launchctl enable` must only run when a
+            // prior disable override exists (a disable override makes bootstrap
+            // fail with EIO). Running it unconditionally writes an `enabled`
+            // override, which makes `autostart status` report enabled even when
+            // RunAtLoad=false (N2a 真机验证发现). Skip it when no override.
+            #[cfg(target_os = "macos")]
+            let macos_enable_needed = {
+                let domain = match &ctx.service {
+                    instance::ServiceTarget::MacosLaunchDaemon { domain_label, .. }
+                    | instance::ServiceTarget::MacosLaunchAgent { domain_label, .. } => {
+                        domain_label.clone()
+                    }
+                    _ => String::new(),
+                };
+                let disabled_out = std::process::Command::new("launchctl")
+                    .args(["print-disabled", &domain])
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                    .unwrap_or_default();
+                disabled_out.contains(&format!("\"io.mihomo\" => disabled"))
+            };
             for command in &plan.commands {
+                #[cfg(target_os = "macos")]
+                let is_unconditional_enable = command.program == "launchctl"
+                    && command.args.first().map(String::as_str) == Some("enable");
+                #[cfg(not(target_os = "macos"))]
+                let is_unconditional_enable = false;
+                if is_unconditional_enable {
+                    #[cfg(target_os = "macos")]
+                    {
+                        if !macos_enable_needed {
+                            continue; // skip — no disable override to clear
+                        }
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        unreachable!("unconditional enable only exists on macOS");
+                    }
+                }
                 let is_best_effort_unload = is_best_effort_install_cleanup_command(command);
                 if is_best_effort_unload {
                     run_install_cleanup_command(command);
@@ -4075,14 +4877,14 @@ async fn cmd_install_instance(
             }
         }
         print_lines(format_install_service_installed());
-        let config_file_exists = ctx.paths.config_file.exists();
+        let config_file_exists = ctx.paths.intent_config_file.exists();
         if skip_config && !config_file_exists {
             // --skip-config and no config yet: core cannot start. User adds
             // config then starts.
             println!(
                 "  ⚠ Core not started (--skip-config: no config yet). \
                  Add config at {} then run: mihomo-cli start",
-                ctx.paths.config_file.display()
+                ctx.paths.intent_config_file.display()
             );
         } else if mode == instance::InstanceMode::System {
             wait_for_system_daemon_readiness().await?;
@@ -4203,11 +5005,14 @@ fn write_instance_bytes_file(
 }
 
 async fn setup_instance_config(ctx: &instance::InstanceContext) -> anyhow::Result<bool> {
-    if ctx.paths.config_file.exists() {
-        let content = std::fs::read_to_string(&ctx.paths.config_file)?;
+    // ADR-22: config_file and intent_config_file are the same single source of truth.
+    let config_path = &ctx.paths.intent_config_file;
+
+    if config_path.exists() {
+        let content = std::fs::read_to_string(config_path)?;
         let fixed = config::ensure_controller_for_endpoint(&content, &ctx.paths.api_endpoint)?;
         if fixed != content {
-            write_instance_text_file(ctx, &ctx.paths.config_file, &fixed, 0o644)?;
+            write_instance_text_file(ctx, config_path, &fixed, 0o644)?;
             println!("  Config updated for instance endpoint");
         } else {
             println!("  Existing config OK");
@@ -4223,10 +5028,16 @@ async fn setup_instance_config(ctx: &instance::InstanceContext) -> anyhow::Resul
             let content = std::fs::read_to_string(&cv_config)?;
             let patched =
                 config::ensure_controller_for_endpoint(&content, &ctx.paths.api_endpoint)?;
-            write_instance_text_file(ctx, &ctx.paths.config_file, &patched, 0o644)?;
+            write_instance_text_file(ctx, config_path, &patched, 0o644)?;
             println!("  Copied config from Clash Verge Rev");
             return Ok(true);
         }
+    }
+
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "install would prompt for a subscription URL, but stdin is not a TTY.\n  Re-run with --skip-config, or add a subscription after install: mihomo-cli config -u <URL>"
+        );
     }
 
     use dialoguer::Input;
@@ -4237,7 +5048,7 @@ async fn setup_instance_config(ctx: &instance::InstanceContext) -> anyhow::Resul
     if url.is_empty() {
         println!(
             "  Skipped. Place config manually at {}",
-            ctx.paths.config_file.display()
+            config_path.display()
         );
         return Ok(false);
     }
@@ -4252,13 +5063,14 @@ async fn setup_instance_config(ctx: &instance::InstanceContext) -> anyhow::Resul
         config::convert_vmess_to_clash(&content)?
     };
     let patched = config::ensure_controller_for_endpoint(&config_content, &ctx.paths.api_endpoint)?;
-    write_instance_text_file(ctx, &ctx.paths.config_file, &patched, 0o644)?;
+    write_instance_text_file(ctx, config_path, &patched, 0o644)?;
     println!("  Config saved");
 
     Ok(true)
 }
 
 struct ConfigCmd {
+    command: Option<ConfigSubcommand>,
     url: Option<String>,
     fix: bool,
     system: bool,
@@ -4279,6 +5091,7 @@ struct ConfigCmd {
     set_ua: Vec<String>,
     activate: bool,
     no_activate: bool,
+    json: bool,
 }
 
 fn print_probe_results(results: &[config::SubscriptionProbeResult]) {
@@ -4358,13 +5171,27 @@ fn config_restart_apply_lines() -> Vec<String> {
     vec!["  Run: mihomo-cli restart  to apply".to_string()]
 }
 
+async fn apply_config_reload_lines(
+    system: bool,
+    user: bool,
+    paths: &utils::AppPaths,
+) -> Vec<String> {
+    match reload_configs_for_resolved_instance(system, user, paths).await {
+        Ok(()) => vec!["  ✓ Config reloaded".to_string()],
+        Err(e) => vec![
+            format!("  ⚠ Config written but running core reload failed: {e}"),
+            "  Run: mihomo-cli restart  to apply".to_string(),
+        ],
+    }
+}
+
 fn format_config_change_result(action: &str, target: &str) -> Vec<String> {
     vec![format!("  {action} {target}")]
 }
 
-fn format_subscription_switch_success(id: &str) -> Vec<String> {
+fn format_subscription_switch_success(id: &str, apply_lines: Vec<String>) -> Vec<String> {
     let mut lines = format_config_change_result("Switched to subscription", id);
-    lines.extend(config_restart_apply_lines());
+    lines.extend(apply_lines);
     lines
 }
 
@@ -4372,9 +5199,9 @@ fn format_refresh_all_start() -> Vec<String> {
     vec!["  Refreshing all subscriptions...".to_string()]
 }
 
-fn format_refresh_all_success() -> Vec<String> {
+fn format_refresh_all_success(apply_lines: Vec<String>) -> Vec<String> {
     let mut lines = vec!["  All subscriptions refreshed.".to_string()];
-    lines.extend(config_restart_apply_lines());
+    lines.extend(apply_lines);
     lines
 }
 
@@ -4382,9 +5209,9 @@ fn format_refresh_active_start(id: &str) -> Vec<String> {
     vec![format!("  Refreshing active subscription {id}...")]
 }
 
-fn format_refresh_active_success() -> Vec<String> {
+fn format_refresh_active_success(apply_lines: Vec<String>) -> Vec<String> {
     let mut lines = vec!["  Subscription refreshed.".to_string()];
-    lines.extend(config_restart_apply_lines());
+    lines.extend(apply_lines);
     lines
 }
 
@@ -4397,12 +5224,13 @@ fn format_config_add_start() -> Vec<String> {
     vec!["  Adding subscription...".to_string()]
 }
 
-fn format_config_add_success(id: &str) -> Vec<String> {
+fn format_config_add_success(id: &str, apply_lines: Vec<String>) -> Vec<String> {
     let mut lines = format_config_change_result("Added subscription", id);
-    lines.extend(config_restart_apply_lines());
+    lines.extend(apply_lines);
     lines
 }
 
+#[allow(dead_code)]
 fn format_legacy_url_add_success(id: &str, hot_reloaded: bool) -> Vec<String> {
     let mut lines = vec![format!("  Added and activated subscription {id}")];
     if hot_reloaded {
@@ -4413,13 +5241,15 @@ fn format_legacy_url_add_success(id: &str, hot_reloaded: bool) -> Vec<String> {
     lines
 }
 
-fn format_import_success(id: &str, activated: bool) -> Vec<String> {
+fn format_import_success(id: &str, activated: bool, apply_lines: Vec<String>) -> Vec<String> {
     let mut lines = if activated {
         vec![format!("  Imported and activated subscription {id}")]
     } else {
         vec![format!("  Imported subscription {id} (not activated)")]
     };
-    lines.extend(config_restart_apply_lines());
+    if activated {
+        lines.extend(apply_lines);
+    }
     lines
 }
 
@@ -4453,7 +5283,21 @@ fn subscription_change_rollback_error(error: &str) -> String {
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+enum ConfigSubcommand {
+    /// Download/convert a subscription URL to a local Clash YAML file without changing local state
+    Fetch {
+        /// Subscription URL to fetch
+        url: String,
+        /// Output Clash YAML file path
+        #[arg(short, long)]
+        output: std::path::PathBuf,
+        /// Use a fixed User-Agent for this fetch (alias: --ua)
+        #[arg(long = "user-agent", alias = "ua")]
+        user_agent: Option<String>,
+    },
+}
+
 enum ConfigDryRunAction<'a> {
     SetUserAgent { id: &'a str, ua: &'a str },
     Switch { id: &'a str },
@@ -4487,6 +5331,58 @@ fn format_config_dry_run(action: ConfigDryRunAction<'_>) -> Vec<String> {
         }
     };
     vec![line]
+}
+
+fn print_json_envelope(
+    command: &str,
+    data: serde_json::Value,
+    warnings: Vec<String>,
+) -> anyhow::Result<()> {
+    let value = serde_json::json!({
+        "ok": true,
+        "command": command,
+        "data": data,
+        "warnings": warnings,
+        "error": serde_json::Value::Null,
+        "meta": {
+            "schema_version": 1,
+            "cli_version": env!("MIHOMO_CLI_VERSION"),
+        }
+    });
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn validate_config_at_paths_with_binary_json(
+    paths: &utils::AppPaths,
+    mihomo: &std::path::Path,
+    json: bool,
+) -> anyhow::Result<()> {
+    let report = config::validate_config_at(paths, Some(mihomo))?;
+    if json {
+        let mut warnings = Vec::new();
+        if !report.mihomo_tested {
+            warnings.push(format!("mihomo binary not found: {}", mihomo.display()));
+        }
+        print_json_envelope(
+            "config.validate",
+            serde_json::json!({
+                "config_path": paths.config_path(),
+                "mihomo_path": mihomo,
+                "yaml_valid": report.yaml_valid,
+                "mihomo_tested": report.mihomo_tested,
+                "mihomo_valid": if report.mihomo_tested { Some(true) } else { None },
+            }),
+            warnings,
+        )
+    } else {
+        print_lines(format_config_validation_result(
+            &paths.config_path(),
+            mihomo,
+            &report,
+        ));
+        Ok(())
+    }
 }
 
 fn format_config_validation_result(
@@ -4569,15 +5465,15 @@ fn format_tui_action_hint() -> Vec<String> {
     ]
 }
 
-fn format_tui_add_success(id: &str) -> Vec<String> {
+fn format_tui_add_success(id: &str, apply_lines: Vec<String>) -> Vec<String> {
     let mut lines = format_config_change_result("Added subscription", id);
-    lines.extend(config_restart_apply_lines());
+    lines.extend(apply_lines);
     lines
 }
 
-fn format_tui_switch_result(id: &str, switched: bool) -> Vec<String> {
+fn format_tui_switch_result(id: &str, switched: bool, apply_lines: Vec<String>) -> Vec<String> {
     if switched {
-        format_subscription_switch_success(id)
+        format_subscription_switch_success(id, apply_lines)
     } else {
         vec!["  Already active.".to_string()]
     }
@@ -4595,10 +5491,11 @@ fn format_tui_no_active_subscription() -> Vec<String> {
 fn format_tui_delete_items(subs: &[config::SubscriptionMeta]) -> Vec<String> {
     subs.iter()
         .map(|sub| {
-            let short_url = if sub.url.chars().count() > 40 {
-                format!("{}…", sub.url.chars().take(37).collect::<String>())
+            let sanitized = utils::sanitize_url(&sub.url);
+            let short_url = if sanitized.chars().count() > 40 {
+                format!("{}…", sanitized.chars().take(37).collect::<String>())
             } else {
-                sub.url.clone()
+                sanitized
             };
             format!("{} ({})", sub.id, short_url)
         })
@@ -4712,12 +5609,33 @@ async fn cmd_config(args: ConfigCmd) -> anyhow::Result<()> {
         probe,
         user_agent,
         set_ua,
+        command,
         activate,
         no_activate,
+        json,
     } = args;
 
     // ADR-02: System config is now per-user, same write path as User config.
     // No guard needed — config writes work for both modes.
+    let has_action = command.is_some()
+        || url.is_some()
+        || fix
+        || refresh
+        || refresh_all
+        || import.is_some()
+        || switch.is_some()
+        || add.is_some()
+        || remove.is_some()
+        || list
+        || validate
+        || info.is_some()
+        || probe.is_some()
+        || !set_ua.is_empty();
+    if !has_action && !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "config requires an explicit action in non-interactive mode.\n  Use --list, --add <URL>, --import <FILE>, --refresh, --refresh-all, --validate, or --probe <URL>."
+        );
+    }
 
     let read_paths = || {
         app_paths_for_resolved_instance_command(
@@ -4735,6 +5653,59 @@ async fn cmd_config(args: ConfigCmd) -> anyhow::Result<()> {
             instance::CommandIntent::Mutating,
         )
     };
+    if let Some(ConfigSubcommand::Fetch {
+        url,
+        output,
+        user_agent: fetch_user_agent,
+    }) = command
+    {
+        if dry_run {
+            println!("  Dry run: no files will be written.");
+            println!(
+                "  Would download, convert, validate, and write subscription: {}",
+                utils::sanitize_url(&url)
+            );
+            println!("  Output: {}", output.display());
+            return Ok(());
+        }
+        let ua = fetch_user_agent.as_deref().or(user_agent.as_deref());
+        let report = config::fetch_subscription_to_file(&url, &output, ua).await?;
+        if json {
+            return print_json_envelope(
+                "config.fetch",
+                serde_json::json!({
+                    "output_path": report.output_path,
+                    "format": if report.is_clash_yaml { "clash-yaml" } else { "converted" },
+                    "proxy_count": report.proxy_count,
+                    "proxy_group_count": report.proxy_group_count,
+                    "rule_count": report.rule_count,
+                }),
+                vec!["Treat the output file as sensitive; it may contain private proxy nodes/tokens.".to_string()],
+            );
+        }
+        println!("  ✓ Fetched subscription: {}", report.output_path.display());
+        println!(
+            "  Format: {}",
+            if report.is_clash_yaml {
+                "Clash YAML"
+            } else {
+                "converted to Clash YAML"
+            }
+        );
+        println!(
+            "  Proxies: {}  Groups: {}  Rules: {}",
+            report.proxy_count, report.proxy_group_count, report.rule_count
+        );
+        println!(
+            "  ⚠ Treat the output file as sensitive; it may contain private proxy nodes/tokens."
+        );
+        println!(
+            "  Import on target machine with: mihomo-cli config --import {}",
+            report.output_path.display()
+        );
+        return Ok(());
+    }
+
     if validate {
         let paths = read_paths()?;
         let core_binary = resolved_core_binary_for_config_command(
@@ -4742,7 +5713,7 @@ async fn cmd_config(args: ConfigCmd) -> anyhow::Result<()> {
             user,
             instance::CommandIntent::ReadOnly,
         )?;
-        validate_config_at_paths_with_binary(&paths, &core_binary)?;
+        validate_config_at_paths_with_binary_json(&paths, &core_binary, json)?;
         return Ok(());
     }
 
@@ -4831,7 +5802,9 @@ async fn cmd_config(args: ConfigCmd) -> anyhow::Result<()> {
             restore_file_snapshot(&paths.active_file_path(), active_snapshot)?;
             anyhow::bail!(subscription_switch_rollback_error(&err.to_string()));
         }
-        print_lines(format_subscription_switch_success(&id));
+        let apply_lines = apply_config_reload_lines(system, user, &paths).await;
+        print_lines(format_subscription_switch_success(&id, apply_lines));
+        print_config_drift_warnings(&paths);
         return Ok(());
     }
 
@@ -4878,7 +5851,9 @@ async fn cmd_config(args: ConfigCmd) -> anyhow::Result<()> {
             meta_snapshot,
             active_snapshot,
         )?;
-        print_lines(format_config_add_success(&id));
+        let apply_lines = apply_config_reload_lines(system, user, &paths).await;
+        print_lines(format_config_add_success(&id, apply_lines));
+        print_config_drift_warnings(&paths);
         return Ok(());
     }
 
@@ -4890,10 +5865,31 @@ async fn cmd_config(args: ConfigCmd) -> anyhow::Result<()> {
             return Ok(());
         }
         let _lock = crate::lock::ConfigLock::acquire(paths.config_dir())?;
+        let was_active = config::get_active_id_at(&paths)?.as_deref() == Some(id.as_str());
+        let meta_snapshot = snapshot_file(&paths.subscriptions_meta_path())?;
+        let active_snapshot = snapshot_file(&paths.active_file_path())?;
+        let sub_snapshot = snapshot_file(&paths.subscription_file_path(&id))?;
         config::remove_subscription_at(&paths, &id)?;
-        for line in format_config_change_result("Removed subscription", &id) {
-            println!("{line}");
+        if was_active {
+            if let Err(err) = config::merge_user_config_checked_at_endpoint(
+                &paths,
+                Some(&core_binary),
+                &config_endpoint,
+            ) {
+                restore_file_snapshot(&paths.subscriptions_meta_path(), meta_snapshot)?;
+                restore_file_snapshot(&paths.active_file_path(), active_snapshot)?;
+                restore_file_snapshot(&paths.subscription_file_path(&id), sub_snapshot)?;
+                anyhow::bail!(
+                    "Subscription remove failed; rolled back metadata and subscription file.\n  {}",
+                    err
+                );
+            }
         }
+        let mut lines = format_config_change_result("Removed subscription", &id);
+        if was_active {
+            lines.extend(apply_config_reload_lines(system, user, &paths).await);
+        }
+        print_lines(lines);
         return Ok(());
     }
 
@@ -4917,7 +5913,9 @@ async fn cmd_config(args: ConfigCmd) -> anyhow::Result<()> {
             Some(&core_binary),
             &config_endpoint,
         )?;
-        print_lines(format_refresh_all_success());
+        let apply_lines = apply_config_reload_lines(system, user, &paths).await;
+        print_lines(format_refresh_all_success(apply_lines));
+        print_config_drift_warnings(&paths);
         return Ok(());
     }
 
@@ -4940,7 +5938,9 @@ async fn cmd_config(args: ConfigCmd) -> anyhow::Result<()> {
                     Some(&core_binary),
                     &config_endpoint,
                 )?;
-                print_lines(format_refresh_active_success());
+                let apply_lines = apply_config_reload_lines(system, user, &paths).await;
+                print_lines(format_refresh_active_success(apply_lines));
+                print_config_drift_warnings(&paths);
                 return Ok(());
             }
             None => {
@@ -5033,9 +6033,10 @@ async fn cmd_config(args: ConfigCmd) -> anyhow::Result<()> {
                 meta_snapshot,
                 active_snapshot,
             )?;
-            print_lines(format_import_success(&id, true));
+            let apply_lines = apply_config_reload_lines(system, user, &paths).await;
+            print_lines(format_import_success(&id, true, apply_lines));
         } else {
-            print_lines(format_import_success(&id, false));
+            print_lines(format_import_success(&id, false, Vec::new()));
             if !std::io::stdin().is_terminal() {
                 println!("  Run `mihomo-cli config --switch {id}` to activate.");
             }
@@ -5084,10 +6085,10 @@ async fn cmd_config(args: ConfigCmd) -> anyhow::Result<()> {
             meta_snapshot,
             active_snapshot,
         )?;
-        let hot_reloaded = reload_configs_for_resolved_instance(system, user, &paths)
-            .await
-            .is_ok();
-        print_lines(format_legacy_url_add_success(&id, hot_reloaded));
+        let apply_lines = apply_config_reload_lines(system, user, &paths).await;
+        let mut lines = vec![format!("  Added and activated subscription {id}")];
+        lines.extend(apply_lines);
+        print_lines(lines);
         return Ok(());
     }
 
@@ -5193,7 +6194,7 @@ async fn show_subscription_menu_inner(
                     print_lines(format_config_add_start());
                     let id = config::add_subscription_at(paths, url).await?;
                     config::merge_user_config_checked_at_endpoint(paths, Some(mihomo), endpoint)?;
-                    print_lines(format_tui_add_success(&id));
+                    print_lines(format_tui_add_success(&id, config_restart_apply_lines()));
                     terminal::enable_raw_mode()?;
                     return Ok(());
                 }
@@ -5236,7 +6237,11 @@ async fn show_subscription_menu_inner(
             let is_active = active.as_deref() == Some(sub.id.as_str());
             let prefix = if i == *cursor { "›" } else { " " };
             let marker = if is_active { " *" } else { "" };
-            let line = format!("{prefix} {}{marker}  {}", sub.id, sub.url);
+            let line = format!(
+                "{prefix} {}{marker}  {}",
+                sub.id,
+                utils::sanitize_url(&sub.url)
+            );
             write!(
                 stdout,
                 "{}\r\n",
@@ -5288,10 +6293,21 @@ async fn show_subscription_menu_inner(
                 let selected_id = &subs[*cursor].id;
                 terminal::disable_raw_mode()?;
                 if active.as_deref() != Some(selected_id.as_str()) {
+                    let active_snapshot = snapshot_file(&paths.active_file_path())?;
                     config::switch_subscription_at(paths, selected_id)?;
-                    print_lines(format_tui_switch_result(selected_id, true));
+                    if let Err(err) =
+                        config::merge_user_config_checked_at_endpoint(paths, Some(mihomo), endpoint)
+                    {
+                        restore_file_snapshot(&paths.active_file_path(), active_snapshot)?;
+                        anyhow::bail!(subscription_switch_rollback_error(&err.to_string()));
+                    }
+                    print_lines(format_tui_switch_result(
+                        selected_id,
+                        true,
+                        config_restart_apply_lines(),
+                    ));
                 } else {
-                    print_lines(format_tui_switch_result(selected_id, false));
+                    print_lines(format_tui_switch_result(selected_id, false, Vec::new()));
                 }
                 return Ok(());
             }
@@ -5300,7 +6316,7 @@ async fn show_subscription_menu_inner(
                 print_lines(format_refresh_all_start());
                 config::refresh_all_at(paths).await?;
                 config::merge_user_config_checked_at_endpoint(paths, Some(mihomo), endpoint)?;
-                print_lines(format_refresh_all_success());
+                print_lines(format_refresh_all_success(config_restart_apply_lines()));
                 terminal::enable_raw_mode()?;
             }
             KeyCode::Char('r') => {
@@ -5314,7 +6330,7 @@ async fn show_subscription_menu_inner(
                             Some(mihomo),
                             endpoint,
                         )?;
-                        print_lines(format_refresh_active_success());
+                        print_lines(format_refresh_active_success(config_restart_apply_lines()));
                     }
                     None => {
                         print_lines(format_tui_no_active_subscription());
@@ -5333,7 +6349,7 @@ async fn show_subscription_menu_inner(
                     print_lines(format_config_add_start());
                     let id = config::add_subscription_at(paths, url).await?;
                     config::merge_user_config_checked_at_endpoint(paths, Some(mihomo), endpoint)?;
-                    print_lines(format_tui_add_success(&id));
+                    print_lines(format_tui_add_success(&id, config_restart_apply_lines()));
                 }
                 terminal::enable_raw_mode()?;
             }
@@ -5708,9 +6724,12 @@ fn shorten_subscription_url(url: &str) -> String {
     const TAIL: usize = 15;
     const LIMIT: usize = 50;
 
+    // Sanitize sensitive query params before display
+    let url = utils::sanitize_url(url);
+
     let char_count = url.chars().count();
     if char_count <= LIMIT {
-        return url.to_string();
+        return url;
     }
 
     let head: String = url.chars().take(HEAD).collect();
@@ -5919,12 +6938,40 @@ fn format_rule_policies(policies: &[String]) -> Vec<String> {
 }
 
 fn format_rule_test_result(target: &str, matched: Option<&crate::rules::RuleMatch>) -> Vec<String> {
+    let mut lines = vec![
+        "  ℹ Static route estimate from config.yaml rules; it does not prove DNS resolution or runtime core matching.".to_string(),
+    ];
     match matched {
-        Some(matched) => vec![
-            format!("  ✓ Matched rule #{}: {}", matched.index, matched.rule),
-            format!("  Policy: {}", matched.policy),
-        ],
-        None => vec![format!("  No matching rule found for {target}")],
+        Some(matched) => {
+            lines.push(format!(
+                "  ✓ Matched rule #{}: {}",
+                matched.index, matched.rule
+            ));
+            lines.push(format!("  Policy: {}", matched.policy));
+        }
+        None => lines.push(format!("  No matching rule found for {target}")),
+    }
+    lines
+}
+
+fn print_config_drift_warnings(paths: &utils::AppPaths) {
+    let rules = crate::rules::load_rules_at(paths).unwrap_or_default();
+    let mut printed = false;
+    if let Ok(warnings) = crate::rules::rule_policy_warnings_at(paths, &rules) {
+        for warning in warnings {
+            println!("  {warning}");
+            printed = true;
+        }
+    }
+    if let Ok(warnings) = crate::rules::selection_drift_warnings_at(paths) {
+        for warning in warnings {
+            println!("  {warning}");
+            printed = true;
+        }
+    }
+    if printed {
+        println!("  Check current policies: mihomo-cli rule policies");
+        println!("  Check current groups/nodes: mihomo-cli list");
     }
 }
 
@@ -6132,6 +7179,7 @@ async fn cmd_rule(system: bool, user: bool, action: RuleAction) -> anyhow::Resul
     match action {
         RuleAction::Add { rule, position } => {
             crate::rules::validate_rule(&rule)?;
+            let target_policy = crate::rules::rule_policy(&rule).map(str::to_string);
             let pos = match position {
                 Some(p) => Some(p.parse::<RulePosition>()?),
                 None => None,
@@ -6139,6 +7187,14 @@ async fn cmd_rule(system: bool, user: bool, action: RuleAction) -> anyhow::Resul
             let paths = write_paths()?;
             let _lock = crate::lock::ConfigLock::acquire(paths.config_dir())?;
             let rules_snapshot = snapshot_file(&paths.rules_path())?;
+            if let Some(policy) = target_policy.as_deref() {
+                let policies = crate::rules::available_policies_at(&paths)?;
+                if !policies.iter().any(|p| p == policy) {
+                    anyhow::bail!(
+                        "Rule target `{policy}` is not available in current config. Run `mihomo-cli rule policies` or `mihomo-cli list` to inspect valid policy/group names."
+                    );
+                }
+            }
             crate::rules::add_rule_at(&paths, &rule, pos)?;
             let merged =
                 merge_rules_change_checked(&paths, &core_binary, &config_endpoint, rules_snapshot)?;
@@ -6293,10 +7349,12 @@ fn merge_dns_change_checked(
     paths: &utils::AppPaths,
     mihomo: &std::path::Path,
     endpoint: &instance::ApiEndpoint,
-    dns_snapshot: Option<String>,
+    snapshots: Vec<(std::path::PathBuf, Option<String>)>,
 ) -> anyhow::Result<()> {
     if let Err(err) = config::merge_user_config_checked_at_endpoint(paths, Some(mihomo), endpoint) {
-        restore_file_snapshot(&paths.dns_policy_path(), dns_snapshot)?;
+        for (path, snapshot) in snapshots {
+            restore_file_snapshot(&path, snapshot)?;
+        }
         anyhow::bail!(
             "DNS policy change failed; rolled back dns-policy.yaml.\n  {}",
             err
@@ -6327,7 +7385,7 @@ fn format_dns_policy_list<T: std::fmt::Display>(policies: &[(usize, T)]) -> Vec<
             "  No DNS policies defined.".to_string(),
             String::new(),
             "  Add one:  mihomo-cli dns policy add <MATCH> <TARGET>".to_string(),
-            "  Example:  mihomo-cli dns policy add ubtrobot.com system".to_string(),
+            "  Example:  mihomo-cli dns policy add internal.example.com system".to_string(),
         ]
     } else {
         let mut lines = vec!["  DNS policies:".to_string()];
@@ -6350,7 +7408,7 @@ fn format_dns_template_list(templates: &[crate::dns::DnsTemplate]) -> Vec<String
     lines.extend([
         String::new(),
         "  Apply company template:".to_string(),
-        "    mihomo-cli dns template apply company --domain corp.example.com --target 10.10.1.251"
+        "    mihomo-cli dns template apply company --domain corp.example.com --target 192.0.2.53"
             .to_string(),
     ]);
     lines
@@ -6389,7 +7447,12 @@ async fn cmd_dns(system: bool, user: bool, action: DnsAction) -> anyhow::Result<
                 crate::dns::add_policy_at(&paths, &match_pattern, &target)?;
 
                 // Regenerate config.yaml from subscription + rules + DNS policies
-                merge_dns_change_checked(&paths, &core_binary, &config_endpoint, dns_snapshot)?;
+                merge_dns_change_checked(
+                    &paths,
+                    &core_binary,
+                    &config_endpoint,
+                    vec![(paths.dns_policy_path(), dns_snapshot)],
+                )?;
 
                 // Also try PATCH for hot-reload (may need restart)
                 let patch = serde_json::json!({
@@ -6414,8 +7477,66 @@ async fn cmd_dns(system: bool, user: bool, action: DnsAction) -> anyhow::Result<
                 let removed = crate::dns::remove_policy_at(&paths, &selector)?;
 
                 // Regenerate config.yaml from subscription + rules + DNS policies
-                merge_dns_change_checked(&paths, &core_binary, &config_endpoint, dns_snapshot)?;
+                merge_dns_change_checked(
+                    &paths,
+                    &core_binary,
+                    &config_endpoint,
+                    vec![(paths.dns_policy_path(), dns_snapshot)],
+                )?;
                 print_lines(format_dns_policy_removed(&removed));
+                Ok(())
+            }
+        },
+
+        DnsAction::FakeIpFilter { action } => match action {
+            DnsFakeIpFilterAction::Add { domain } => {
+                let paths = write_paths()?;
+                let _lock = crate::lock::ConfigLock::acquire(paths.config_dir())?;
+                let snapshot = snapshot_file(&paths.dns_fake_ip_filter_path())?;
+                let normalized = crate::dns::add_fake_ip_filter_at(&paths, &domain)?;
+                merge_dns_change_checked(
+                    &paths,
+                    &core_binary,
+                    &config_endpoint,
+                    vec![(paths.dns_fake_ip_filter_path(), snapshot)],
+                )?;
+                print_lines(vec![
+                    format!("  ✓ fake-ip-filter added: {normalized}"),
+                    "  ✓ Config updated — restart mihomo to apply DNS changes".to_string(),
+                ]);
+                Ok(())
+            }
+            DnsFakeIpFilterAction::Remove { domain } => {
+                let paths = write_paths()?;
+                let _lock = crate::lock::ConfigLock::acquire(paths.config_dir())?;
+                let snapshot = snapshot_file(&paths.dns_fake_ip_filter_path())?;
+                let removed = crate::dns::remove_fake_ip_filter_at(&paths, &domain)?;
+                merge_dns_change_checked(
+                    &paths,
+                    &core_binary,
+                    &config_endpoint,
+                    vec![(paths.dns_fake_ip_filter_path(), snapshot)],
+                )?;
+                print_lines(vec![
+                    format!("  ✓ fake-ip-filter removed: {removed}"),
+                    "  ✓ Config updated — restart mihomo to apply DNS changes".to_string(),
+                ]);
+                Ok(())
+            }
+            DnsFakeIpFilterAction::List => {
+                let paths = read_paths()?;
+                let filters = crate::dns::list_fake_ip_filters_at(&paths)?;
+                if filters.is_empty() {
+                    print_lines(vec![
+                        "  No DNS fake-ip-filter entries defined.".to_string(),
+                        String::new(),
+                        "  Add one:  mihomo-cli dns fake-ip-filter add <DOMAIN>".to_string(),
+                    ]);
+                } else {
+                    let mut lines = vec!["  DNS fake-ip-filter entries:".to_string()];
+                    lines.extend(filters.iter().map(|(idx, f)| format!("  {idx}. {f}")));
+                    print_lines(lines);
+                }
                 Ok(())
             }
         },
@@ -6440,7 +7561,12 @@ async fn cmd_dns(system: bool, user: bool, action: DnsAction) -> anyhow::Result<
                         domain.as_deref(),
                         target.as_deref(),
                     )?;
-                    merge_dns_change_checked(&paths, &core_binary, &config_endpoint, dns_snapshot)?;
+                    merge_dns_change_checked(
+                        &paths,
+                        &core_binary,
+                        &config_endpoint,
+                        vec![(paths.dns_policy_path(), dns_snapshot)],
+                    )?;
                     print_lines(format_dns_template_applied(&name, &added));
                     Ok(())
                 }
@@ -6686,7 +7812,7 @@ fn build_info_lines(core_version: Option<&str>, core_error: Option<&str>) -> Vec
     lines
 }
 
-async fn cmd_version(system: bool, user: bool) -> anyhow::Result<()> {
+async fn cmd_version(system: bool, user: bool, json: bool) -> anyhow::Result<()> {
     let client = resolve_api_client(system, user, instance::CommandIntent::ReadOnly);
     let (core_version, core_error) = match client {
         Ok(client) => match mihomo_api::get_version_with_client(&client).await {
@@ -6695,8 +7821,29 @@ async fn cmd_version(system: bool, user: bool) -> anyhow::Result<()> {
         },
         Err(err) => (None, Some(err.to_string())),
     };
-    let lines = build_info_lines(core_version.as_deref(), core_error.as_deref());
-    print_lines(lines);
+    if json {
+        print_json_envelope(
+            "version",
+            serde_json::json!({
+                "cli": {
+                    "version": env!("MIHOMO_CLI_VERSION"),
+                    "package_version": env!("MIHOMO_CLI_PKG_VERSION"),
+                    "git_commit": env!("MIHOMO_CLI_GIT_COMMIT"),
+                    "git_short_commit": env!("MIHOMO_CLI_GIT_SHORT_COMMIT"),
+                    "git_branch": env!("MIHOMO_CLI_GIT_BRANCH"),
+                    "git_dirty": env!("MIHOMO_CLI_GIT_DIRTY"),
+                    "build_unix": env!("MIHOMO_CLI_BUILD_UNIX"),
+                    "target": env!("MIHOMO_CLI_BUILD_TARGET"),
+                    "profile": env!("MIHOMO_CLI_BUILD_PROFILE"),
+                },
+                "core": { "version": core_version, "probe_error": core_error }
+            }),
+            Vec::new(),
+        )?;
+    } else {
+        let lines = build_info_lines(core_version.as_deref(), core_error.as_deref());
+        print_lines(lines);
+    }
     Ok(())
 }
 
@@ -6882,10 +8029,9 @@ fn cmd_uninstall_instance_mode(
         let geo_exists = installer::geo_files_exist()
             || ctx.paths.config_dir.join("geoip.metadb").exists()
             || ctx.paths.config_dir.join("GeoSite.dat").exists();
-        if geo_exists
-            && selections.contains(&idx) {
-                sel_geo = true;
-            }
+        if geo_exists && selections.contains(&idx) {
+            sel_geo = true;
+        }
         (sel_binary, sel_config, sel_geo)
     };
 
@@ -6985,9 +8131,15 @@ fn cmd_uninstall_instance_mode(
     // 3. Remove binary
     if selected_binary {
         println!("Removing binaries...");
-        remove_instance_path(&ctx.paths.core_binary, ctx.permissions == instance::PermissionModel::PrivilegedSystem)?;
+        remove_instance_path(
+            &ctx.paths.core_binary,
+            ctx.permissions == instance::PermissionModel::PrivilegedSystem,
+        )?;
         if ctx.paths.cli_binary != ctx.paths.core_binary {
-            remove_instance_path(&ctx.paths.cli_binary, ctx.permissions == instance::PermissionModel::PrivilegedSystem)?;
+            remove_instance_path(
+                &ctx.paths.cli_binary,
+                ctx.permissions == instance::PermissionModel::PrivilegedSystem,
+            )?;
         }
         println!("  Removed {}", ctx.paths.core_binary.display());
     }
@@ -7088,7 +8240,7 @@ async fn update_instance_core_binary(
     Ok(())
 }
 
-async fn cmd_upgrade(system: bool, user: bool) -> anyhow::Result<()> {
+async fn cmd_upgrade(system: bool, user: bool, yes: bool) -> anyhow::Result<()> {
     let resolved =
         resolve_current_instance_context(system, user, instance::CommandIntent::Mutating)?;
 
@@ -7137,14 +8289,16 @@ async fn cmd_upgrade(system: bool, user: bool) -> anyhow::Result<()> {
 
     println!("  Current: {current_version}");
     println!("  Latest:  {latest_tag}");
-    print!("  Upgrade? [y/N] ");
-    use std::io::Write;
-    std::io::stdout().flush()?;
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    if !input.trim().eq_ignore_ascii_case("y") {
-        println!("  Cancelled.");
-        return Ok(());
+    if !yes {
+        print!("  Upgrade? [y/N] ");
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("  Cancelled.");
+            return Ok(());
+        }
     }
 
     let _lock = crate::lock::ConfigLock::acquire(&resolved.ctx.paths.config_dir)?;
@@ -7351,6 +8505,68 @@ mod cli_parse_tests {
     }
 
     #[test]
+    fn macos_launchctl_print_parses_running_as_enabled() {
+        let out = r#"system/io.mihomo = {
+    active count = 1
+    path = /Library/LaunchDaemons/io.mihomo.plist
+    state = running
+    program = /usr/local/bin/mihomo-cli
+}"#;
+        assert_eq!(
+            macos_launchctl_print_indicates_enabled(true, out),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn macos_launchctl_print_parses_not_running_loaded_as_enabled() {
+        // Loaded but not currently running → launchd will start at boot.
+        let out = r#"gui/501/io.mihomo = {
+    active count = 0
+    path = /Users/alice/Library/LaunchAgents/io.mihomo.plist
+    state = not running
+}"#;
+        assert_eq!(
+            macos_launchctl_print_indicates_enabled(true, out),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn macos_launchctl_print_parses_disabled_as_disabled() {
+        let out = r#"system/io.mihomo = {
+    state = disabled
+}"#;
+        assert_eq!(
+            macos_launchctl_print_indicates_enabled(true, out),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn macos_launchctl_print_failure_means_not_loaded_disabled() {
+        // Non-zero exit (service not found) → not loaded → disabled.
+        assert_eq!(
+            macos_launchctl_print_indicates_enabled(false, ""),
+            Some(false)
+        );
+        assert_eq!(
+            macos_launchctl_print_indicates_enabled(
+                false,
+                "Could not find service \"io.mihomo\" in domain for system"
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn macos_launchctl_print_unknown_shape_returns_none() {
+        // Unrecognized output shape → None (caller reports "unknown").
+        let out = "some unexpected output format";
+        assert_eq!(macos_launchctl_print_indicates_enabled(true, out), None);
+    }
+
+    #[test]
     fn read_mixed_port_rejects_out_of_range_values() {
         let temp = tempfile::tempdir().unwrap();
         let config = temp.path().join("config.yaml");
@@ -7391,7 +8607,7 @@ mod cli_parse_tests {
             .get_subcommands()
             .filter(|cmd| !cmd.is_hide_set())
             .map(|cmd| cmd.get_name().to_string())
-            .filter(|name| name != "help" && name != "dashboard")
+            .filter(|name| name != "help" && name != "dashboard" && name != "use")
             .collect();
 
         for name in subcommands {
@@ -7578,7 +8794,10 @@ RuntimeDirectory=mihomo"#;
             assert_eq!(resolved.source, instance::ResolutionSource::EnvOverride);
             assert_eq!(resolved.ctx.mode, instance::InstanceMode::User);
             assert_eq!(resolved.ctx.paths.config_dir, isolated);
-            assert_eq!(resolved.ctx.paths.config_file, isolated.join("config.yaml"));
+            assert_eq!(
+                resolved.ctx.paths.intent_config_file,
+                isolated.join("config.yaml")
+            );
         });
     }
 
@@ -7787,6 +9006,7 @@ RuntimeDirectory=mihomo"#;
             user: false,
         };
 
+        // S5: settings auto mode prefers system when installed
         assert_eq!(
             resolve_instance_mode_runtime_first(
                 instance::ModeRequest::Unspecified,
@@ -7796,7 +9016,7 @@ RuntimeDirectory=mihomo"#;
             ),
             RuntimeFirstModeResolution::Resolved {
                 mode: instance::InstanceMode::System,
-                source: instance::ResolutionSource::ServicePresence,
+                source: instance::ResolutionSource::ExplicitFlag, // settings converts to ExplicitSystem
             }
         );
     }
@@ -7815,6 +9035,39 @@ RuntimeDirectory=mihomo"#;
         match cli.command {
             Some(Command::Config { list, .. }) => assert!(list),
             _ => panic!("expected config --list"),
+        }
+    }
+
+    #[test]
+    fn global_json_parses_for_stage1_commands() {
+        let cli = parse(&["--json", "version"]);
+        assert!(cli.json);
+        assert!(matches!(cli.command, Some(Command::Version { .. })));
+
+        let cli = parse(&["status", "--json"]);
+        assert!(cli.json);
+        assert!(matches!(cli.command, Some(Command::Status { .. })));
+
+        let cli = parse(&["config", "--validate", "--json"]);
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Config { validate: true, .. })
+        ));
+    }
+
+    #[test]
+    fn json_envelope_has_ai_contract_fields() {
+        let value = serde_json::json!({
+            "ok": true,
+            "command": "version",
+            "data": {},
+            "warnings": [],
+            "error": serde_json::Value::Null,
+            "meta": { "schema_version": 1, "cli_version": env!("MIHOMO_CLI_VERSION") }
+        });
+        for key in ["ok", "command", "data", "warnings", "error", "meta"] {
+            assert!(value.get(key).is_some(), "missing {key}");
         }
     }
 
@@ -7856,8 +9109,22 @@ RuntimeDirectory=mihomo"#;
             _ => panic!("expected update --system"),
         }
         match parse(&["upgrade", "--system"]).command {
-            Some(Command::Upgrade { system }) => assert!(system),
+            Some(Command::Upgrade { system, yes }) => {
+                assert!(system);
+                assert!(!yes);
+            }
             _ => panic!("expected upgrade --system"),
+        }
+        match parse(&["upgrade", "--yes"]).command {
+            Some(Command::Upgrade { system, yes }) => {
+                assert!(!system);
+                assert!(yes);
+            }
+            _ => panic!("expected upgrade --yes"),
+        }
+        match parse(&["upgrade", "-y"]).command {
+            Some(Command::Upgrade { yes, .. }) => assert!(yes),
+            _ => panic!("expected upgrade -y"),
         }
         assert!(Cli::try_parse_from(["mihomo-cli", "update", "--user"]).is_err());
         assert!(Cli::try_parse_from(["mihomo-cli", "upgrade", "--user"]).is_err());
@@ -8032,6 +9299,42 @@ RuntimeDirectory=mihomo"#;
             false,
             "STATE : 4 RUNNING"
         ));
+    }
+
+    #[test]
+    fn non_interactive_stage_a_flags_parse() {
+        match parse(&["install", "--user", "--skip-config", "--yes"]).command {
+            Some(Command::Install {
+                user,
+                skip_config,
+                yes,
+                ..
+            }) => {
+                assert!(user);
+                assert!(skip_config);
+                assert!(yes);
+            }
+            _ => panic!("expected install --user --skip-config --yes"),
+        }
+        match parse(&["install", "--system", "-y"]).command {
+            Some(Command::Install { system, yes, .. }) => {
+                assert!(system);
+                assert!(yes);
+            }
+            _ => panic!("expected install --system -y"),
+        }
+        match parse(&["tun", "on", "--yes"]).command {
+            Some(Command::Tun { action, yes, .. }) => {
+                assert!(matches!(action, Some(TunAction::On)));
+                assert!(yes);
+            }
+            _ => panic!("expected tun on --yes"),
+        }
+        assert!(Cli::try_parse_from(["mihomo-cli", "tun", "on", "--lan-direct"]).is_err());
+        match parse(&["tun", "on", "-y"]).command {
+            Some(Command::Tun { yes, .. }) => assert!(yes),
+            _ => panic!("expected tun on -y"),
+        }
     }
 
     #[test]
@@ -8276,7 +9579,12 @@ RuntimeDirectory=mihomo"#;
         // Individual flags
         let cli = parse(&["uninstall", "--remove-binary", "--remove-config"]);
         match cli.command {
-            Some(Command::Uninstall { remove_binary, remove_config, remove_geo, .. }) => {
+            Some(Command::Uninstall {
+                remove_binary,
+                remove_config,
+                remove_geo,
+                ..
+            }) => {
                 assert!(remove_binary);
                 assert!(remove_config);
                 assert!(!remove_geo);
@@ -8287,7 +9595,9 @@ RuntimeDirectory=mihomo"#;
         // --yes + granular flags should work
         let cli = parse(&["uninstall", "--remove-geo", "--yes"]);
         match cli.command {
-            Some(Command::Uninstall { remove_geo, yes, .. }) => {
+            Some(Command::Uninstall {
+                remove_geo, yes, ..
+            }) => {
                 assert!(remove_geo);
                 assert!(yes);
             }
@@ -8574,7 +9884,7 @@ vmess://example"
     #[test]
     fn refresh_messages_are_planned() {
         assert_eq!(
-            format_refresh_all_success(),
+            format_refresh_all_success(config_restart_apply_lines()),
             vec![
                 "  All subscriptions refreshed.".to_string(),
                 "  Run: mihomo-cli restart  to apply".to_string(),
@@ -8585,7 +9895,7 @@ vmess://example"
             vec!["  Refreshing active subscription sub-a...".to_string()]
         );
         assert_eq!(
-            format_refresh_active_success(),
+            format_refresh_active_success(config_restart_apply_lines()),
             vec![
                 "  Subscription refreshed.".to_string(),
                 "  Run: mihomo-cli restart  to apply".to_string(),
@@ -8636,7 +9946,7 @@ vmess://example"
     }
 
     #[test]
-    fn system_core_start_command_uses_v3_per_user_config() {
+    fn system_core_start_command_uses_intent_config_by_default() {
         let ctx = instance::InstanceContext::planned(
             instance::TargetOs::Linux,
             instance::InstanceMode::System,
@@ -8644,13 +9954,35 @@ vmess://example"
         );
         match system_core_start_command(&ctx) {
             ipc::DaemonCommand::StartCore { config_path, .. } => {
-                assert_eq!(
-                    config_path,
-                    std::path::PathBuf::from("/Users/alice/.config/mihomo/config.yaml")
-                );
+                assert_eq!(config_path, ctx.paths.intent_config_file.clone());
             }
             other => panic!("expected StartCore command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lifecycle_system_config_path_prefers_imported_user_intent_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut ctx = instance::InstanceContext::planned(
+            instance::TargetOs::Linux,
+            instance::InstanceMode::System,
+            &instance::PathInputs::for_tests(),
+        );
+        ctx.paths.config_dir = temp.path().join("user-config");
+        ctx.paths.intent_config_file = temp.path().join("system-store/config.yaml");
+        ctx.paths.intent_config_file = ctx.paths.config_dir.join("config.yaml");
+        std::fs::create_dir_all(&ctx.paths.config_dir).unwrap();
+        std::fs::write(
+            &ctx.paths.intent_config_file,
+            "mixed-port: 7897
+",
+        )
+        .unwrap();
+
+        assert_eq!(
+            lifecycle_system_config_path(&ctx),
+            ctx.paths.intent_config_file
+        );
     }
 
     #[test]
@@ -8894,14 +10226,14 @@ vmess://example"
         assert!(delete_items[1].ends_with("…)"));
 
         assert_eq!(
-            format_tui_add_success("sub-a"),
+            format_tui_add_success("sub-a", config_restart_apply_lines()),
             vec![
                 "  Added subscription sub-a".to_string(),
                 "  Run: mihomo-cli restart  to apply".to_string(),
             ]
         );
         assert_eq!(
-            format_tui_switch_result("sub-a", false),
+            format_tui_switch_result("sub-a", false, Vec::new()),
             vec!["  Already active.".to_string()]
         );
         assert_eq!(
@@ -8944,7 +10276,7 @@ vmess://example"
                 "  No DNS policies defined.".to_string(),
                 String::new(),
                 "  Add one:  mihomo-cli dns policy add <MATCH> <TARGET>".to_string(),
-                "  Example:  mihomo-cli dns policy add ubtrobot.com system".to_string(),
+                "  Example:  mihomo-cli dns policy add internal.example.com system".to_string(),
             ]
         );
         assert_eq!(
@@ -8963,7 +10295,7 @@ vmess://example"
                     .to_string(),
                 String::new(),
                 "  Apply company template:".to_string(),
-                "    mihomo-cli dns template apply company --domain corp.example.com --target 10.10.1.251".to_string(),
+                "    mihomo-cli dns template apply company --domain corp.example.com --target 192.0.2.53".to_string(),
             ]
         );
         assert_eq!(
@@ -9056,13 +10388,17 @@ vmess://example"
         assert_eq!(
             format_rule_test_result("example.com", Some(&matched)),
             vec![
+                "  ℹ Static route estimate from config.yaml rules; it does not prove DNS resolution or runtime core matching.".to_string(),
                 "  ✓ Matched rule #2: DOMAIN,example.com,DIRECT".to_string(),
                 "  Policy: DIRECT".to_string(),
             ]
         );
         assert_eq!(
             format_rule_test_result("none.test", None),
-            vec!["  No matching rule found for none.test".to_string()]
+            vec![
+                "  ℹ Static route estimate from config.yaml rules; it does not prove DNS resolution or runtime core matching.".to_string(),
+                "  No matching rule found for none.test".to_string(),
+            ]
         );
     }
 
@@ -9211,7 +10547,7 @@ vmess://example"
             vec!["  Adding subscription...".to_string()]
         );
         assert_eq!(
-            format_config_add_success("sub-a"),
+            format_config_add_success("sub-a", config_restart_apply_lines()),
             vec![
                 "  Added subscription sub-a".to_string(),
                 "  Run: mihomo-cli restart  to apply".to_string(),
@@ -9232,18 +10568,15 @@ vmess://example"
             ]
         );
         assert_eq!(
-            format_import_success("sub-a", true),
+            format_import_success("sub-a", true, config_restart_apply_lines()),
             vec![
                 "  Imported and activated subscription sub-a".to_string(),
                 "  Run: mihomo-cli restart  to apply".to_string(),
             ]
         );
         assert_eq!(
-            format_import_success("sub-a", false),
-            vec![
-                "  Imported subscription sub-a (not activated)".to_string(),
-                "  Run: mihomo-cli restart  to apply".to_string(),
-            ]
+            format_import_success("sub-a", false, config_restart_apply_lines()),
+            vec!["  Imported subscription sub-a (not activated)".to_string()]
         );
         assert_eq!(
             format_fix_result(true, true),
@@ -9263,7 +10596,7 @@ vmess://example"
     #[test]
     fn subscription_switch_and_rollback_messages_are_planned() {
         assert_eq!(
-            format_subscription_switch_success("sub-a"),
+            format_subscription_switch_success("sub-a", config_restart_apply_lines()),
             vec![
                 "  Switched to subscription sub-a".to_string(),
                 "  Run: mihomo-cli restart  to apply".to_string(),
@@ -9584,6 +10917,34 @@ vmess://example"
     }
 
     #[test]
+    fn tun_privileged_actions_trigger_sudo_plan() {
+        assert!(is_tun_privileged_action(Some(&TunAction::On)));
+        assert!(is_tun_privileged_action(Some(&TunAction::Off)));
+        assert!(!is_tun_privileged_action(Some(&TunAction::Status)));
+        assert!(!is_tun_privileged_action(None));
+
+        let args = vec![
+            "/tmp/mihomo-cli".to_string(),
+            "tun".to_string(),
+            "on".to_string(),
+        ];
+        let cmd = sudo_reexec_command(&args);
+        assert_eq!(cmd.get_program(), "sudo");
+        assert_eq!(
+            cmd.get_args().collect::<Vec<_>>(),
+            vec!["/tmp/mihomo-cli", "tun", "on"]
+        );
+    }
+
+    #[test]
+    fn tun_on_existing_config_confirmation_defaults_no() {
+        assert!(!should_update_existing_tun_answer(""));
+        assert!(!should_update_existing_tun_answer("n"));
+        assert!(should_update_existing_tun_answer("y"));
+        assert!(should_update_existing_tun_answer(" yes "));
+    }
+
+    #[test]
     fn non_windows_pipe_probe_is_false_on_this_target() {
         #[cfg(not(windows))]
         assert!(!windows_pipe_connectable(r"\\.\pipe\mihomo-alice"));
@@ -9713,9 +11074,9 @@ vmess://example"
             &instance::PathInputs::for_tests(),
         );
         ctx.paths.config_dir = temp.path().to_path_buf();
-        ctx.paths.config_file = temp.path().join("config.yaml");
+        ctx.paths.intent_config_file = temp.path().join("config.yaml");
         std::fs::write(
-            &ctx.paths.config_file,
+            &ctx.paths.intent_config_file,
             "mixed-port: 7897\ntun:\n  enable: false\n  stack: system\n",
         )
         .unwrap();
@@ -9723,7 +11084,7 @@ vmess://example"
         set_instance_tun_config(&ctx, true, Some(&TunStack::Gvisor), Some("any:53")).unwrap();
 
         let doc: serde_yaml::Value =
-            serde_yaml::from_str(&std::fs::read_to_string(&ctx.paths.config_file).unwrap())
+            serde_yaml::from_str(&std::fs::read_to_string(&ctx.paths.intent_config_file).unwrap())
                 .unwrap();
         assert_eq!(doc["mixed-port"].as_i64(), Some(7897));
         assert_eq!(doc["tun"]["enable"].as_bool(), Some(true));
@@ -9741,18 +11102,62 @@ vmess://example"
             &instance::PathInputs::for_tests(),
         );
         ctx.paths.config_dir = temp.path().to_path_buf();
-        ctx.paths.config_file = temp.path().join("config.yaml");
+        ctx.paths.intent_config_file = temp.path().join("config.yaml");
         ctx.paths.backup_dir = temp.path().join("backups");
         std::fs::write(
-            &ctx.paths.config_file,
+            &ctx.paths.intent_config_file,
             "mixed-port: 7897\nexternal-controller-unix: /tmp/old.sock\n",
         )
         .unwrap();
 
         ensure_instance_controller_endpoint(&ctx).unwrap();
-        let fixed = std::fs::read_to_string(&ctx.paths.config_file).unwrap();
+        let fixed = std::fs::read_to_string(&ctx.paths.intent_config_file).unwrap();
         assert!(fixed.contains("external-controller-unix: /var/run/mihomo/mihomo.sock"));
         assert!(!fixed.contains("/tmp/old.sock"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ensure_instance_controller_endpoint_skips_when_config_missing_after_skip_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut ctx = instance::InstanceContext::planned(
+            instance::TargetOs::Linux,
+            instance::InstanceMode::System,
+            &instance::PathInputs::for_tests(),
+        );
+        ctx.paths.config_dir = temp.path().join("user-config");
+        ctx.paths.intent_config_file = temp.path().join("system-store/config.yaml");
+        ctx.paths.intent_config_file = ctx.paths.config_dir.join("config.yaml");
+
+        ensure_instance_controller_endpoint(&ctx).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ensure_instance_controller_endpoint_repairs_imported_user_intent_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut ctx = instance::InstanceContext::planned(
+            instance::TargetOs::Linux,
+            instance::InstanceMode::System,
+            &instance::PathInputs::for_tests(),
+        );
+        ctx.paths.config_dir = temp.path().join("user-config");
+        ctx.paths.intent_config_file = temp.path().join("system-store/config.yaml");
+        ctx.paths.intent_config_file = ctx.paths.config_dir.join("config.yaml");
+        std::fs::create_dir_all(&ctx.paths.config_dir).unwrap();
+        std::fs::write(
+            &ctx.paths.intent_config_file,
+            "mixed-port: 7897
+external-controller-unix: /tmp/old.sock
+",
+        )
+        .unwrap();
+
+        ensure_instance_controller_endpoint(&ctx).unwrap();
+        let fixed = std::fs::read_to_string(&ctx.paths.intent_config_file).unwrap();
+        assert!(fixed.contains("external-controller-unix: /var/run/mihomo/mihomo.sock"));
+        assert!(!fixed.contains("/tmp/old.sock"));
+        assert!(ctx.paths.intent_config_file.exists());
     }
 
     #[test]
@@ -9931,7 +11336,12 @@ mod g5_resolution_source_tests {
         ServicePresence { system, user }
     }
 
-    fn env(runtime_sys: bool, runtime_usr: bool, installed_sys: bool, installed_usr: bool) -> EnvironmentState {
+    fn env(
+        runtime_sys: bool,
+        runtime_usr: bool,
+        installed_sys: bool,
+        installed_usr: bool,
+    ) -> EnvironmentState {
         EnvironmentState {
             runtime: presence(runtime_sys, runtime_usr),
             installed: presence(installed_sys, installed_usr),
@@ -10023,7 +11433,10 @@ mod g5_resolution_source_tests {
             RuntimeFirstModeResolution::Resolved { mode, .. } => {
                 assert_eq!(mode, instance::InstanceMode::System);
             }
-            other => panic!("expected Resolved(System) with explicit flag, got {:?}", other),
+            other => panic!(
+                "expected Resolved(System) with explicit flag, got {:?}",
+                other
+            ),
         }
     }
 
@@ -10039,18 +11452,101 @@ mod g5_resolution_source_tests {
             RuntimeFirstModeResolution::Resolved { mode, .. } => {
                 assert_eq!(mode, instance::InstanceMode::User);
             }
-            other => panic!("expected Resolved(User) with explicit flag, got {:?}", other),
+            other => panic!(
+                "expected Resolved(User) with explicit flag, got {:?}",
+                other
+            ),
         }
     }
 
     #[test]
-    fn g5_both_installed_but_not_running_errors() {
-        // 两者都装了但都没跑 → AmbiguousBothInstalled
+    fn g5_both_installed_but_not_running_uses_settings() {
+        // 两者都装了但都没跑 → settings 解析（auto 优先 system）
         let result = resolve_environment_for_intent(
             ModeRequest::Unspecified,
             &env(false, false, true, true),
             UserIntent::ApiRead,
         );
-        assert_eq!(result, RuntimeFirstModeResolution::AmbiguousBothInstalled);
+        // S5: settings auto mode prefers system when both installed
+        match result {
+            RuntimeFirstModeResolution::Resolved { mode, source } => {
+                assert_eq!(mode, instance::InstanceMode::System);
+                // Source is ExplicitFlag because settings converts to ExplicitSystem
+                assert_eq!(source, instance::ResolutionSource::ExplicitFlag);
+            }
+            other => panic!("expected Resolved(System) from settings, got {:?}", other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tun_config_isolation_tests {
+    use super::*;
+
+    #[test]
+    fn tun_config_copy_logic_copies_user_config_to_isolated_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inputs = instance::PathInputs {
+            home: tmp.path().join("home"),
+            uid: Some(1000),
+            xdg_runtime_dir: Some(tmp.path().join("run/user/1000")),
+            program_data: tmp.path().join("ProgramData"),
+            app_data: tmp.path().join("AppData/Roaming"),
+            local_app_data: tmp.path().join("AppData/Local"),
+            username_or_sid: "alice".to_string(),
+        };
+        let mut ctx = instance::InstanceContext::planned(
+            instance::TargetOs::Windows,
+            instance::InstanceMode::System,
+            &inputs,
+        );
+        ctx.permissions = instance::PermissionModel::DirectUser;
+        std::fs::create_dir_all(ctx.paths.intent_config_file.parent().unwrap()).unwrap();
+        let content = b"mixed-port: 7890\ntun:\n  enable: true\n";
+        std::fs::write(&ctx.paths.intent_config_file, content).unwrap();
+
+        prepare_tun_config_snapshot(&ctx).unwrap();
+
+        assert_eq!(std::fs::read(&ctx.paths.tun_config_file).unwrap(), content);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tun_config_copy_sets_file_permission_0644() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let inputs = instance::PathInputs {
+            home: tmp.path().join("home"),
+            uid: Some(1000),
+            xdg_runtime_dir: Some(tmp.path().join("run/user/1000")),
+            program_data: tmp.path().join("ProgramData"),
+            app_data: tmp.path().join("AppData/Roaming"),
+            local_app_data: tmp.path().join("AppData/Local"),
+            username_or_sid: "alice".to_string(),
+        };
+        let mut ctx = instance::InstanceContext::planned(
+            instance::TargetOs::Windows,
+            instance::InstanceMode::System,
+            &inputs,
+        );
+        ctx.permissions = instance::PermissionModel::DirectUser;
+        std::fs::create_dir_all(ctx.paths.intent_config_file.parent().unwrap()).unwrap();
+        std::fs::write(&ctx.paths.intent_config_file, b"mixed-port: 7890\n").unwrap();
+
+        prepare_tun_config_snapshot(&ctx).unwrap();
+
+        let file_mode = std::fs::metadata(&ctx.paths.tun_config_file)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let dir_mode = std::fs::metadata(ctx.paths.tun_config_file.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o644);
+        // create_dir_all follows process umask; production privileged writer is expected to create 0755.
+        assert!(dir_mode & 0o111 != 0);
     }
 }

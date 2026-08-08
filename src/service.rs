@@ -89,10 +89,7 @@ impl PrivilegeExecutor {
     }
 
     /// Write string content to a privileged path (convenience wrapper).
-    pub(crate) fn write_file_str(
-        path: &std::path::Path,
-        content: &str,
-    ) -> anyhow::Result<()> {
+    pub(crate) fn write_file_str(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
         write_file_privileged(path, content)
     }
 
@@ -104,7 +101,13 @@ impl PrivilegeExecutor {
     /// Create a directory at a privileged path.
     pub(crate) fn ensure_dir(path: &std::path::Path, mode: u16) -> anyhow::Result<()> {
         let mode_str = format!("{mode:o}");
-        run_privileged(&["install", "-d", "-m", &mode_str, &path.display().to_string()])
+        run_privileged(&[
+            "install",
+            "-d",
+            "-m",
+            &mode_str,
+            &path.display().to_string(),
+        ])
     }
 }
 
@@ -153,6 +156,7 @@ struct PrivilegedFileWritePlan {
 struct ServiceInstallPlan {
     cleanup_commands: Vec<PlannedCommand>,
     cleanup_files: Vec<ServiceFileRemoval>,
+    pre_commands: Vec<PlannedCommand>,
     files: Vec<ServiceFilePlan>,
     commands: Vec<PlannedCommand>,
 }
@@ -478,13 +482,23 @@ fn launchd_plist(home: &str) -> String {
 <plist version="1.0"><dict>
 <key>Label</key><string>io.mihomo</string>
 <key>ProgramArguments</key><array><string>{home}/.config/mihomo/start.sh</string></array>
-<key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>Crashed</key><true/></dict>
+<key>RunAtLoad</key><false/><key>KeepAlive</key><dict><key>Crashed</key><true/></dict>
 <key>WorkingDirectory</key><string>{home}/.config/mihomo</string>
 <key>StandardOutPath</key><string>{home}/.config/mihomo/mihomo.log</string>
 <key>StandardErrorPath</key><string>{home}/.config/mihomo/mihomo.log</string>
 </dict></plist>
 "#
     )
+}
+
+fn systemd_system_prepare_commands() -> Vec<PlannedCommand> {
+    vec![
+        PlannedCommand::privileged("sh", ["-c", "getent group mihomo >/dev/null || groupadd --system mihomo"]),
+        PlannedCommand::privileged("sh", ["-c", "id -u mihomo >/dev/null 2>&1 || useradd --system --gid mihomo --home-dir /var/lib/mihomo-cli --no-create-home --shell /usr/sbin/nologin mihomo"]),
+        PlannedCommand::privileged("install", ["-d", "-o", "mihomo", "-g", "mihomo", "-m", "0750", "/var/run/mihomo"]),
+        PlannedCommand::privileged("install", ["-d", "-o", "mihomo", "-g", "mihomo", "-m", "0750", "/var/log/mihomo"]),
+        PlannedCommand::privileged("install", ["-d", "-o", "root", "-g", "mihomo", "-m", "0750", "/var/lib/mihomo-cli"]),
+    ]
 }
 
 fn systemd_install_plan(
@@ -513,6 +527,7 @@ fn systemd_install_plan(
                 } else {
                     vec![]
                 },
+                pre_commands: systemd_system_prepare_commands(),
                 files: vec![ServiceFilePlan {
                     path: linux_system_unit_path().to_string(),
                     content: systemd_system_unit(home),
@@ -554,6 +569,7 @@ fn systemd_install_plan(
                 } else {
                     vec![]
                 },
+                pre_commands: vec![],
                 files: vec![ServiceFilePlan {
                     path: linux_user_unit_path(home),
                     content: systemd_user_unit(home),
@@ -570,6 +586,7 @@ fn launchd_install_plan(mode: ServiceMode, home: &str) -> ServiceInstallPlan {
         ServiceMode::System => ServiceInstallPlan {
             cleanup_commands: vec![],
             cleanup_files: vec![],
+            pre_commands: vec![],
             files: vec![ServiceFilePlan {
                 path: macos_daemon_plist_path().to_string(),
                 content: launchd_plist(home),
@@ -586,6 +603,7 @@ fn launchd_install_plan(mode: ServiceMode, home: &str) -> ServiceInstallPlan {
         ServiceMode::User => ServiceInstallPlan {
             cleanup_commands: vec![],
             cleanup_files: vec![],
+            pre_commands: vec![],
             files: vec![ServiceFilePlan {
                 path: macos_agent_plist_path(home),
                 content: launchd_plist(home),
@@ -754,9 +772,7 @@ pub(crate) fn windows_service_query_indicates_installed(stdout: &[u8]) -> bool {
 /// lifted from mullvad/windows-service-rs) — fixing the StartService 87 caused by
 /// manual binPath quoting through PowerShell.
 pub fn windows_install_service(ctx: &crate::instance::InstanceContext) -> anyhow::Result<()> {
-    use service_manager::{
-        ServiceInstallCtx, ServiceLabel, ServiceManager, ServiceStartCtx,
-    };
+    use service_manager::{ServiceInstallCtx, ServiceLabel, ServiceManager, ServiceStartCtx};
 
     // Persist the installing user's SID — the daemon (running as SYSTEM) reads
     // it at startup to build the pipe SDDL (it cannot query its own token for
@@ -809,10 +825,8 @@ pub fn windows_install_service(ctx: &crate::instance::InstanceContext) -> anyhow
 /// query its own token for the installer's identity.
 fn persist_installer_sid() -> anyhow::Result<()> {
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::Security::{
-        GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER,
-    };
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     unsafe {
@@ -823,13 +837,7 @@ fn persist_installer_sid() -> anyhow::Result<()> {
 
         // First call gets required size.
         let mut size: u32 = 0;
-        GetTokenInformation(
-            token,
-            TokenUser,
-            std::ptr::null_mut(),
-            0,
-            &mut size,
-        );
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut size);
         let mut buffer = vec![0u8; size as usize];
         if GetTokenInformation(
             token,
@@ -871,23 +879,49 @@ fn persist_installer_sid() -> anyhow::Result<()> {
     }
 }
 
+/// Generate a 32-byte random token as 64 lowercase hex chars — the daemon IPC
+/// auth token. Pure function (cross-platform, testable).
+fn generate_auth_token() -> String {
+    use rand::RngCore;
+
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub(crate) fn generate_and_write_token(token_path: &std::path::Path) -> anyhow::Result<String> {
+    let token = generate_auth_token();
+    if let Some(parent) = token_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(token_path, token.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(token_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(token)
+}
+
+#[cfg(unix)]
+pub(crate) fn client_token_path_for_home(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".config").join("mihomo").join("service-token")
+}
+
+#[cfg(unix)]
+pub(crate) fn generate_client_token_for_home(home: &std::path::Path) -> anyhow::Result<String> {
+    generate_and_write_token(&client_token_path_for_home(home))
+}
+
 #[cfg(windows)]
 /// Generate a 32-byte random token and persist it in two copies (N1a):
 /// - server: `%ProgramData%\mihomo\service-token` (daemon reads for validation)
 /// - client: `<config_dir>\service-client-token` (CLI reads to attach)
 fn persist_service_token(ctx: &crate::instance::InstanceContext) -> anyhow::Result<()> {
-    use rand::RngCore;
-
-    let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    let token = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
-
     let program_data = std::env::var_os("ProgramData")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(r"C:\ProgramData"));
-    let server_dir = program_data.join("mihomo");
-    std::fs::create_dir_all(&server_dir)?;
-    std::fs::write(server_dir.join("service-token"), token.as_bytes())?;
+    let token = generate_and_write_token(&program_data.join("mihomo").join("service-token"))?;
 
     std::fs::create_dir_all(&ctx.paths.config_dir)?;
     std::fs::write(
@@ -1108,9 +1142,7 @@ fn windows_create_dir_elevated_script(path: &std::path::Path) -> String {
 #[cfg(windows)]
 pub(crate) fn is_process_elevated() -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::Security::{
-        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY,
-    };
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     unsafe {
@@ -1213,25 +1245,42 @@ pub fn install_staged_file_privileged(
 
     #[cfg(unix)]
     {
-        let temp_path = std::env::temp_dir().join(format!(
-            "mihomo-cli-privileged-write-{}-{}",
-            std::process::id(),
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("config")
-        ));
-        std::fs::write(&temp_path, bytes)?;
-        let cleanup = TempFileCleanup(temp_path.clone());
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-        if let Some(parent) = path.parent() {
-            let parent = parent.display().to_string();
-            run_privileged(&["install", "-d", "-m", "755", &parent])?;
+        // 1. Reject symlinks to prevent symlink attacks
+        if let Ok(metadata) = path.symlink_metadata() {
+            if metadata.file_type().is_symlink() {
+                anyhow::bail!(
+                    "refusing to write to symlink: {}\n  \
+                     This is a security measure to prevent symlink attacks.",
+                    path.display()
+                );
+            }
         }
-        let temp = temp_path.display().to_string();
-        let target = path.display().to_string();
-        let mode = format!("{mode:o}");
-        run_privileged(&["install", "-m", &mode, &temp, &target])?;
-        drop(cleanup);
+
+        // 2. Ensure parent directory exists with safe permissions (0o700)
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
+
+        // 3. Direct write with O_NOFOLLOW to prevent following symlinks
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .mode(mode as u32)
+            .open(path)?;
+
+        file.write_all(bytes)?;
+        drop(file);
+
+        // Explicitly set permissions (mode in OpenOptions only applies to new files)
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode as u32))?;
+
         Ok(())
     }
 }
@@ -1331,6 +1380,9 @@ fn apply_service_install_plan_with(
     }
     for removal in &plan.cleanup_files {
         executor.remove_best_effort(removal);
+    }
+    for command in &plan.pre_commands {
+        executor.run(command)?;
     }
     for file in &plan.files {
         executor.write_file(file)?;
@@ -1926,20 +1978,27 @@ fn uninstall_launchagent() -> bool {
 
 /// Generate systemd unit content for system service mode.
 fn systemd_system_unit(home: &str) -> String {
-    let log_path = format!("{home}/.config/mihomo/mihomo.log");
     format!(
         "[Unit]\n\
          Description=Mihomo proxy\n\
          After=network.target\n\n\
          [Service]\n\
          Type=simple\n\
-         User=root\n\
-         UMask=0022\n\
+         User=mihomo\n\
+         Group=mihomo\n\
+         UMask=0027\n\
          RuntimeDirectory=mihomo\n\
-         RuntimeDirectoryMode=0700\n\
+         RuntimeDirectoryMode=0750\n\
+         CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE\n\
+         AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE\n\
+         NoNewPrivileges=true\n\
+         PrivateTmp=true\n\
+         ProtectHome=read-only\n\
+         ProtectSystem=strict\n\
+         ReadWritePaths=/var/run/mihomo /run/mihomo /var/log/mihomo {home}/.config/mihomo /var/lib/mihomo-cli\n\
          ExecStart={home}/.local/bin/mihomo -d {home}/.config/mihomo\n\
-         StandardOutput=append:{log_path}\n\
-         StandardError=append:{log_path}\n\
+         StandardOutput=append:/var/log/mihomo/mihomo.log\n\
+         StandardError=append:/var/log/mihomo/mihomo.log\n\
          Restart=on-failure\n\n\
          [Install]\n\
          WantedBy=multi-user.target\n"
@@ -2068,6 +2127,52 @@ fn uninstall_windows() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_token_is_64_hex_chars() {
+        let token = generate_auth_token();
+        assert_eq!(token.len(), 64);
+        assert!(token
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_ne!(token, generate_auth_token());
+    }
+
+    #[test]
+    fn generate_and_write_token_writes_token_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("service-token");
+        let token = generate_and_write_token(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), token);
+        assert_eq!(token.len(), 64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generate_and_write_token_sets_unix_permissions_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("service-token");
+        generate_and_write_token(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generate_client_token_for_home_writes_0600_client_token() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let token = generate_client_token_for_home(dir.path()).unwrap();
+        let path = client_token_path_for_home(dir.path());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), token);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     #[derive(Default)]
     struct RecordingExecutor {
@@ -2405,12 +2510,22 @@ mod tests {
     fn systemd_system_unit_contains_log_directives() {
         let unit = systemd_system_unit("/home/testuser");
         assert!(
-            unit.contains("UMask=0022"),
+            unit.contains("UMask=0027"),
             "system mode should set UMask for readable logs"
         );
-        assert!(unit.contains("StandardOutput=append:/home/testuser/.config/mihomo/mihomo.log"));
-        assert!(unit.contains("StandardError=append:/home/testuser/.config/mihomo/mihomo.log"));
-        assert!(unit.contains("User=root"));
+        assert!(unit.contains("StandardOutput=append:/var/log/mihomo/mihomo.log"));
+        assert!(unit.contains("StandardError=append:/var/log/mihomo/mihomo.log"));
+        assert!(unit.contains("User=mihomo"));
+        assert!(unit.contains("Group=mihomo"));
+        assert!(
+            unit.contains("CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE")
+        );
+        assert!(unit.contains("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE"));
+        assert!(unit.contains("NoNewPrivileges=true"));
+        assert!(unit.contains("PrivateTmp=true"));
+        assert!(unit.contains("ProtectHome=read-only"));
+        assert!(unit.contains("ProtectSystem=strict"));
+        assert!(unit.contains("ReadWritePaths=/var/run/mihomo /run/mihomo /var/log/mihomo /home/testuser/.config/mihomo /var/lib/mihomo-cli"));
     }
 
     #[test]
@@ -2764,7 +2879,7 @@ e"
         assert_eq!(plan.files.len(), 1);
         assert_eq!(plan.files[0].path, "/etc/systemd/system/mihomo.service");
         assert!(plan.files[0].privileged);
-        assert!(plan.files[0].content.contains("User=root"));
+        assert!(plan.files[0].content.contains("User=mihomo"));
         assert!(plan.files[0]
             .content
             .contains("ExecStart=/home/alice/.local/bin/mihomo -d /home/alice/.config/mihomo"));
@@ -2906,6 +3021,7 @@ e"
                 path: "/home/alice/old.service".to_string(),
                 privileged: false,
             }],
+            pre_commands: vec![],
             files: vec![ServiceFilePlan {
                 path: "/etc/systemd/system/mihomo.service".to_string(),
                 content: "unit".to_string(),
@@ -2940,6 +3056,7 @@ e"
                 ["--user", "stop", "mihomo"],
             )],
             cleanup_files: vec![],
+            pre_commands: vec![],
             files: vec![ServiceFilePlan {
                 path: "/tmp/mihomo.service".to_string(),
                 content: "unit".to_string(),
@@ -3114,6 +3231,60 @@ e"
         assert_eq!(
             password_provider_result(Err("tty".to_string())),
             PasswordProviderResult::IoError("tty".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_staged_file_rejects_symlink_target() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-file");
+        std::fs::write(&real, b"original").unwrap();
+        let link = dir.path().join("symlink-to-real");
+        symlink(&real, &link).unwrap();
+
+        let result = install_staged_file_privileged(&link, b"pwned", 0o644);
+        assert!(result.is_err(), "write to symlink must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("refusing to write to symlink"),
+            "error must mention symlink: {msg}"
+        );
+        // Original file must be untouched
+        assert_eq!(std::fs::read(&real).unwrap(), b"original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_staged_file_writes_new_file_with_correct_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub").join("file.bin");
+
+        install_staged_file_privileged(&path, b"hello world", 0o755).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello world");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_staged_file_overwrites_existing_regular_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing");
+        std::fs::write(&path, b"old content").unwrap();
+
+        install_staged_file_privileged(&path, b"new content", 0o600).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new content");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
         );
     }
 }

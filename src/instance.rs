@@ -116,7 +116,10 @@ impl Drop for InstanceLock {
 /// Get the instance lock path for the given mode.
 pub fn instance_lock_path(mode: InstanceMode) -> Option<PathBuf> {
     let ctx = planned_current_context(mode)?;
-    ctx.paths.runtime_dir.as_ref().map(|d| d.join("instance.lock"))
+    ctx.paths
+        .runtime_dir
+        .as_ref()
+        .map(|d| d.join("instance.lock"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,12 +195,77 @@ pub struct InstancePaths {
     pub cli_binary: PathBuf,
     pub config_dir: PathBuf,
     pub config_file: PathBuf,
+    /// Per-user intent config. ADR-22 makes this the single source of truth;
+    /// `config_file` and `intent_config_file` intentionally point to the same file.
+    pub intent_config_file: PathBuf,
     pub start_script: Option<PathBuf>,
     pub runtime_dir: Option<PathBuf>,
     pub api_endpoint: ApiEndpoint,
     pub log_file: Option<PathBuf>,
     pub service_file: Option<PathBuf>,
     pub backup_dir: PathBuf,
+    /// Root-owned isolated config used when enabling system-wide TUN.
+    pub tun_config_file: PathBuf,
+}
+
+/// System-mode paths (root-owned runtime/install paths, ADR-22).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemPaths {
+    /// Runtime config path. ADR-22 makes the per-user intent config the single
+    /// source of truth; callers should prefer `InstancePaths::intent_config_file`
+    /// when a user context is available.
+    pub config_file: PathBuf,
+    /// Runtime socket / named pipe dir:
+    /// Linux: `/run/mihomo`, macOS: `/var/run/mihomo`, Windows: named pipe (N/A).
+    pub runtime: PathBuf,
+    /// Log directory.
+    pub logs: PathBuf,
+}
+
+impl SystemPaths {
+    /// Resolve system paths for the given OS (real OS, not `for_tests`).
+    pub fn for_os(os: TargetOs) -> Self {
+        match os {
+            TargetOs::Linux => Self {
+                config_file: dirs::home_dir()
+                    .unwrap_or_default()
+                    .join(".config/mihomo/config.yaml"),
+                runtime: PathBuf::from("/run/mihomo"),
+                logs: PathBuf::from("/var/log/mihomo"),
+            },
+            TargetOs::Macos => Self {
+                config_file: dirs::home_dir()
+                    .unwrap_or_default()
+                    .join(".config/mihomo/config.yaml"),
+                runtime: PathBuf::from("/var/run/mihomo"),
+                logs: PathBuf::from("/var/log/mihomo"),
+            },
+            TargetOs::Windows => {
+                let config = std::env::var_os("APPDATA")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(r"C:\Users\Default\AppData\Roaming"))
+                    .join("mihomo")
+                    .join("config.yaml");
+                // Windows runtime is a named pipe, not a filesystem path.
+                // We store an empty PathBuf here; actual pipe resolution
+                // happens in instance planning (planned_api_endpoint).
+                Self {
+                    config_file: config,
+                    runtime: PathBuf::new(), // named pipe, resolved elsewhere
+                    logs: std::env::var_os("ProgramData")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+                        .join("mihomo")
+                        .join("logs"),
+                }
+            }
+        }
+    }
+
+    /// Convenience: the OS we are running on.
+    pub fn current() -> Option<Self> {
+        TargetOs::current().map(Self::for_os)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -317,24 +385,38 @@ impl InstanceContext {
     }
 }
 
+pub fn planned_tun_config_file(os: TargetOs, inputs: &PathInputs) -> PathBuf {
+    match os {
+        TargetOs::Linux => PathBuf::from("/var/lib/mihomo-cli/tun-config.yaml"),
+        TargetOs::Macos => PathBuf::from("/Library/Application Support/mihomo-cli/tun-config.yaml"),
+        TargetOs::Windows => inputs
+            .program_data
+            .join("mihomo-cli")
+            .join("tun-config.yaml"),
+    }
+}
+
 fn planned_paths(os: TargetOs, mode: InstanceMode, inputs: &PathInputs) -> InstancePaths {
     match (os, mode) {
         (TargetOs::Macos, InstanceMode::System) => {
             let app = PathBuf::from("/Library/Application Support/mihomo");
-            // ADR-02: 配置始终 per-user，即使系统服务模式
-            let config_dir = inputs.home.join(".config/mihomo");
+            // System mode: intent config in user dir; config_file is the same single source of truth
+            let intent_config_dir = inputs.home.join(".config/mihomo");
+
             let runtime_dir = PathBuf::from("/var/run/mihomo");
             InstancePaths {
                 core_binary: app.join("bin/mihomo"),
                 cli_binary: app.join("bin/mihomo-cli"),
-                config_file: config_dir.join("config.yaml"),
+                config_file: intent_config_dir.join("config.yaml"),
+                intent_config_file: intent_config_dir.join("config.yaml"),
                 start_script: Some(app.join("start.sh")),
                 api_endpoint: ApiEndpoint::UnixSocket(runtime_dir.join("mihomo.sock")),
                 log_file: Some(PathBuf::from("/var/log/mihomo/mihomo.log")),
                 service_file: Some(PathBuf::from("/Library/LaunchDaemons/io.mihomo.plist")),
-                backup_dir: config_dir.join("backups"),
-                config_dir,
+                backup_dir: intent_config_dir.join("backups"),
+                config_dir: intent_config_dir,
                 runtime_dir: Some(runtime_dir),
+                tun_config_file: planned_tun_config_file(os, inputs),
             }
         }
         (TargetOs::Macos, InstanceMode::User) => {
@@ -344,6 +426,7 @@ fn planned_paths(os: TargetOs, mode: InstanceMode, inputs: &PathInputs) -> Insta
                 core_binary: inputs.home.join(".local/bin/mihomo"),
                 cli_binary: inputs.home.join(".local/bin/mihomo-cli"),
                 config_file: config_dir.join("config.yaml"),
+                intent_config_file: config_dir.join("config.yaml"),
                 start_script: Some(config_dir.join("start.sh")),
                 api_endpoint: ApiEndpoint::UnixSocket(runtime_dir.join("mihomo.sock")),
                 log_file: Some(inputs.home.join("Library/Logs/mihomo/mihomo.log")),
@@ -351,23 +434,27 @@ fn planned_paths(os: TargetOs, mode: InstanceMode, inputs: &PathInputs) -> Insta
                 backup_dir: config_dir.join("backups"),
                 config_dir,
                 runtime_dir: Some(runtime_dir),
+                tun_config_file: planned_tun_config_file(os, inputs),
             }
         }
         (TargetOs::Linux, InstanceMode::System) => {
-            // ADR-02: 配置始终 per-user，即使系统服务模式
-            let config_dir = inputs.home.join(".config/mihomo");
+            // System mode: intent config in user dir; config_file is the same single source of truth
+            let intent_config_dir = inputs.home.join(".config/mihomo");
+
             let runtime_dir = PathBuf::from("/var/run/mihomo");
             InstancePaths {
                 core_binary: PathBuf::from("/usr/local/lib/mihomo/mihomo"),
                 cli_binary: PathBuf::from("/usr/local/bin/mihomo-cli"),
-                config_file: config_dir.join("config.yaml"),
+                config_file: intent_config_dir.join("config.yaml"),
+                intent_config_file: intent_config_dir.join("config.yaml"),
                 start_script: None,
                 api_endpoint: ApiEndpoint::UnixSocket(runtime_dir.join("mihomo.sock")),
                 log_file: Some(PathBuf::from("/var/log/mihomo/mihomo.log")),
                 service_file: Some(PathBuf::from("/etc/systemd/system/mihomo.service")),
-                backup_dir: config_dir.join("backups"),
-                config_dir,
+                backup_dir: intent_config_dir.join("backups"),
+                config_dir: intent_config_dir,
                 runtime_dir: Some(runtime_dir),
+                tun_config_file: planned_tun_config_file(os, inputs),
             }
         }
         (TargetOs::Linux, InstanceMode::User) => {
@@ -379,16 +466,14 @@ fn planned_paths(os: TargetOs, mode: InstanceMode, inputs: &PathInputs) -> Insta
                     // Fallback when XDG_RUNTIME_DIR is unset (e.g. containers, non-systemd
                     // sessions). Use the real UID instead of assuming 1000, per XDG spec
                     // which requires a suitable default with a warning.
-                    PathBuf::from(format!(
-                        "/run/user/{}",
-                        inputs.uid.unwrap_or(1000)
-                    ))
+                    PathBuf::from(format!("/run/user/{}", inputs.uid.unwrap_or(1000)))
                 })
                 .join("mihomo");
             InstancePaths {
                 core_binary: inputs.home.join(".local/bin/mihomo"),
                 cli_binary: inputs.home.join(".local/bin/mihomo-cli"),
                 config_file: config_dir.join("config.yaml"),
+                intent_config_file: config_dir.join("config.yaml"),
                 start_script: None,
                 api_endpoint: ApiEndpoint::UnixSocket(runtime_dir.join("mihomo.sock")),
                 log_file: Some(inputs.home.join(".local/state/mihomo/mihomo.log")),
@@ -396,23 +481,27 @@ fn planned_paths(os: TargetOs, mode: InstanceMode, inputs: &PathInputs) -> Insta
                 backup_dir: config_dir.join("backups"),
                 config_dir,
                 runtime_dir: Some(runtime_dir),
+                tun_config_file: planned_tun_config_file(os, inputs),
             }
         }
         (TargetOs::Windows, InstanceMode::System) => {
             let install_root = inputs.program_data.join("mihomo");
-            // ADR-02: 配置始终 per-user，即使系统服务模式；Windows 使用 %APPDATA%\mihomo
-            let config_dir = inputs.app_data.join("mihomo");
+            // System mode: intent config in user dir; config_file is the same single source of truth
+            let intent_config_dir = inputs.app_data.join("mihomo");
+
             InstancePaths {
                 core_binary: install_root.join("bin").join("mihomo.exe"),
                 cli_binary: install_root.join("bin").join("mihomo-cli.exe"),
-                config_file: config_dir.join("config.yaml"),
+                config_file: intent_config_dir.join("config.yaml"),
+                intent_config_file: intent_config_dir.join("config.yaml"),
                 start_script: None,
                 runtime_dir: None,
                 api_endpoint: ApiEndpoint::WindowsNamedPipe(r"\\.\pipe\mihomo-core".to_string()),
                 log_file: Some(install_root.join("mihomo.log")),
                 service_file: None,
-                backup_dir: config_dir.join("backups"),
-                config_dir,
+                backup_dir: intent_config_dir.join("backups"),
+                config_dir: intent_config_dir,
+                tun_config_file: planned_tun_config_file(os, inputs),
             }
         }
         (TargetOs::Windows, InstanceMode::User) => {
@@ -422,6 +511,7 @@ fn planned_paths(os: TargetOs, mode: InstanceMode, inputs: &PathInputs) -> Insta
                 core_binary: install_root.join("bin").join("mihomo.exe"),
                 cli_binary: install_root.join("bin").join("mihomo-cli.exe"),
                 config_file: config_dir.join("config.yaml"),
+                intent_config_file: config_dir.join("config.yaml"),
                 start_script: None,
                 runtime_dir: None,
                 api_endpoint: ApiEndpoint::WindowsNamedPipe(format!(
@@ -432,6 +522,7 @@ fn planned_paths(os: TargetOs, mode: InstanceMode, inputs: &PathInputs) -> Insta
                 service_file: None,
                 backup_dir: config_dir.join("backups"),
                 config_dir,
+                tun_config_file: planned_tun_config_file(os, inputs),
             }
         }
     }
@@ -493,7 +584,7 @@ pub fn planned_macos_launchd_artifacts(ctx: &InstanceContext) -> Option<LaunchdA
 <plist version="1.0"><dict>
 <key>Label</key><string>io.mihomo</string>
 <key>ProgramArguments</key><array><string>{}</string></array>
-<key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>Crashed</key><true/></dict>
+<key>RunAtLoad</key><false/><key>KeepAlive</key><dict><key>Crashed</key><true/></dict>
 <key>WorkingDirectory</key><string>{}</string>
 <key>StandardOutPath</key><string>{}</string>
 <key>StandardErrorPath</key><string>{}</string>
@@ -676,6 +767,14 @@ pub fn planned_macos_install_plan(ctx: &InstanceContext) -> Option<InstanceInsta
             args: vec!["bootout".to_string(), domain.clone()],
             privileged,
         },
+        // Clear any prior `launchctl disable` override — a disabled override
+        // makes bootstrap fail with EIO (Input/output error), leaving the
+        // service unloaded (N2a 真机验证发现).
+        PlannedCommand {
+            program: "launchctl".to_string(),
+            args: vec!["enable".to_string(), domain.clone()],
+            privileged,
+        },
         PlannedCommand {
             program: "launchctl".to_string(),
             args: vec![
@@ -776,7 +875,7 @@ pub fn planned_linux_install_plan(ctx: &InstanceContext) -> Option<InstanceInsta
         });
     let unit_content = match ctx.mode {
         InstanceMode::System => format!(
-            "[Unit]\nDescription=Mihomo CLI System Daemon\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={} daemon\nRestart=on-failure\nRuntimeDirectory=mihomo\nRuntimeDirectoryMode=0755\nWorkingDirectory={}\n{}\n[Install]\nWantedBy=multi-user.target\n",
+            "[Unit]\nDescription=Mihomo CLI System Daemon\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={} daemon\nRestart=always\nRuntimeDirectory=mihomo\nRuntimeDirectoryMode=0755\nWorkingDirectory={}\n{}\n[Install]\nWantedBy=multi-user.target\n",
             ctx.paths.cli_binary.display(),
             ctx.paths.config_dir.display(),
             log_directives
@@ -847,7 +946,10 @@ fn planned_windows_user_process_start(ctx: &InstanceContext) -> InstanceServiceP
             args: vec![
                 "/C".to_string(),
                 "start".to_string(),
-                format!("mihomo:{}", ctx.paths.config_dir.display()),
+                // `start` treats an UNQUOTED first arg as the program, not the
+                // window title — a title containing ':' (mihomo:C:\...) would be
+                // executed as a command and fail (os error 2). Quote it.
+                format!("\"mihomo:{}\"", ctx.paths.config_dir.display()),
                 "/B".to_string(),
                 ctx.paths.core_binary.display().to_string(),
                 "-d".to_string(),
@@ -887,38 +989,13 @@ pub fn planned_windows_install_plan(ctx: &InstanceContext) -> Option<InstanceIns
     let mut files = Vec::new();
 
     let commands = match ctx.mode {
-        InstanceMode::System => vec![
-            PlannedCommand {
-                program: "sc.exe".to_string(),
-                args: vec!["stop".to_string(), "mihomo".to_string()],
-                privileged: true,
-            },
-            PlannedCommand {
-                program: "sc.exe".to_string(),
-                args: vec!["delete".to_string(), "mihomo".to_string()],
-                privileged: true,
-            },
-            PlannedCommand {
-                program: "sc.exe".to_string(),
-                args: vec![
-                    "create".to_string(),
-                    "mihomo".to_string(),
-                    format!("binPath= \"{}\" daemon", ctx.paths.cli_binary.display()),
-                    // sc.exe parses `start= auto` as two tokens (name= + value);
-                    // a single token with an embedded space breaks the parser.
-                    "start=".to_string(),
-                    "auto".to_string(),
-                    "DisplayName=".to_string(),
-                    "Mihomo Proxy Service".to_string(),
-                ],
-                privileged: true,
-            },
-            PlannedCommand {
-                program: "sc.exe".to_string(),
-                args: vec!["start".to_string(), "mihomo".to_string()],
-                privileged: true,
-            },
-        ],
+        InstanceMode::System => {
+            // Service installation/uninstallation for the Windows system mode
+            // is handled by service-manager (service::windows_install_service /
+            // windows_uninstall_service, M5/ADR-16) — the legacy sc.exe
+            // stop/delete/create/start plan was removed (P1-4).
+            Vec::new()
+        }
         InstanceMode::User => {
             let plan = planned_windows_user_process_start(ctx);
             // BUG: Windows user mode install previously left no persistent
@@ -1132,6 +1209,18 @@ fn launchctl_uninstall_plan(ctx: &InstanceContext) -> InstanceServicePlan {
         mode: 0,
         privileged: false,
     });
+    if ctx.mode == InstanceMode::System {
+        plan.remove_paths.push(PlannedDirectory {
+            path: ctx
+                .paths
+                .config_file
+                .parent()
+                .unwrap_or(&ctx.paths.config_file)
+                .to_path_buf(),
+            mode: 0,
+            privileged: true,
+        });
+    }
 
     for path in [
         Some(ctx.paths.core_binary.clone()),
@@ -1228,6 +1317,18 @@ fn linux_uninstall_plan(ctx: &InstanceContext, privileged: bool) -> InstanceServ
         mode: 0,
         privileged: false,
     });
+    if ctx.mode == InstanceMode::System {
+        remove_paths.push(PlannedDirectory {
+            path: ctx
+                .paths
+                .config_file
+                .parent()
+                .unwrap_or(&ctx.paths.config_file)
+                .to_path_buf(),
+            mode: 0,
+            privileged: true,
+        });
+    }
     remove_paths.push(PlannedDirectory {
         path: ctx.paths.core_binary.clone(),
         mode: 0,
@@ -1301,6 +1402,18 @@ fn windows_uninstall_plan(ctx: &InstanceContext, privileged: bool) -> InstanceSe
             path: log_file.clone(),
             mode: 0,
             privileged,
+        });
+    }
+    if ctx.mode == InstanceMode::System {
+        remove_paths.push(PlannedDirectory {
+            path: ctx
+                .paths
+                .config_file
+                .parent()
+                .unwrap_or(&ctx.paths.config_file)
+                .to_path_buf(),
+            mode: 0,
+            privileged: true,
         });
     }
     // Windows user mode: remove the install marker so presence detection no
@@ -1835,6 +1948,119 @@ pub fn resolve_instance_mode_with_source(
     }
 }
 
+/// User settings stored in `~/.config/mihomo/settings.json`.
+///
+/// The `mode` field controls which instance the CLI operates on
+/// when no explicit `--system`/`--user` flag is provided.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct UserSettings {
+    /// Preferred instance mode: "system", "user", or "auto" (default).
+    /// "auto" means: use system if installed, otherwise user.
+    #[serde(default = "default_mode")]
+    pub mode: String,
+}
+
+fn default_mode() -> String {
+    "auto".to_string()
+}
+
+impl Default for UserSettings {
+    fn default() -> Self {
+        Self {
+            mode: default_mode(),
+        }
+    }
+}
+
+impl UserSettings {
+    /// Load settings from the user's config directory.
+    pub fn load() -> Self {
+        let path = Self::settings_path();
+        if path.exists() {
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default()
+        } else {
+            Self::default()
+        }
+    }
+
+    /// Save settings to the user's config directory.
+    pub fn save(&self) -> anyhow::Result<()> {
+        let path = Self::settings_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(self)?;
+        std::fs::write(&path, json)?;
+        Ok(())
+    }
+
+    /// Path to the settings file: `~/.config/mihomo/settings.json`.
+    pub fn settings_path() -> PathBuf {
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("~/.config"))
+            .join("mihomo/settings.json")
+    }
+
+    /// Resolve the effective mode from settings, considering service presence.
+    ///
+    /// Returns the mode to use, or None if auto mode with no services installed.
+    pub fn resolve_mode(&self, services: &ServicePresence) -> Option<InstanceMode> {
+        match self.mode.as_str() {
+            "system" => Some(InstanceMode::System),
+            "user" => Some(InstanceMode::User),
+            "auto" => Self::resolve_auto_mode(services),
+            _ => Self::resolve_auto_mode(services),
+        }
+    }
+
+    fn resolve_auto_mode(services: &ServicePresence) -> Option<InstanceMode> {
+        // Auto: prefer system if installed, otherwise user
+        if services.system {
+            Some(InstanceMode::System)
+        } else if services.user {
+            Some(InstanceMode::User)
+        } else {
+            None
+        }
+    }
+}
+
+/// Display current settings and resolved mode.
+pub fn print_settings_status(services: &ServicePresence) {
+    let settings = UserSettings::load();
+    let path = UserSettings::settings_path();
+
+    println!("Mode preference: {}", settings.mode);
+    println!("Settings file: {}", path.display());
+
+    match settings.resolve_mode(services) {
+        Some(mode) => println!("Effective mode: {mode:?}"),
+        None => println!("Effective mode: (no service installed)"),
+    }
+
+    println!();
+    println!("Service presence:");
+    println!(
+        "  System: {}",
+        if services.system {
+            "installed"
+        } else {
+            "not installed"
+        }
+    );
+    println!(
+        "  User:   {}",
+        if services.user {
+            "installed"
+        } else {
+            "not installed"
+        }
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1842,6 +2068,25 @@ mod tests {
 
     fn inputs() -> PathInputs {
         PathInputs::for_tests()
+    }
+
+    #[test]
+    fn tun_config_paths_are_platform_specific() {
+        let inputs = inputs();
+        assert_eq!(
+            planned_tun_config_file(TargetOs::Linux, &inputs),
+            PathBuf::from("/var/lib/mihomo-cli/tun-config.yaml")
+        );
+        assert_eq!(
+            planned_tun_config_file(TargetOs::Macos, &inputs),
+            PathBuf::from("/Library/Application Support/mihomo-cli/tun-config.yaml")
+        );
+        assert_eq!(
+            planned_tun_config_file(TargetOs::Windows, &inputs),
+            PathBuf::from(r"C:\ProgramData")
+                .join("mihomo-cli")
+                .join("tun-config.yaml")
+        );
     }
 
     fn empty_inventory() -> InstanceInventory {
@@ -2455,7 +2700,6 @@ mod tests {
         let plan = planned_install_plan(&ctx).unwrap();
         let rendered = format!("{plan:#?}");
 
-        assert!(plan.commands.iter().all(|c| c.privileged));
         // ADR-02: system config_dir is per-user and follows Windows APPDATA convention.
         assert!(plan.directories.iter().any(|d| {
             d.path == PathBuf::from(r"C:\Users\alice\AppData\Roaming").join("mihomo")
@@ -2471,23 +2715,13 @@ mod tests {
             ctx.paths.api_endpoint,
             ApiEndpoint::WindowsNamedPipe(r"\\.\pipe\mihomo-core".to_string())
         );
-        assert_eq!(plan.commands[0].args, vec!["stop", "mihomo"]);
-        assert_eq!(plan.commands[1].args, vec!["delete", "mihomo"]);
-        let create = plan
-            .commands
-            .iter()
-            .find(|command| command.args.first().map(String::as_str) == Some("create"))
-            .expect("windows service create command");
-        assert!(create.args.contains(&format!(
-            "binPath= \"{}\" daemon",
-            ctx.paths.cli_binary.display()
-        )));
-        for required in ["sc.exe", "create", "start=", "auto"] {
-            assert!(
-                rendered.contains(required),
-                "missing {required}\n{rendered}"
-            );
-        }
+        // M5/ADR-16: Windows system service install/uninstall is handled by
+        // service-manager (service::windows_install_service), not the legacy
+        // sc.exe plan — commands must be empty (P1-4).
+        assert!(
+            plan.commands.is_empty(),
+            "system install plan must not carry legacy sc.exe commands"
+        );
         assert!(!rendered.contains(r"C:\\Users\\alice\\AppData\\Local"));
     }
 
@@ -2664,6 +2898,28 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_user_plans_do_not_include_system_store_app_root() {
+        for (os, app_root) in [
+            (TargetOs::Linux, PathBuf::from("/var/lib/mihomo-cli")),
+            (
+                TargetOs::Macos,
+                PathBuf::from("/Library/Application Support/mihomo-cli"),
+            ),
+            (
+                TargetOs::Windows,
+                PathBuf::from(r"C:\ProgramData").join("mihomo-cli"),
+            ),
+        ] {
+            let ctx = InstanceContext::planned(os, InstanceMode::User, &inputs());
+            let plan = planned_service_plan(&ctx, ServiceAction::Uninstall);
+            assert!(
+                plan.remove_paths.iter().all(|p| p.path != app_root),
+                "{os:?} user uninstall should not remove system app_root"
+            );
+        }
+    }
+
+    #[test]
     fn config_store_plan_keeps_system_config_writes_direct_and_rollback_capable() {
         let ctx = InstanceContext::planned(TargetOs::Macos, InstanceMode::System, &inputs());
         let plan = planned_config_store(&ctx);
@@ -2782,6 +3038,7 @@ mod tests {
             system_plan.binary,
             PathBuf::from("/Library/Application Support/mihomo/bin/mihomo")
         );
+        // S4: system mode config_file is the intent config
         assert_eq!(
             system_plan.config_file,
             PathBuf::from("/Users/alice/.config/mihomo/config.yaml")
@@ -2798,7 +3055,6 @@ mod tests {
             .probes
             .iter()
             .any(|p| p.kind == DiagnosticProbeKind::ApiResponds));
-        // ADR-02: config-related probe targets may reference per-user config path
 
         let user_plan = planned_status_diagnostics(&user);
         assert_eq!(user_plan.mode, InstanceMode::User);
@@ -2913,10 +3169,9 @@ mod tests {
                         !p.as_os_str().is_empty(),
                         "{os:?} {mode:?} socket path is empty"
                     ),
-                    ApiEndpoint::WindowsNamedPipe(p) => assert!(
-                        !p.is_empty(),
-                        "{os:?} {mode:?} pipe name is empty"
-                    ),
+                    ApiEndpoint::WindowsNamedPipe(p) => {
+                        assert!(!p.is_empty(), "{os:?} {mode:?} pipe name is empty")
+                    }
                 }
             }
         }
@@ -3121,13 +3376,12 @@ mod tests {
             "/var/log/mihomo",
         ];
 
-        let entries = std::fs::read_dir(&src_dir)
-            .expect("src/ directory must exist");
+        let entries = std::fs::read_dir(&src_dir).expect("src/ directory must exist");
 
         for entry in entries {
             let entry = entry.unwrap();
             let path = entry.path();
-            if path.extension().map_or(true, |e| e != "rs") {
+            if path.extension().is_none_or(|e| e != "rs") {
                 continue;
             }
             let file_name = path.file_name().unwrap().to_string_lossy().to_string();
@@ -3137,10 +3391,7 @@ mod tests {
 
             let content = std::fs::read_to_string(&path).unwrap();
             // 只检查生产代码，跳过 #[cfg(test)] 块
-            let production_code = content
-                .split("#[cfg(test)]")
-                .next()
-                .unwrap_or(&content);
+            let production_code = content.split("#[cfg(test)]").next().unwrap_or(&content);
 
             for pattern in &forbidden_patterns {
                 assert!(
@@ -3266,14 +3517,20 @@ mod tests {
 
         // Second lock should fail (non-blocking)
         let mut lock2 = InstanceLock::new(lock_path.clone());
-        assert!(!lock2.try_acquire(), "second lock acquisition should fail while first is held");
+        assert!(
+            !lock2.try_acquire(),
+            "second lock acquisition should fail while first is held"
+        );
 
         // Release first lock
         lock1.release();
 
         // Now second lock should succeed
         let mut lock3 = InstanceLock::new(lock_path.clone());
-        assert!(lock3.try_acquire(), "lock acquisition should succeed after release");
+        assert!(
+            lock3.try_acquire(),
+            "lock acquisition should succeed after release"
+        );
 
         // Drop should also release
         drop(lock3);
@@ -3288,8 +3545,7 @@ mod tests {
         let marker = windows_user_install_marker(&ctx).expect("user marker for windows user");
         assert_eq!(
             marker,
-            PathBuf::from(r"C:\Users\alice\AppData\Local")
-                .join("mihomo/bin/.user-installed")
+            PathBuf::from(r"C:\Users\alice\AppData\Local").join("mihomo/bin/.user-installed")
         );
         // System mode and non-Windows must not produce a user marker.
         let system_ctx =
@@ -3347,5 +3603,27 @@ mod tests {
             inv.service_presence_for_mode_resolution().user,
             "marker presence must resolve user mode installed"
         );
+    }
+
+    #[test]
+    fn system_paths_linux_has_correct_layout() {
+        let p = SystemPaths::for_os(TargetOs::Linux);
+        assert!(p.config_file.ends_with(".config/mihomo/config.yaml"));
+        assert_eq!(p.runtime, PathBuf::from("/run/mihomo"));
+        assert_eq!(p.logs, PathBuf::from("/var/log/mihomo"));
+    }
+
+    #[test]
+    fn system_paths_macos_has_correct_layout() {
+        let p = SystemPaths::for_os(TargetOs::Macos);
+        assert!(p.config_file.ends_with(".config/mihomo/config.yaml"));
+        assert_eq!(p.runtime, PathBuf::from("/var/run/mihomo"));
+    }
+
+    #[test]
+    fn system_paths_windows_uses_config_dir() {
+        let p = SystemPaths::for_os(TargetOs::Windows);
+        assert!(p.config_file.ends_with("config.yaml"));
+        assert!(p.logs.ends_with("logs"));
     }
 }
