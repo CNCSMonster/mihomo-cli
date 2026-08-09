@@ -947,6 +947,7 @@ fn lookup_user(name: &str) -> anyhow::Result<(u32, u32, std::path::PathBuf)> {
 
 #[cfg(unix)]
 fn cmd_access(action: AccessAction) -> anyhow::Result<()> {
+    use std::ffi::CString;
     if matches!(
         action,
         AccessAction::Grant { .. } | AccessAction::Revoke { .. }
@@ -968,23 +969,17 @@ fn cmd_access(action: AccessAction) -> anyhow::Result<()> {
             let token_path = service::client_token_path_for_home(&home);
             if let Some(dir) = token_path.parent() {
                 std::fs::create_dir_all(dir)?;
+                let c_path = CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
                 unsafe {
-                    libc::chown(
-                        dir.as_os_str().as_encoded_bytes().as_ptr() as *const i8,
-                        uid,
-                        gid,
-                    );
+                    libc::chown(c_path.as_ptr(), uid, gid);
                 }
             }
             let token = service::generate_client_token_for_home(&home)?;
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600))?;
+            let c_path = CString::new(token_path.as_os_str().as_encoded_bytes()).unwrap();
             unsafe {
-                libc::chown(
-                    token_path.as_os_str().as_encoded_bytes().as_ptr() as *const i8,
-                    uid,
-                    gid,
-                );
+                libc::chown(c_path.as_ptr(), uid, gid);
             }
             table.clients.retain(|c| c.user != user && c.uid != uid);
             table.clients.push(daemon::AuthorizedClient {
