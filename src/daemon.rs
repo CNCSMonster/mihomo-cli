@@ -210,6 +210,72 @@ pub(crate) fn validate_client_token_for_peer(
     }
 }
 
+#[cfg(windows)]
+/// Windows token-only validation — no peer UID available on named pipes.
+/// Skips the UID cross-check that the Unix version performs.
+pub(crate) fn validate_client_token_for_peer(
+    token: Option<&str>,
+    _peer_uid: Option<u32>,
+) -> Result<(), String> {
+    let token = token.ok_or_else(|| "invalid or missing auth token".to_string())?;
+    let table = read_authorized_clients_from(&authorized_clients_path())
+        .map_err(|e| format!("cannot read authorized clients: {e}"))?;
+    fn ct_eq(a: &str, b: &str) -> bool {
+        let ab = a.as_bytes();
+        let bb = b.as_bytes();
+        let mut diff = ab.len() ^ bb.len();
+        for i in 0..ab.len().max(bb.len()) {
+            let x = *ab.get(i).unwrap_or(&0);
+            let y = *bb.get(i).unwrap_or(&0);
+            diff |= (x ^ y) as usize;
+        }
+        diff == 0
+    }
+    match table.clients.iter().find(|c| ct_eq(&c.token, token)) {
+        Some(_) => Ok(()),
+        None => Err("invalid or missing auth token".to_string()),
+    }
+}
+
+#[cfg(windows)]
+/// Windows path for the authorized-clients file.
+pub(crate) fn authorized_clients_path() -> PathBuf {
+    std::env::var_os("MIHOMO_CLI_AUTHORIZED_CLIENTS_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("ProgramData")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+                .join("mihomo")
+                .join("authorized-clients.json")
+        })
+}
+
+#[cfg(windows)]
+pub(crate) fn read_authorized_clients_from(
+    path: &std::path::Path,
+) -> anyhow::Result<AuthorizedClients> {
+    if !path.exists() {
+        return Ok(AuthorizedClients::default());
+    }
+    let text = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&text)?)
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct AuthorizedClient {
+    pub user: String,
+    pub uid: u32,
+    pub token: String,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default, PartialEq, Eq)]
+pub(crate) struct AuthorizedClients {
+    pub clients: Vec<AuthorizedClient>,
+}
+
 #[cfg(any(unix, windows))]
 pub(crate) fn expected_system_core_binary_path() -> PathBuf {
     if cfg!(target_os = "macos") {
@@ -610,7 +676,7 @@ async fn process_windows_command(
         | DaemonCommand::GetStatus { token }
         | DaemonCommand::SetAutostart { token, .. } => token.as_deref(),
     };
-    if let Err(message) = validate_client_token_for_peer(client_token, peer_uid) {
+    if let Err(message) = validate_client_token_for_peer(client_token, None) {
         return DaemonResponse::Error { message };
     }
     match cmd {
@@ -1172,6 +1238,7 @@ fn validate_tun_peer_is_root(peer_uid: Option<u32>) -> Result<(), String> {
     }
 }
 
+#[cfg(unix)]
 async fn process_command(
     cmd: DaemonCommand,
     state: Arc<Mutex<DaemonState>>,
