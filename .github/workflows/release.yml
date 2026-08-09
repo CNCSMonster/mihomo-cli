@@ -137,13 +137,50 @@ jobs:
 
             ## Install
 
-            Download the binary for your platform from **Assets** below, then:
+            Download the binary for your platform from **Assets** below.
+
+            ### Linux / macOS
 
             ```bash
-            chmod +x mihomo-cli
+            # 解压
+            tar xzf mihomo-cli-*.tar.gz
+
+            # 移动到 PATH
             sudo mv mihomo-cli /usr/local/bin/
-            mihomo-cli install
+            # 或者用户级安装
+            mkdir -p ~/.local/bin
+            mv mihomo-cli ~/.local/bin/
+
+            # 验证安装
+            mihomo-cli --version
             ```
+
+            ### Windows
+
+            ```powershell
+            # 解压
+            Expand-Archive -Path mihomo-cli-*.zip -DestinationPath .
+
+            # 移动到 PATH（需要管理员权限）
+            Move-Item mihomo-cli.exe "C:\Program Files\mihomo-cli\"
+            # 或者用户级安装
+            Move-Item mihomo-cli.exe "$env:APPDATA\mihomo-cli\"
+
+            # 验证安装
+            mihomo-cli --version
+            ```
+
+            ### 首次使用
+
+            ```bash
+            # 交互式安装（选择普通代理模式或 TUN 模式）
+            mihomo-cli install
+
+            # 或者直接开启 TUN（自动引导安装 system service）
+            mihomo-cli tun on
+            ```
+
+            > **注意**：TUN 模式需要管理员权限，CLI 会自动请求 sudo（Linux/macOS）或 UAC（Windows）。
 
             ## Checksums
 
