@@ -105,7 +105,10 @@ pub fn unix_client_token(config_dir: &std::path::Path) -> Option<String> {
 ///
 /// Reads `%ProgramData%\mihomo\service-token` (written at install time).
 /// None when absent (legacy install / unix) — validation is skipped then.
+///
+/// Reserved for token dual validation (see PLAN-windows-usability.md §2.3).
 #[cfg(windows)]
+#[allow(dead_code)]
 pub fn windows_service_token() -> Option<String> {
     let program_data = std::env::var_os("ProgramData")
         .map(std::path::PathBuf::from)

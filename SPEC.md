@@ -94,14 +94,22 @@ enum DaemonResponse {
 ### 1.5 IPC 认证（跨平台）
 
 **当前状态**：
-- Windows：token 认证已实现（`windows_service_token()`）
-- Unix：无 token 认证（socket 权限 `0o666`）
+- Windows：token 双副本认证已实现（`service-token` + `service-client-token` + named pipe SDDL）
+- Unix：L3 方案 A token 认证已实施
 
-**计划改进**：
-- Unix 平台扩展 token 认证机制
-- Token 文件权限 `0o644`（所有用户可读取）
-- Socket 权限 `0o666`（所有用户可连接）
-- Daemon 侧 peer UID 检查（TUN 操作需要 root）
+**Unix 方案 A（已实施）**：
+- **Server token**：`/var/lib/mihomo-cli/service-token`，权限 `0o600 root:root`，仅 daemon 读取。
+- **Per-user client token**：`~/.config/mihomo/service-token`，权限 `0o600 <user>:<user>`，CLI 连接时携带。
+- **授权表**：`/var/lib/mihomo-cli/authorized-clients.json`，权限 `0o600 root:root`，记录被授权的 (uid, client token) 对。
+- **Socket 权限**：保持 `0o666`，允许所有本机用户连接；授权边界在 daemon 应用层完成。
+- **Daemon 校验**：
+  - 若 peer UID == 0（root），直接放行 token 校验（保留 root 排障/管理路径）。
+  - 非 root 用户：client token 必须存在于授权表，且 Unix socket peer UID 与授权表中该 token 归属 UID 一致。
+- **TUN 操作额外限制**：`EnableTun` / `DisableTun` 仍要求 peer UID == 0（root）。
+- **管理命令**：`mihomo-cli access grant --user <name>` / `access revoke --user <name>` / `access list` / `access status` 由 root 维护授权表。
+
+**计划改进（后续）**：
+- 长期考虑将 token 文件保护扩展到 macOS Keychain / Linux keyring（超出当前阶段）
 
 ### 1.6 Lifecycle Concurrency & Readiness
 

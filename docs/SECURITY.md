@@ -66,11 +66,13 @@ user-a$ mihomo-cli tun on
 
 ### 2.2 当前 mihomo-cli 的问题
 
-| 问题 | 说明 | 风险等级 |
-|------|------|---------|
-| **任何用户都可以修改配置** | config 目录是 per-user 的，每个用户都有自己的配置 | 🟡 中 |
-| **任何用户都可以 `tun on`（Unix 无认证）** | IPC socket `0o666`，无 token 认证 | 🔴 高 |
-| **TUN 是系统级的，影响所有用户** | TUN 网卡是系统级单例，一旦开启，所有用户的流量都被拦截 | 🔴 高 |
+> 下表记录威胁模型分析阶段识别的问题。L1-L7 安全改进实施后，标 ✅ 的项已得到缓解；详见 §3 防护设计。
+
+| 问题 | 说明 | 风险等级 | 状态 |
+|------|------|---------|------|
+| **任何用户都可以修改配置** | config 目录是 per-user 的，每个用户都有自己的配置 | 🟡 中 | 按设计保留；系统敏感配置修改通过 L1 + L2 间接约束 |
+| **任何用户都可以 `tun on`（Unix 无认证）** | IPC socket `0o666`，无 token 认证 | 🔴 高 | ✅ 已缓解：L1（daemon peer UID 要求 root）+ L3（token + 授权表） |
+| **TUN 是系统级的，影响所有用户** | TUN 网卡是系统级单例，一旦开启，所有用户的流量都被拦截 | 🔴 高 | ✅ 已缓解：L1 限制仅 root 可开关；TUN 配置隔离（L2）降低配置篡改影响 |
 
 ### 2.3 Proxy-RS 能否防止此攻击？
 
@@ -96,13 +98,13 @@ attacker$ echo '{"EnableTun": {...}}' | nc -U /var/run/mihomo/service.sock
 
 🔴 **高**
 
-#### 当前问题
+#### 当前问题（已缓解）
 
 - Unix IPC socket 权限 `0o666`，所有用户可访问
-- Unix 无 token 认证
-- 无 peer UID 检查
+- ~~Unix 无 token 认证~~ ✅ 已实施 L3 方案 A
+- ~~无 peer UID 检查~~ ✅ 已实施 L3/L1
 
-#### 防护方案
+#### 防护方案（已实施）
 
 - Unix token 认证（方案 A）：root-only server token + per-user client token
 - Daemon 校验 client token 是否在授权表中，并校验 socket peer UID 等于授权表记录 UID
@@ -170,13 +172,13 @@ attacker$ ln -s /etc/passwd ~/.config/mihomo/config.yaml
 
 🔴 **严重**
 
-#### 当前问题
+#### 历史问题（BUG-21 已修复）
 
-`install_staged_file_privileged` 函数使用 `install` 命令写入文件，**会跟随符号链接**。
+`install_staged_file_privileged` 函数早期直接使用 `install` 命令写入文件，**会跟随符号链接**。BUG-21 修复后已改为 D1-D3 防护。
 
 #### 防护方案
 
-**直接写入 + `O_NOFOLLOW` + 符号链接检查**（非临时文件方案）：
+**实现：`install_staged_file_privileged`（BUG-21 修复后）**
 
 ```rust
 pub fn install_staged_file_privileged(
@@ -184,49 +186,42 @@ pub fn install_staged_file_privileged(
     bytes: &[u8],
     mode: u16,
 ) -> anyhow::Result<()> {
-    // 1. 检查目标文件是否是符号链接
-    if let Ok(metadata) = path.symlink_metadata() {
-        if metadata.file_type().is_symlink() {
-            anyhow::bail!(
-                "refusing to write to symlink: {}\n  \
-                 This is a security measure to prevent symlink attacks.",
-                path.display()
-            );
+    #[cfg(unix)]
+    {
+        // D1: 写入前检查目标是否已是符号链接
+        if let Ok(metadata) = path.symlink_metadata() {
+            if metadata.file_type().is_symlink() {
+                anyhow::bail!(
+                    "refusing to write to symlink: {}\n  \
+                     This is a security measure to prevent symlink attacks.",
+                    path.display()
+                );
+            }
         }
+
+        // D2: root 直接写入（O_NOFOLLOW + 显式权限）
+        if is_root() {
+            return write_installed_file_direct(path, bytes, mode);
+        }
+
+        // D3: 非 root 先用 O_NOFOLLOW + 0o600 写入临时文件，
+        //     再 `sudo install` 提升到目标路径
+        install_staged_file_privileged_non_root(path, bytes, mode)
     }
-    
-    // 2. 确保父目录权限安全（0o700）
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-    }
-    
-    // 3. 直接写入文件（O_NOFOLLOW 防止跟随符号链接）
-    use std::fs::OpenOptions;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    use std::io::Write;
-    
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .mode(mode)
-        .open(path)?;
-    
-    file.write_all(bytes)?;
-    
-    Ok(())
 }
 ```
 
-**防御层次**：
+**符号链接防御层次**（本节专属编号，避免与 §3.1 L1-L7 混淆）：
 
 | 层次 | 措施 | 防御的攻击 |
 |------|------|-----------|
-| **L1** | 写入前检查符号链接 | 已存在的符号链接 |
-| **L2** | `O_NOFOLLOW` 标志 | 写入时跟随符号链接 |
-| **L3** | 父目录权限 `0o700` | 其他用户创建符号链接 |
+| **D1** | 写入前 `symlink_metadata()` 检查 | 已存在的符号链接 |
+| **D2** | `O_NOFOLLOW` 标志（root 直接写入 + 非 root 临时文件） | 写入时目标被替换为符号链接（root 路径）；临时文件被篡改（非 root 路径） |
+| **D3** | 临时文件 mode `0o600` + `sudo install` 原子落盘 | 其他用户读取/篡改 stage 内容 |
+
+> 注：BUG-21 修复后已**移除**对父目录强制 `set_permissions(0o700)` 的逻辑，因为该操作会破坏 `/usr/local/bin` 等系统目录权限。当前通过 D1-D3 三层防护替代。
+>
+> **局限性（非 root 路径）**：D1 的符号链接检查发生在 CLI 进程内，D3 的 `sudo install` 在提权后执行。两者之间存在极短的 TOCTOU 窗口：攻击者若能在检查后、安装前把目标路径替换为符号链接，`sudo install` 仍可能跟随该链接。该窗口取决于目标目录的权限（如 `/usr/local/bin` 仅 root 可写时风险较低）；对 root 可写系统目录，此风险可接受。完全消除该窗口需要 daemon 在提权后重新执行 `O_NOFOLLOW` 校验，属于后续加固方向。
 
 **为什么不用临时文件 + rename**：
 - 临时文件本身可能被符号链接攻击
@@ -294,7 +289,9 @@ TOCTOU 攻击的前提是攻击者已经能够修改用户配置文件所在的�
 | **L6** | 符号链接攻击防护（O_NOFOLLOW + 检查） | 场景 7 | 🔴 必须 | ✅ 已实施 |
 | **L7** | 日志脱敏 + 级别控制 | 场景 10 | 🟡 推荐 | ✅ 已实施 |
 
-### 3.2 L1: TUN 操作需要 root 权限（必须）
+> 下节 S1-S5 是威胁模型分析阶段提出的补充性安全建议/设计，编号独立于 §3.1 的 L1-L7 多层防护设计，避免混淆。
+
+### 3.2 S1: TUN 操作需要 root 权限（必须）
 
 #### CLI 侧：非 root 自动 sudo re-exec 原命令
 
@@ -351,7 +348,7 @@ TUN: enabled
 Core: running
 ```
 
-### 3.3 L2: 系统敏感配置修改需要 root 权限（推荐）
+### 3.3 S2: 系统敏感配置修改需要 root 权限（推荐）
 
 #### 哪些配置算"系统敏感"？
 
@@ -380,7 +377,7 @@ if is_system_sensitive_config_change(&opts) {
 }
 ```
 
-### 3.4 L3: TUN 状态变化通知（推荐）
+### 3.4 S3: TUN 状态变化通知（推荐）
 
 #### 通知机制
 
@@ -398,7 +395,7 @@ if tun_enabled {
 }
 ```
 
-### 3.5 L4: 审计日志（推荐）
+### 3.5 S4: 审计日志（推荐）
 
 #### 日志格式
 
@@ -415,7 +412,7 @@ audit_log!("Rule added by user={}: {:?}", current_user(), rule);
 - macOS: `/var/log/mihomo/audit.log`
 - Windows: `%ProgramData%\mihomo\audit.log`
 
-### 3.6 L5: IPC 认证（借鉴 Proxy-RS）
+### 3.6 S5: IPC 认证（借鉴 Proxy-RS）
 
 #### Token 认证
 
@@ -529,7 +526,7 @@ std::fs::set_permissions(token_path, std::fs::Permissions::from_mode(0o600))?;
 
 **优先级**：🔴 必须
 
-### 6.2 阶段 2: IPC 认证（L5）
+### 6.2 阶段 2: IPC 认证（L3）
 
 **目标**：防止绕过 CLI 直接访问 IPC
 
@@ -540,7 +537,7 @@ std::fs::set_permissions(token_path, std::fs::Permissions::from_mode(0o600))?;
 
 **优先级**：🟡 推荐
 
-### 6.3 阶段 3: 系统敏感配置保护（L2）
+### 6.3 阶段 3: TUN 配置隔离（L2）
 
 **目标**：防止低权限用户修改影响系统流量的配置
 
@@ -555,11 +552,11 @@ std::fs::set_permissions(token_path, std::fs::Permissions::from_mode(0o600))?;
 
 **后续**：
 - Windows ProgramData ACL 明确化/测试
-- L6 符号链接防护完成后复核 privileged write 安全性
+- L6 符号链接防护完成后复核 privileged write 安全性（✅ 已完成，见 BUG-21）
 
 **优先级**：🟡 推荐
 
-### 6.4 阶段 4: 通知 + 审计（L3 + L4）
+### 6.4 阶段 4: 通知 + 审计（S3 + S4）
 
 **目标**：及时发现异常 + 事后追溯
 
