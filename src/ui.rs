@@ -22,29 +22,52 @@ pub(crate) fn flat_selector_item(group: &str, node: &str, current: bool) -> Stri
 pub(crate) fn selected_flat_node(
     nodes: &[(String, String, bool)],
     selection: Option<usize>,
-) -> anyhow::Result<(&str, &str)> {
-    let idx = selection.ok_or_else(|| anyhow::anyhow!("Cancelled."))?;
+) -> anyhow::Result<Option<(&str, &str)>> {
+    let Some(selection) = selection else {
+        return Ok(None);
+    };
     nodes
-        .get(idx)
-        .map(|(group, node, _)| (group.as_str(), node.as_str()))
-        .ok_or_else(|| anyhow::anyhow!("Invalid selection index: {idx}"))
+        .get(selection)
+        .map(|(group, node, _)| Some((group.as_str(), node.as_str())))
+        .ok_or_else(|| anyhow::anyhow!("Invalid selection index: {selection}"))
 }
 
 pub(crate) fn selected_group_node(
     nodes: &[String],
     selection: Option<usize>,
-) -> anyhow::Result<&str> {
-    let idx = selection.ok_or_else(|| anyhow::anyhow!("Cancelled."))?;
+) -> anyhow::Result<Option<&str>> {
+    let Some(selection) = selection else {
+        return Ok(None);
+    };
     nodes
-        .get(idx)
-        .map(|node| node.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Invalid selection index: {idx}"))
+        .get(selection)
+        .map(|node| Some(node.as_str()))
+        .ok_or_else(|| anyhow::anyhow!("Invalid selection index: {selection}"))
+}
+
+/// Flat selector: all groups merged, supports j/k navigation + fuzzy filter.
+pub(crate) fn flat_select(
+    nodes: &[(String, String, bool)],
+    selection: Option<usize>,
+) -> anyhow::Result<Option<(String, String)>> {
+    let Some((group, node)) = selected_flat_node(nodes, selection)? else {
+        return Ok(None);
+    };
+    Ok(Some((group.to_string(), node.to_string())))
+}
+
+/// Group-scoped selector result.
+pub(crate) fn select_node(
+    nodes: &[String],
+    selection: Option<usize>,
+) -> anyhow::Result<Option<String>> {
+    Ok(selected_group_node(nodes, selection)?.map(str::to_string))
 }
 
 /// Flat selector: all groups merged, supports j/k navigation + fuzzy filter.
 pub(crate) async fn flat_select_with_client(
     client: &impl mihomo_api::MihomoApiClient,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<(String, String)>> {
     let data = client.get("/proxies").await?;
     let nodes = mihomo_api::parse_selector_nodes(&data);
     if nodes.is_empty() {
@@ -56,18 +79,14 @@ pub(crate) async fn flat_select_with_client(
         &items,
         "Select node (↑/↓ or Ctrl+n/p navigate, / filter, Enter select, Esc cancel)",
     )?;
-
-    let (group, node) = selected_flat_node(&nodes, selection)?;
-    mihomo_api::select_proxy_with_client(client, group, node).await?;
-    println!("Switched [{group}] → {node}");
-    Ok(())
+    flat_select(&nodes, selection)
 }
 
 /// Group-scoped selector with j/k navigation.
 pub(crate) async fn select_node_with_client(
     client: &impl mihomo_api::MihomoApiClient,
     group: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     let nodes = mihomo_api::get_group_nodes_with_client(client, group).await?;
     if nodes.is_empty() {
         anyhow::bail!("No nodes found in group '{group}'");
@@ -77,11 +96,7 @@ pub(crate) async fn select_node_with_client(
         &nodes,
         &format!("Select node for {group} (↑/↓ or Ctrl+n/p navigate, Enter select, Esc cancel)"),
     )?;
-
-    let node = selected_group_node(&nodes, selection)?;
-    mihomo_api::select_proxy_with_client(client, group, node).await?;
-    println!("Switched {group} → {node}");
-    Ok(())
+    select_node(&nodes, selection)
 }
 
 /// Interactive selector with j/k navigation, fuzzy filtering, and Enter/Esc.
@@ -266,20 +281,40 @@ mod tests {
         let nodes = vec![("Proxy".to_string(), "HK 01".to_string(), false)];
         assert_eq!(
             selected_flat_node(&nodes, Some(0)).unwrap(),
-            ("Proxy", "HK 01")
+            Some(("Proxy", "HK 01"))
         );
-        assert!(selected_flat_node(&nodes, None)
-            .unwrap_err()
-            .to_string()
-            .contains("Cancelled"));
+        assert_eq!(selected_flat_node(&nodes, None).unwrap(), None);
         assert!(selected_flat_node(&nodes, Some(1))
             .unwrap_err()
             .to_string()
             .contains("Invalid selection index"));
 
         let group_nodes = vec!["DIRECT".to_string(), "Proxy".to_string()];
-        assert_eq!(selected_group_node(&group_nodes, Some(1)).unwrap(), "Proxy");
-        assert!(selected_group_node(&group_nodes, None).is_err());
-        assert!(selected_group_node(&group_nodes, Some(2)).is_err());
+        assert_eq!(
+            selected_group_node(&group_nodes, Some(1)).unwrap(),
+            Some("Proxy")
+        );
+        assert_eq!(selected_group_node(&group_nodes, None).unwrap(), None);
+        assert!(selected_group_node(&group_nodes, Some(2))
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid selection index"));
+    }
+
+    #[test]
+    fn selector_results_are_owned_for_command_layer_submission() {
+        let nodes = vec![("Proxy".to_string(), "HK 01".to_string(), false)];
+        assert_eq!(
+            flat_select(&nodes, Some(0)).unwrap(),
+            Some(("Proxy".to_string(), "HK 01".to_string()))
+        );
+        assert_eq!(flat_select(&nodes, None).unwrap(), None);
+
+        let group_nodes = vec!["DIRECT".to_string(), "Proxy".to_string()];
+        assert_eq!(
+            select_node(&group_nodes, Some(1)).unwrap(),
+            Some("Proxy".to_string())
+        );
+        assert_eq!(select_node(&group_nodes, None).unwrap(), None);
     }
 }

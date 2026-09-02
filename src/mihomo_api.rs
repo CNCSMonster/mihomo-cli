@@ -10,80 +10,6 @@ use tokio::net::windows::named_pipe::ClientOptions;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
-/// Check if the socket is actually connectable (not just file exists).
-/// Returns true if a connection attempt succeeds.
-#[cfg(unix)]
-fn socket_is_alive() -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::net::UnixStream as StdUnixStream;
-        StdUnixStream::connect(socket_path()).is_ok()
-    }
-    #[cfg(windows)]
-    {
-        use std::fs::OpenOptions;
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&socket_path())
-            .is_ok()
-    }
-}
-
-/// Build a context-aware fix suggestion message when socket/API is unreachable.
-pub fn socket_fix_suggestion() -> String {
-    #[cfg(not(unix))]
-    {
-        "  Is mihomo running? Run: mihomo-cli status".to_string()
-    }
-    #[cfg(unix)]
-    {
-        let proc_alive = mihomo_process_running();
-        let sock_alive = socket_is_alive();
-        let svc_installed = crate::service::service_installed();
-
-        if proc_alive && sock_alive {
-            "  Try: mihomo-cli config --fix && mihomo-cli restart".to_string()
-        } else if proc_alive && !sock_alive {
-            "  Config may be missing API controller. Try: mihomo-cli config --fix".to_string()
-        } else if !proc_alive && svc_installed {
-            "  Try: mihomo-cli restart".to_string()
-        } else {
-            "  Try: mihomo-cli start".to_string()
-        }
-    }
-}
-
-/// Check if mihomo process is actually running (via pgrep/tasklist)
-#[cfg(unix)]
-pub fn mihomo_process_running() -> bool {
-    if cfg!(target_os = "windows") {
-        std::process::Command::new("tasklist")
-            .args(["/FI", "IMAGENAME eq mihomo.exe"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains("mihomo"))
-            .unwrap_or(false)
-    } else {
-        std::process::Command::new("pgrep")
-            .args(["-x", "mihomo"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-}
-
-#[cfg(unix)]
-fn socket_path() -> String {
-    #[cfg(unix)]
-    {
-        format!("{}/mihomo.sock", crate::utils::socket_dir())
-    }
-    #[cfg(windows)]
-    {
-        r"\\.\pipe\mihomo".to_string()
-    }
-}
-
 /// Percent-encode non-ASCII and reserved characters in the URL path.
 fn percent_encode_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
@@ -231,12 +157,34 @@ pub(crate) trait MihomoApiClient {
 
 #[derive(Debug, Clone)]
 pub(crate) struct EndpointMihomoApiClient {
-    endpoint: crate::instance::ApiEndpoint,
+    transport: ApiTransport,
+}
+
+#[derive(Debug, Clone)]
+enum ApiTransport {
+    Endpoint(crate::instance::ApiEndpoint),
+    #[cfg(unix)]
+    SystemDaemon,
 }
 
 impl EndpointMihomoApiClient {
     pub(crate) fn new(endpoint: crate::instance::ApiEndpoint) -> Self {
-        Self { endpoint }
+        Self {
+            transport: ApiTransport::Endpoint(endpoint),
+        }
+    }
+
+    pub(crate) fn for_instance(
+        #[cfg_attr(not(unix), allow(unused_variables))] mode: crate::instance::InstanceMode,
+        endpoint: crate::instance::ApiEndpoint,
+    ) -> Self {
+        #[cfg(unix)]
+        if mode == crate::instance::InstanceMode::System {
+            return Self {
+                transport: ApiTransport::SystemDaemon,
+            };
+        }
+        Self::new(endpoint)
     }
 
     async fn request(
@@ -245,8 +193,8 @@ impl EndpointMihomoApiClient {
         path: &str,
         body: Option<&[u8]>,
     ) -> anyhow::Result<Value> {
-        match &self.endpoint {
-            crate::instance::ApiEndpoint::UnixSocket(socket) => {
+        match &self.transport {
+            ApiTransport::Endpoint(crate::instance::ApiEndpoint::UnixSocket(socket)) => {
                 do_socket_request_with(
                     &PlatformSocketTransport,
                     &socket.display().to_string(),
@@ -256,8 +204,33 @@ impl EndpointMihomoApiClient {
                 )
                 .await
             }
-            crate::instance::ApiEndpoint::WindowsNamedPipe(pipe) => {
+            ApiTransport::Endpoint(crate::instance::ApiEndpoint::WindowsNamedPipe(pipe)) => {
                 do_socket_request_with(&PlatformSocketTransport, pipe, method, path, body).await
+            }
+            #[cfg(unix)]
+            ApiTransport::SystemDaemon => {
+                let method = match method {
+                    "GET" => crate::ipc::CoreApiMethod::Get,
+                    "PUT" => crate::ipc::CoreApiMethod::Put,
+                    "PATCH" => crate::ipc::CoreApiMethod::Patch,
+                    "DELETE" => crate::ipc::CoreApiMethod::Delete,
+                    other => anyhow::bail!("unsupported Core API method: {other}"),
+                };
+                let body = body.map(serde_json::from_slice).transpose()?;
+                match crate::ipc::send_command(&crate::ipc::DaemonCommand::CoreApiRequest {
+                    method,
+                    path: path.to_string(),
+                    body,
+                    token: None,
+                })
+                .await?
+                {
+                    crate::ipc::DaemonResponse::CoreApi { data } => Ok(data),
+                    crate::ipc::DaemonResponse::Error { message } => anyhow::bail!(message),
+                    response => anyhow::bail!(
+                        "unexpected daemon response to Core API request: {response:?}"
+                    ),
+                }
             }
         }
     }
@@ -289,6 +262,15 @@ pub async fn api_get_at_endpoint(
 ) -> anyhow::Result<Value> {
     EndpointMihomoApiClient::new(endpoint.clone())
         .get(path)
+        .await
+}
+
+pub(crate) async fn get_config_for_instance(
+    mode: crate::instance::InstanceMode,
+    endpoint: &crate::instance::ApiEndpoint,
+) -> anyhow::Result<Value> {
+    EndpointMihomoApiClient::for_instance(mode, endpoint.clone())
+        .get("/configs")
         .await
 }
 
@@ -324,15 +306,21 @@ pub async fn wait_for_api_ready_at_endpoint(
     false
 }
 
-pub(crate) async fn list_proxies_with_client(client: &impl MihomoApiClient) -> anyhow::Result<()> {
+pub(crate) async fn list_proxies_with_selections(
+    client: &impl MihomoApiClient,
+    selections: &std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<()> {
     let data = client.get("/proxies").await?;
-    for line in format_proxy_list(&data)? {
+    for line in format_proxy_list_with_selections(&data, selections)? {
         println!("{line}");
     }
     Ok(())
 }
 
-pub(crate) fn format_proxy_list(data: &Value) -> anyhow::Result<Vec<String>> {
+pub(crate) fn format_proxy_list_with_selections(
+    data: &Value,
+    selections: &std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<Vec<String>> {
     let proxies = data["proxies"]
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("no proxies"))?;
@@ -353,7 +341,13 @@ pub(crate) fn format_proxy_list(data: &Value) -> anyhow::Result<Vec<String>> {
             continue;
         }
         let now = p["now"].as_str().unwrap_or("-");
-        lines.push(format!("[{ptype:12}] {name}  →  {now}"));
+        let pinned = selections.get(name.as_str());
+        let status = match pinned {
+            Some(selected) if selected == now => format!("  [pinned: {selected}]"),
+            Some(selected) => format!("  [pinned: {selected}, not applied]"),
+            None => String::new(),
+        };
+        lines.push(format!("[{ptype:12}] {name}  →  {now}{status}"));
         if let Some(all) = p["all"].as_array() {
             for sub in all {
                 let s = sub.as_str().unwrap_or("");
@@ -515,9 +509,12 @@ fn save_delay_results(
             results,
         },
     );
-    std::fs::create_dir_all(paths.config_dir())?;
+    crate::utils::ensure_dir_all_no_follow(paths.config_dir())?;
     let content = serde_json::to_string_pretty(&cache)?;
-    crate::utils::atomic_write_file(&paths.delay_cache_path().display().to_string(), &content)?;
+    crate::utils::atomic_write_file_for_original_user(
+        &paths.delay_cache_path().display().to_string(),
+        &content,
+    )?;
     Ok(())
 }
 
@@ -1367,10 +1364,30 @@ mod api_client_tests {
                 "US-02": {"type": "Shadowsocks"}
             }
         });
-        let lines = format_proxy_list(&data).unwrap();
+        let lines =
+            format_proxy_list_with_selections(&data, &std::collections::BTreeMap::new()).unwrap();
         assert!(lines.contains(&"[Selector    ] OpenAI  →  US-01".to_string()));
         assert!(lines.contains(&"              └ [group] Auto".to_string()));
         assert!(lines.iter().any(|l| l.contains("[node] US-01")));
+    }
+
+    #[test]
+    fn format_proxy_list_marks_pinned_selection_state() {
+        let data = json!({
+            "proxies": {
+                "OpenAI": {"type": "Selector", "now": "US-01", "all": ["US-01", "US-02"]}
+            }
+        });
+        let mut selections = std::collections::BTreeMap::new();
+        selections.insert("OpenAI".to_string(), "US-01".to_string());
+        let lines = format_proxy_list_with_selections(&data, &selections).unwrap();
+        assert!(lines.iter().any(|l| l.contains("[pinned: US-01]")));
+
+        selections.insert("OpenAI".to_string(), "US-02".to_string());
+        let lines = format_proxy_list_with_selections(&data, &selections).unwrap();
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("[pinned: US-02, not applied]")));
     }
 
     #[tokio::test]

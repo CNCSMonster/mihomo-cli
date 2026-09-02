@@ -9,6 +9,8 @@ const BACKUP_ITEMS: &[&str] = &[
     "dns-policy.yaml",
     "subscriptions.yaml",
     ".rules-position",
+    "selections",
+    "overrides",
     "subscriptions",
 ];
 
@@ -37,7 +39,7 @@ pub fn backup_config(paths: &AppPaths, dest: &Path) -> Result<BackupReport> {
         anyhow::bail!("Config directory does not exist: {}", src.display());
     }
 
-    std::fs::create_dir_all(dest)?;
+    crate::utils::ensure_dir_all_no_follow(dest)?;
     let mut copied_items = Vec::new();
     for item in BACKUP_ITEMS {
         let from = src.join(item);
@@ -73,14 +75,14 @@ pub fn restore_config(
     }
 
     let dest = paths.config_dir();
-    std::fs::create_dir_all(dest)?;
+    crate::utils::ensure_dir_all_no_follow(dest)?;
 
     let safety_backup = if create_safety_backup && has_existing_config(paths) {
         let safety = dest.join("backups").join(format!(
             "pre-restore-{}",
             Utc::now().format("%Y%m%d-%H%M%S")
         ));
-        std::fs::create_dir_all(&safety)?;
+        crate::utils::ensure_dir_all_no_follow(&safety)?;
         for name in BACKUP_ITEMS {
             let from = dest.join(name);
             if from.exists() {
@@ -125,21 +127,94 @@ fn has_existing_config(paths: &AppPaths) -> bool {
 }
 
 fn copy_path(from: &Path, to: &Path) -> Result<()> {
-    if from.is_dir() {
+    let metadata = std::fs::symlink_metadata(from)?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!("refusing to copy symbolic link: {}", from.display());
+    }
+    if metadata.is_dir() {
         if to.exists() {
-            std::fs::remove_dir_all(to)?;
+            remove_dir_all_no_follow(to)?;
         }
-        std::fs::create_dir_all(to)?;
+        crate::utils::ensure_dir_all_no_follow(to)?;
         for entry in std::fs::read_dir(from)? {
             let entry = entry?;
             copy_path(&entry.path(), &to.join(entry.file_name()))?;
         }
-    } else {
+    } else if metadata.is_file() {
         if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::utils::ensure_dir_all_no_follow(parent)?;
         }
-        std::fs::copy(from, to)?;
+        let content = read_regular_file_no_follow(from)?;
+        crate::utils::atomic_write_file_for_original_user(&to.display().to_string(), &content)?;
+    } else {
+        anyhow::bail!("refusing to copy non-regular file: {}", from.display());
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_regular_file_no_follow(path: &Path) -> Result<String> {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("path has no file name: {}", path.display()))?;
+    let dir = crate::utils::open_directory_no_follow(parent)?;
+    let name = std::ffi::CString::new(name.as_bytes())?;
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        anyhow::bail!("refusing to read non-regular file: {}", path.display());
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok(content)
+}
+
+#[cfg(not(unix))]
+fn read_regular_file_no_follow(path: &Path) -> Result<String> {
+    Ok(std::fs::read_to_string(path)?)
+}
+
+fn remove_dir_all_no_follow(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!("refusing to remove symbolic link: {}", path.display());
+    }
+    if !metadata.is_dir() {
+        anyhow::bail!("refusing to remove non-directory: {}", path.display());
+    }
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let child = entry.path();
+        let child_metadata = std::fs::symlink_metadata(&child)?;
+        if child_metadata.file_type().is_symlink() {
+            anyhow::bail!("refusing to remove symbolic link: {}", child.display());
+        }
+        if child_metadata.is_dir() {
+            remove_dir_all_no_follow(&child)?;
+        } else if child_metadata.is_file() {
+            crate::utils::remove_file_if_exists(&child)?;
+        } else {
+            anyhow::bail!("refusing to remove non-regular file: {}", child.display());
+        }
+    }
+    std::fs::remove_dir(path)?;
     Ok(())
 }
 
@@ -159,6 +234,12 @@ mod tests {
         std::fs::create_dir_all(paths.subscriptions_dir()).unwrap();
         std::fs::write(paths.config_path(), "port: 7890\n").unwrap();
         std::fs::write(paths.rules_path(), "rules: []\n").unwrap();
+        std::fs::create_dir_all(paths.selections_dir()).unwrap();
+        std::fs::write(
+            paths.selection_state_path_for_subscription("sub-a"),
+            "selections: {}\n",
+        )
+        .unwrap();
         std::fs::write(paths.subscription_file_path("sub-a"), "proxies: []\n").unwrap();
 
         let dest = tmp.path().join("backup-out");
@@ -167,6 +248,7 @@ mod tests {
         assert_eq!(report.path, dest);
         assert!(report.copied_items.contains(&"config.yaml".to_string()));
         assert!(report.copied_items.contains(&"rules.yaml".to_string()));
+        assert!(report.copied_items.contains(&"selections".to_string()));
         assert!(report.copied_items.contains(&"subscriptions".to_string()));
         assert_eq!(
             std::fs::read_to_string(dest.join("config.yaml")).unwrap(),

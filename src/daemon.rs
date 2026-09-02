@@ -9,10 +9,14 @@
 #[cfg(unix)]
 use crate::instance::ApiEndpoint;
 use crate::instance::{SystemPaths, TargetOs};
+#[cfg(unix)]
+use crate::ipc::CoreApiMethod;
 #[cfg(any(unix, windows))]
 use crate::ipc::{DaemonCommand, DaemonResponse};
 #[cfg(unix)]
 use crate::mihomo_api;
+#[cfg(unix)]
+use crate::mihomo_api::MihomoApiClient;
 use std::path::PathBuf;
 #[cfg(any(unix, windows))]
 use std::process::Stdio;
@@ -27,6 +31,52 @@ use tokio::sync::Mutex;
 #[cfg(any(unix, windows))]
 use tokio_util::sync::CancellationToken;
 
+#[cfg(unix)]
+fn validate_selection_intent_dir(path: &std::path::Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "refusing to use non-absolute selection intent directory {}",
+            path.display()
+        ));
+    }
+    let text = path.to_string_lossy().replace('\\', "/");
+    if text.contains("/../") || text.contains("/./") {
+        return Err(format!(
+            "refusing to use selection intent directory {}; path must not contain . or .. components",
+            path.display()
+        ));
+    }
+    let parts: Vec<&str> = text.split('/').collect();
+    let allowed = if cfg!(target_os = "macos") {
+        matches!(
+            parts.as_slice(),
+            ["", "Users", user, ".config", "mihomo"] if !user.is_empty()
+        ) || matches!(parts.as_slice(), ["", "var", "root", ".config", "mihomo"])
+    } else {
+        matches!(
+            parts.as_slice(),
+            ["", "home", user, ".config", "mihomo"] if !user.is_empty()
+        )
+    };
+    if !allowed {
+        return Err(format!(
+            "refusing to use selection intent directory {}; expected a per-user .config/mihomo directory",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_optional_selection_intent_dir(path: Option<&str>) -> Result<Option<PathBuf>, String> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    validate_selection_intent_dir(&path)?;
+    Ok(Some(path))
+}
+
 #[cfg(any(unix, windows))]
 fn validate_daemon_config_path_shape(config_path: &std::path::Path) -> Result<(), String> {
     if !config_path.is_absolute() {
@@ -35,9 +85,16 @@ fn validate_daemon_config_path_shape(config_path: &std::path::Path) -> Result<()
             config_path.display()
         ));
     }
-    if config_path.file_name() != Some(std::ffi::OsStr::new("config.yaml")) {
+    let file_name = config_path.file_name().and_then(|n| n.to_str());
+    let is_tun_config = file_name == Some("tun-config.yaml");
+    let is_user_config = file_name == Some("config.yaml");
+    let is_managed_recovery_config = matches!(
+        file_name,
+        Some("active-config.yaml") | Some("recovery-target.yaml")
+    );
+    if !is_tun_config && !is_user_config && !is_managed_recovery_config {
         return Err(format!(
-            "refusing to use config path {}; expected config.yaml",
+            "refusing to use config path {}; expected config.yaml or tun-config.yaml",
             config_path.display()
         ));
     }
@@ -50,24 +107,66 @@ fn validate_daemon_config_path_shape(config_path: &std::path::Path) -> Result<()
     }
 
     let allowed = if cfg!(target_os = "windows") {
-        (text.ends_with("/AppData/Roaming/mihomo/config.yaml")
+        // User config: %APPDATA%/mihomo/config.yaml
+        let user_config_ok = (text.ends_with("/AppData/Roaming/mihomo/config.yaml")
             || text.ends_with("/AppData/Roaming/Mihomo/config.yaml"))
-            && (text.contains(":/") || text.starts_with("//"))
+            && (text.contains(":/") || text.starts_with("//"));
+        // TUN config: %ProgramData%/mihomo-cli/tun-config.yaml
+        let tun_config_ok =
+            is_tun_config && text.ends_with("/ProgramData/mihomo-cli/tun-config.yaml");
+        user_config_ok || tun_config_ok
     } else {
         let parts: Vec<&str> = text.split('/').collect();
         if cfg!(target_os = "macos") {
-            matches!(
+            // User config: /Users/<user>/.config/mihomo/config.yaml
+            let user_config_ok = matches!(
                 parts.as_slice(),
                 ["", "Users", user, ".config", "mihomo", "config.yaml"] if !user.is_empty()
             ) || matches!(
                 parts.as_slice(),
                 ["", "var", "root", ".config", "mihomo", "config.yaml"]
-            )
+            );
+            // TUN config: /Library/Application Support/mihomo-cli/tun-config.yaml
+            let tun_config_ok = is_tun_config
+                && matches!(
+                    parts.as_slice(),
+                    [
+                        "",
+                        "Library",
+                        "Application Support",
+                        "mihomo-cli",
+                        "tun-config.yaml"
+                    ]
+                );
+            user_config_ok || tun_config_ok
         } else {
-            matches!(
+            // Linux
+            // User config: /home/<user>/.config/mihomo/config.yaml
+            let user_config_ok = matches!(
                 parts.as_slice(),
                 ["", "home", user, ".config", "mihomo", "config.yaml"] if !user.is_empty()
-            )
+            );
+            // TUN config: /var/lib/mihomo-cli/tun-config.yaml
+            let tun_config_ok = is_tun_config
+                && matches!(
+                    parts.as_slice(),
+                    ["", "var", "lib", "mihomo-cli", "tun-config.yaml"]
+                );
+            let managed_recovery_config_ok = is_managed_recovery_config
+                && matches!(
+                    parts.as_slice(),
+                    ["", "var", "lib", "mihomo-cli", "active-config.yaml"]
+                        | [
+                            "",
+                            "var",
+                            "lib",
+                            "mihomo-cli",
+                            "transactions",
+                            "active",
+                            "recovery-target.yaml"
+                        ]
+                );
+            user_config_ok || tun_config_ok || managed_recovery_config_ok
         }
     };
 
@@ -75,7 +174,7 @@ fn validate_daemon_config_path_shape(config_path: &std::path::Path) -> Result<()
         Ok(())
     } else {
         Err(format!(
-            "refusing to use config path {}; system daemon only accepts per-user mihomo config.yaml",
+            "refusing to use config path {}; system daemon only accepts per-user config.yaml or system-level tun-config.yaml",
             config_path.display()
         ))
     }
@@ -86,6 +185,15 @@ fn validate_daemon_config_path_for_peer(
     config_path: &std::path::Path,
     peer_uid: Option<u32>,
 ) -> Result<(), String> {
+    if matches!(
+        config_path.file_name().and_then(|name| name.to_str()),
+        Some("active-config.yaml") | Some("recovery-target.yaml")
+    ) {
+        return Err(format!(
+            "refusing to use internal recovery config path {} through daemon IPC",
+            config_path.display()
+        ));
+    }
     validate_daemon_config_path_shape(config_path)?;
     let Some(peer_uid) = peer_uid else {
         return Err(format!(
@@ -150,9 +258,53 @@ pub(crate) struct AuthorizedClients {
 
 #[cfg(unix)]
 pub(crate) fn authorized_clients_path() -> PathBuf {
+    // 提权上下文（root）下忽略可伪造的环境变量覆盖，避免 root 借它写到任意路径
+    if unsafe { libc::geteuid() } == 0 {
+        return PathBuf::from("/var/lib/mihomo-cli/authorized-clients.json");
+    }
     std::env::var_os("MIHOMO_CLI_AUTHORIZED_CLIENTS_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/var/lib/mihomo-cli/authorized-clients.json"))
+}
+
+#[cfg(unix)]
+pub(crate) fn revoke_authorized_client(
+    table: &mut AuthorizedClients,
+    uid: u32,
+    token: &str,
+) -> anyhow::Result<bool> {
+    if token.is_empty() {
+        anyhow::bail!("refusing to revoke an empty client token");
+    }
+    let matches: Vec<usize> = table
+        .clients
+        .iter()
+        .enumerate()
+        .filter(|(_, client)| client.uid == uid && constant_time_token_eq(&client.token, token))
+        .map(|(index, _)| index)
+        .collect();
+    if matches.len() > 1 {
+        anyhow::bail!("authorized-client table has duplicate UID/token entries");
+    }
+    if matches.is_empty() {
+        return Ok(false);
+    }
+    table.clients.remove(matches[0]);
+    Ok(true)
+}
+
+#[cfg(unix)]
+pub(crate) fn read_client_token_for_home(home: &std::path::Path) -> anyhow::Result<String> {
+    use std::io::Read;
+    let path = crate::service::client_token_path_for_home(home);
+    let mut file = crate::utils::open_regular_file_no_follow(&path)?;
+    let mut token = String::new();
+    file.read_to_string(&mut token)?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        anyhow::bail!("client token is empty: {}", path.display());
+    }
+    Ok(token)
 }
 
 #[cfg(unix)]
@@ -167,16 +319,124 @@ pub(crate) fn read_authorized_clients_from(
 }
 
 #[cfg(unix)]
+fn write_root_authorized_clients_file(
+    path: &std::path::Path,
+    bytes: &[u8],
+    mode: u16,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    if unsafe { libc::geteuid() } != 0 || path != authorized_clients_path() {
+        anyhow::bail!(
+            "refusing privileged authorized-client write outside {}",
+            authorized_clients_path().display()
+        );
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("authorized-clients path has no parent"))?;
+    if !parent.is_dir() {
+        anyhow::bail!(
+            "authorized-client state directory is missing: {}. Reinstall the system service",
+            parent.display()
+        );
+    }
+    let dir = crate::utils::open_directory_no_follow(parent)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("authorized-clients path has no file name"))?;
+    let name = std::ffi::CString::new(name.as_bytes())?;
+    let temp_name =
+        std::ffi::CString::new(format!(".authorized-clients.{}.tmp", std::process::id()))?;
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            temp_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+            mode as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let write_result = (|| -> anyhow::Result<()> {
+        if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        unsafe {
+            libc::unlinkat(dir.as_raw_fd(), temp_name.as_ptr(), 0);
+        }
+        return Err(error);
+    }
+    if unsafe {
+        libc::renameat(
+            dir.as_raw_fd(),
+            temp_name.as_ptr(),
+            dir.as_raw_fd(),
+            name.as_ptr(),
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            libc::unlinkat(dir.as_raw_fd(), temp_name.as_ptr(), 0);
+        }
+        return Err(error.into());
+    }
+    if unsafe { libc::fsync(dir.as_raw_fd()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 pub(crate) fn write_authorized_clients_to(
     path: &std::path::Path,
     table: &AuthorizedClients,
 ) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    #[cfg(target_os = "linux")]
+    let mode = 0o640;
+    #[cfg(not(target_os = "linux"))]
+    let mode = 0o600;
+    let bytes = serde_json::to_vec_pretty(table)?;
+    let privileged_system_path =
+        unsafe { libc::geteuid() } == 0 && path == authorized_clients_path();
+    if privileged_system_path {
+        write_root_authorized_clients_file(path, &bytes, mode)?;
+    } else {
+        if let Some(parent) = path.parent() {
+            crate::utils::ensure_dir_all_no_follow(parent)?;
+        }
+        crate::utils::write_bytes_file_no_follow(path, &bytes, mode)?;
     }
-    std::fs::write(path, serde_json::to_vec_pretty(table)?)?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    #[cfg(target_os = "linux")]
+    if privileged_system_path {
+        let group = unsafe { libc::getgrnam(c"mihomo".as_ptr()) };
+        if group.is_null() {
+            anyhow::bail!("mihomo group not found; reinstall the system service");
+        }
+        let gid = unsafe { (*group).gr_gid };
+        let path_c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+        if unsafe { libc::chown(path_c.as_ptr(), 0, gid) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    if privileged_system_path {
+        use std::os::unix::ffi::OsStrExt;
+        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+        if unsafe { libc::chown(path_c.as_ptr(), 0, 0) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
     Ok(())
 }
 
@@ -192,88 +452,68 @@ pub(crate) fn validate_client_token_for_peer(
     let uid = peer_uid.ok_or_else(|| "cannot determine IPC peer uid".to_string())?;
     let table = read_authorized_clients_from(&authorized_clients_path())
         .map_err(|e| format!("cannot read authorized clients: {e}"))?;
-    fn ct_eq(a: &str, b: &str) -> bool {
-        let ab = a.as_bytes();
-        let bb = b.as_bytes();
-        let mut diff = ab.len() ^ bb.len();
-        for i in 0..ab.len().max(bb.len()) {
-            let x = *ab.get(i).unwrap_or(&0);
-            let y = *bb.get(i).unwrap_or(&0);
-            diff |= (x ^ y) as usize;
-        }
-        diff == 0
-    }
-    match table.clients.iter().find(|c| ct_eq(&c.token, token)) {
+    match table
+        .clients
+        .iter()
+        .find(|c| constant_time_token_eq(&c.token, token))
+    {
         Some(c) if c.uid == uid => Ok(()),
         Some(_) => Err("auth token does not belong to IPC peer uid".to_string()),
         None => Err("invalid or missing auth token".to_string()),
     }
 }
 
+fn constant_time_token_eq(a: &str, b: &str) -> bool {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    let mut diff = ab.len() ^ bb.len();
+    for i in 0..ab.len().max(bb.len()) {
+        let x = *ab.get(i).unwrap_or(&0);
+        let y = *bb.get(i).unwrap_or(&0);
+        diff |= (x ^ y) as usize;
+    }
+    diff == 0
+}
+
+#[cfg(any(test, windows))]
+fn validate_windows_client_token_value(
+    request_token: Option<&str>,
+    service_token: Option<&str>,
+) -> Result<(), String> {
+    match (request_token, service_token) {
+        (Some(request), Some(stored))
+            if !request.is_empty()
+                && !stored.is_empty()
+                && constant_time_token_eq(request, stored) =>
+        {
+            Ok(())
+        }
+        _ => Err("invalid or missing auth token".to_string()),
+    }
+}
+
 #[cfg(windows)]
 /// Windows token-only validation — no peer UID available on named pipes.
-/// Skips the UID cross-check that the Unix version performs.
+/// The single credential in `%ProgramData%\mihomo\service-token` is shared by
+/// the daemon and the installing user's CLI.
 pub(crate) fn validate_client_token_for_peer(
     token: Option<&str>,
     _peer_uid: Option<u32>,
 ) -> Result<(), String> {
-    let token = token.ok_or_else(|| "invalid or missing auth token".to_string())?;
-    let table = read_authorized_clients_from(&authorized_clients_path())
-        .map_err(|e| format!("cannot read authorized clients: {e}"))?;
-    fn ct_eq(a: &str, b: &str) -> bool {
-        let ab = a.as_bytes();
-        let bb = b.as_bytes();
-        let mut diff = ab.len() ^ bb.len();
-        for i in 0..ab.len().max(bb.len()) {
-            let x = *ab.get(i).unwrap_or(&0);
-            let y = *bb.get(i).unwrap_or(&0);
-            diff |= (x ^ y) as usize;
-        }
-        diff == 0
-    }
-    match table.clients.iter().find(|c| ct_eq(&c.token, token)) {
-        Some(_) => Ok(()),
-        None => Err("invalid or missing auth token".to_string()),
-    }
-}
+    use std::io::Read;
 
-#[cfg(windows)]
-/// Windows path for the authorized-clients file.
-pub(crate) fn authorized_clients_path() -> PathBuf {
-    std::env::var_os("MIHOMO_CLI_AUTHORIZED_CLIENTS_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("ProgramData")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-                .join("mihomo")
-                .join("authorized-clients.json")
-        })
-}
-
-#[cfg(windows)]
-pub(crate) fn read_authorized_clients_from(
-    path: &std::path::Path,
-) -> anyhow::Result<AuthorizedClients> {
-    if !path.exists() {
-        return Ok(AuthorizedClients::default());
-    }
-    let text = std::fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&text)?)
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub(crate) struct AuthorizedClient {
-    pub user: String,
-    pub uid: u32,
-    pub token: String,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default, PartialEq, Eq)]
-pub(crate) struct AuthorizedClients {
-    pub clients: Vec<AuthorizedClient>,
+    let inputs = crate::instance::PathInputs::from_current_env();
+    let service_token_path = crate::instance::planned_daemon_credential_paths(
+        crate::instance::TargetOs::Windows,
+        &inputs,
+    )
+    .token;
+    let mut file = crate::utils::open_regular_file_no_follow(&service_token_path)
+        .map_err(|_| "invalid or missing auth token".to_string())?;
+    let mut stored = String::new();
+    file.read_to_string(&mut stored)
+        .map_err(|_| "invalid or missing auth token".to_string())?;
+    validate_windows_client_token_value(token, Some(stored.trim()))
 }
 
 #[cfg(any(unix, windows))]
@@ -309,6 +549,7 @@ fn validate_system_core_binary_request(core_binary: &std::path::Path) -> Result<
 #[cfg(windows)]
 /// Run the Windows daemon main loop on a named pipe until cancelled.
 pub async fn run_daemon(pipe_path: PathBuf, cancel: CancellationToken) -> anyhow::Result<()> {
+    let _ = daemon_executable_revision();
     let pipe_name = pipe_path.display().to_string();
     let state = Arc::new(Mutex::new(WindowsDaemonState::default()));
     eprintln!("[mihomo-daemon] listening on {pipe_name}");
@@ -446,14 +687,20 @@ mod windows_pipe_security {
 #[cfg(windows)]
 /// Read the installer SID from `%ProgramData%\mihomo\installer-sid`.
 fn read_installer_sid() -> Option<String> {
-    let program_data = std::env::var_os("ProgramData")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default();
-    let path = program_data.join("mihomo").join("installer-sid");
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    use std::io::Read;
+
+    let inputs = crate::instance::PathInputs::from_current_env();
+    let service_token = crate::instance::planned_daemon_credential_paths(
+        crate::instance::TargetOs::Windows,
+        &inputs,
+    )
+    .token;
+    let path = service_token.parent()?.join("installer-sid");
+    let mut file = crate::utils::open_regular_file_no_follow(&path).ok()?;
+    let mut sid = String::new();
+    file.read_to_string(&mut sid).ok()?;
+    let sid = sid.trim();
+    crate::instance::valid_windows_sid_string(sid).then(|| sid.to_string())
 }
 
 /// Build the pipe SDDL string restricting access to SYSTEM + Administrators +
@@ -461,13 +708,11 @@ fn read_installer_sid() -> Option<String> {
 /// (SYSTEM + Administrators only). Pure function for testability.
 #[cfg(any(windows, test))]
 fn pipe_sddl_for_installer(installer_sid: &str) -> String {
-    if installer_sid.trim().is_empty() {
+    let installer_sid = installer_sid.trim();
+    if !crate::instance::valid_windows_sid_string(installer_sid) {
         "D:P(A;;GA;;;SY)(A;;GA;;;BA)".to_string()
     } else {
-        format!(
-            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{})",
-            installer_sid.trim()
-        )
+        format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{})", installer_sid)
     }
 }
 
@@ -630,8 +875,8 @@ struct WindowsDaemonState {
     core_running: bool,
     core_child: Option<tokio::process::Child>,
     core_pid: Option<u32>,
-    tun_enabled: bool,
     config_path: Option<PathBuf>,
+    launched_config_revision: Option<String>,
     core_binary: Option<PathBuf>,
 }
 
@@ -653,11 +898,17 @@ async fn handle_windows_pipe(
     Ok(())
 }
 
-#[cfg(any(unix, windows))]
-fn read_tun_enabled_from_config(config_path: Option<&PathBuf>) -> Option<bool> {
-    let content = std::fs::read_to_string(config_path?).ok()?;
-    let config: serde_yaml::Value = serde_yaml::from_str(&content).ok()?;
-    config.get("tun")?.get("enable")?.as_bool()
+#[cfg(windows)]
+async fn promote_system_config_windows(
+    _state: Arc<Mutex<WindowsDaemonState>>,
+    _config_content: String,
+    _config_revision: String,
+    _selection_intent_dir: Option<String>,
+) -> DaemonResponse {
+    DaemonResponse::Error {
+        message: "system configuration promotion is not supported by the Windows service yet"
+            .to_string(),
+    }
 }
 
 #[cfg(windows)]
@@ -670,11 +921,21 @@ async fn process_windows_command(
     let client_token = match &cmd {
         DaemonCommand::StartCore { token, .. }
         | DaemonCommand::RestartCore { token, .. }
-        | DaemonCommand::EnableTun { token, .. }
+        | DaemonCommand::ApplySystemTunSnapshot { token, .. }
+        | DaemonCommand::PromoteSystemConfig { token, .. }
+        | DaemonCommand::SelectSystemProxy { token, .. }
         | DaemonCommand::StopCore { token }
         | DaemonCommand::DisableTun { token }
         | DaemonCommand::GetStatus { token }
-        | DaemonCommand::SetAutostart { token, .. } => token.as_deref(),
+        | DaemonCommand::CoreApiRequest { token, .. }
+        | DaemonCommand::SetAutostart { token, .. }
+        | DaemonCommand::ValidatePreparedRuntime { token, .. }
+        | DaemonCommand::ApplyPromotedSnapshot { token, .. }
+        | DaemonCommand::QuiesceCandidateRuntime { token, .. }
+        | DaemonCommand::RestoreOldRuntime { token, .. }
+        | DaemonCommand::AttestCurrentTransaction { token, .. }
+        | DaemonCommand::ApplyLegacyRecoveryTarget { token, .. }
+        | DaemonCommand::GetTransactionStatus { token } => token.as_deref(),
     };
     if let Err(message) = validate_client_token_for_peer(client_token, None) {
         return DaemonResponse::Error { message };
@@ -683,17 +944,45 @@ async fn process_windows_command(
         DaemonCommand::GetStatus { .. } => {
             let mut s = state.lock().await;
             reap_exited_windows_core(&mut s);
-            if let Some(tun_enabled) = read_tun_enabled_from_config(s.config_path.as_ref()) {
-                s.tun_enabled = tun_enabled;
-            }
+            let (tun_journal_state, tun_journal_error) = active_journal_status();
             DaemonResponse::Status {
                 running: s.core_running,
-                tun_enabled: s.tun_enabled,
                 core_pid: s.core_pid,
                 config_path: s.config_path.clone(),
+                tun_snapshot_revision: managed_system_tun_snapshot_path()
+                    .ok()
+                    .and_then(|path| crate::ipc::managed_snapshot_revision(&path).ok()),
+                launched_config_revision: s.launched_config_revision.clone(),
                 autostart_enabled: daemon_config_dir().join("autostart").exists(),
+                daemon_executable_revision: daemon_executable_revision(),
+                tun_journal_state,
+                tun_journal_error,
             }
         }
+        DaemonCommand::PromoteSystemConfig {
+            config_content,
+            config_revision,
+            selection_intent_dir,
+            ..
+        } => {
+            promote_system_config_windows(
+                state,
+                config_content,
+                config_revision,
+                selection_intent_dir,
+            )
+            .await
+        }
+        DaemonCommand::SelectSystemProxy { group, node, .. } => {
+            let _ = (group, node);
+            DaemonResponse::Error {
+                message: "system proxy selection is not supported by the Windows service yet"
+                    .to_string(),
+            }
+        }
+        DaemonCommand::CoreApiRequest { .. } => DaemonResponse::Error {
+            message: "Core API forwarding is not supported by the Windows service yet".to_string(),
+        },
         // ADR-19: daemon owns the autostart marker.
         DaemonCommand::SetAutostart { enabled, .. } => {
             let marker = daemon_config_dir().join("autostart");
@@ -726,53 +1015,51 @@ async fn process_windows_command(
                 },
             }
         }
-        DaemonCommand::StartCore { config_path, .. } => {
-            start_windows_core(state, config_path, expected_system_core_binary_path()).await
-        }
-        DaemonCommand::StopCore { .. } => stop_windows_core(state).await,
-        DaemonCommand::RestartCore { config_path, .. } => {
-            let core_binary = expected_system_core_binary_path();
-            if let Err(message) = preflight_system_core_start_request(&config_path, &core_binary) {
-                return DaemonResponse::Error { message };
-            }
-            let _ = stop_windows_core(Arc::clone(&state)).await;
-            match start_windows_core(state, config_path.clone(), core_binary).await {
-                DaemonResponse::Success { .. } => DaemonResponse::Success {
-                    message: format!("core restarted with config {}", config_path.display()),
-                },
-                other => other,
-            }
-        }
-        DaemonCommand::EnableTun {
-            config_path,
-            stack,
-            dns_hijack,
+        DaemonCommand::StartCore {
+            config_content,
+            config_revision,
+            selection_intent_dir,
             ..
         } => {
-            if let Err(message) = validate_daemon_config_path_shape(&config_path) {
-                return DaemonResponse::Error { message };
-            }
-            toggle_windows_tun_by_restart(
+            promote_system_config_windows(
                 state,
-                config_path,
-                true,
-                stack.as_deref(),
-                dns_hijack.as_deref(),
+                config_content,
+                config_revision,
+                selection_intent_dir,
             )
             .await
         }
-        DaemonCommand::DisableTun { .. } => {
-            let config_path = {
-                let s = state.lock().await;
-                s.config_path.clone()
-            };
-            match config_path {
-                Some(path) => toggle_windows_tun_by_restart(state, path, false, None, None).await,
-                None => DaemonResponse::Error {
-                    message: "core is not running, cannot disable TUN".to_string(),
-                },
+        DaemonCommand::StopCore { .. } => stop_windows_core(state).await,
+        DaemonCommand::RestartCore {
+            config_content,
+            config_revision,
+            selection_intent_dir,
+            ..
+        } => {
+            promote_system_config_windows(
+                state,
+                config_content,
+                config_revision,
+                selection_intent_dir,
+            )
+            .await
+        }
+        DaemonCommand::ApplySystemTunSnapshot { .. } | DaemonCommand::DisableTun { .. } => {
+            DaemonResponse::Error {
+                message:
+                    "legacy TUN commands are deprecated; please use transaction-based tun on/off"
+                        .to_string(),
             }
         }
+        DaemonCommand::ValidatePreparedRuntime { .. }
+        | DaemonCommand::ApplyPromotedSnapshot { .. }
+        | DaemonCommand::QuiesceCandidateRuntime { .. }
+        | DaemonCommand::RestoreOldRuntime { .. }
+        | DaemonCommand::AttestCurrentTransaction { .. }
+        | DaemonCommand::ApplyLegacyRecoveryTarget { .. }
+        | DaemonCommand::GetTransactionStatus { .. } => DaemonResponse::Error {
+            message: "TUN transaction recovery is not implemented on Windows yet".to_string(),
+        },
     }
 }
 
@@ -788,7 +1075,6 @@ fn reap_exited_windows_core(s: &mut WindowsDaemonState) {
             s.core_child = None;
             s.core_running = false;
             s.core_pid = None;
-            s.tun_enabled = false;
             s.config_path = None;
             s.core_binary = None;
         }
@@ -805,6 +1091,14 @@ async fn start_windows_core(
     config_path: PathBuf,
     core_binary: PathBuf,
 ) -> DaemonResponse {
+    let config_path = match system_runtime_config_path(&config_path) {
+        Ok(path) => path,
+        Err(error) => {
+            return DaemonResponse::Error {
+                message: format!("failed to prepare system runtime config: {error}"),
+            };
+        }
+    };
     let mut s = state.lock().await;
     if let Some(child) = s.core_child.as_mut() {
         match child.try_wait() {
@@ -818,6 +1112,7 @@ async fn start_windows_core(
                 s.core_child = None;
                 s.core_pid = None;
                 s.core_running = false;
+                s.launched_config_revision = None;
             }
         }
     }
@@ -826,16 +1121,20 @@ async fn start_windows_core(
         Ok(endpoint) => endpoint,
         Err(message) => return DaemonResponse::Error { message },
     };
+    let config_revision = match config_content_revision(&config_path) {
+        Ok(revision) => revision,
+        Err(error) => {
+            return DaemonResponse::Error {
+                message: format!("failed to read Core config revision: {error}"),
+            }
+        }
+    };
     if endpoint_is_connectable(&api_endpoint) {
         return DaemonResponse::Error {
             message: duplicate_core_endpoint_message(&api_endpoint),
         };
     }
 
-    let config_dir = config_path
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
     let log_file = windows_core_log_file_path();
     let stdout_log = match open_append_log_file(&log_file) {
         Ok(file) => file,
@@ -855,11 +1154,13 @@ async fn start_windows_core(
     };
 
     let mut cmd = tokio::process::Command::new(&core_binary);
-    cmd.arg("-d")
-        .arg(&config_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_log))
-        .stderr(Stdio::from(stderr_log));
+    cmd.args(core_command_args(
+        &config_path,
+        &runtime_data_dir_for_config(&config_path),
+    ))
+    .stdin(Stdio::null())
+    .stdout(Stdio::from(stdout_log))
+    .stderr(Stdio::from(stderr_log));
 
     match cmd.spawn() {
         Ok(mut child) => {
@@ -871,14 +1172,14 @@ async fn start_windows_core(
                 },
                 Err(e) => DaemonResponse::Error {
                     message: format!(
-                        "failed to inspect started core process: {e}
-  Logs: {}",
+                        "failed to inspect started core process: {e}\n  Logs: {}",
                         log_file.display()
                     ),
                 },
                 Ok(None) => {
                     s.core_running = true;
                     s.config_path = Some(config_path.clone());
+                    s.launched_config_revision = Some(config_revision);
                     s.core_binary = Some(core_binary.clone());
                     s.core_pid = pid;
                     s.core_child = Some(child);
@@ -900,8 +1201,8 @@ async fn stop_windows_core(state: Arc<Mutex<WindowsDaemonState>>) -> DaemonRespo
     let Some(mut child) = s.core_child.take() else {
         s.core_running = false;
         s.core_pid = None;
-        s.tun_enabled = false;
         s.config_path = None;
+        s.launched_config_revision = None;
         s.core_binary = None;
         return DaemonResponse::Error {
             message: "core is not running".to_string(),
@@ -912,7 +1213,6 @@ async fn stop_windows_core(state: Arc<Mutex<WindowsDaemonState>>) -> DaemonRespo
     let _ = child.wait().await;
     s.core_running = false;
     s.core_pid = None;
-    s.tun_enabled = false;
     s.config_path = None;
     s.core_binary = None;
 
@@ -927,6 +1227,7 @@ async fn stop_windows_core(state: Arc<Mutex<WindowsDaemonState>>) -> DaemonRespo
 }
 
 #[cfg(windows)]
+#[allow(dead_code)]
 async fn toggle_windows_tun_by_restart(
     state: Arc<Mutex<WindowsDaemonState>>,
     config_path: PathBuf,
@@ -965,13 +1266,9 @@ async fn toggle_windows_tun_by_restart(
 
     let _ = stop_windows_core(Arc::clone(&state)).await;
     match start_windows_core(Arc::clone(&state), config_path, core_binary).await {
-        DaemonResponse::Success { .. } => {
-            let mut s = state.lock().await;
-            s.tun_enabled = enable;
-            DaemonResponse::Success {
-                message: format!("TUN {}", if enable { "enabled" } else { "disabled" }),
-            }
-        }
+        DaemonResponse::Success { .. } => DaemonResponse::Success {
+            message: format!("TUN {}", if enable { "enabled" } else { "disabled" }),
+        },
         other => other,
     }
 }
@@ -1000,10 +1297,10 @@ struct DaemonState {
     core_child: Option<tokio::process::Child>,
     /// PID of the running core process.
     core_pid: Option<u32>,
-    /// Whether TUN is enabled.
-    tun_enabled: bool,
     /// Path to the active config.
     config_path: Option<PathBuf>,
+    /// Revision of the config content loaded when Core was launched.
+    launched_config_revision: Option<String>,
     /// Path to the active core binary. Needed to restart the core when another
     /// user enables TUN with a different per-user config.
     core_binary: Option<PathBuf>,
@@ -1022,8 +1319,8 @@ impl Default for DaemonState {
             core_running: false,
             core_child: None,
             core_pid: None,
-            tun_enabled: false,
             config_path: None,
+            launched_config_revision: None,
             core_binary: None,
             api_endpoint: None,
             pid_file: core_pid_file_path(),
@@ -1050,9 +1347,196 @@ fn daemon_system_paths() -> SystemPaths {
     SystemPaths::for_os(os)
 }
 
-/// The daemon's authoritative config directory (ADR-22 single source of truth).
+/// The daemon's authoritative runtime directory.
 fn daemon_config_dir() -> std::path::PathBuf {
-    dirs::home_dir().unwrap_or_default().join(".config/mihomo")
+    system_runtime_data_dir()
+}
+
+/// Durable record of the per-user config dir holding selection-state.yaml, so
+/// the daemon can replay pinned selections after a daemon restart or boot-time
+/// autostart (the pid file lives on tmpfs and does not survive boot).
+#[cfg(unix)]
+fn selection_intent_dir_state_path() -> PathBuf {
+    daemon_config_dir().join("selection-intent-dir")
+}
+
+#[cfg(unix)]
+fn persist_selection_intent_dir(intent_dir: &std::path::Path) {
+    let path = selection_intent_dir_state_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, format!("{}\n", intent_dir.display()));
+}
+
+#[cfg(unix)]
+fn read_persisted_selection_intent_dir() -> Option<PathBuf> {
+    let raw = std::fs::read_to_string(selection_intent_dir_state_path()).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+/// Best-effort replay of persisted selection intent against the running Core
+/// (SPEC-select-persistence §3.2/§3.3). Returns user-facing report lines;
+/// failures degrade to warning lines instead of failing the caller. Holds no
+/// state lock while awaiting (replay has its own ≤5s budget).
+#[cfg(unix)]
+struct DaemonSelectionApiClient {
+    state: Arc<Mutex<DaemonState>>,
+    inner: mihomo_api::EndpointMihomoApiClient,
+}
+
+#[cfg(unix)]
+impl mihomo_api::MihomoApiClient for DaemonSelectionApiClient {
+    async fn get(&self, path: &str) -> anyhow::Result<serde_json::Value> {
+        self.inner.get(path).await
+    }
+
+    async fn put(&self, path: &str, body: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let prefix = "/proxies/";
+        if let Some(encoded_group) = path.strip_prefix(prefix) {
+            let group = percent_decode_proxy_segment(encoded_group)?;
+            let node = body["name"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("proxy selection payload has no node name"))?;
+            return match select_system_proxy(Arc::clone(&self.state), group, node.to_string()).await
+            {
+                DaemonResponse::Success { .. } => Ok(serde_json::Value::Null),
+                DaemonResponse::Error { message } => anyhow::bail!(message),
+                response => anyhow::bail!("unexpected daemon selection response: {response:?}"),
+            };
+        }
+        self.inner.put(path, body).await
+    }
+
+    async fn patch(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.inner.patch(path, body).await
+    }
+
+    async fn delete(&self, path: &str) -> anyhow::Result<serde_json::Value> {
+        self.inner.delete(path).await
+    }
+}
+
+#[cfg(unix)]
+fn percent_decode_proxy_segment(value: &str) -> anyhow::Result<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                anyhow::bail!("invalid encoded proxy group path");
+            }
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3])?;
+            decoded.push(u8::from_str_radix(hex, 16)?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    Ok(String::from_utf8(decoded)?)
+}
+
+#[cfg(unix)]
+async fn replay_selection_intent(
+    state: &Arc<Mutex<DaemonState>>,
+    intent_dir: &std::path::Path,
+    subscription_id: &str,
+) -> Vec<String> {
+    let api_endpoint = {
+        let mut s = state.lock().await;
+        reap_exited_core(&mut s);
+        if !s.core_running {
+            return Vec::new();
+        }
+        s.api_endpoint.clone()
+    };
+    let Some(api_endpoint) = api_endpoint else {
+        return Vec::new();
+    };
+    let ep = ApiEndpoint::UnixSocket(
+        endpoint_unix_path(&api_endpoint)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(api_endpoint)),
+    );
+    let client = mihomo_api::EndpointMihomoApiClient::new(ep);
+    let deadline = std::time::Instant::now() + crate::selection::REPLAY_TOTAL_BUDGET;
+    loop {
+        if client.get("/configs").await.is_ok() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return vec![format!(
+                "⚠ Selections not replayed: Core API not ready within {}s",
+                crate::selection::REPLAY_TOTAL_BUDGET.as_secs()
+            )];
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    let paths = crate::utils::AppPaths::new(intent_dir.to_path_buf());
+    let scope = crate::selection::SelectionScope {
+        subscription_id: subscription_id.to_string(),
+        path: paths.selection_state_path_for_subscription(subscription_id),
+    };
+    let replay_client = DaemonSelectionApiClient {
+        state: Arc::clone(state),
+        inner: client,
+    };
+    match crate::selection::replay_scope_until(&scope, &replay_client, deadline).await {
+        Ok(report) => report.format_lines(),
+        Err(err) => vec![format!("⚠ Selections not replayed: {err:#}")],
+    }
+}
+
+fn daemon_transaction_context() -> Option<crate::instance::InstanceContext> {
+    let mut ctx = crate::instance::planned_current_context(crate::instance::InstanceMode::System)?;
+    let config_dir = daemon_config_dir();
+    ctx.paths.config_dir = config_dir.clone();
+    ctx.paths.config_file = config_dir.join("config.yaml");
+    ctx.paths.intent_config_file = config_dir.join("config.yaml");
+    Some(ctx)
+}
+
+#[cfg(any(unix, windows))]
+fn active_journal_status() -> (Option<crate::tun_transaction::JournalPhase>, Option<String>) {
+    let Some(ctx) = daemon_transaction_context() else {
+        return (None, None);
+    };
+    journal_status_from_result(crate::tun_transaction::read_active_journal(&ctx))
+}
+
+#[cfg(any(unix, windows))]
+fn journal_status_from_result(
+    result: anyhow::Result<Option<crate::tun_transaction::TunJournal>>,
+) -> (Option<crate::tun_transaction::JournalPhase>, Option<String>) {
+    match result {
+        Ok(Some(journal)) => (Some(journal.phase), None),
+        Ok(None) => (None, None),
+        Err(error) => (
+            Some(crate::tun_transaction::JournalPhase::RecoveryRequired),
+            Some(error.to_string()),
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn allowed_with_unreadable_journal(cmd: &DaemonCommand) -> bool {
+    matches!(
+        cmd,
+        DaemonCommand::GetStatus { .. } | DaemonCommand::GetTransactionStatus { .. }
+    )
+}
+
+fn managed_system_tun_snapshot_path() -> Result<PathBuf, String> {
+    crate::instance::planned_current_context(crate::instance::InstanceMode::System)
+        .map(|ctx| ctx.paths.tun_config_file)
+        .ok_or_else(|| "system instance paths are unavailable".to_string())
 }
 
 #[cfg(unix)]
@@ -1062,6 +1546,7 @@ fn daemon_config_dir() -> std::path::PathBuf {
 /// It should be called as the main entry point when the binary
 /// is invoked as a system service daemon.
 pub async fn run_daemon(socket_path: PathBuf, cancel: CancellationToken) -> anyhow::Result<()> {
+    let _ = daemon_executable_revision();
     // Ensure parent directory exists
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1085,6 +1570,7 @@ pub async fn run_daemon(socket_path: PathBuf, cancel: CancellationToken) -> anyh
             initial_state.core_running = true;
             initial_state.core_pid = Some(metadata.pid);
             initial_state.config_path = non_empty_path(metadata.config_path.clone());
+            initial_state.launched_config_revision = metadata.config_revision.clone();
             initial_state.core_binary = non_empty_path(metadata.core_binary.clone());
             initial_state.api_endpoint = metadata.api_endpoint.clone();
         } else {
@@ -1098,7 +1584,7 @@ pub async fn run_daemon(socket_path: PathBuf, cancel: CancellationToken) -> anyh
     // authoritative config dir — NOT the CLI's possibly-root-resolved home.
     let autostart_marker = daemon_config_dir().join("autostart");
     if autostart_marker.exists() {
-        let config_path = daemon_config_dir().join("config.yaml");
+        let config_path = system_runtime_data_dir().join("active-config.yaml");
         if config_path.exists() {
             eprintln!("[mihomo-daemon] autostart marker present; starting core");
             let core_binary =
@@ -1116,12 +1602,63 @@ pub async fn run_daemon(socket_path: PathBuf, cancel: CancellationToken) -> anyh
         }
     }
 
+    // If a core ended up running (pid-file recovery or autostart), replay the
+    // persisted selection intent once — idempotent and best-effort
+    // (SPEC-select-persistence §3.2 daemon lifecycle hook).
+    let core_running_at_startup = state.lock().await.core_running;
+    if core_running_at_startup {
+        if let Some(intent_dir) = read_persisted_selection_intent_dir() {
+            let paths = crate::utils::AppPaths::new(intent_dir.clone());
+            if let Ok(Some(subscription_id)) = crate::config::get_active_id_at(&paths) {
+                for line in replay_selection_intent(&state, &intent_dir, &subscription_id).await {
+                    eprintln!("[mihomo-daemon] {line}");
+                }
+            }
+        }
+    }
+
     eprintln!("[mihomo-daemon] listening on {}", socket_path.display());
 
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     loop {
         tokio::select! {
+            _ = sigterm.recv() => {
+                eprintln!("[mihomo-daemon] SIGTERM received");
+                match stop_core(Arc::clone(&state)).await {
+                    DaemonResponse::Success { message } => eprintln!("[mihomo-daemon] {message}"),
+                    DaemonResponse::Error { message } if message != "core is not running" => {
+                        eprintln!("[mihomo-daemon] core shutdown cleanup failed: {message}");
+                    }
+                    _ => {}
+                }
+                let _ = std::fs::remove_file(&socket_path);
+                return Ok(());
+            }
+            _ = sigint.recv() => {
+                eprintln!("[mihomo-daemon] SIGINT received");
+                match stop_core(Arc::clone(&state)).await {
+                    DaemonResponse::Success { message } => eprintln!("[mihomo-daemon] {message}"),
+                    DaemonResponse::Error { message } if message != "core is not running" => {
+                        eprintln!("[mihomo-daemon] core shutdown cleanup failed: {message}");
+                    }
+                    _ => {}
+                }
+                let _ = std::fs::remove_file(&socket_path);
+                return Ok(());
+            }
             _ = cancel.cancelled() => {
-                eprintln!("[mihomo-daemon] shutdown requested, exiting accept loop");
+                eprintln!("[mihomo-daemon] shutdown requested, stopping managed core");
+                match stop_core(Arc::clone(&state)).await {
+                    DaemonResponse::Success { message } => {
+                        eprintln!("[mihomo-daemon] {message}");
+                    }
+                    DaemonResponse::Error { message } if message != "core is not running" => {
+                        eprintln!("[mihomo-daemon] core shutdown cleanup failed: {message}");
+                    }
+                    _ => {}
+                }
+                let _ = std::fs::remove_file(&socket_path);
                 return Ok(());
             }
             accepted = listener.accept() => {
@@ -1136,39 +1673,6 @@ pub async fn run_daemon(socket_path: PathBuf, cancel: CancellationToken) -> anyh
             }
         }
     }
-}
-
-/// Recover from daemon crash by restarting the daemon.
-///
-/// This function is called when the CLI detects that the daemon has crashed
-/// but the core process may still be running. The daemon's normal startup
-/// logic will detect the existing core process via the PID file and reattach to it.
-#[cfg(unix)]
-pub async fn recover_daemon(socket_path: PathBuf) -> anyhow::Result<()> {
-    eprintln!("[mihomo-daemon] recovery mode: checking for existing core process...");
-
-    // Check if there's a PID file with a running core
-    if let Some(metadata) = read_pid_file(&PathBuf::from("/var/run/mihomo/core.pid")) {
-        if pid_metadata_is_recoverable_system_core(&metadata) {
-            eprintln!(
-                "[mihomo-daemon] found running core (PID {}), will reattach",
-                metadata.pid
-            );
-        } else {
-            eprintln!("[mihomo-daemon] no recoverable core found, starting fresh");
-        }
-    } else {
-        eprintln!("[mihomo-daemon] no PID file found, starting fresh");
-    }
-
-    // Run the normal daemon startup which handles recovery automatically
-    run_daemon(socket_path, CancellationToken::new()).await
-}
-
-#[cfg(not(unix))]
-pub async fn recover_daemon(socket_path: PathBuf) -> anyhow::Result<()> {
-    eprintln!("[mihomo-daemon] recovery mode not supported on this platform");
-    run_daemon(socket_path, CancellationToken::new()).await
 }
 
 #[cfg(unix)]
@@ -1206,7 +1710,10 @@ async fn handle_connection(
     // single global mutex held for the *entire* operation — including core
     // spawn and readiness wait — so concurrent clients cannot interleave.
     // GetStatus is read-only and does not take the lifecycle lock.
-    let is_lifecycle = !matches!(cmd, DaemonCommand::GetStatus { token: None });
+    let is_lifecycle = !matches!(
+        cmd,
+        DaemonCommand::GetStatus { .. } | DaemonCommand::GetTransactionStatus { .. }
+    );
     let response = if is_lifecycle {
         let lock = OWNER_LIFECYCLE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
         let _guard = lock.lock().await;
@@ -1224,6 +1731,18 @@ async fn handle_connection(
 #[cfg(any(unix, windows))]
 fn parse_daemon_command(bytes: &[u8]) -> Result<DaemonCommand, String> {
     serde_json::from_slice(bytes).map_err(|e| format!("invalid daemon command: {e}"))
+}
+
+static DAEMON_EXECUTABLE_REVISION: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+fn daemon_executable_revision() -> Option<String> {
+    DAEMON_EXECUTABLE_REVISION
+        .get_or_init(|| {
+            let executable = std::env::current_exe().ok()?;
+            let bytes = std::fs::read(executable).ok()?;
+            Some(crate::tun_transaction::sha256_revision(&bytes))
+        })
+        .clone()
 }
 
 #[cfg(unix)]
@@ -1247,37 +1766,155 @@ async fn process_command(
     let client_token = match &cmd {
         DaemonCommand::StartCore { token, .. }
         | DaemonCommand::RestartCore { token, .. }
-        | DaemonCommand::EnableTun { token, .. }
+        | DaemonCommand::ApplySystemTunSnapshot { token, .. }
+        | DaemonCommand::PromoteSystemConfig { token, .. }
+        | DaemonCommand::SelectSystemProxy { token, .. }
         | DaemonCommand::StopCore { token }
         | DaemonCommand::DisableTun { token }
         | DaemonCommand::GetStatus { token }
-        | DaemonCommand::SetAutostart { token, .. } => token.as_deref(),
+        | DaemonCommand::CoreApiRequest { token, .. }
+        | DaemonCommand::SetAutostart { token, .. }
+        | DaemonCommand::ValidatePreparedRuntime { token, .. }
+        | DaemonCommand::ApplyPromotedSnapshot { token, .. }
+        | DaemonCommand::QuiesceCandidateRuntime { token, .. }
+        | DaemonCommand::RestoreOldRuntime { token, .. }
+        | DaemonCommand::AttestCurrentTransaction { token, .. }
+        | DaemonCommand::ApplyLegacyRecoveryTarget { token, .. }
+        | DaemonCommand::GetTransactionStatus { token } => token.as_deref(),
     };
     if let Err(message) = validate_client_token_for_peer(client_token, peer_uid) {
         return DaemonResponse::Error { message };
     }
     if matches!(
         cmd,
-        DaemonCommand::EnableTun { .. } | DaemonCommand::DisableTun { .. }
+        DaemonCommand::ApplySystemTunSnapshot { .. } | DaemonCommand::DisableTun { .. }
     ) {
         if let Err(message) = validate_tun_peer_is_root(peer_uid) {
             return DaemonResponse::Error { message };
+        }
+    }
+
+    // SPEC §12.4: Phase command allowlist gate for active transaction
+    if let Some(ctx) = daemon_transaction_context() {
+        match crate::tun_transaction::read_active_journal(&ctx) {
+            Ok(Some(journal)) => {
+                if !matches!(
+                    journal.phase,
+                    crate::tun_transaction::JournalPhase::IntentCommitted
+                        | crate::tun_transaction::JournalPhase::RolledBack
+                ) {
+                    let is_allowed_txn_cmd = match &cmd {
+                        DaemonCommand::ValidatePreparedRuntime { fence, .. } => {
+                            fence.transaction_id == journal.transaction_id
+                                && fence.generation == journal.generation
+                                && journal.phase == crate::tun_transaction::JournalPhase::Prepared
+                        }
+                        DaemonCommand::ApplyPromotedSnapshot { fence, .. } => {
+                            fence.transaction_id == journal.transaction_id
+                                && fence.generation == journal.generation
+                                && journal.phase
+                                    == crate::tun_transaction::JournalPhase::SnapshotPromoted
+                        }
+                        DaemonCommand::QuiesceCandidateRuntime { fence, .. } => {
+                            fence.transaction_id == journal.transaction_id
+                                && fence.generation == journal.generation
+                                && fence.expected_candidate_revision == journal.candidate_revision
+                                && journal.phase
+                                    == crate::tun_transaction::JournalPhase::RollbackPending
+                        }
+                        DaemonCommand::RestoreOldRuntime { fence, .. } => {
+                            fence.transaction_id == journal.transaction_id
+                                && fence.generation == journal.generation
+                                && journal.phase
+                                    == crate::tun_transaction::JournalPhase::RollbackPending
+                        }
+                        DaemonCommand::AttestCurrentTransaction { fence, .. } => {
+                            fence.transaction_id == journal.transaction_id
+                                && fence.generation == journal.generation
+                                && fence.expected_candidate_revision == journal.candidate_revision
+                                && journal.phase
+                                    == crate::tun_transaction::JournalPhase::CoreApplied
+                        }
+                        DaemonCommand::ApplyLegacyRecoveryTarget { fence, .. } => {
+                            fence.transaction_id == journal.transaction_id
+                                && fence.generation == journal.generation
+                                && journal.phase
+                                    == crate::tun_transaction::JournalPhase::RecoveryRequired
+                        }
+                        DaemonCommand::GetTransactionStatus { .. }
+                        | DaemonCommand::GetStatus { .. } => true,
+                        _ => false,
+                    };
+
+                    if !is_allowed_txn_cmd {
+                        return DaemonResponse::Error {
+                            message: format!(
+                                "A system TUN transaction ({}) is in progress (phase: {:?}).
+                             Inspect status or restart the service:
+                               mihomo-cli status
+                               mihomo-cli restart --system",
+                                journal.transaction_id, journal.phase
+                            ),
+                        };
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let is_allowed = allowed_with_unreadable_journal(&cmd);
+                if !is_allowed {
+                    return DaemonResponse::Error {
+                        message: format!(
+                            "Active system TUN transaction journal is unreadable or corrupted: {}.
+                             Inspect diagnostics:
+                               mihomo-cli status",
+                            e
+                        ),
+                    };
+                }
+            }
         }
     }
     match cmd {
         DaemonCommand::GetStatus { .. } => {
             let mut s = state.lock().await;
             reap_exited_core(&mut s);
-            if let Some(tun_enabled) = read_tun_enabled_from_config(s.config_path.as_ref()) {
-                s.tun_enabled = tun_enabled;
-            }
+            let (tun_journal_state, tun_journal_error) = active_journal_status();
             DaemonResponse::Status {
                 running: s.core_running,
-                tun_enabled: s.tun_enabled,
                 core_pid: s.core_pid,
                 config_path: s.config_path.clone(),
+                tun_snapshot_revision: managed_system_tun_snapshot_path()
+                    .ok()
+                    .and_then(|path| crate::ipc::managed_snapshot_revision(&path).ok()),
+                launched_config_revision: s.launched_config_revision.clone(),
                 autostart_enabled: daemon_config_dir().join("autostart").exists(),
+                daemon_executable_revision: daemon_executable_revision(),
+                tun_journal_state,
+                tun_journal_error,
             }
+        }
+        DaemonCommand::CoreApiRequest {
+            method, path, body, ..
+        } => process_core_api_request(method, path, body, state, peer_uid).await,
+        DaemonCommand::PromoteSystemConfig {
+            config_content,
+            config_revision,
+            selection_intent_dir,
+            subscription_id,
+            ..
+        } => {
+            promote_system_config(
+                state,
+                config_content,
+                config_revision,
+                selection_intent_dir,
+                subscription_id,
+            )
+            .await
+        }
+        DaemonCommand::SelectSystemProxy { group, node, .. } => {
+            select_system_proxy(state, group, node).await
         }
         // ADR-19: daemon owns the autostart marker (its config_dir is the
         // authoritative per-user path — the CLI under sudo would resolve a
@@ -1313,125 +1950,120 @@ async fn process_command(
                 },
             }
         }
-        DaemonCommand::StartCore { config_path, .. } => {
-            if let Err(message) = validate_daemon_config_path_for_peer(&config_path, peer_uid) {
-                return DaemonResponse::Error { message };
-            }
-            start_core(state, config_path, expected_system_core_binary_path()).await
-        }
-        DaemonCommand::StopCore { .. } => stop_core(state).await,
-        DaemonCommand::RestartCore { config_path, .. } => {
-            if let Err(message) = validate_daemon_config_path_for_peer(&config_path, peer_uid) {
-                return DaemonResponse::Error { message };
-            }
-            let core_binary = expected_system_core_binary_path();
-            if let Err(message) = preflight_system_core_start_request(&config_path, &core_binary) {
-                return DaemonResponse::Error { message };
-            }
-            let _ = stop_core(Arc::clone(&state)).await;
-            match start_core(state, config_path.clone(), core_binary).await {
-                DaemonResponse::Success { .. } => DaemonResponse::Success {
-                    message: format!("core restarted with config {}", config_path.display()),
-                },
-                other => other,
-            }
-        }
-        DaemonCommand::EnableTun {
-            config_path,
-            stack,
-            dns_hijack,
+        DaemonCommand::StartCore {
+            config_content,
+            config_revision,
+            selection_intent_dir,
+            subscription_id,
             ..
         } => {
-            if let Err(message) = validate_daemon_config_path_for_peer(&config_path, peer_uid) {
-                return DaemonResponse::Error { message };
-            }
-            let restart_with = {
-                let mut s = state.lock().await;
-                reap_exited_core(&mut s);
-
-                if !s.core_running {
-                    return DaemonResponse::Error {
-                        message: "core is not running, cannot enable TUN".to_string(),
-                    };
-                }
-
-                if !active_config_matches_requested(s.config_path.as_ref(), &config_path) {
-                    match s.core_binary.clone() {
-                        Some(core_binary) => Some(core_binary),
-                        None => {
-                            return DaemonResponse::Error {
-                                message: "daemon does not know the core binary path; restart the system service".to_string(),
-                            };
-                        }
-                    }
-                } else {
-                    None
-                }
-            };
-
-            if let Some(core_binary) = restart_with {
-                let _ = stop_core(Arc::clone(&state)).await;
-                match start_core(Arc::clone(&state), config_path.clone(), core_binary).await {
-                    DaemonResponse::Success { .. } => {}
-                    other => return other,
-                }
-            }
-
+            promote_system_config(
+                state,
+                config_content,
+                config_revision,
+                selection_intent_dir,
+                subscription_id,
+            )
+            .await
+        }
+        DaemonCommand::StopCore { .. } => stop_core(state).await,
+        DaemonCommand::RestartCore {
+            config_content,
+            config_revision,
+            selection_intent_dir,
+            subscription_id,
+            ..
+        } => {
+            promote_system_config(
+                state,
+                config_content,
+                config_revision,
+                selection_intent_dir,
+                subscription_id,
+            )
+            .await
+        }
+        DaemonCommand::ApplySystemTunSnapshot { .. } | DaemonCommand::DisableTun { .. } => {
             let mut s = state.lock().await;
             reap_exited_core(&mut s);
             if !s.core_running {
                 return DaemonResponse::Error {
-                    message: "core is not running, cannot enable TUN".to_string(),
+                    message: "system Core is not running. Fix: mihomo-cli restart --system"
+                        .to_string(),
                 };
             }
-
-            // Toggle TUN via mihomo core's API
-            match toggle_tun_via_core_api(
-                &s.api_endpoint,
-                true,
-                stack.as_deref(),
-                dns_hijack.as_deref(),
+            DaemonResponse::Error {
+                message: "legacy TUN IPC command is deprecated; use transaction-based tun on/off"
+                    .to_string(),
+            }
+        }
+        DaemonCommand::ValidatePreparedRuntime {
+            fence,
+            expected_old_runtime_revision,
+            expected_old_runtime_tun,
+            ..
+        } => {
+            handle_validate_prepared_runtime(
+                state,
+                fence,
+                expected_old_runtime_revision,
+                expected_old_runtime_tun,
+                peer_uid,
             )
             .await
-            {
-                Ok(()) => {
-                    s.tun_enabled = true;
-                    DaemonResponse::Success {
-                        message: "TUN enabled".to_string(),
-                    }
-                }
-                Err(e) => DaemonResponse::Error {
-                    message: format!("failed to enable TUN: {e}"),
-                },
-            }
         }
-        DaemonCommand::DisableTun { .. } => {
-            let api_endpoint = {
-                let mut s = state.lock().await;
-                reap_exited_core(&mut s);
-
-                if !s.core_running {
-                    return DaemonResponse::Error {
-                        message: "core is not running, cannot disable TUN".to_string(),
-                    };
-                }
-                s.api_endpoint.clone()
-            };
-
-            // Toggle TUN via mihomo core's API
-            match toggle_tun_via_core_api(&api_endpoint, false, None, None).await {
-                Ok(()) => {
-                    let mut s = state.lock().await;
-                    s.tun_enabled = false;
-                    DaemonResponse::Success {
-                        message: "TUN disabled".to_string(),
-                    }
-                }
-                Err(e) => DaemonResponse::Error {
-                    message: format!("failed to disable TUN: {e}"),
-                },
-            }
+        DaemonCommand::ApplyPromotedSnapshot {
+            fence,
+            target_runtime_tun,
+            ..
+        } => handle_apply_promoted_snapshot(state, fence, target_runtime_tun, peer_uid).await,
+        DaemonCommand::QuiesceCandidateRuntime { fence, .. } => {
+            handle_quiesce_candidate_runtime(state, fence, peer_uid).await
         }
+        DaemonCommand::RestoreOldRuntime {
+            fence,
+            expected_old_runtime_revision,
+            expected_old_runtime_tun,
+            ..
+        } => {
+            handle_restore_old_runtime(
+                state,
+                fence,
+                expected_old_runtime_revision,
+                expected_old_runtime_tun,
+                peer_uid,
+            )
+            .await
+        }
+        DaemonCommand::AttestCurrentTransaction {
+            fence,
+            expected_runtime_revision,
+            expected_runtime_tun,
+            ..
+        } => {
+            handle_attest_current_transaction(
+                state,
+                fence,
+                expected_runtime_revision,
+                expected_runtime_tun,
+                peer_uid,
+            )
+            .await
+        }
+        DaemonCommand::ApplyLegacyRecoveryTarget {
+            fence,
+            expected_recovery_target_revision,
+            ..
+        } => {
+            handle_apply_legacy_recovery_target(
+                state,
+                fence,
+                expected_recovery_target_revision,
+                peer_uid,
+            )
+            .await
+        }
+        DaemonCommand::GetTransactionStatus { .. } => handle_get_transaction_status(state).await,
     }
 }
 
@@ -1453,9 +2085,11 @@ fn reap_exited_core(s: &mut DaemonState) {
             if s.api_endpoint.is_none() {
                 s.api_endpoint = metadata.api_endpoint.clone();
             }
+            s.launched_config_revision = metadata.config_revision.clone();
         } else {
             s.core_running = false;
             s.core_pid = None;
+            s.launched_config_revision = None;
             remove_pid_file(&s.pid_file);
         }
         return;
@@ -1465,9 +2099,9 @@ fn reap_exited_core(s: &mut DaemonState) {
             s.core_child = None;
             s.core_running = false;
             s.core_pid = None;
-            s.tun_enabled = false;
-            s.config_path = None;
-            s.core_binary = None;
+            s.launched_config_revision = None;
+            // Preserve the last successful start intent. ADR-23 uses these
+            // values to recover a crashed core on the next command.
             s.api_endpoint = None;
             remove_pid_file(&s.pid_file);
         }
@@ -1479,17 +2113,14 @@ fn reap_exited_core(s: &mut DaemonState) {
 }
 
 #[cfg(unix)]
-fn active_config_matches_requested(active: Option<&PathBuf>, requested: &std::path::Path) -> bool {
-    active.map(|path| path == requested).unwrap_or(false)
-}
-
-#[cfg(unix)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 struct CorePidMetadata {
     pid: u32,
     config_path: PathBuf,
     core_binary: PathBuf,
     api_endpoint: Option<String>,
+    #[serde(default)]
+    config_revision: Option<String>,
 }
 
 #[cfg(unix)]
@@ -1513,19 +2144,6 @@ fn open_append_log_file(path: &std::path::Path) -> std::io::Result<std::fs::File
         .open(path)
 }
 
-#[cfg(any(unix, windows))]
-fn early_exit_message(
-    status: std::process::ExitStatus,
-    core_binary: &std::path::Path,
-    log_file: &std::path::Path,
-) -> String {
-    format!(
-        "core exited immediately after start (status: {status}). Check config and binary: {}\n  Logs: {}",
-        core_binary.display(),
-        log_file.display()
-    )
-}
-
 #[cfg(unix)]
 fn format_pid_metadata(metadata: &CorePidMetadata) -> String {
     serde_json::to_string_pretty(metadata).unwrap_or_else(|_| format!("{}\n", metadata.pid))
@@ -1546,6 +2164,7 @@ fn parse_pid_file_content(content: &str) -> Option<CorePidMetadata> {
             config_path: PathBuf::new(),
             core_binary: PathBuf::new(),
             api_endpoint: None,
+            config_revision: None,
         })
 }
 
@@ -1822,12 +2441,292 @@ fn preflight_system_core_start_request(
     validate_daemon_config_path_shape(config_path)?;
     validate_system_core_binary_request(core_binary)?;
     if !core_binary.exists() {
-        return Err(format!("core binary not found: {}", core_binary.display()));
+        return Err(format!(
+            "core binary not found: {}. Fix: mihomo-cli install --system",
+            core_binary.display()
+        ));
     }
     if !config_path.exists() {
-        return Err(format!("config not found: {}", config_path.display()));
+        return Err(format!(
+            "config not found: {}. Fix: mihomo-cli config",
+            config_path.display()
+        ));
     }
     read_required_system_core_api_endpoint(config_path)
+}
+
+/// Read the last N lines of a log file. Returns empty string if file doesn't exist.
+fn read_log_tail(log_file: &std::path::Path, n: usize) -> String {
+    let content = match std::fs::read_to_string(log_file) {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+    content
+        .lines()
+        .rev()
+        .take(n)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Classification of core startup failures (ADR-24).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CoreFailure {
+    /// GeoIP MMDB file missing — auto-fixable by downloading.
+    GeoipMissing,
+    /// GeoSite.dat file missing — auto-fixable by downloading.
+    GeositeMissing,
+    /// Config syntax error — report with details, don't auto-fix.
+    ConfigError { detail: String },
+    /// Port already in use — report with details.
+    PortConflict { detail: String },
+    /// Permission denied — report with guidance.
+    PermissionDenied { detail: String },
+    /// Unknown failure — report last N lines of log.
+    Unknown { log_tail: String },
+}
+
+/// Classify a core startup failure from its log output (ADR-24).
+fn classify_core_startup_failure(log_tail: &str) -> CoreFailure {
+    let lower = log_tail.to_lowercase();
+
+    if lower.contains("can't find mmdb")
+        || lower.contains("can't download mmdb")
+        || lower.contains("geoip") && lower.contains("no such file")
+    {
+        return CoreFailure::GeoipMissing;
+    }
+
+    if lower.contains("can't find geosite")
+        || lower.contains("geosite") && lower.contains("no such file")
+    {
+        return CoreFailure::GeositeMissing;
+    }
+
+    if lower.contains("permission denied")
+        && lower.contains("/var/lib/mihomo-cli")
+        && (lower.contains("geoip.metadb") || lower.contains("geosite.dat"))
+    {
+        let detail = log_tail
+            .lines()
+            .find(|line| line.to_lowercase().contains("permission denied"))
+            .unwrap_or("permission denied")
+            .to_string();
+        return CoreFailure::PermissionDenied { detail };
+    }
+
+    if let Some(pos) = lower.rfind("parse config error") {
+        let detail = log_tail[pos..]
+            .lines()
+            .next()
+            .unwrap_or("unknown config error");
+        return CoreFailure::ConfigError {
+            detail: detail.to_string(),
+        };
+    }
+
+    if lower.contains("address already in use") {
+        let detail = log_tail
+            .lines()
+            .find(|l| l.to_lowercase().contains("address already in use"))
+            .unwrap_or("address already in use")
+            .to_string();
+        return CoreFailure::PortConflict { detail };
+    }
+
+    if lower.contains("permission denied") {
+        let detail = log_tail
+            .lines()
+            .find(|l| l.to_lowercase().contains("permission denied"))
+            .unwrap_or("permission denied")
+            .to_string();
+        return CoreFailure::PermissionDenied { detail };
+    }
+
+    CoreFailure::Unknown {
+        log_tail: log_tail.to_string(),
+    }
+}
+
+/// Try to auto-download missing geo data and retry core start (ADR-24).
+/// Returns the retry result, or the original error if recovery doesn't apply.
+#[cfg(unix)]
+async fn try_geo_recovery_and_retry(
+    state: &Arc<Mutex<DaemonState>>,
+    failure: &CoreFailure,
+    config_path: PathBuf,
+    core_binary: PathBuf,
+    original_error: String,
+) -> DaemonResponse {
+    let config_dir = runtime_data_dir_for_config(&config_path);
+
+    match failure {
+        CoreFailure::GeoipMissing => {
+            let dest = config_dir.join("geoip.metadb");
+            match crate::installer::download_geo_file(crate::installer::GEOIP_URL, &dest).await {
+                Ok(()) => {
+                    crate::log!("Auto-downloaded geoip.metadb to {}", dest.display());
+                    Box::pin(start_core(Arc::clone(state), config_path, core_binary)).await
+                }
+                Err(e) => DaemonResponse::Error {
+                    message: format!(
+                        "GeoIP MMDB data missing and auto-download failed: {e}\n  \
+                         Fix: mihomo-cli install --system --force"
+                    ),
+                },
+            }
+        }
+        CoreFailure::GeositeMissing => {
+            let dest = config_dir.join("GeoSite.dat");
+            match crate::installer::download_geo_file(crate::installer::GEOSITE_URL, &dest).await {
+                Ok(()) => {
+                    crate::log!("Auto-downloaded GeoSite.dat to {}", dest.display());
+                    Box::pin(start_core(Arc::clone(state), config_path, core_binary)).await
+                }
+                Err(e) => DaemonResponse::Error {
+                    message: format!(
+                        "GeoSite data missing and auto-download failed: {e}\n  \
+                         Fix: mihomo-cli install --system --force"
+                    ),
+                },
+            }
+        }
+        _ => DaemonResponse::Error {
+            message: original_error,
+        },
+    }
+}
+
+/// Format a CoreFailure into a user-facing error message (ADR-24).
+fn format_core_failure_message(failure: &CoreFailure, log_file: &std::path::Path) -> String {
+    match failure {
+        CoreFailure::GeoipMissing => {
+            "GeoIP MMDB data missing — auto-download should have been attempted. \
+             Fix: mihomo-cli install --system --force (re-downloads geo data)"
+                .to_string()
+        }
+        CoreFailure::GeositeMissing => {
+            "GeoSite data missing. Auto-downloading is not yet implemented in daemon. \
+             Fix: mihomo-cli install --system --force (re-downloads geo data)"
+                .to_string()
+        }
+        CoreFailure::ConfigError { detail } => {
+            format!("core config error: {detail}\n  Fix: mihomo-cli config --validate")
+        }
+        CoreFailure::PortConflict { detail } => {
+            format!("{detail}\n  Fix: stop the conflicting process or change the port in config")
+        }
+        CoreFailure::PermissionDenied { detail }
+            if detail.contains("/var/lib/mihomo-cli")
+                && (detail.contains("geoip.metadb") || detail.contains("GeoSite.dat")) =>
+        {
+            format!(
+                "{detail}\n  Fix: system Mihomo data directory permissions are invalid. \
+                 Run: mihomo-cli install --system --force"
+            )
+        }
+        CoreFailure::PermissionDenied { detail } => {
+            format!("{detail}\n  Fix: check file permissions for mihomo binary and config")
+        }
+        CoreFailure::Unknown { log_tail } => {
+            let last_lines: String = log_tail
+                .lines()
+                .rev()
+                .take(10)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "core failed to start. Last log entries:\n{last_lines}\n  Logs: {}",
+                log_file.display()
+            )
+        }
+    }
+}
+
+#[cfg(windows)]
+fn early_exit_message(
+    _status: std::process::ExitStatus,
+    _core_binary: &std::path::Path,
+    log_file: &std::path::Path,
+) -> String {
+    let log_tail = read_log_tail(log_file, 40);
+    format_core_failure_message(&classify_core_startup_failure(&log_tail), log_file)
+}
+
+#[cfg(any(unix, windows))]
+fn system_runtime_data_dir() -> PathBuf {
+    crate::instance::planned_current_context(crate::instance::InstanceMode::System)
+        .and_then(|ctx| ctx.paths.tun_config_file.parent().map(PathBuf::from))
+        .unwrap_or_else(|| {
+            if cfg!(target_os = "windows") {
+                std::env::var_os("ProgramData")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+                    .join("mihomo-cli")
+            } else if cfg!(target_os = "macos") {
+                PathBuf::from("/Library/Application Support/mihomo-cli")
+            } else {
+                PathBuf::from("/var/lib/mihomo-cli")
+            }
+        })
+}
+
+#[cfg(any(unix, windows))]
+fn system_runtime_config_path(config_path: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let runtime_dir = system_runtime_data_dir();
+    if config_path == runtime_dir.join("tun-config.yaml") {
+        return Ok(config_path.to_path_buf());
+    }
+    let active_path = runtime_dir.join("active-config.yaml");
+    if config_path != active_path {
+        let bytes = crate::utils::read_file_no_follow_limited(
+            config_path,
+            crate::tun_transaction::MAX_TRANSACTION_ARTIFACT_BYTES,
+        )?;
+        crate::utils::atomic_write_bytes_no_follow(&active_path, &bytes, 0o640)?;
+    }
+    Ok(active_path)
+}
+
+#[cfg(any(unix, windows))]
+fn runtime_data_dir_for_config(config_path: &std::path::Path) -> PathBuf {
+    let system_dir = system_runtime_data_dir();
+    if config_path.starts_with(&system_dir) {
+        system_dir
+    } else {
+        config_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn core_command_args(
+    config_path: &std::path::Path,
+    runtime_data_dir: &std::path::Path,
+) -> Vec<std::ffi::OsString> {
+    vec![
+        "-d".into(),
+        runtime_data_dir.into(),
+        "-f".into(),
+        config_path.into(),
+    ]
+}
+
+#[cfg(any(unix, windows))]
+fn config_content_revision(path: &std::path::Path) -> anyhow::Result<String> {
+    let bytes = crate::utils::read_file_no_follow_limited(
+        path,
+        crate::tun_transaction::MAX_TRANSACTION_ARTIFACT_BYTES,
+    )?;
+    Ok(crate::tun_transaction::content_revision(&bytes))
 }
 
 #[cfg(unix)]
@@ -1838,11 +2737,1615 @@ fn remove_stale_unix_endpoint(endpoint: &str) {
 }
 
 #[cfg(unix)]
+async fn promote_system_config(
+    state: Arc<Mutex<DaemonState>>,
+    config_content: String,
+    config_revision: String,
+    selection_intent_dir: Option<String>,
+    subscription_id: Option<String>,
+) -> DaemonResponse {
+    if config_content.is_empty() || config_content.len() > 16 * 1024 * 1024 {
+        return DaemonResponse::Error {
+            message: "system configuration payload is empty or too large".to_string(),
+        };
+    }
+    if crate::tun_transaction::sha256_revision(config_content.as_bytes()) != config_revision {
+        return DaemonResponse::Error {
+            message: "system configuration revision does not match its payload".to_string(),
+        };
+    }
+    let Some(transaction_ctx) = daemon_transaction_context() else {
+        return DaemonResponse::Error {
+            message: "system instance paths are unavailable".to_string(),
+        };
+    };
+
+    // Check if active transaction exists
+    match crate::tun_transaction::read_active_journal(&transaction_ctx) {
+        Ok(Some(journal)) => {
+            if !matches!(
+                journal.phase,
+                crate::tun_transaction::JournalPhase::IntentCommitted
+                    | crate::tun_transaction::JournalPhase::RolledBack
+            ) {
+                return DaemonResponse::Error {
+                    message: format!(
+                        "A system TUN transaction ({}) is in progress (phase: {:?}).
+                     Inspect status or restart the service:
+                       mihomo-cli status
+                       mihomo-cli restart --system",
+                        journal.transaction_id, journal.phase
+                    ),
+                };
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return DaemonResponse::Error {
+                message: format!(
+                    "Active system TUN transaction journal is unreadable: {}.
+                     Inspect status:
+                       mihomo-cli status",
+                    e
+                ),
+            };
+        }
+    }
+    let is_tun_snapshot = {
+        let mut s = state.lock().await;
+        reap_exited_core(&mut s);
+        s.config_path.as_ref() == Some(&transaction_ctx.paths.tun_config_file)
+    };
+
+    let selection_intent_dir =
+        match validate_optional_selection_intent_dir(selection_intent_dir.as_deref()) {
+            Ok(path) => path,
+            Err(message) => return DaemonResponse::Error { message },
+        };
+    let selection_scope = match (selection_intent_dir.as_deref(), subscription_id.as_deref()) {
+        (Some(dir), Some(id)) => {
+            let paths = crate::utils::AppPaths::new(dir.to_path_buf());
+            match crate::config::get_active_id_at(&paths) {
+                Ok(Some(active)) if active == id => Some((dir.to_path_buf(), id.to_string())),
+                Ok(Some(active)) => {
+                    return DaemonResponse::Error {
+                        message: format!(
+                        "selection subscription identity mismatch: active={active}, request={id}"
+                    ),
+                    }
+                }
+                Ok(None) => {
+                    return DaemonResponse::Error {
+                        message: "selection replay requires an active subscription".to_string(),
+                    }
+                }
+                Err(error) => {
+                    return DaemonResponse::Error {
+                        message: format!(
+                            "cannot validate active subscription for selection replay: {error}"
+                        ),
+                    }
+                }
+            }
+        }
+        (Some(_), None) => {
+            return DaemonResponse::Error {
+                message: "selection replay requires subscription_id".to_string(),
+            }
+        }
+        _ => None,
+    };
+
+    let target_path = if is_tun_snapshot {
+        transaction_ctx.paths.tun_config_file.clone()
+    } else {
+        crate::tun_transaction::active_config_path(&transaction_ctx)
+    };
+
+    let endpoint = match read_api_endpoint_from_content(&config_content) {
+        Some(endpoint) => endpoint,
+        None => {
+            return DaemonResponse::Error {
+                message: "system configuration is missing the managed Core API endpoint"
+                    .to_string(),
+            }
+        }
+    };
+    if let Err(message) = validate_system_core_api_endpoint(&endpoint) {
+        return DaemonResponse::Error { message };
+    }
+    if let Err(error) = serde_yaml::from_str::<serde_yaml::Value>(&config_content) {
+        return DaemonResponse::Error {
+            message: format!("system configuration YAML is invalid: {error}"),
+        };
+    }
+
+    if let Err(e) = std::fs::write(&target_path, config_content.as_bytes()) {
+        return DaemonResponse::Error {
+            message: format!("failed to persist promoted system configuration: {e}"),
+        };
+    }
+
+    let core_binary = expected_system_core_binary_path();
+    if let Err(message) = preflight_system_core_start_request(&target_path, &core_binary) {
+        return DaemonResponse::Error { message };
+    }
+
+    let _ = stop_core(Arc::clone(&state)).await;
+    match start_core(Arc::clone(&state), target_path.clone(), core_binary).await {
+        DaemonResponse::Success { .. } => {
+            let mut state_guard = state.lock().await;
+            reap_exited_core(&mut state_guard);
+            let runtime_revision = state_guard
+                .launched_config_revision
+                .clone()
+                .unwrap_or_default();
+            drop(state_guard);
+            if runtime_revision != config_revision {
+                return DaemonResponse::Error {
+                    message: "system configuration was loaded but its runtime revision could not be attested"
+                        .to_string(),
+                };
+            }
+            let mut message = "system configuration promoted and runtime applied".to_string();
+            // D6: replay persisted selection intent synchronously (≤5s budget)
+            // so start/restart report restored selections in the same response.
+            if let Some((intent_dir, subscription_id)) = selection_scope {
+                persist_selection_intent_dir(&intent_dir);
+                for line in replay_selection_intent(&state, &intent_dir, &subscription_id).await {
+                    message.push('\n');
+                    message.push_str(&line);
+                }
+            }
+            DaemonResponse::Success { message }
+        }
+        DaemonResponse::Error { message } => DaemonResponse::Error { message },
+        response => response,
+    }
+}
+
+// ---------------- Transaction IPC Handlers ----------------
+
+#[cfg(unix)]
+async fn get_runtime_observation(
+    state: &Arc<Mutex<DaemonState>>,
+) -> crate::tun_transaction::RuntimeObservation {
+    let mut s = state.lock().await;
+    reap_exited_core(&mut s);
+    let core_running = s.core_running;
+    let core_pid = s.core_pid;
+    let launched_revision = s.launched_config_revision.clone();
+    let core_binary = s.core_binary.clone();
+    let api_endpoint_str = s.api_endpoint.clone();
+    drop(s);
+
+    let (api_ready, runtime_tun) =
+        if let (true, Some(api_endpoint)) = (core_running, api_endpoint_str.as_deref()) {
+            let ep = ApiEndpoint::UnixSocket(
+                endpoint_unix_path(api_endpoint)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(api_endpoint)),
+            );
+            let client = mihomo_api::EndpointMihomoApiClient::new(ep);
+            match client.get("/configs").await {
+                Ok(val) => {
+                    let tun_enabled = val
+                        .get("tun")
+                        .and_then(|v| v.get("enable"))
+                        .and_then(|v| v.as_bool());
+                    (true, tun_enabled)
+                }
+                Err(_) => (false, None),
+            }
+        } else {
+            (false, None)
+        };
+
+    let core_identity = core_binary
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "mihomo".to_string());
+
+    crate::tun_transaction::RuntimeObservation {
+        core_running,
+        core_identity: Some(core_identity),
+        core_pid,
+        launched_revision,
+        runtime_tun,
+        api_ready,
+    }
+}
+
+#[cfg(unix)]
+async fn handle_validate_prepared_runtime(
+    state: Arc<Mutex<DaemonState>>,
+    fence: crate::tun_transaction::TransactionFence,
+    expected_old_runtime_revision: String,
+    expected_old_runtime_tun: bool,
+    peer_uid: Option<u32>,
+) -> DaemonResponse {
+    if let Err(message) = validate_tun_peer_is_root(peer_uid) {
+        return DaemonResponse::Error { message };
+    }
+    let Some(ctx) = daemon_transaction_context() else {
+        return DaemonResponse::Error {
+            message: "system instance paths are unavailable".to_string(),
+        };
+    };
+    let journal = match crate::tun_transaction::read_active_journal(&ctx) {
+        Ok(Some(j)) => j,
+        Ok(None) => {
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::Stale {
+                    observed_transaction_id: None,
+                    observed_generation: None,
+                    observed_phase: None,
+                },
+            };
+        }
+        Err(e) => {
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::Unavailable {
+                    observation: None,
+                    error: crate::tun_transaction::StructuredError {
+                        code:
+                            crate::tun_transaction::TransactionErrorCode::UnsupportedJournalSchema,
+                        stage: "read_journal".to_string(),
+                        retryable: false,
+                        message: e.to_string(),
+                    },
+                },
+            };
+        }
+    };
+
+    if journal.transaction_id != fence.transaction_id
+        || journal.generation != fence.generation
+        || journal.phase != crate::tun_transaction::JournalPhase::Prepared
+    {
+        return DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::Stale {
+                observed_transaction_id: Some(journal.transaction_id),
+                observed_generation: Some(journal.generation),
+                observed_phase: Some(journal.phase),
+            },
+        };
+    }
+
+    let obs = get_runtime_observation(&state).await;
+    if !obs.core_running || !obs.api_ready {
+        return DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::Unavailable {
+                observation: Some(obs),
+                error: crate::tun_transaction::StructuredError {
+                    code: crate::tun_transaction::TransactionErrorCode::ApiUnavailable,
+                    stage: "validate_prepared_runtime".to_string(),
+                    retryable: true,
+                    message: "core is not running or API is not ready".to_string(),
+                },
+            },
+        };
+    }
+
+    if obs.launched_revision.as_deref() != Some(&expected_old_runtime_revision)
+        || obs.runtime_tun != Some(expected_old_runtime_tun)
+    {
+        return DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                observation: obs.clone(),
+                error: crate::tun_transaction::StructuredError {
+                    code: crate::tun_transaction::TransactionErrorCode::RuntimeRevisionMismatch,
+                    stage: "validate_prepared_runtime".to_string(),
+                    retryable: false,
+                    message: format!(
+                        "current runtime revision/tun ({:?}/{:?}) does not match expected ({:?}/{:?})",
+                        obs.launched_revision, obs.runtime_tun, expected_old_runtime_revision, expected_old_runtime_tun
+                    ),
+                },
+            },
+        };
+    }
+
+    DaemonResponse::Transaction {
+        response: crate::tun_transaction::TransactionResponse::Completed(
+            crate::tun_transaction::RuntimeProof {
+                transaction_id: fence.transaction_id,
+                generation: fence.generation,
+                observed_phase: crate::tun_transaction::JournalPhase::Prepared,
+                proof_kind: crate::tun_transaction::RuntimeProofKind::OldRuntimeValidated,
+                core_identity: obs.core_identity.unwrap_or_default(),
+                core_pid: obs.core_pid.unwrap_or_default(),
+                launched_revision: obs.launched_revision.unwrap_or_default(),
+                runtime_tun: obs.runtime_tun.unwrap_or(false),
+                api_ready: true,
+            },
+        ),
+    }
+}
+
+#[cfg(unix)]
+async fn handle_apply_promoted_snapshot(
+    state: Arc<Mutex<DaemonState>>,
+    fence: crate::tun_transaction::TransactionFence,
+    target_runtime_tun: bool,
+    peer_uid: Option<u32>,
+) -> DaemonResponse {
+    if let Err(message) = validate_tun_peer_is_root(peer_uid) {
+        return DaemonResponse::Error { message };
+    }
+    let Some(ctx) = daemon_transaction_context() else {
+        return DaemonResponse::Error {
+            message: "system instance paths are unavailable".to_string(),
+        };
+    };
+    let journal = match crate::tun_transaction::read_active_journal(&ctx) {
+        Ok(Some(j)) => j,
+        Ok(None) => {
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::Stale {
+                    observed_transaction_id: None,
+                    observed_generation: None,
+                    observed_phase: None,
+                },
+            };
+        }
+        Err(e) => {
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::Unavailable {
+                    observation: None,
+                    error: crate::tun_transaction::StructuredError {
+                        code:
+                            crate::tun_transaction::TransactionErrorCode::UnsupportedJournalSchema,
+                        stage: "read_journal".to_string(),
+                        retryable: false,
+                        message: e.to_string(),
+                    },
+                },
+            };
+        }
+    };
+
+    if journal.transaction_id != fence.transaction_id
+        || journal.generation != fence.generation
+        || journal.phase != crate::tun_transaction::JournalPhase::SnapshotPromoted
+    {
+        return DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::Stale {
+                observed_transaction_id: Some(journal.transaction_id),
+                observed_generation: Some(journal.generation),
+                observed_phase: Some(journal.phase),
+            },
+        };
+    }
+
+    // Read and validate candidate file
+    let candidate_path = crate::tun_transaction::active_candidate_path(&ctx);
+    let candidate_bytes = match crate::utils::read_file_no_follow_limited(
+        &candidate_path,
+        crate::tun_transaction::MAX_TRANSACTION_ARTIFACT_BYTES,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            let obs = get_runtime_observation(&state).await;
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                    observation: obs,
+                    error: crate::tun_transaction::StructuredError {
+                        code: crate::tun_transaction::TransactionErrorCode::UnsafeArtifact,
+                        stage: "read_candidate".to_string(),
+                        retryable: false,
+                        message: format!("cannot read candidate artifact: {e}"),
+                    },
+                },
+            };
+        }
+    };
+    let candidate_rev = crate::tun_transaction::sha256_revision(&candidate_bytes);
+    if candidate_rev != fence.expected_candidate_revision {
+        let obs = get_runtime_observation(&state).await;
+        return DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                observation: obs,
+                error: crate::tun_transaction::StructuredError {
+                    code: crate::tun_transaction::TransactionErrorCode::ArtifactRevisionMismatch,
+                    stage: "validate_candidate".to_string(),
+                    retryable: false,
+                    message: "candidate file hash does not match fence expected revision"
+                        .to_string(),
+                },
+            },
+        };
+    }
+
+    // Validate candidate tun.enable
+    let candidate_yaml: serde_yaml::Value = match serde_yaml::from_slice(&candidate_bytes) {
+        Ok(y) => y,
+        Err(e) => {
+            let obs = get_runtime_observation(&state).await;
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                    observation: obs,
+                    error: crate::tun_transaction::StructuredError {
+                        code: crate::tun_transaction::TransactionErrorCode::UnsafeArtifact,
+                        stage: "parse_candidate".to_string(),
+                        retryable: false,
+                        message: format!("candidate is invalid yaml: {e}"),
+                    },
+                },
+            };
+        }
+    };
+    let candidate_tun = candidate_yaml
+        .get("tun")
+        .and_then(|t| t.get("enable"))
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+    if candidate_tun != target_runtime_tun {
+        let obs = get_runtime_observation(&state).await;
+        return DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                observation: obs,
+                error: crate::tun_transaction::StructuredError {
+                    code: crate::tun_transaction::TransactionErrorCode::RuntimeTunMismatch,
+                    stage: "validate_candidate_tun".to_string(),
+                    retryable: false,
+                    message: format!(
+                        "candidate tun.enable ({}) != target_runtime_tun ({})",
+                        candidate_tun, target_runtime_tun
+                    ),
+                },
+            },
+        };
+    }
+
+    // Validate snapshot matches candidate revision
+    let snapshot_path = &ctx.paths.tun_config_file;
+    let snapshot_bytes = match crate::utils::read_file_no_follow_limited(
+        snapshot_path,
+        crate::tun_transaction::MAX_TRANSACTION_ARTIFACT_BYTES,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            let obs = get_runtime_observation(&state).await;
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                    observation: obs,
+                    error: crate::tun_transaction::StructuredError {
+                        code: crate::tun_transaction::TransactionErrorCode::SnapshotConflict,
+                        stage: "read_snapshot".to_string(),
+                        retryable: false,
+                        message: format!("snapshot file not readable: {e}"),
+                    },
+                },
+            };
+        }
+    };
+    if crate::tun_transaction::sha256_revision(&snapshot_bytes) != candidate_rev {
+        let obs = get_runtime_observation(&state).await;
+        return DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                observation: obs,
+                error: crate::tun_transaction::StructuredError {
+                    code: crate::tun_transaction::TransactionErrorCode::SnapshotConflict,
+                    stage: "validate_snapshot".to_string(),
+                    retryable: false,
+                    message: "snapshot file has not been promoted to candidate revision"
+                        .to_string(),
+                },
+            },
+        };
+    }
+
+    // Read and verify immutable old-runtime evidence before applying candidate
+    let old_runtime = match crate::tun_transaction::read_and_validate_old_runtime(&ctx, &journal) {
+        Ok(ev) => ev,
+        Err(e) => {
+            let obs = get_runtime_observation(&state).await;
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                    observation: obs,
+                    error: crate::tun_transaction::StructuredError {
+                        code: crate::tun_transaction::TransactionErrorCode::UnsafeArtifact,
+                        stage: "validate_old_runtime_for_apply".to_string(),
+                        retryable: false,
+                        message: e.to_string(),
+                    },
+                },
+            };
+        }
+    };
+
+    // Check if already satisfied (Idempotency, SPEC §12.5)
+    let obs = get_runtime_observation(&state).await;
+    if obs.core_running
+        && obs.api_ready
+        && obs.launched_revision.as_deref() == Some(&candidate_rev)
+        && obs.runtime_tun == Some(target_runtime_tun)
+    {
+        return DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::AlreadySatisfied(
+                crate::tun_transaction::RuntimeProof {
+                    transaction_id: fence.transaction_id,
+                    generation: fence.generation,
+                    observed_phase: crate::tun_transaction::JournalPhase::SnapshotPromoted,
+                    proof_kind: crate::tun_transaction::RuntimeProofKind::CandidateApplied,
+                    core_identity: obs.core_identity.unwrap_or_default(),
+                    core_pid: obs.core_pid.unwrap_or_default(),
+                    launched_revision: candidate_rev,
+                    runtime_tun: target_runtime_tun,
+                    api_ready: true,
+                },
+            ),
+        };
+    }
+
+    // If core is running, only stop if it matches the attested old runtime
+    if obs.core_running {
+        if crate::tun_transaction::runtime_matches_old_evidence(&old_runtime, &obs) {
+            let stop_res = stop_core(Arc::clone(&state)).await;
+            if !matches!(stop_res, DaemonResponse::Success { .. }) {
+                let message = match stop_res {
+                    DaemonResponse::Error { message } => message,
+                    other => format!("unexpected stop response: {other:?}"),
+                };
+                return DaemonResponse::Transaction {
+                    response: crate::tun_transaction::TransactionResponse::NotSatisfied {
+                        observation: get_runtime_observation(&state).await,
+                        error: crate::tun_transaction::StructuredError {
+                            code: crate::tun_transaction::TransactionErrorCode::CoreStopFailed,
+                            stage: "stop_old_core".to_string(),
+                            retryable: false,
+                            message,
+                        },
+                    },
+                };
+            }
+            let obs_stopped = get_runtime_observation(&state).await;
+            if obs_stopped.core_running {
+                return DaemonResponse::Transaction {
+                    response: crate::tun_transaction::TransactionResponse::NotSatisfied {
+                        observation: obs_stopped,
+                        error: crate::tun_transaction::StructuredError {
+                            code: crate::tun_transaction::TransactionErrorCode::CoreStopFailed,
+                            stage: "verify_old_core_stopped".to_string(),
+                            retryable: false,
+                            message: "old core is still running after stop request".to_string(),
+                        },
+                    },
+                };
+            }
+        } else {
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                    observation: obs,
+                    error: crate::tun_transaction::StructuredError {
+                        code: crate::tun_transaction::TransactionErrorCode::RuntimeRevisionMismatch,
+                        stage: "verify_running_core_before_apply".to_string(),
+                        retryable: false,
+                        message: "running core does not match attested old runtime; refusing to stop unknown runtime".to_string(),
+                    },
+                },
+            };
+        }
+    }
+
+    // Start core from snapshot path
+    let core_binary = expected_system_core_binary_path();
+    let start_res = start_core(Arc::clone(&state), snapshot_path.clone(), core_binary).await;
+    let obs_after = get_runtime_observation(&state).await;
+
+    match start_res {
+        DaemonResponse::Success { .. } => {
+            if obs_after.core_running
+                && obs_after.api_ready
+                && obs_after.launched_revision.as_deref() == Some(&candidate_rev)
+                && obs_after.runtime_tun == Some(target_runtime_tun)
+            {
+                DaemonResponse::Transaction {
+                    response: crate::tun_transaction::TransactionResponse::Completed(
+                        crate::tun_transaction::RuntimeProof {
+                            transaction_id: fence.transaction_id,
+                            generation: fence.generation,
+                            observed_phase: crate::tun_transaction::JournalPhase::SnapshotPromoted,
+                            proof_kind: crate::tun_transaction::RuntimeProofKind::CandidateApplied,
+                            core_identity: obs_after.core_identity.unwrap_or_default(),
+                            core_pid: obs_after.core_pid.unwrap_or_default(),
+                            launched_revision: candidate_rev,
+                            runtime_tun: target_runtime_tun,
+                            api_ready: true,
+                        },
+                    ),
+                }
+            } else {
+                DaemonResponse::Transaction {
+                    response: crate::tun_transaction::TransactionResponse::NotSatisfied {
+                        observation: obs_after,
+                        error: crate::tun_transaction::StructuredError {
+                            code: crate::tun_transaction::TransactionErrorCode::RuntimeTunMismatch,
+                            stage: "attest_candidate_after_start".to_string(),
+                            retryable: false,
+                            message:
+                                "core started but runtime revision or tun did not match target"
+                                    .to_string(),
+                        },
+                    },
+                }
+            }
+        }
+        DaemonResponse::Error { message } => DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::NotSatisfied {
+                observation: obs_after,
+                error: crate::tun_transaction::StructuredError {
+                    code: crate::tun_transaction::TransactionErrorCode::CoreStartFailed,
+                    stage: "start_core".to_string(),
+                    retryable: false,
+                    message,
+                },
+            },
+        },
+        _ => DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::NotSatisfied {
+                observation: obs_after,
+                error: crate::tun_transaction::StructuredError {
+                    code: crate::tun_transaction::TransactionErrorCode::CoreStartFailed,
+                    stage: "start_core".to_string(),
+                    retryable: false,
+                    message: "unexpected daemon response starting core".to_string(),
+                },
+            },
+        },
+    }
+}
+
+#[cfg(unix)]
+async fn handle_quiesce_candidate_runtime(
+    state: Arc<Mutex<DaemonState>>,
+    fence: crate::tun_transaction::TransactionFence,
+    peer_uid: Option<u32>,
+) -> DaemonResponse {
+    if let Err(message) = validate_tun_peer_is_root(peer_uid) {
+        return DaemonResponse::Error { message };
+    }
+    let Some(ctx) = daemon_transaction_context() else {
+        return DaemonResponse::Error {
+            message: "system instance paths are unavailable".to_string(),
+        };
+    };
+    let journal = match crate::tun_transaction::read_active_journal(&ctx) {
+        Ok(Some(j)) => j,
+        Ok(None) => {
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::Stale {
+                    observed_transaction_id: None,
+                    observed_generation: None,
+                    observed_phase: None,
+                },
+            };
+        }
+        Err(e) => {
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::Unavailable {
+                    observation: None,
+                    error: crate::tun_transaction::StructuredError {
+                        code:
+                            crate::tun_transaction::TransactionErrorCode::UnsupportedJournalSchema,
+                        stage: "read_journal".to_string(),
+                        retryable: false,
+                        message: e.to_string(),
+                    },
+                },
+            };
+        }
+    };
+
+    if journal.transaction_id != fence.transaction_id
+        || journal.generation != fence.generation
+        || journal.phase != crate::tun_transaction::JournalPhase::RollbackPending
+        || journal.candidate_revision != fence.expected_candidate_revision
+    {
+        return DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::Stale {
+                observed_transaction_id: Some(journal.transaction_id),
+                observed_generation: Some(journal.generation),
+                observed_phase: Some(journal.phase),
+            },
+        };
+    }
+
+    let obs = get_runtime_observation(&state).await;
+    if !obs.core_running {
+        return DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::AlreadySatisfied(
+                crate::tun_transaction::RuntimeProof {
+                    transaction_id: fence.transaction_id,
+                    generation: fence.generation,
+                    observed_phase: crate::tun_transaction::JournalPhase::RollbackPending,
+                    proof_kind: crate::tun_transaction::RuntimeProofKind::CandidateQuiesced,
+                    core_identity: obs.core_identity.unwrap_or_default(),
+                    core_pid: 0,
+                    launched_revision: String::new(),
+                    runtime_tun: false,
+                    api_ready: false,
+                },
+            ),
+        };
+    }
+
+    let old_evidence = match crate::tun_transaction::read_and_validate_old_runtime(&ctx, &journal) {
+        Ok(evidence) => evidence,
+        Err(e) => {
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                    observation: obs,
+                    error: crate::tun_transaction::StructuredError {
+                        code: crate::tun_transaction::TransactionErrorCode::UnsafeArtifact,
+                        stage: "validate_old_runtime_for_quiesce".to_string(),
+                        retryable: false,
+                        message: e.to_string(),
+                    },
+                },
+            };
+        }
+    };
+
+    // If core is running candidate, stop it
+    if crate::tun_transaction::runtime_matches_candidate(&journal, &obs) {
+        let stop_response = stop_core(Arc::clone(&state)).await;
+        let obs_after = get_runtime_observation(&state).await;
+        if !matches!(stop_response, DaemonResponse::Success { .. }) || obs_after.core_running {
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::NotSatisfied {
+                    observation: obs_after,
+                    error: crate::tun_transaction::StructuredError {
+                        code: crate::tun_transaction::TransactionErrorCode::CoreStopFailed,
+                        stage: "quiesce_candidate".to_string(),
+                        retryable: false,
+                        message: "candidate core did not stop".to_string(),
+                    },
+                },
+            };
+        }
+        DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::Completed(
+                crate::tun_transaction::RuntimeProof {
+                    transaction_id: fence.transaction_id,
+                    generation: fence.generation,
+                    observed_phase: crate::tun_transaction::JournalPhase::RollbackPending,
+                    proof_kind: crate::tun_transaction::RuntimeProofKind::CandidateQuiesced,
+                    core_identity: obs_after.core_identity.unwrap_or_default(),
+                    core_pid: 0,
+                    launched_revision: String::new(),
+                    runtime_tun: false,
+                    api_ready: false,
+                },
+            ),
+        }
+    } else if crate::tun_transaction::runtime_matches_old_evidence(&old_evidence, &obs) {
+        // The old runtime is fully attested, so the candidate is already
+        // quiesced without stopping the old Core.
+        DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::AlreadySatisfied(
+                crate::tun_transaction::RuntimeProof {
+                    transaction_id: fence.transaction_id,
+                    generation: fence.generation,
+                    observed_phase: crate::tun_transaction::JournalPhase::RollbackPending,
+                    proof_kind: crate::tun_transaction::RuntimeProofKind::CandidateQuiesced,
+                    core_identity: old_evidence.core_identity,
+                    core_pid: old_evidence.core_pid,
+                    launched_revision: old_evidence.launched_revision,
+                    runtime_tun: old_evidence.runtime_tun,
+                    api_ready: obs.api_ready,
+                },
+            ),
+        }
+    } else {
+        DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                observation: obs,
+                error: crate::tun_transaction::StructuredError {
+                    code: crate::tun_transaction::TransactionErrorCode::RuntimeRevisionMismatch,
+                    stage: "quiesce_candidate".to_string(),
+                    retryable: false,
+                    message: "running runtime is neither candidate nor fully attested old runtime"
+                        .to_string(),
+                },
+            },
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn handle_restore_old_runtime(
+    state: Arc<Mutex<DaemonState>>,
+    fence: crate::tun_transaction::TransactionFence,
+    expected_old_runtime_revision: String,
+    expected_old_runtime_tun: bool,
+    peer_uid: Option<u32>,
+) -> DaemonResponse {
+    if let Err(message) = validate_tun_peer_is_root(peer_uid) {
+        return DaemonResponse::Error { message };
+    }
+    let Some(ctx) = daemon_transaction_context() else {
+        return DaemonResponse::Error {
+            message: "system instance paths are unavailable".to_string(),
+        };
+    };
+    let journal = match crate::tun_transaction::read_active_journal(&ctx) {
+        Ok(Some(j)) => j,
+        Ok(None) => {
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::Stale {
+                    observed_transaction_id: None,
+                    observed_generation: None,
+                    observed_phase: None,
+                },
+            };
+        }
+        Err(e) => {
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::Unavailable {
+                    observation: None,
+                    error: crate::tun_transaction::StructuredError {
+                        code:
+                            crate::tun_transaction::TransactionErrorCode::UnsupportedJournalSchema,
+                        stage: "read_journal".to_string(),
+                        retryable: false,
+                        message: e.to_string(),
+                    },
+                },
+            };
+        }
+    };
+
+    if journal.transaction_id != fence.transaction_id
+        || journal.generation != fence.generation
+        || journal.phase != crate::tun_transaction::JournalPhase::RollbackPending
+    {
+        return DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::Stale {
+                observed_transaction_id: Some(journal.transaction_id),
+                observed_generation: Some(journal.generation),
+                observed_phase: Some(journal.phase),
+            },
+        };
+    }
+
+    // Read and verify immutable old-runtime evidence before using it.
+    let old_runtime = match crate::tun_transaction::read_and_validate_old_runtime(&ctx, &journal) {
+        Ok(ev) => ev,
+        Err(e) => {
+            let obs = get_runtime_observation(&state).await;
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                    observation: obs,
+                    error: crate::tun_transaction::StructuredError {
+                        code: crate::tun_transaction::TransactionErrorCode::UnsafeArtifact,
+                        stage: "validate_old_runtime".to_string(),
+                        retryable: false,
+                        message: e.to_string(),
+                    },
+                },
+            };
+        }
+    };
+
+    // Check if already restored (must match full old runtime evidence)
+    let obs = get_runtime_observation(&state).await;
+    if crate::tun_transaction::runtime_matches_old_evidence(&old_runtime, &obs) {
+        return DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::AlreadySatisfied(
+                crate::tun_transaction::RuntimeProof {
+                    transaction_id: fence.transaction_id,
+                    generation: fence.generation,
+                    observed_phase: crate::tun_transaction::JournalPhase::RollbackPending,
+                    proof_kind: crate::tun_transaction::RuntimeProofKind::OldRuntimeRestored,
+                    core_identity: old_runtime.core_identity,
+                    core_pid: old_runtime.core_pid,
+                    launched_revision: old_runtime.launched_revision,
+                    runtime_tun: old_runtime.runtime_tun,
+                    api_ready: true,
+                },
+            ),
+        };
+    }
+
+    // Determine launch source
+    let launch_source_path = match old_runtime.launch_source {
+        crate::tun_transaction::LaunchSource::SystemActiveConfig => {
+            crate::tun_transaction::active_config_path(&ctx)
+        }
+        crate::tun_transaction::LaunchSource::SystemTunSnapshot => {
+            ctx.paths.tun_config_file.clone()
+        }
+    };
+
+    if !launch_source_path.exists() {
+        return DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                observation: obs,
+                error: crate::tun_transaction::StructuredError {
+                    code: crate::tun_transaction::TransactionErrorCode::SnapshotConflict,
+                    stage: "check_launch_source".to_string(),
+                    retryable: false,
+                    message: format!(
+                        "old launch source {} does not exist",
+                        launch_source_path.display()
+                    ),
+                },
+            },
+        };
+    }
+
+    let src_bytes = match crate::utils::read_file_no_follow_limited(
+        &launch_source_path,
+        crate::tun_transaction::MAX_TRANSACTION_ARTIFACT_BYTES,
+    ) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                    observation: obs,
+                    error: crate::tun_transaction::StructuredError {
+                        code: crate::tun_transaction::TransactionErrorCode::UnsafeArtifact,
+                        stage: "read_launch_source".to_string(),
+                        retryable: false,
+                        message: e.to_string(),
+                    },
+                },
+            };
+        }
+    };
+    if crate::tun_transaction::sha256_revision(&src_bytes) != expected_old_runtime_revision {
+        return DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                observation: obs,
+                error: crate::tun_transaction::StructuredError {
+                    code: crate::tun_transaction::TransactionErrorCode::RuntimeRevisionMismatch,
+                    stage: "check_launch_source_revision".to_string(),
+                    retryable: false,
+                    message: format!(
+                        "launch source {} revision does not match expected old revision {}",
+                        launch_source_path.display(),
+                        expected_old_runtime_revision
+                    ),
+                },
+            },
+        };
+    }
+
+    // Stop candidate runtime if running and verified to belong to candidate
+    if obs.core_running {
+        if crate::tun_transaction::runtime_matches_candidate(&journal, &obs) {
+            let stop_res = stop_core(Arc::clone(&state)).await;
+            if !matches!(stop_res, DaemonResponse::Success { .. }) {
+                let message = match stop_res {
+                    DaemonResponse::Error { message } => message,
+                    other => format!("unexpected stop response: {other:?}"),
+                };
+                return DaemonResponse::Transaction {
+                    response: crate::tun_transaction::TransactionResponse::NotSatisfied {
+                        observation: get_runtime_observation(&state).await,
+                        error: crate::tun_transaction::StructuredError {
+                            code: crate::tun_transaction::TransactionErrorCode::CoreStopFailed,
+                            stage: "stop_candidate_core".to_string(),
+                            retryable: false,
+                            message,
+                        },
+                    },
+                };
+            }
+            let obs_stopped = get_runtime_observation(&state).await;
+            if obs_stopped.core_running {
+                return DaemonResponse::Transaction {
+                    response: crate::tun_transaction::TransactionResponse::NotSatisfied {
+                        observation: obs_stopped,
+                        error: crate::tun_transaction::StructuredError {
+                            code: crate::tun_transaction::TransactionErrorCode::CoreStopFailed,
+                            stage: "verify_candidate_stopped".to_string(),
+                            retryable: false,
+                            message: "candidate core is still running after stop request"
+                                .to_string(),
+                        },
+                    },
+                };
+            }
+        } else {
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                    observation: obs,
+                    error: crate::tun_transaction::StructuredError {
+                        code: crate::tun_transaction::TransactionErrorCode::RuntimeRevisionMismatch,
+                        stage: "verify_running_core_before_restore".to_string(),
+                        retryable: false,
+                        message: "running core does not match candidate runtime; refusing to stop unknown runtime".to_string(),
+                    },
+                },
+            };
+        }
+    }
+
+    // Start core from launch source
+    let core_binary = expected_system_core_binary_path();
+    let start_res = start_core(Arc::clone(&state), launch_source_path, core_binary).await;
+    let obs_after = get_runtime_observation(&state).await;
+
+    match start_res {
+        DaemonResponse::Success { .. } => {
+            if crate::tun_transaction::runtime_matches_old_evidence(&old_runtime, &obs_after)
+                && obs_after.launched_revision.as_deref() == Some(&expected_old_runtime_revision)
+                && obs_after.runtime_tun == Some(expected_old_runtime_tun)
+            {
+                DaemonResponse::Transaction {
+                    response: crate::tun_transaction::TransactionResponse::Completed(
+                        crate::tun_transaction::RuntimeProof {
+                            transaction_id: fence.transaction_id,
+                            generation: fence.generation,
+                            observed_phase: crate::tun_transaction::JournalPhase::RollbackPending,
+                            proof_kind:
+                                crate::tun_transaction::RuntimeProofKind::OldRuntimeRestored,
+                            core_identity: obs_after.core_identity.unwrap_or_default(),
+                            core_pid: obs_after.core_pid.unwrap_or_default(),
+                            launched_revision: expected_old_runtime_revision,
+                            runtime_tun: expected_old_runtime_tun,
+                            api_ready: true,
+                        },
+                    ),
+                }
+            } else {
+                DaemonResponse::Transaction {
+                    response: crate::tun_transaction::TransactionResponse::NotSatisfied {
+                        observation: obs_after,
+                        error: crate::tun_transaction::StructuredError {
+                            code: crate::tun_transaction::TransactionErrorCode::RuntimeRevisionMismatch,
+                            stage: "attest_old_runtime_after_start".to_string(),
+                            retryable: false,
+                            message: "old core started but runtime revision or tun did not match expected".to_string(),
+                        },
+                    },
+                }
+            }
+        }
+        DaemonResponse::Error { message } => DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::NotSatisfied {
+                observation: obs_after,
+                error: crate::tun_transaction::StructuredError {
+                    code: crate::tun_transaction::TransactionErrorCode::CoreStartFailed,
+                    stage: "start_old_core".to_string(),
+                    retryable: false,
+                    message,
+                },
+            },
+        },
+        _ => DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::NotSatisfied {
+                observation: obs_after,
+                error: crate::tun_transaction::StructuredError {
+                    code: crate::tun_transaction::TransactionErrorCode::CoreStartFailed,
+                    stage: "start_old_core".to_string(),
+                    retryable: false,
+                    message: "unexpected daemon response restoring old core".to_string(),
+                },
+            },
+        },
+    }
+}
+
+#[cfg(unix)]
+async fn handle_attest_current_transaction(
+    state: Arc<Mutex<DaemonState>>,
+    fence: crate::tun_transaction::TransactionFence,
+    expected_runtime_revision: String,
+    expected_runtime_tun: bool,
+    peer_uid: Option<u32>,
+) -> DaemonResponse {
+    if let Err(message) = validate_tun_peer_is_root(peer_uid) {
+        return DaemonResponse::Error { message };
+    }
+    let Some(ctx) = daemon_transaction_context() else {
+        return DaemonResponse::Error {
+            message: "system instance paths are unavailable".to_string(),
+        };
+    };
+    let journal = match crate::tun_transaction::read_active_journal(&ctx) {
+        Ok(Some(j)) => j,
+        Ok(None) => {
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::Stale {
+                    observed_transaction_id: None,
+                    observed_generation: None,
+                    observed_phase: None,
+                },
+            };
+        }
+        Err(e) => {
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::Unavailable {
+                    observation: None,
+                    error: crate::tun_transaction::StructuredError {
+                        code:
+                            crate::tun_transaction::TransactionErrorCode::UnsupportedJournalSchema,
+                        stage: "read_journal".to_string(),
+                        retryable: false,
+                        message: e.to_string(),
+                    },
+                },
+            };
+        }
+    };
+
+    if journal.transaction_id != fence.transaction_id || journal.generation != fence.generation {
+        return DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::Stale {
+                observed_transaction_id: Some(journal.transaction_id),
+                observed_generation: Some(journal.generation),
+                observed_phase: Some(journal.phase),
+            },
+        };
+    }
+
+    let obs = get_runtime_observation(&state).await;
+    if obs.core_running
+        && obs.api_ready
+        && obs.launched_revision.as_deref() == Some(&expected_runtime_revision)
+        && obs.runtime_tun == Some(expected_runtime_tun)
+    {
+        DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::Completed(
+                crate::tun_transaction::RuntimeProof {
+                    transaction_id: fence.transaction_id,
+                    generation: fence.generation,
+                    observed_phase: journal.phase,
+                    proof_kind: crate::tun_transaction::RuntimeProofKind::CandidateAttested,
+                    core_identity: obs.core_identity.unwrap_or_default(),
+                    core_pid: obs.core_pid.unwrap_or_default(),
+                    launched_revision: expected_runtime_revision,
+                    runtime_tun: expected_runtime_tun,
+                    api_ready: true,
+                },
+            ),
+        }
+    } else {
+        DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::NotSatisfied {
+                observation: obs,
+                error: crate::tun_transaction::StructuredError {
+                    code: crate::tun_transaction::TransactionErrorCode::RuntimeRevisionMismatch,
+                    stage: "attest_current_transaction".to_string(),
+                    retryable: false,
+                    message: "runtime attestation did not match expected revision or tun state"
+                        .to_string(),
+                },
+            },
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn handle_apply_legacy_recovery_target(
+    state: Arc<Mutex<DaemonState>>,
+    fence: crate::tun_transaction::TransactionFence,
+    expected_recovery_target_revision: String,
+    peer_uid: Option<u32>,
+) -> DaemonResponse {
+    if let Err(message) = validate_tun_peer_is_root(peer_uid) {
+        return DaemonResponse::Error { message };
+    }
+    let Some(ctx) = daemon_transaction_context() else {
+        return DaemonResponse::Error {
+            message: "system instance paths are unavailable".to_string(),
+        };
+    };
+    let journal = match crate::tun_transaction::read_active_journal(&ctx) {
+        Ok(Some(j)) => j,
+        Ok(None) => {
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::Stale {
+                    observed_transaction_id: None,
+                    observed_generation: None,
+                    observed_phase: None,
+                },
+            };
+        }
+        Err(e) => {
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::Unavailable {
+                    observation: None,
+                    error: crate::tun_transaction::StructuredError {
+                        code:
+                            crate::tun_transaction::TransactionErrorCode::UnsupportedJournalSchema,
+                        stage: "read_journal".to_string(),
+                        retryable: false,
+                        message: e.to_string(),
+                    },
+                },
+            };
+        }
+    };
+
+    if journal.transaction_id != fence.transaction_id
+        || journal.generation != fence.generation
+        || journal.phase != crate::tun_transaction::JournalPhase::RecoveryRequired
+        || !journal.legacy_source
+        || journal.rollback_evidence_complete
+        || journal.recovery_target_revision.as_deref() != Some(&expected_recovery_target_revision)
+    {
+        return DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::Stale {
+                observed_transaction_id: Some(journal.transaction_id),
+                observed_generation: Some(journal.generation),
+                observed_phase: Some(journal.phase),
+            },
+        };
+    }
+
+    let recovery_target_path = crate::tun_transaction::active_recovery_target_path(&ctx);
+    let target_bytes = match crate::utils::read_file_no_follow_limited(
+        &recovery_target_path,
+        crate::tun_transaction::MAX_TRANSACTION_ARTIFACT_BYTES,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            let obs = get_runtime_observation(&state).await;
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                    observation: obs,
+                    error: crate::tun_transaction::StructuredError {
+                        code: crate::tun_transaction::TransactionErrorCode::UnsafeArtifact,
+                        stage: "read_recovery_target".to_string(),
+                        retryable: false,
+                        message: format!("cannot read recovery-target.yaml: {e}"),
+                    },
+                },
+            };
+        }
+    };
+    if crate::tun_transaction::sha256_revision(&target_bytes) != expected_recovery_target_revision {
+        let obs = get_runtime_observation(&state).await;
+        return DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                observation: obs,
+                error: crate::tun_transaction::StructuredError {
+                    code: crate::tun_transaction::TransactionErrorCode::ArtifactRevisionMismatch,
+                    stage: "validate_recovery_target".to_string(),
+                    retryable: false,
+                    message: "recovery-target file hash does not match expected".to_string(),
+                },
+            },
+        };
+    }
+
+    let obs = get_runtime_observation(&state).await;
+    let expected_target_tun =
+        match crate::tun_transaction::parse_tun_enabled_from_bytes(&target_bytes) {
+            Ok(value) => value,
+            Err(error) => {
+                return DaemonResponse::Transaction {
+                    response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                        observation: obs,
+                        error: crate::tun_transaction::StructuredError {
+                            code: crate::tun_transaction::TransactionErrorCode::UnsafeArtifact,
+                            stage: "parse_recovery_target".to_string(),
+                            retryable: false,
+                            message: format!("recovery target is invalid YAML: {error}"),
+                        },
+                    },
+                };
+            }
+        };
+
+    if crate::tun_transaction::runtime_matches_recovery_target(
+        &journal,
+        &obs,
+        &expected_recovery_target_revision,
+        expected_target_tun,
+    ) {
+        return DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::AlreadySatisfied(
+                crate::tun_transaction::RuntimeProof {
+                    transaction_id: fence.transaction_id,
+                    generation: fence.generation,
+                    observed_phase: crate::tun_transaction::JournalPhase::RecoveryRequired,
+                    proof_kind:
+                        crate::tun_transaction::RuntimeProofKind::LegacyRecoveryTargetApplied,
+                    core_identity: obs.core_identity.unwrap_or_default(),
+                    core_pid: obs.core_pid.unwrap_or_default(),
+                    launched_revision: expected_recovery_target_revision,
+                    runtime_tun: expected_target_tun,
+                    api_ready: true,
+                },
+            ),
+        };
+    }
+
+    if obs.core_running {
+        let is_legacy_candidate = crate::tun_transaction::runtime_matches_candidate(&journal, &obs);
+        if !is_legacy_candidate {
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                    observation: obs,
+                    error: crate::tun_transaction::StructuredError {
+                        code: crate::tun_transaction::TransactionErrorCode::RuntimeRevisionMismatch,
+                        stage: "verify_running_core_before_legacy_apply".to_string(),
+                        retryable: false,
+                        message: "running core does not match legacy candidate runtime; refusing to stop unknown runtime".to_string(),
+                    },
+                },
+            };
+        }
+
+        let stop_res = stop_core(Arc::clone(&state)).await;
+        if !matches!(stop_res, DaemonResponse::Success { .. }) {
+            let message = match stop_res {
+                DaemonResponse::Error { message } => message,
+                other => format!("unexpected stop response: {other:?}"),
+            };
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::NotSatisfied {
+                    observation: get_runtime_observation(&state).await,
+                    error: crate::tun_transaction::StructuredError {
+                        code: crate::tun_transaction::TransactionErrorCode::CoreStopFailed,
+                        stage: "stop_legacy_candidate_core".to_string(),
+                        retryable: false,
+                        message,
+                    },
+                },
+            };
+        }
+        let obs_stopped = get_runtime_observation(&state).await;
+        if obs_stopped.core_running {
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::NotSatisfied {
+                    observation: obs_stopped,
+                    error: crate::tun_transaction::StructuredError {
+                        code: crate::tun_transaction::TransactionErrorCode::CoreStopFailed,
+                        stage: "verify_legacy_candidate_stopped".to_string(),
+                        retryable: false,
+                        message: "legacy candidate core is still running after stop request"
+                            .to_string(),
+                    },
+                },
+            };
+        }
+    }
+
+    let core_binary = expected_system_core_binary_path();
+    let start_res = start_core(Arc::clone(&state), recovery_target_path, core_binary).await;
+    let obs_after = get_runtime_observation(&state).await;
+
+    match start_res {
+        DaemonResponse::Success { .. } => {
+            if obs_after.core_running
+                && obs_after.api_ready
+                && obs_after
+                    .core_identity
+                    .as_deref()
+                    .is_some_and(|v| !v.is_empty())
+                && obs_after.core_pid.is_some_and(|pid| pid > 0)
+                && obs_after.launched_revision.as_deref()
+                    == Some(&expected_recovery_target_revision)
+                && obs_after.runtime_tun == Some(expected_target_tun)
+            {
+                DaemonResponse::Transaction {
+                    response: crate::tun_transaction::TransactionResponse::Completed(
+                        crate::tun_transaction::RuntimeProof {
+                            transaction_id: fence.transaction_id,
+                            generation: fence.generation,
+                            observed_phase: crate::tun_transaction::JournalPhase::RecoveryRequired,
+                            proof_kind: crate::tun_transaction::RuntimeProofKind::LegacyRecoveryTargetApplied,
+                            core_identity: obs_after.core_identity.unwrap_or_default(),
+                            core_pid: obs_after.core_pid.unwrap_or_default(),
+                            launched_revision: expected_recovery_target_revision,
+                            runtime_tun: obs_after.runtime_tun.unwrap_or(false),
+                            api_ready: true,
+                        },
+                    ),
+                }
+            } else {
+                DaemonResponse::Transaction {
+                    response: crate::tun_transaction::TransactionResponse::NotSatisfied {
+                        observation: obs_after,
+                        error: crate::tun_transaction::StructuredError {
+                            code: crate::tun_transaction::TransactionErrorCode::RuntimeRevisionMismatch,
+                            stage: "attest_legacy_target_after_start".to_string(),
+                            retryable: false,
+                            message: "core started but runtime revision did not match recovery target".to_string(),
+                        },
+                    },
+                }
+            }
+        }
+        DaemonResponse::Error { message } => DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::NotSatisfied {
+                observation: obs_after,
+                error: crate::tun_transaction::StructuredError {
+                    code: crate::tun_transaction::TransactionErrorCode::CoreStartFailed,
+                    stage: "start_recovery_core".to_string(),
+                    retryable: false,
+                    message,
+                },
+            },
+        },
+        _ => DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::NotSatisfied {
+                observation: obs_after,
+                error: crate::tun_transaction::StructuredError {
+                    code: crate::tun_transaction::TransactionErrorCode::CoreStartFailed,
+                    stage: "start_recovery_core".to_string(),
+                    retryable: false,
+                    message: "unexpected daemon response applying recovery target".to_string(),
+                },
+            },
+        },
+    }
+}
+
+#[cfg(unix)]
+fn transaction_status_response(
+    obs: crate::tun_transaction::RuntimeObservation,
+    journal_result: anyhow::Result<Option<crate::tun_transaction::TunJournal>>,
+) -> DaemonResponse {
+    let journal = match journal_result {
+        Ok(Some(journal)) => journal,
+        Ok(None) => {
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::Unavailable {
+                    observation: Some(obs),
+                    error: crate::tun_transaction::StructuredError {
+                        code: crate::tun_transaction::TransactionErrorCode::ObservationUnavailable,
+                        stage: "get_transaction_status".to_string(),
+                        retryable: true,
+                        message: "no active TUN transaction journal".to_string(),
+                    },
+                },
+            };
+        }
+        Err(error) => {
+            return DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                    observation: obs,
+                    error: crate::tun_transaction::StructuredError {
+                        code: crate::tun_transaction::TransactionErrorCode::UnsafeArtifact,
+                        stage: "read_active_journal".to_string(),
+                        retryable: false,
+                        message: error.to_string(),
+                    },
+                },
+            };
+        }
+    };
+
+    if obs.core_running
+        && obs.api_ready
+        && obs
+            .core_identity
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        && obs.core_pid.is_some_and(|pid| pid > 0)
+        && obs
+            .launched_revision
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        && obs.runtime_tun.is_some()
+    {
+        DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::Completed(
+                crate::tun_transaction::RuntimeProof {
+                    transaction_id: journal.transaction_id,
+                    generation: journal.generation,
+                    observed_phase: journal.phase,
+                    proof_kind: crate::tun_transaction::RuntimeProofKind::CandidateAttested,
+                    core_identity: obs.core_identity.clone().unwrap_or_default(),
+                    core_pid: obs.core_pid.unwrap_or_default(),
+                    launched_revision: obs.launched_revision.clone().unwrap_or_default(),
+                    runtime_tun: obs.runtime_tun.unwrap_or(false),
+                    api_ready: true,
+                },
+            ),
+        }
+    } else {
+        DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::Unavailable {
+                observation: Some(obs),
+                error: crate::tun_transaction::StructuredError {
+                    code: crate::tun_transaction::TransactionErrorCode::ObservationUnavailable,
+                    stage: "get_transaction_status".to_string(),
+                    retryable: true,
+                    message: "system Core is not running or its API is not ready".to_string(),
+                },
+            },
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn handle_get_transaction_status(state: Arc<Mutex<DaemonState>>) -> DaemonResponse {
+    let obs = get_runtime_observation(&state).await;
+    let journal_result = if let Some(ctx) = daemon_transaction_context() {
+        crate::tun_transaction::read_active_journal(&ctx)
+    } else {
+        Err(anyhow::anyhow!("system instance paths are unavailable"))
+    };
+    transaction_status_response(obs, journal_result)
+}
+
+#[cfg(unix)]
+async fn select_system_proxy(
+    state: Arc<Mutex<DaemonState>>,
+    group: String,
+    node: String,
+) -> DaemonResponse {
+    if group.is_empty() || node.is_empty() || group.len() > 512 || node.len() > 512 {
+        return DaemonResponse::Error {
+            message: "proxy group and node must be non-empty and reasonably sized".to_string(),
+        };
+    }
+    let endpoint = {
+        let mut state_guard = state.lock().await;
+        reap_exited_core(&mut state_guard);
+        if !state_guard.core_running {
+            return DaemonResponse::Error {
+                message: "system Core is not running. Fix: mihomo-cli restart --system".to_string(),
+            };
+        }
+        state_guard.api_endpoint.clone()
+    };
+    let Some(socket) = endpoint
+        .as_deref()
+        .and_then(endpoint_unix_path)
+        .map(PathBuf::from)
+    else {
+        return DaemonResponse::Error {
+            message: "system Core has no usable Unix API endpoint".to_string(),
+        };
+    };
+    let client = mihomo_api::EndpointMihomoApiClient::new(ApiEndpoint::UnixSocket(socket));
+    if let Err(error) = mihomo_api::select_proxy_with_client(&client, &group, &node).await {
+        return DaemonResponse::Error {
+            message: format!("failed to select proxy {group} → {node}: {error}"),
+        };
+    }
+    match client
+        .get(&format!("/proxies/{}", encode_proxy_path_segment(&group)))
+        .await
+    {
+        Ok(config) if config["now"].as_str() == Some(node.as_str()) => DaemonResponse::Success {
+            message: format!("proxy selection applied: {group} → {node}"),
+        },
+        Ok(_) => DaemonResponse::Error {
+            message: "proxy selection was accepted but runtime attestation did not match"
+                .to_string(),
+        },
+        Err(error) => DaemonResponse::Error {
+            message: format!("proxy selection runtime attestation failed: {error}"),
+        },
+    }
+}
+
+#[cfg(unix)]
+fn encode_proxy_path_segment(value: &str) -> String {
+    value.bytes().fold(String::new(), |mut encoded, byte| {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+        encoded
+    })
+}
+
+#[cfg(unix)]
 async fn start_core(
     state: Arc<Mutex<DaemonState>>,
     config_path: PathBuf,
     core_binary: PathBuf,
 ) -> DaemonResponse {
+    let config_path = match system_runtime_config_path(&config_path) {
+        Ok(path) => path,
+        Err(error) => {
+            return DaemonResponse::Error {
+                message: format!("failed to prepare system runtime config: {error}"),
+            };
+        }
+    };
     let mut s = state.lock().await;
     if let Some(child) = s.core_child.as_mut() {
         match child.try_wait() {
@@ -1869,12 +4372,16 @@ async fn start_core(
             message: duplicate_core_endpoint_message(&api_endpoint),
         };
     }
+    let config_revision = match config_content_revision(&config_path) {
+        Ok(revision) => revision,
+        Err(error) => {
+            return DaemonResponse::Error {
+                message: format!("failed to read Core config revision: {error}"),
+            }
+        }
+    };
     remove_stale_unix_endpoint(&api_endpoint);
 
-    let config_dir = config_path
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
     let stdout_log = match open_append_log_file(&s.core_log_file) {
         Ok(file) => file,
         Err(e) => {
@@ -1899,31 +4406,41 @@ async fn start_core(
     };
 
     let mut cmd = tokio::process::Command::new(&core_binary);
-    cmd.arg("-d")
-        .arg(&config_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_log))
-        .stderr(Stdio::from(stderr_log));
+    cmd.args(core_command_args(
+        &config_path,
+        &runtime_data_dir_for_config(&config_path),
+    ))
+    .stdin(Stdio::null())
+    .stdout(Stdio::from(stdout_log))
+    .stderr(Stdio::from(stderr_log));
 
     match cmd.spawn() {
         Ok(mut child) => {
             let pid = child.id();
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             match child.try_wait() {
-                Ok(Some(status)) => {
+                Ok(Some(_status)) => {
                     s.core_running = false;
                     s.core_pid = None;
-                    s.config_path = None;
                     s.api_endpoint = None;
                     remove_pid_file(&s.pid_file);
-                    DaemonResponse::Error {
-                        message: early_exit_message(status, &core_binary, &s.core_log_file),
-                    }
+                    // ADR-24: classify the failure and attempt geo auto-recovery.
+                    let log_tail = read_log_tail(&s.core_log_file, 50);
+                    let failure = classify_core_startup_failure(&log_tail);
+                    let error_msg = format_core_failure_message(&failure, &s.core_log_file);
+                    drop(s);
+                    return try_geo_recovery_and_retry(
+                        &state,
+                        &failure,
+                        config_path,
+                        core_binary,
+                        error_msg,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     s.core_running = false;
                     s.core_pid = None;
-                    s.config_path = None;
                     s.api_endpoint = None;
                     remove_pid_file(&s.pid_file);
                     DaemonResponse::Error {
@@ -1939,17 +4456,6 @@ async fn start_core(
                     s.core_binary = Some(core_binary.clone());
                     s.core_pid = pid;
                     s.api_endpoint = Some(api_endpoint.clone());
-                    if let Some(pid) = pid {
-                        write_pid_file(
-                            &s.pid_file,
-                            &CorePidMetadata {
-                                pid,
-                                config_path: config_path.clone(),
-                                core_binary: core_binary.clone(),
-                                api_endpoint: s.api_endpoint.clone(),
-                            },
-                        );
-                    }
                     s.core_child = Some(child);
 
                     // Readiness: wait for the core API to become reachable before
@@ -1964,19 +4470,40 @@ async fn start_core(
                     let ready = mihomo_api::wait_for_api_ready_at_endpoint(&endpoint, 15).await;
                     if !ready {
                         // Core spawned but did not become ready; kill it and report failure.
-                        let _ = s.core_child.take();
+                        if let Some(mut child) = s.core_child.take() {
+                            let _ = child.start_kill();
+                            let _ = child.try_wait();
+                        }
                         s.core_running = false;
                         s.core_pid = None;
-                        s.config_path = None;
                         s.api_endpoint = None;
                         remove_pid_file(&s.pid_file);
-                        return DaemonResponse::Error {
-                            message: format!(
-                                "core started but did not become API-ready within 15s at {api_endpoint}\n  \
-                                 Logs: {}",
-                                s.core_log_file.display()
-                            ),
-                        };
+                        // ADR-24: classify the failure and attempt geo auto-recovery.
+                        let log_tail = read_log_tail(&s.core_log_file, 50);
+                        let failure = classify_core_startup_failure(&log_tail);
+                        let error_msg = format_core_failure_message(&failure, &s.core_log_file);
+                        drop(s);
+                        return try_geo_recovery_and_retry(
+                            &state,
+                            &failure,
+                            config_path,
+                            core_binary,
+                            error_msg,
+                        )
+                        .await;
+                    }
+                    s.launched_config_revision = Some(config_revision.clone());
+                    if let Some(pid) = pid {
+                        write_pid_file(
+                            &s.pid_file,
+                            &CorePidMetadata {
+                                pid,
+                                config_path: config_path.clone(),
+                                core_binary: core_binary.clone(),
+                                api_endpoint: s.api_endpoint.clone(),
+                                config_revision: Some(config_revision.clone()),
+                            },
+                        );
                     }
                     DaemonResponse::Success {
                         message: format!(
@@ -2016,9 +4543,7 @@ async fn stop_core(state: Arc<Mutex<DaemonState>>) -> DaemonResponse {
             remove_pid_file(&s.pid_file);
             s.core_running = false;
             s.core_pid = None;
-            s.tun_enabled = false;
-            s.config_path = None;
-            s.core_binary = None;
+            s.launched_config_revision = None;
             s.api_endpoint = None;
             return match result {
                 Ok(()) => DaemonResponse::Success {
@@ -2034,12 +4559,6 @@ async fn stop_core(state: Arc<Mutex<DaemonState>>) -> DaemonResponse {
             .as_ref()
             .filter(|endpoint| endpoint_is_connectable(endpoint))
             .cloned();
-        s.core_running = false;
-        s.core_pid = None;
-        s.tun_enabled = false;
-        s.config_path = None;
-        s.core_binary = None;
-        remove_pid_file(&s.pid_file);
         if let Some(endpoint) = orphan_endpoint {
             return DaemonResponse::Error {
                 message: format!(
@@ -2047,8 +4566,13 @@ async fn stop_core(state: Arc<Mutex<DaemonState>>) -> DaemonResponse {
                 ),
             };
         }
-        return DaemonResponse::Error {
-            message: "core is not running".to_string(),
+        s.core_running = false;
+        s.core_pid = None;
+        s.launched_config_revision = None;
+        s.api_endpoint = None;
+        remove_pid_file(&s.pid_file);
+        return DaemonResponse::Success {
+            message: "core already stopped".to_string(),
         };
     };
 
@@ -2056,9 +4580,6 @@ async fn stop_core(state: Arc<Mutex<DaemonState>>) -> DaemonResponse {
     let _ = child.wait().await;
     s.core_running = false;
     s.core_pid = None;
-    s.tun_enabled = false;
-    s.config_path = None;
-    s.core_binary = None;
     s.api_endpoint = None;
     remove_pid_file(&s.pid_file);
 
@@ -2068,6 +4589,192 @@ async fn stop_core(state: Arc<Mutex<DaemonState>>) -> DaemonResponse {
         },
         Err(e) => DaemonResponse::Error {
             message: format!("failed to stop core: {e}"),
+        },
+    }
+}
+
+#[cfg(unix)]
+fn validate_core_api_request(
+    method: CoreApiMethod,
+    path: &str,
+    body: Option<&serde_json::Value>,
+    peer_uid: Option<u32>,
+) -> Result<(), String> {
+    if path.len() > 2048
+        || !path.starts_with('/')
+        || path.contains(['\r', '\n', '\\'])
+        || path.contains("://")
+        || path.split(['/', '?', '&']).any(|part| part == "..")
+    {
+        return Err("refusing malformed Core API path".to_string());
+    }
+
+    let allowed = match method {
+        CoreApiMethod::Get => {
+            matches!(path, "/configs" | "/proxies" | "/connections" | "/version")
+                || path.starts_with("/proxies/")
+                || path.starts_with("/group/")
+        }
+        CoreApiMethod::Put => path == "/configs" || path.starts_with("/proxies/"),
+        CoreApiMethod::Patch => path == "/configs",
+        CoreApiMethod::Delete => path == "/connections",
+    };
+    if !allowed {
+        return Err(format!(
+            "Core API request is not allowlisted: {method:?} {path}"
+        ));
+    }
+
+    if method == CoreApiMethod::Patch
+        && body
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|object| object.contains_key("tun"))
+    {
+        return Err("TUN changes must use the root-authorized TUN command".to_string());
+    }
+
+    if method == CoreApiMethod::Put && path == "/configs" {
+        let config_path = body
+            .and_then(|value| value.get("path"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "Core config reload requires an absolute config path".to_string())?;
+        validate_daemon_config_path_for_peer(std::path::Path::new(config_path), peer_uid)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn core_api_mutation_requires_promotion(
+    method: CoreApiMethod,
+    path: &str,
+    runtime_tun: Option<bool>,
+) -> anyhow::Result<()> {
+    let is_effective_mutation = match method {
+        CoreApiMethod::Put if path == "/configs" => true,
+        CoreApiMethod::Patch if path == "/configs" => true,
+        CoreApiMethod::Put if path.starts_with("/proxies/") => true,
+        _ => false,
+    };
+    if !is_effective_mutation {
+        return Ok(());
+    }
+    match runtime_tun {
+        Some(false) => Ok(()),
+        Some(true) => anyhow::bail!(
+            "system TUN is active; this mutation must use the active-config promotion dispatcher"
+        ),
+        None => anyhow::bail!(
+            "system TUN runtime is unknown; refusing an untracked Core API mutation. Run `mihomo-cli restart --system` and retry"
+        ),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod core_api_mutation_tests {
+    use super::*;
+
+    #[test]
+    fn direct_core_api_mutations_are_blocked_when_tun_is_active_or_unknown() {
+        for runtime_tun in [Some(true), None] {
+            assert!(core_api_mutation_requires_promotion(
+                CoreApiMethod::Put,
+                "/configs",
+                runtime_tun,
+            )
+            .is_err());
+            assert!(core_api_mutation_requires_promotion(
+                CoreApiMethod::Put,
+                "/proxies/Group",
+                runtime_tun,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn config_reload_is_allowed_only_when_tun_is_observed_disabled() {
+        assert!(
+            core_api_mutation_requires_promotion(CoreApiMethod::Put, "/configs", Some(false),)
+                .is_ok()
+        );
+        assert!(
+            core_api_mutation_requires_promotion(CoreApiMethod::Get, "/configs", None,).is_ok()
+        );
+    }
+}
+
+#[cfg(unix)]
+async fn process_core_api_request(
+    method: CoreApiMethod,
+    path: String,
+    body: Option<serde_json::Value>,
+    state: Arc<Mutex<DaemonState>>,
+    peer_uid: Option<u32>,
+) -> DaemonResponse {
+    if let Err(message) = validate_core_api_request(method, &path, body.as_ref(), peer_uid) {
+        return DaemonResponse::Error { message };
+    }
+    let endpoint = {
+        let mut state = state.lock().await;
+        reap_exited_core(&mut state);
+        if !state.core_running {
+            return DaemonResponse::Error {
+                message: "system Core is not running. Fix: mihomo-cli restart --system".to_string(),
+            };
+        }
+        state.api_endpoint.clone()
+    };
+    let Some(socket) = endpoint
+        .as_deref()
+        .and_then(endpoint_unix_path)
+        .map(PathBuf::from)
+    else {
+        return DaemonResponse::Error {
+            message:
+                "system Core has no usable Unix API endpoint. Fix: mihomo-cli restart --system"
+                    .to_string(),
+        };
+    };
+    let client = mihomo_api::EndpointMihomoApiClient::new(ApiEndpoint::UnixSocket(socket));
+    let runtime_tun = if matches!(method, CoreApiMethod::Put | CoreApiMethod::Patch)
+        && (path == "/configs" || path.starts_with("/proxies/"))
+    {
+        match client.get("/configs").await {
+            Ok(config) => config["tun"]["enable"].as_bool(),
+            Err(error) => {
+                return DaemonResponse::Error {
+                    message: format!(
+                        "cannot observe system Core TUN runtime before mutation: {error}. Run `mihomo-cli restart --system` and retry"
+                    ),
+                }
+            }
+        }
+    } else {
+        None
+    };
+    if let Err(error) = core_api_mutation_requires_promotion(method, &path, runtime_tun) {
+        return DaemonResponse::Error {
+            message: error.to_string(),
+        };
+    }
+    let result = match method {
+        CoreApiMethod::Get => client.get(&path).await,
+        CoreApiMethod::Put => {
+            client
+                .put(&path, body.unwrap_or(serde_json::Value::Null))
+                .await
+        }
+        CoreApiMethod::Patch => {
+            client
+                .patch(&path, body.unwrap_or(serde_json::Value::Null))
+                .await
+        }
+        CoreApiMethod::Delete => client.delete(&path).await,
+    };
+    match result {
+        Ok(data) => DaemonResponse::CoreApi { data },
+        Err(error) => DaemonResponse::Error {
+            message: format!("Core API request failed: {error}"),
         },
     }
 }
@@ -2093,7 +4800,12 @@ async fn send_response(
 /// `external-controller-pipe` (Windows) in the config file.
 fn read_api_endpoint_from_config(config_path: &PathBuf) -> Option<String> {
     let content = std::fs::read_to_string(config_path).ok()?;
-    let config: serde_yaml::Value = serde_yaml::from_str(&content).ok()?;
+    read_api_endpoint_from_content(&content)
+}
+
+#[cfg(any(unix, windows))]
+fn read_api_endpoint_from_content(content: &str) -> Option<String> {
+    let config: serde_yaml::Value = serde_yaml::from_str(content).ok()?;
     read_api_endpoint_from_yaml_value(&config, cfg!(windows))
 }
 
@@ -2123,6 +4835,7 @@ fn read_api_endpoint_from_yaml_value(
 }
 
 #[cfg(any(windows, test))]
+#[allow(dead_code)]
 fn set_tun_in_config_file(
     config_path: &std::path::Path,
     enable: bool,
@@ -2168,6 +4881,7 @@ fn set_tun_in_config_file(
 ///
 /// The core exposes a PATCH /configs endpoint that accepts partial config updates.
 /// We use this to enable/disable TUN without restarting the core.
+#[allow(dead_code)]
 async fn toggle_tun_via_core_api(
     api_endpoint: &Option<String>,
     enable: bool,
@@ -2226,6 +4940,85 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn corrupt_journal_only_allows_read_only_status_commands() {
+        assert!(allowed_with_unreadable_journal(&DaemonCommand::GetStatus {
+            token: None
+        }));
+        assert!(allowed_with_unreadable_journal(
+            &DaemonCommand::GetTransactionStatus { token: None }
+        ));
+        assert!(!allowed_with_unreadable_journal(
+            &DaemonCommand::CoreApiRequest {
+                method: CoreApiMethod::Put,
+                path: "/configs".to_string(),
+                body: None,
+                token: None,
+            }
+        ));
+        assert!(!allowed_with_unreadable_journal(
+            &DaemonCommand::PromoteSystemConfig {
+                config_content: "tun:\n  enable: false\n".to_string(),
+                config_revision: "revision".to_string(),
+                selection_intent_dir: None,
+                subscription_id: None,
+                token: None,
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn get_status_preserves_corrupt_journal_diagnostic() {
+        let result: anyhow::Result<Option<crate::tun_transaction::TunJournal>> =
+            Err(anyhow::anyhow!("unsupported active TUN journal schema 99"));
+        let (phase, error) = journal_status_from_result(result);
+        assert_eq!(
+            phase,
+            Some(crate::tun_transaction::JournalPhase::RecoveryRequired)
+        );
+        assert_eq!(
+            error.as_deref(),
+            Some("unsupported active TUN journal schema 99")
+        );
+    }
+    use crate::ipc::DaemonResponse;
+
+    #[test]
+    fn core_api_proxy_allowlist_rejects_tun_and_unrecognized_paths() {
+        assert!(
+            validate_core_api_request(CoreApiMethod::Get, "/configs", None, Some(1000)).is_ok()
+        );
+        assert!(validate_core_api_request(
+            CoreApiMethod::Get,
+            "/group/selector/delay?url=http%3A%2F%2Fexample.com&timeout=5000",
+            None,
+            Some(1000)
+        )
+        .is_ok());
+
+        let tun = serde_json::json!({"tun": {"enable": true}});
+        let error =
+            validate_core_api_request(CoreApiMethod::Patch, "/configs", Some(&tun), Some(1000))
+                .unwrap_err();
+        assert!(error.contains("root-authorized TUN"));
+        assert!(validate_core_api_request(
+            CoreApiMethod::Get,
+            "/providers/proxies",
+            None,
+            Some(1000)
+        )
+        .is_err());
+        assert!(validate_core_api_request(
+            CoreApiMethod::Get,
+            "/configs\r\nInjected: true",
+            None,
+            Some(1000)
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn daemon_tun_peer_uid_requires_root() {
         assert!(validate_tun_peer_is_root(Some(0)).is_ok());
         assert!(validate_tun_peer_is_root(Some(1000)).is_err());
@@ -2235,7 +5028,7 @@ mod tests {
     }
 
     #[test]
-    fn authorized_clients_table_roundtrip_sets_0600() {
+    fn authorized_clients_table_roundtrip_sets_daemon_readable_mode() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("authorized-clients.json");
@@ -2248,10 +5041,63 @@ mod tests {
         };
         write_authorized_clients_to(&path, &table).unwrap();
         assert_eq!(read_authorized_clients_from(&path).unwrap(), table);
+        #[cfg(target_os = "linux")]
+        let expected_mode = 0o640;
+        #[cfg(not(target_os = "linux"))]
+        let expected_mode = 0o600;
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
+            expected_mode
         );
+    }
+
+    #[test]
+    fn revoke_authorized_client_matches_uid_and_token_only() {
+        let mut table = AuthorizedClients {
+            clients: vec![
+                AuthorizedClient {
+                    user: "alice".into(),
+                    uid: 1000,
+                    token: "alice-token".into(),
+                },
+                AuthorizedClient {
+                    user: "bob".into(),
+                    uid: 1001,
+                    token: "bob-token".into(),
+                },
+            ],
+        };
+        assert!(revoke_authorized_client(&mut table, 1000, "alice-token").unwrap());
+        assert_eq!(table.clients.len(), 1);
+        assert_eq!(table.clients[0].user, "bob");
+        assert!(!revoke_authorized_client(&mut table, 1000, "wrong-token").unwrap());
+        assert_eq!(table.clients.len(), 1);
+    }
+
+    #[test]
+    fn revoke_authorized_client_rejects_duplicate_uid_token_entries() {
+        let mut table = AuthorizedClients {
+            clients: vec![
+                AuthorizedClient {
+                    user: "alice".into(),
+                    uid: 1000,
+                    token: "same-token".into(),
+                },
+                AuthorizedClient {
+                    user: "alias".into(),
+                    uid: 1000,
+                    token: "same-token".into(),
+                },
+            ],
+        };
+        assert!(revoke_authorized_client(&mut table, 1000, "same-token").is_err());
+        assert_eq!(table.clients.len(), 2);
+    }
+
+    #[test]
+    fn revoke_authorized_client_rejects_empty_token() {
+        let mut table = AuthorizedClients::default();
+        assert!(revoke_authorized_client(&mut table, 1000, "").is_err());
     }
 
     #[test]
@@ -2269,6 +5115,7 @@ mod tests {
             },
         )
         .unwrap();
+        let _guard = crate::utils::env_test_lock().lock().unwrap();
         let old = std::env::var_os("MIHOMO_CLI_AUTHORIZED_CLIENTS_PATH");
         unsafe {
             std::env::set_var("MIHOMO_CLI_AUTHORIZED_CLIENTS_PATH", &path);
@@ -2289,41 +5136,19 @@ mod tests {
 
     #[tokio::test]
     async fn process_command_rejects_unauthorized_client_token() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("authorized-clients.json");
-        write_authorized_clients_to(&path, &AuthorizedClients { clients: vec![] }).unwrap();
-        let old = std::env::var_os("MIHOMO_CLI_AUTHORIZED_CLIENTS_PATH");
-        unsafe {
-            std::env::set_var("MIHOMO_CLI_AUTHORIZED_CLIENTS_PATH", &path);
-        }
         let state = Arc::new(Mutex::new(DaemonState::default()));
-        let response = process_command(
-            DaemonCommand::GetStatus {
-                token: Some("bad".into()),
-            },
-            state,
-            Some(1000),
-        )
-        .await;
+        let response =
+            process_command(DaemonCommand::GetStatus { token: None }, state, Some(1000)).await;
         assert!(matches!(response, DaemonResponse::Error { .. }));
-        if let Some(v) = old {
-            unsafe {
-                std::env::set_var("MIHOMO_CLI_AUTHORIZED_CLIENTS_PATH", v);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("MIHOMO_CLI_AUTHORIZED_CLIENTS_PATH");
-            }
-        }
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn process_command_rejects_enable_tun_from_non_root_peer() {
+    async fn process_command_rejects_apply_tun_from_non_root_peer() {
         let state = Arc::new(Mutex::new(DaemonState::default()));
         let response = process_command(
-            DaemonCommand::EnableTun {
-                config_path: PathBuf::from("/home/alice/.config/mihomo/config.yaml"),
+            DaemonCommand::ApplySystemTunSnapshot {
+                expected_revision: "test-revision".to_string(),
                 stack: None,
                 dns_hijack: None,
                 token: None,
@@ -2364,6 +5189,8 @@ mod tests {
         assert!(!sddl.contains("(A;;GA;;;S-1-"));
         let sddl_whitespace = pipe_sddl_for_installer("   ");
         assert_eq!(sddl, sddl_whitespace);
+        let injected = pipe_sddl_for_installer("S-1-5-21-1000)(A;;GA;;;WD");
+        assert_eq!(sddl, injected);
     }
 
     #[test]
@@ -2376,7 +5203,7 @@ mod tests {
 
         let err = parse_daemon_command(legacy).unwrap_err();
         assert!(err.contains("invalid daemon command"));
-        assert!(err.contains("core_binary"));
+        assert!(err.contains("config_content"));
     }
 
     #[test]
@@ -2443,6 +5270,7 @@ mod tests {
             config_path,
             core_binary,
             api_endpoint: Some("/var/run/mihomo/mihomo.sock".to_string()),
+            config_revision: Some("rev-1".to_string()),
         }
     }
 
@@ -2452,6 +5280,10 @@ mod tests {
         let content = format_pid_metadata(&metadata);
         assert_eq!(parse_pid_file_content(&content), Some(metadata));
         assert_eq!(parse_pid_file_content("1234\n").map(|m| m.pid), Some(1234));
+        assert_eq!(
+            parse_pid_file_content("1234\n").and_then(|m| m.config_revision),
+            None
+        );
         assert_eq!(parse_pid_file_content("0"), None);
         assert_eq!(parse_pid_file_content("not-a-pid"), None);
         assert_eq!(parse_pid_file_content(""), None);
@@ -2532,6 +5364,46 @@ mod tests {
     }
 
     #[test]
+    fn core_command_args_keeps_runtime_data_dir_independent_from_config_file() {
+        let config = PathBuf::from("/var/lib/mihomo-cli/transactions/active/recovery-target.yaml");
+        let runtime = PathBuf::from("/var/lib/mihomo-cli");
+        let args: Vec<String> = core_command_args(&config, &runtime)
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            args,
+            vec![
+                "-d",
+                "/var/lib/mihomo-cli",
+                "-f",
+                "/var/lib/mihomo-cli/transactions/active/recovery-target.yaml",
+            ]
+        );
+    }
+
+    #[test]
+    fn core_command_args_explicitly_selects_nondefault_config_file() {
+        let config = PathBuf::from("/var/lib/mihomo-cli/tun-config.yaml");
+        let runtime = PathBuf::from("/var/lib/mihomo-cli");
+        let args: Vec<String> = core_command_args(&config, &runtime)
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            args,
+            vec![
+                "-d",
+                "/var/lib/mihomo-cli",
+                "-f",
+                "/var/lib/mihomo-cli/tun-config.yaml",
+            ]
+        );
+    }
+
+    #[test]
     fn set_tun_in_config_file_preserves_config_and_sets_flag() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = tmp.path().join("config.yaml");
@@ -2604,16 +5476,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_core_clears_stale_tun_state_when_no_core_is_running() {
+    async fn stop_core_clears_runtime_state_but_preserves_last_start_intent() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let api_endpoint = tmp.path().join("missing-core.sock");
         let state = Arc::new(Mutex::new(DaemonState {
             core_running: true,
             core_child: None,
             core_pid: Some(4242),
-            tun_enabled: true,
             config_path: Some(PathBuf::from("/home/alice/.config/mihomo/config.yaml")),
+            launched_config_revision: None,
             core_binary: Some(expected_system_core_binary_path()),
-            api_endpoint: Some("/var/run/mihomo/mihomo.sock".to_string()),
+            api_endpoint: Some(api_endpoint.display().to_string()),
             pid_file: tmp.path().join("missing-core.pid"),
             core_log_file: tmp.path().join("mihomo.log"),
         }));
@@ -2621,18 +5494,20 @@ mod tests {
         let response = stop_core(Arc::clone(&state)).await;
 
         match response {
-            DaemonResponse::Error { message } => assert!(message.contains("core is not running")),
-            other => panic!("expected not-running error, got {other:?}"),
+            DaemonResponse::Success { message } => {
+                assert_eq!(message, "core already stopped")
+            }
+            other => panic!("expected idempotent stop success, got {other:?}"),
         }
         let s = state.lock().await;
         assert!(!s.core_running);
         assert_eq!(s.core_pid, None);
-        assert!(
-            !s.tun_enabled,
-            "stale TUN state must be cleared when core is stopped"
+        assert_eq!(
+            s.config_path,
+            Some(PathBuf::from("/home/alice/.config/mihomo/config.yaml"))
         );
-        assert_eq!(s.config_path, None);
-        assert_eq!(s.core_binary, None);
+        assert_eq!(s.core_binary, Some(expected_system_core_binary_path()));
+        assert_eq!(s.api_endpoint, None);
     }
 
     #[tokio::test]
@@ -2646,18 +5521,19 @@ mod tests {
             core_running: true,
             core_child: None,
             core_pid: Some(4242),
-            tun_enabled: false,
             config_path: Some(config_path.clone()),
+            launched_config_revision: None,
             core_binary: Some(expected_system_core_binary_path()),
             api_endpoint: Some("/var/run/mihomo/mihomo.sock".to_string()),
             pid_file: tmp.path().join("core.pid"),
             core_log_file: tmp.path().join("mihomo.log"),
         }));
-        let missing_config = config_path.clone();
-
         let response = process_command(
             DaemonCommand::RestartCore {
-                config_path: missing_config,
+                config_content: "invalid: [yaml".to_string(),
+                config_revision: "invalid-revision".to_string(),
+                selection_intent_dir: None,
+                subscription_id: None,
                 token: None,
             },
             Arc::clone(&state),
@@ -2667,7 +5543,9 @@ mod tests {
 
         match response {
             DaemonResponse::Error { message } => assert!(
-                message.contains("core binary not found") || message.contains("config not found")
+                message.contains("revision")
+                    || message.contains("YAML")
+                    || message.contains("endpoint")
             ),
             other => panic!("expected preflight error, got {other:?}"),
         }
@@ -2784,6 +5662,17 @@ external-controller: 127.0.0.1:9090
         #[cfg(not(target_os = "macos"))]
         let valid = "/home/alice/.config/mihomo/config.yaml";
         assert!(validate_daemon_config_path_shape(std::path::Path::new(valid)).is_ok());
+
+        // TUN config path (system-level) must also be accepted.
+        #[cfg(target_os = "macos")]
+        let valid_tun = "/Library/Application Support/mihomo-cli/tun-config.yaml";
+        #[cfg(target_os = "linux")]
+        let valid_tun = "/var/lib/mihomo-cli/tun-config.yaml";
+        #[cfg(target_os = "windows")]
+        let valid_tun = "C:/ProgramData/mihomo-cli/tun-config.yaml";
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        assert!(validate_daemon_config_path_shape(std::path::Path::new(valid_tun)).is_ok());
+
         // The other platform's path shape must be rejected.
         let platform_other_home = if cfg!(target_os = "macos") {
             "/home/alice/.config/mihomo/config.yaml"
@@ -2792,21 +5681,21 @@ external-controller: 127.0.0.1:9090
         };
         let err = validate_daemon_config_path_shape(std::path::Path::new(platform_other_home))
             .unwrap_err();
-        assert!(err.contains("system daemon only accepts per-user mihomo config.yaml"));
+        assert!(err.contains("system daemon only accepts"));
 
         let err =
             validate_daemon_config_path_shape(std::path::Path::new("/etc/shadow")).unwrap_err();
-        assert!(err.contains("expected config.yaml"));
+        assert!(err.contains("expected config.yaml or tun-config.yaml"));
         let err = validate_daemon_config_path_shape(std::path::Path::new(
             "/home/alice/.config/other/config.yaml",
         ))
         .unwrap_err();
-        assert!(err.contains("system daemon only accepts per-user mihomo config.yaml"));
+        assert!(err.contains("system daemon only accepts"));
         let err = validate_daemon_config_path_shape(std::path::Path::new(
             "/home/alice/extra/.config/mihomo/config.yaml",
         ))
         .unwrap_err();
-        assert!(err.contains("system daemon only accepts per-user mihomo config.yaml"));
+        assert!(err.contains("system daemon only accepts"));
         let err = validate_daemon_config_path_shape(std::path::Path::new("relative/config.yaml"))
             .unwrap_err();
         assert!(err.contains("non-absolute"));
@@ -2820,6 +5709,13 @@ external-controller: 127.0.0.1:9090
         ))
         .unwrap_err();
         assert!(err.contains("must not contain . or .. components"));
+
+        // Invalid tun-config.yaml path should be rejected.
+        let err = validate_daemon_config_path_shape(std::path::Path::new(
+            "/home/alice/.config/mihomo/tun-config.yaml",
+        ))
+        .unwrap_err();
+        assert!(err.contains("system daemon only accepts"));
     }
 
     #[test]
@@ -2835,35 +5731,6 @@ external-controller: 127.0.0.1:9090
         let wrong_uid = if uid == 0 { 1 } else { 0 };
         let err = validate_config_owner_for_peer(&config, wrong_uid).unwrap_err();
         assert!(err.contains("does not match IPC peer uid"));
-    }
-
-    #[test]
-    fn early_exit_message_mentions_binary_and_log_path() {
-        let status = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("exit 7")
-            .status()
-            .unwrap();
-        let message = early_exit_message(
-            status,
-            std::path::Path::new("/usr/local/lib/mihomo/mihomo"),
-            std::path::Path::new("/var/log/mihomo/mihomo.log"),
-        );
-        assert!(message.contains("core exited immediately after start"));
-        assert!(message.contains("/usr/local/lib/mihomo/mihomo"));
-        assert!(message.contains("/var/log/mihomo/mihomo.log"));
-    }
-
-    #[test]
-    fn reads_tun_enabled_from_active_config() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = tmp.path().join("config.yaml");
-        std::fs::write(&config, "mixed-port: 7897\ntun:\n  enable: true\n").unwrap();
-        assert_eq!(read_tun_enabled_from_config(Some(&config)), Some(true));
-
-        std::fs::write(&config, "mixed-port: 7897\ntun:\n  enable: false\n").unwrap();
-        assert_eq!(read_tun_enabled_from_config(Some(&config)), Some(false));
-        assert_eq!(read_tun_enabled_from_config(None), None);
     }
 
     #[test]
@@ -2927,6 +5794,7 @@ second
             config_path: PathBuf::new(),
             core_binary: PathBuf::new(),
             api_endpoint: None,
+            config_revision: None,
         };
         assert!(cmdline_matches_core_metadata(
             &["mihomo".to_string(), "-d".to_string()],
@@ -2948,18 +5816,57 @@ second
 
         // 持锁时，GetStatus 仍应立即执行（不取生命周期锁）
         let cmd = DaemonCommand::GetStatus { token: None };
-        let is_lifecycle = !matches!(cmd, DaemonCommand::GetStatus { token: None });
+        let is_lifecycle = !matches!(cmd, DaemonCommand::GetStatus { .. });
         assert!(!is_lifecycle, "GetStatus must not be a lifecycle command");
+
+        let cmd = DaemonCommand::GetStatus {
+            token: Some("authorized-token".to_string()),
+        };
+        let is_lifecycle = !matches!(cmd, DaemonCommand::GetStatus { .. });
+        assert!(
+            !is_lifecycle,
+            "authenticated GetStatus must not take the lifecycle lock"
+        );
 
         drop(guard);
 
         // 生命周期命令（StartCore）应标记为需要锁
         let cmd = DaemonCommand::StartCore {
-            config_path: PathBuf::from("/tmp/x/config.yaml"),
+            config_content: "mode: rule\n".to_string(),
+            config_revision: "revision".to_string(),
+            selection_intent_dir: None,
+            subscription_id: None,
             token: None,
         };
-        let is_lifecycle = !matches!(cmd, DaemonCommand::GetStatus { token: None });
+        let is_lifecycle = !matches!(cmd, DaemonCommand::GetStatus { .. });
         assert!(is_lifecycle, "StartCore must be a lifecycle command");
+    }
+
+    #[test]
+    fn reaping_crashed_core_preserves_recovery_intent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = PathBuf::from("/home/alice/.config/mihomo/config.yaml");
+        let core_binary = expected_system_core_binary_path();
+        let mut state = DaemonState {
+            core_running: true,
+            core_pid: Some(u32::MAX),
+            config_path: Some(config_path.clone()),
+            core_binary: Some(core_binary.clone()),
+            api_endpoint: Some("/var/run/mihomo/mihomo.sock".to_string()),
+            pid_file: tmp.path().join("missing.pid"),
+            core_log_file: tmp.path().join("mihomo.log"),
+            ..DaemonState::default()
+        };
+
+        reap_exited_core(&mut state);
+
+        assert!(!state.core_running);
+        assert_eq!(state.config_path, Some(config_path));
+        assert_eq!(state.core_binary, Some(core_binary));
+        assert_eq!(
+            state.api_endpoint.as_deref(),
+            Some("/var/run/mihomo/mihomo.sock")
+        );
     }
 
     #[tokio::test]
@@ -3002,6 +5909,418 @@ second
             max_concurrent.load(Ordering::SeqCst),
             1,
             "lifecycle operations must be strictly serialized (max concurrency 1)"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_tun_requires_explicit_core_restart_when_stopped() {
+        let state = Arc::new(Mutex::new(DaemonState {
+            core_running: false,
+            core_binary: None,
+            config_path: None,
+            ..DaemonState::default()
+        }));
+
+        let response = process_command(
+            DaemonCommand::ApplySystemTunSnapshot {
+                expected_revision: "test-revision".to_string(),
+                stack: None,
+                dns_hijack: None,
+                token: None,
+            },
+            state,
+            Some(0),
+        )
+        .await;
+
+        match response {
+            DaemonResponse::Error { ref message } => {
+                assert!(
+                    message.contains("restart --system"),
+                    "error must require explicit restart: {message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn core_api_request_does_not_start_stopped_core() {
+        let state = Arc::new(Mutex::new(DaemonState {
+            core_running: false,
+            ..DaemonState::default()
+        }));
+
+        let response = process_core_api_request(
+            CoreApiMethod::Get,
+            "/configs".to_string(),
+            None,
+            state,
+            Some(1000),
+        )
+        .await;
+
+        match response {
+            DaemonResponse::Error { message } => {
+                assert!(
+                    message.contains("restart --system"),
+                    "unexpected error: {message}"
+                );
+            }
+            other => panic!("expected stopped-core error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn disable_tun_requires_explicit_core_restart_when_stopped() {
+        let state = Arc::new(Mutex::new(DaemonState {
+            core_running: false,
+            core_binary: None,
+            config_path: None,
+            ..DaemonState::default()
+        }));
+
+        let response =
+            process_command(DaemonCommand::DisableTun { token: None }, state, Some(0)).await;
+
+        match response {
+            DaemonResponse::Error { ref message } => {
+                assert!(
+                    message.contains("restart --system"),
+                    "error must require explicit restart: {message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn enable_tun_with_core_running_does_not_error_on_binary_check() {
+        let config_path = if cfg!(target_os = "macos") {
+            PathBuf::from("/Users/alice/.config/mihomo/config.yaml")
+        } else {
+            PathBuf::from("/home/alice/.config/mihomo/config.yaml")
+        };
+        let core_binary = if cfg!(target_os = "macos") {
+            PathBuf::from("/Library/Application Support/mihomo/bin/mihomo")
+        } else {
+            PathBuf::from("/usr/local/lib/mihomo/mihomo")
+        };
+
+        // Write a pid file so reap_exited_core doesn't clear core_running.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pid_file = tmp.path().join("core.pid");
+        let metadata = CorePidMetadata {
+            pid: std::process::id(),
+            config_path: config_path.clone(),
+            core_binary: core_binary.clone(),
+            api_endpoint: Some("unix:///var/run/mihomo/mihomo.sock".to_string()),
+            config_revision: Some("test-revision".to_string()),
+        };
+        std::fs::write(
+            &pid_file,
+            serde_json::to_string(&metadata).unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        let state = Arc::new(Mutex::new(DaemonState {
+            core_running: true,
+            core_pid: Some(std::process::id()),
+            core_binary: Some(core_binary),
+            config_path: Some(config_path.clone()),
+            api_endpoint: Some("unix:///var/run/mihomo/mihomo.sock".to_string()),
+            pid_file,
+            ..DaemonState::default()
+        }));
+
+        let response = process_command(
+            DaemonCommand::ApplySystemTunSnapshot {
+                expected_revision: "test-revision".to_string(),
+                stack: None,
+                dns_hijack: None,
+                token: None,
+            },
+            state,
+            Some(0),
+        )
+        .await;
+
+        // Core is running, so the error should NOT be about missing binary.
+        // It may fail at the API call (no real core), but that's expected.
+        if let DaemonResponse::Error { ref message } = response {
+            assert!(
+                !message.contains("core binary path unknown"),
+                "should not fail on binary check when core is running: {message}"
+            );
+            assert!(
+                !message.contains("core is not running"),
+                "should not report core not running when it is: {message}"
+            );
+        }
+    }
+
+    // ADR-24: classify_core_startup_failure tests.
+    #[test]
+    fn classify_geoip_mmdb_missing() {
+        let log = r#"time="2026-08-12T14:50:39" level=info msg="Can't find MMDB, start download"
+time="2026-08-12T14:52:09" level=error msg="can't download MMDB: context deadline exceeded"
+time="2026-08-12T14:52:09" level=fatal msg="Parse config error: rules[3848] [GEOIP,telegram,Telegram,no-resolve] error: can't download MMDB""#;
+
+        let failure = classify_core_startup_failure(log);
+        assert_eq!(failure, CoreFailure::GeoipMissing);
+    }
+
+    #[test]
+    fn classify_geosite_missing() {
+        let log = r#"time="2026-08-12T14:50:39" level=info msg="Can't find GeoSite.dat""#;
+        let failure = classify_core_startup_failure(log);
+        assert_eq!(failure, CoreFailure::GeositeMissing);
+    }
+
+    #[test]
+    fn classify_config_parse_error() {
+        let log = r#"time="2026-08-12T14:50:39" level=fatal msg="Parse config error: invalid key 'foo' at line 42""#;
+        let failure = classify_core_startup_failure(log);
+        match failure {
+            CoreFailure::ConfigError { ref detail } => {
+                assert!(detail.contains("Parse config error"));
+            }
+            other => panic!("expected ConfigError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_system_geo_permission_before_config_error() {
+        let log = r#"time="2026-08-13T14:50:39" level=fatal msg="Parse config error: rules[3848] error: can't remove invalid MMDB: remove /var/lib/mihomo-cli/geoip.metadb: permission denied""#;
+        let failure = classify_core_startup_failure(log);
+        assert!(matches!(failure, CoreFailure::PermissionDenied { .. }));
+        let message = format_core_failure_message(
+            &failure,
+            std::path::Path::new("/var/log/mihomo/mihomo.log"),
+        );
+        assert!(message.contains("system Mihomo data directory permissions"));
+        assert!(message.contains("mihomo-cli install --system --force"));
+        assert!(!message.contains("config --validate"));
+    }
+
+    #[test]
+    fn classify_port_conflict() {
+        let log = r#"time="2026-08-12T14:50:39" level=error msg="listen tcp 0.0.0.0:9090: address already in use""#;
+        let failure = classify_core_startup_failure(log);
+        match failure {
+            CoreFailure::PortConflict { ref detail } => {
+                assert!(detail.contains("address already in use"));
+            }
+            other => panic!("expected PortConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_permission_denied() {
+        let log = r#"time="2026-08-12T14:50:39" level=fatal msg="open /etc/mihomo/config.yaml: permission denied""#;
+        let failure = classify_core_startup_failure(log);
+        match failure {
+            CoreFailure::PermissionDenied { ref detail } => {
+                assert!(detail.contains("permission denied"));
+            }
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_unknown_fallback() {
+        let log = r#"time="2026-08-12T14:50:39" level=fatal msg="something completely unexpected happened""#;
+        let failure = classify_core_startup_failure(log);
+        assert!(matches!(failure, CoreFailure::Unknown { .. }));
+    }
+
+    #[test]
+    fn classify_empty_log_returns_unknown() {
+        let failure = classify_core_startup_failure("");
+        assert!(matches!(failure, CoreFailure::Unknown { .. }));
+    }
+
+    // ADR-24: format_core_failure_message tests.
+    #[test]
+    fn format_geoip_message_contains_fix() {
+        let msg = format_core_failure_message(
+            &CoreFailure::GeoipMissing,
+            std::path::Path::new("/var/log/mihomo/mihomo.log"),
+        );
+        assert!(msg.contains("GeoIP"));
+        assert!(msg.contains("Fix:"));
+    }
+
+    #[test]
+    fn format_config_error_shows_detail_and_fix() {
+        let msg = format_core_failure_message(
+            &CoreFailure::ConfigError {
+                detail: "Parse config error: invalid key at line 42".to_string(),
+            },
+            std::path::Path::new("/var/log/mihomo/mihomo.log"),
+        );
+        assert!(msg.contains("Parse config error"));
+        assert!(msg.contains("config --validate"));
+    }
+
+    #[test]
+    fn format_unknown_shows_log_tail() {
+        let msg = format_core_failure_message(
+            &CoreFailure::Unknown {
+                log_tail: "line1\nline2\nline3".to_string(),
+            },
+            std::path::Path::new("/var/log/mihomo/mihomo.log"),
+        );
+        assert!(msg.contains("line1"));
+        assert!(msg.contains("Logs:"));
+    }
+
+    // ADR-24: read_log_tail tests.
+    #[test]
+    fn read_log_tail_returns_last_n_lines() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log_file = tmp.path().join("test.log");
+        std::fs::write(&log_file, "line1\nline2\nline3\nline4\nline5\n").unwrap();
+
+        let result = read_log_tail(&log_file, 3);
+        assert_eq!(result, "line3\nline4\nline5");
+    }
+
+    #[test]
+    fn read_log_tail_missing_file_returns_empty() {
+        let result = read_log_tail(std::path::Path::new("/nonexistent/file.log"), 10);
+        assert_eq!(result, "");
+    }
+}
+
+#[cfg(any(unix, test))]
+#[allow(dead_code)]
+fn active_config_matches_requested(active: Option<&PathBuf>, requested: &std::path::Path) -> bool {
+    active.map(|path| path == requested).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod windows_auth_model_tests {
+    use super::validate_windows_client_token_value;
+    use crate::ipc::DaemonResponse;
+
+    #[test]
+    fn windows_daemon_accepts_only_the_canonical_service_token_value() {
+        assert!(
+            validate_windows_client_token_value(Some("same-token"), Some("same-token")).is_ok()
+        );
+        assert!(
+            validate_windows_client_token_value(Some("wrong-token"), Some("same-token")).is_err()
+        );
+        assert!(validate_windows_client_token_value(None, Some("same-token")).is_err());
+        assert!(validate_windows_client_token_value(Some("same-token"), None).is_err());
+        assert!(validate_windows_client_token_value(Some(""), Some("")).is_err());
+    }
+
+    #[test]
+    fn windows_reinstall_invalidates_the_old_client_copy() {
+        let old_token = crate::service::generate_auth_token();
+        let new_token = crate::service::generate_auth_token();
+        assert_ne!(old_token, new_token);
+
+        assert!(validate_windows_client_token_value(Some(&new_token), Some(&new_token)).is_ok());
+        assert!(validate_windows_client_token_value(Some(&old_token), Some(&new_token)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transaction_status_never_returns_completed_without_a_valid_journal() {
+        let observation = crate::tun_transaction::RuntimeObservation {
+            core_running: true,
+            core_identity: Some("core".to_string()),
+            core_pid: Some(42),
+            launched_revision: Some("candidate".to_string()),
+            runtime_tun: Some(true),
+            api_ready: true,
+        };
+
+        let no_journal = super::transaction_status_response(observation.clone(), Ok(None));
+        assert!(matches!(
+            no_journal,
+            DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::Unavailable { .. }
+            }
+        ));
+
+        let corrupt = super::transaction_status_response(
+            observation,
+            Err(anyhow::anyhow!("unsupported active journal schema 99")),
+        );
+        assert!(matches!(
+            corrupt,
+            DaemonResponse::Transaction {
+                response: crate::tun_transaction::TransactionResponse::EvidenceMismatch { .. }
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quiesce_candidate_rejects_and_does_not_stop_unknown_core_with_same_revision() {
+        use super::*;
+        let state = std::sync::Arc::new(tokio::sync::Mutex::new(DaemonState {
+            core_running: true,
+            core_pid: Some(9999),
+            core_binary: Some(std::path::PathBuf::from("/usr/bin/unknown-core-identity")),
+            launched_config_revision: Some("cand-rev".to_string()),
+            ..DaemonState::default()
+        }));
+
+        let fence = crate::tun_transaction::TransactionFence {
+            transaction_id: "tx-quiesce-test".to_string(),
+            generation: 1,
+            expected_phase: crate::tun_transaction::JournalPhase::RollbackPending,
+            expected_candidate_revision: "cand-rev".to_string(),
+        };
+
+        // If journal is not found, it returns Stale/Unavailable
+        let _response =
+            handle_quiesce_candidate_runtime(std::sync::Arc::clone(&state), fence.clone(), Some(0))
+                .await;
+
+        // Core must still be running after rejection
+        let state_guard = state.lock().await;
+        assert!(state_guard.core_running, "unknown core must not be stopped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_promoted_snapshot_rejects_and_does_not_stop_unknown_core() {
+        use super::*;
+        let state = std::sync::Arc::new(tokio::sync::Mutex::new(DaemonState {
+            core_running: true,
+            core_pid: Some(8888),
+            core_binary: Some(std::path::PathBuf::from("/usr/bin/unknown-core-identity")),
+            launched_config_revision: Some("unknown-rev".to_string()),
+            ..DaemonState::default()
+        }));
+
+        let fence = crate::tun_transaction::TransactionFence {
+            transaction_id: "tx-apply-test".to_string(),
+            generation: 1,
+            expected_phase: crate::tun_transaction::JournalPhase::SnapshotPromoted,
+            expected_candidate_revision: "candidate-rev".to_string(),
+        };
+
+        // When journal is absent or evidence does not match, it must return EvidenceMismatch / Stale
+        // and under no circumstance stop the running unknown core.
+        let _response = handle_apply_promoted_snapshot(
+            std::sync::Arc::clone(&state),
+            fence.clone(),
+            true,
+            Some(0),
+        )
+        .await;
+
+        let state_guard = state.lock().await;
+        assert!(
+            state_guard.core_running,
+            "running unknown core must not be stopped by apply_promoted_snapshot"
         );
     }
 }

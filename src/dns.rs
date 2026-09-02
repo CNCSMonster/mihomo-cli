@@ -39,7 +39,7 @@ pub fn load_policies_at(paths: &AppPaths) -> Result<Vec<DnsPolicy>> {
 /// Save DNS policies to dns-policy.yaml using explicit paths.
 pub fn save_policies_at(paths: &AppPaths, policies: &[DnsPolicy]) -> Result<()> {
     let path = paths.dns_policy_path();
-    std::fs::create_dir_all(paths.config_dir())?;
+    crate::utils::ensure_dir_all_no_follow(paths.config_dir())?;
     let file = DnsPolicyFile {
         policies: policies.to_vec(),
     };
@@ -55,7 +55,7 @@ pub fn save_policies_at(paths: &AppPaths, policies: &[DnsPolicy]) -> Result<()> 
 #     target: 192.0.2.53
 
 ";
-    crate::utils::atomic_write_file(
+    crate::utils::atomic_write_file_for_original_user(
         &path.display().to_string(),
         &format!("{}{}", header, content),
     )?;
@@ -382,13 +382,13 @@ pub fn load_fake_ip_filters_at(paths: &AppPaths) -> Result<Vec<String>> {
 
 pub fn save_fake_ip_filters_at(paths: &AppPaths, filters: &[String]) -> Result<()> {
     let path = paths.dns_fake_ip_filter_path();
-    std::fs::create_dir_all(paths.config_dir())?;
+    crate::utils::ensure_dir_all_no_follow(paths.config_dir())?;
     let file = FakeIpFilterFile {
         filters: filters.to_vec(),
     };
     let content = serde_yaml::to_string(&file)?;
     let header = "# User-defined DNS fake-ip-filter entries\n# Entries are normalized to +.<domain> suffix match format.\n\n";
-    crate::utils::atomic_write_file(
+    crate::utils::atomic_write_file_for_original_user(
         &path.display().to_string(),
         &format!("{}{}", header, content),
     )?;

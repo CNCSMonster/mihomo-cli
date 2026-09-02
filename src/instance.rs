@@ -272,15 +272,29 @@ impl SystemPaths {
 pub struct InstanceContext {
     pub os: TargetOs,
     pub mode: InstanceMode,
+    pub owner_home: PathBuf,
+    pub owner_uid: Option<u32>,
+    pub owner_gid: Option<u32>,
+    pub daemon_credentials: DaemonCredentialPaths,
     pub paths: InstancePaths,
     pub service: ServiceTarget,
     pub permissions: PermissionModel,
+}
+
+/// Canonical daemon credential. Unix scopes it to the original user's home;
+/// Windows uses one machine-level file shared by the CLI and daemon. The path
+/// deliberately does not use MIHOMO_CLI_CONFIG_DIR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonCredentialPaths {
+    /// The single canonical credential read by both the CLI and daemon.
+    pub token: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathInputs {
     pub home: PathBuf,
     pub uid: Option<u32>,
+    pub gid: Option<u32>,
     pub xdg_runtime_dir: Option<PathBuf>,
     pub program_data: PathBuf,
     pub app_data: PathBuf,
@@ -293,6 +307,7 @@ impl PathInputs {
         Self {
             home: PathBuf::from("/Users/alice"),
             uid: Some(501),
+            gid: Some(20),
             xdg_runtime_dir: Some(PathBuf::from("/run/user/1000")),
             program_data: PathBuf::from(r"C:\ProgramData"),
             app_data: PathBuf::from(r"C:\Users\alice\AppData\Roaming"),
@@ -318,25 +333,39 @@ impl TargetOs {
 
 impl PathInputs {
     pub fn from_current_env() -> Self {
-        let home = dirs::home_dir().unwrap_or_default();
-        let uid = current_uid();
+        // 路径解析优先级：
+        // 1. 私有环境变量（_MIHOMO_CLI_ORIGINAL_HOME）— 自动 reexec 场景（Linux only）
+        // 2. SUDO_UID / SUDO_USER — 用户显式 sudo 场景（Unix only）
+        // 3. dirs::home_dir() — 直接 root 登录或普通用户的 fallback
+        let home = resolve_home_dir();
+        let uid = resolve_uid();
+        let gid = uid.and_then(primary_gid_by_uid);
         let xdg_runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+        #[cfg(windows)]
+        let program_data =
+            windows_known_folder_path(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramData)
+                .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        #[cfg(not(windows))]
         let program_data = std::env::var_os("ProgramData")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        #[cfg(windows)]
+        let app_data =
+            windows_known_folder_path(&windows_sys::Win32::UI::Shell::FOLDERID_RoamingAppData)
+                .unwrap_or_else(|| home.join("AppData/Roaming"));
+        #[cfg(not(windows))]
         let app_data = std::env::var_os("APPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join("AppData/Roaming"));
         let local_app_data = dirs::data_local_dir()
             .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))
             .unwrap_or_else(|| home.join("AppData/Local"));
-        let username_or_sid = std::env::var("USERNAME")
-            .or_else(|_| std::env::var("USER"))
-            .unwrap_or_else(|_| "user".to_string());
+        let username_or_sid = resolve_username();
 
         Self {
             home,
             uid,
+            gid,
             xdg_runtime_dir,
             program_data,
             app_data,
@@ -346,6 +375,187 @@ impl PathInputs {
     }
 }
 
+/// 解析原始用户的 home 目录与 UID 的结果
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct IdentityResolution {
+    pub home: PathBuf,
+    pub uid: Option<u32>,
+}
+
+/// 身份解析核心逻辑（纯函数，便于测试）。
+///
+/// 安全不变量：euid==0 且 SUDO_UID 有效（非 0）时处于提权上下文，
+/// `_MIHOMO_CLI_ORIGINAL_*` 环境变量可被命令行注入，不可信——
+/// uid 一律取 SUDO_UID，home 以 passwd(SUDO_UID).pw_dir 为准。
+/// passwd 查询失败必须 fail-closed（Err），绝不回退到可伪造的 env home。
+#[cfg(unix)]
+fn resolve_identity_with(
+    euid: u32,
+    sudo_uid: Option<u32>,
+    env_home: Option<String>,
+    env_uid: Option<u32>,
+    lookup_home: impl Fn(u32) -> Option<PathBuf>,
+    current_uid: Option<u32>,
+    fallback_home: PathBuf,
+) -> anyhow::Result<IdentityResolution> {
+    if euid == 0 {
+        if let Some(sudo) = sudo_uid.filter(|uid| *uid != 0) {
+            let home = lookup_home(sudo)
+                .ok_or_else(|| anyhow::anyhow!("cannot resolve passwd home for sudo uid {sudo}"))?;
+            return Ok(IdentityResolution {
+                home,
+                uid: Some(sudo),
+            });
+        }
+        // 直接 root（含 sudo -i，SUDO_UID=0）：无提权边界，保留 env 优先
+        let home = env_home.map(PathBuf::from).unwrap_or(fallback_home);
+        return Ok(IdentityResolution {
+            home,
+            uid: env_uid.or(Some(0)),
+        });
+    }
+    // 非 root：无提权边界
+    let home = env_home.map(PathBuf::from).unwrap_or(fallback_home);
+    Ok(IdentityResolution {
+        home,
+        uid: env_uid.or(current_uid),
+    })
+}
+
+/// 通过 passwd 数据库查询 UID 的 home 目录（Unix only，走 NSS，不 fork 子进程）
+#[cfg(unix)]
+pub(crate) fn passwd_home_by_uid(uid: u32) -> Option<PathBuf> {
+    let account = unsafe { libc::getpwuid(uid) };
+    if account.is_null() {
+        return None;
+    }
+    let home = unsafe { std::ffi::CStr::from_ptr((*account).pw_dir) }
+        .to_str()
+        .ok()?;
+    if home.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(home))
+    }
+}
+
+#[cfg(unix)]
+fn primary_gid_by_uid(uid: u32) -> Option<u32> {
+    let account = unsafe { libc::getpwuid(uid) };
+    if account.is_null() {
+        None
+    } else {
+        Some(unsafe { (*account).pw_gid })
+    }
+}
+
+#[cfg(not(unix))]
+fn primary_gid_by_uid(_uid: u32) -> Option<u32> {
+    None
+}
+
+/// 解析原始用户的 home 目录
+/// 优先级：sudo 场景 SUDO_UID + passwd > dirs::home_dir()
+/// passwd 查询失败时 fail-closed：回退 dirs::home_dir()（非注入来源），
+/// 绝不消费可伪造的 SUDO_USER / _MIHOMO_CLI_ORIGINAL_HOME env。
+#[cfg(target_os = "linux")]
+fn resolve_home_dir() -> PathBuf {
+    resolve_identity()
+        .map(|r| r.home)
+        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default())
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_identity() -> anyhow::Result<IdentityResolution> {
+    let euid = unsafe { libc::geteuid() };
+    let sudo_uid = std::env::var("SUDO_UID").ok().and_then(|v| v.parse().ok());
+    let env_home = std::env::var("_MIHOMO_CLI_ORIGINAL_HOME")
+        .ok()
+        .filter(|home| !home.is_empty());
+    let env_uid = std::env::var("_MIHOMO_CLI_ORIGINAL_UID")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    resolve_identity_with(
+        euid,
+        sudo_uid,
+        env_home,
+        env_uid,
+        passwd_home_by_uid,
+        current_uid(),
+        dirs::home_dir().unwrap_or_default(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_home_dir() -> PathBuf {
+    // macOS sudo 默认保留 HOME，无需特殊处理
+    // 但仍支持 SUDO_UID 以兼容用户显式 sudo 的场景
+    if let Ok(sudo_uid) = std::env::var("SUDO_UID") {
+        if let Ok(uid) = sudo_uid.parse() {
+            if let Some(home) = passwd_home_by_uid(uid) {
+                return home;
+            }
+        }
+    }
+    dirs::home_dir().unwrap_or_default()
+}
+
+#[cfg(not(unix))]
+fn resolve_home_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_default()
+}
+
+/// 解析原始用户的 UID
+///
+/// sudo 提权上下文下只信 SUDO_UID（sudo 注入、不可伪造）；即使 passwd 查询
+/// 失败也保留该 uid，使写入侧 original_user_identity 继续 fail-closed（bail），
+/// 而不是退化为"无原始用户"从而失去 home 锚定。
+#[cfg(target_os = "linux")]
+fn resolve_uid() -> Option<u32> {
+    if unsafe { libc::geteuid() } == 0 {
+        if let Ok(sudo_uid) = std::env::var("SUDO_UID") {
+            if let Ok(uid) = sudo_uid.parse() {
+                if uid != 0 {
+                    return Some(uid);
+                }
+            }
+        }
+    }
+    resolve_identity().ok().and_then(|r| r.uid)
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_uid() -> Option<u32> {
+    // 1. SUDO_UID
+    if let Ok(sudo_uid) = std::env::var("SUDO_UID") {
+        if let Ok(uid) = sudo_uid.parse() {
+            return Some(uid);
+        }
+    }
+    // 2. fallback
+    current_uid()
+}
+
+#[cfg(not(unix))]
+fn resolve_uid() -> Option<u32> {
+    None
+}
+
+/// 解析原始用户名
+fn resolve_username() -> String {
+    // 1. SUDO_USER（用户显式 sudo 场景）
+    if let Ok(user) = std::env::var("SUDO_USER") {
+        if !user.is_empty() {
+            return user;
+        }
+    }
+    // 2. fallback
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "user".to_string())
+}
+
 pub fn planned_current_context(mode: InstanceMode) -> Option<InstanceContext> {
     let os = TargetOs::current()?;
     let inputs = PathInputs::from_current_env();
@@ -353,7 +563,7 @@ pub fn planned_current_context(mode: InstanceMode) -> Option<InstanceContext> {
 }
 
 #[cfg(unix)]
-fn current_uid() -> Option<u32> {
+pub fn current_uid() -> Option<u32> {
     std::process::Command::new("id")
         .arg("-u")
         .output()
@@ -363,7 +573,7 @@ fn current_uid() -> Option<u32> {
 }
 
 #[cfg(not(unix))]
-fn current_uid() -> Option<u32> {
+pub fn current_uid() -> Option<u32> {
     None
 }
 
@@ -371,6 +581,7 @@ impl InstanceContext {
     pub fn planned(os: TargetOs, mode: InstanceMode, inputs: &PathInputs) -> Self {
         let paths = planned_paths(os, mode, inputs);
         let service = planned_service(os, mode, inputs, &paths);
+        let daemon_credentials = planned_daemon_credential_paths(os, inputs);
         let permissions = match mode {
             InstanceMode::System => PermissionModel::PrivilegedSystem,
             InstanceMode::User => PermissionModel::DirectUser,
@@ -378,11 +589,72 @@ impl InstanceContext {
         Self {
             os,
             mode,
+            owner_home: inputs.home.clone(),
+            owner_uid: inputs.uid,
+            owner_gid: inputs.gid,
+            daemon_credentials,
             paths,
             service,
             permissions,
         }
     }
+}
+
+#[cfg(windows)]
+fn windows_known_folder_path(id: &windows_sys::core::GUID) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::SHGetKnownFolderPath;
+
+    let mut raw = std::ptr::null_mut();
+    let result = unsafe { SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut raw) };
+    if result < 0 || raw.is_null() {
+        if !raw.is_null() {
+            unsafe {
+                CoTaskMemFree(raw.cast());
+            }
+        }
+        return None;
+    }
+    let mut len = 0usize;
+    unsafe {
+        while *raw.add(len) != 0 {
+            len += 1;
+        }
+    }
+    let path = PathBuf::from(std::ffi::OsString::from_wide(unsafe {
+        std::slice::from_raw_parts(raw, len)
+    }));
+    unsafe {
+        CoTaskMemFree(raw.cast());
+    }
+    Some(path)
+}
+
+pub fn planned_daemon_credential_paths(os: TargetOs, inputs: &PathInputs) -> DaemonCredentialPaths {
+    match os {
+        TargetOs::Linux | TargetOs::Macos => DaemonCredentialPaths {
+            token: planned_unix_daemon_client_token_path(&inputs.home),
+        },
+        TargetOs::Windows => DaemonCredentialPaths {
+            token: inputs.program_data.join("mihomo/service-token"),
+        },
+    }
+}
+
+pub fn planned_unix_daemon_client_token_path(home: &std::path::Path) -> PathBuf {
+    home.join(".config/mihomo/service-token")
+}
+
+pub(crate) fn valid_windows_sid_string(sid: &str) -> bool {
+    let Some(body) = sid.strip_prefix("S-") else {
+        return false;
+    };
+    let parts = body.split('-').collect::<Vec<_>>();
+    parts.len() >= 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 pub fn planned_tun_config_file(os: TargetOs, inputs: &PathInputs) -> PathBuf {
@@ -761,7 +1033,18 @@ pub fn planned_macos_install_plan(ctx: &InstanceContext) -> Option<InstanceInsta
         _ => return None,
     };
 
-    let commands = vec![
+    let mut commands = Vec::new();
+    if ctx.mode == InstanceMode::System {
+        commands.push(PlannedCommand {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "dscl . -read /Groups/mihomo >/dev/null 2>&1 || /usr/sbin/dseditgroup -o create -r 'Mihomo service group' mihomo".to_string(),
+            ],
+            privileged: true,
+        });
+    }
+    commands.extend([
         PlannedCommand {
             program: "launchctl".to_string(),
             args: vec!["bootout".to_string(), domain.clone()],
@@ -789,7 +1072,7 @@ pub fn planned_macos_install_plan(ctx: &InstanceContext) -> Option<InstanceInsta
             args: vec!["kickstart".to_string(), "-k".to_string(), domain],
             privileged,
         },
-    ];
+    ]);
 
     Some(InstanceInstallPlan {
         directories,
@@ -860,8 +1143,25 @@ pub fn planned_linux_install_plan(ctx: &InstanceContext) -> Option<InstanceInsta
             });
         }
     }
+    if privileged {
+        directories.push(PlannedDirectory {
+            path: PathBuf::from("/var/lib/mihomo-cli"),
+            mode: 0o755,
+            privileged: true,
+        });
+    }
 
     let service_file = ctx.paths.service_file.clone()?;
+    let owner_uid = if privileged {
+        Some(ctx.owner_uid?)
+    } else {
+        None
+    };
+    let supplementary_group = if privileged {
+        Some(ctx.owner_gid?)
+    } else {
+        None
+    };
     let log_directives = ctx
         .paths
         .log_file
@@ -875,15 +1175,19 @@ pub fn planned_linux_install_plan(ctx: &InstanceContext) -> Option<InstanceInsta
         });
     let unit_content = match ctx.mode {
         InstanceMode::System => format!(
-            "[Unit]\nDescription=Mihomo CLI System Daemon\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={} daemon\nRestart=always\nRuntimeDirectory=mihomo\nRuntimeDirectoryMode=0755\nWorkingDirectory={}\n{}\n[Install]\nWantedBy=multi-user.target\n",
+            "[Unit]\nDescription=Mihomo CLI System Daemon\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser=mihomo\nGroup=mihomo\nSupplementaryGroups={}\nUMask=0027\nEnvironment=MIHOMO_CLI_CONFIG_DIR={}\nExecStart={} daemon\nRestart=always\nRuntimeDirectory=mihomo\nRuntimeDirectoryMode=0711\nWorkingDirectory={}\nCapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE\nAmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE\nNoNewPrivileges=true\nPrivateTmp=true\nProtectHome=read-only\nProtectSystem=strict\nReadWritePaths=/var/run/mihomo /run/mihomo /var/log/mihomo /var/lib/mihomo-cli {}\n{}\n[Install]\nWantedBy=multi-user.target\n",
+            supplementary_group.expect("system mode requires the owner's primary gid"),
+            ctx.paths.config_dir.display(),
             ctx.paths.cli_binary.display(),
+            "/var/lib/mihomo-cli",
             ctx.paths.config_dir.display(),
             log_directives
         ),
         InstanceMode::User => format!(
-            "[Unit]\nDescription=Mihomo Proxy Service\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={} -d {}\nRestart=on-failure\nWorkingDirectory={}\n{}\n[Install]\nWantedBy=default.target\n",
+            "[Unit]\nDescription=Mihomo Proxy Service\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={} -d {}\nExecStartPost={} select --replay --user\nRestart=on-failure\nWorkingDirectory={}\n{}\n[Install]\nWantedBy=default.target\n",
             ctx.paths.core_binary.display(),
             ctx.paths.config_dir.display(),
+            ctx.paths.cli_binary.display(),
             ctx.paths.config_dir.display(),
             log_directives
         ),
@@ -898,6 +1202,127 @@ pub fn planned_linux_install_plan(ctx: &InstanceContext) -> Option<InstanceInsta
 
     let commands = match ctx.mode {
         InstanceMode::System => vec![
+            PlannedCommand {
+                program: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "getent group mihomo >/dev/null || groupadd --system mihomo".to_string(),
+                ],
+                privileged: true,
+            },
+            PlannedCommand {
+                program: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "id -u mihomo >/dev/null 2>&1 || useradd --system --gid mihomo --home-dir /var/lib/mihomo-cli --no-create-home --shell /usr/sbin/nologin mihomo".to_string(),
+                ],
+                privileged: true,
+            },
+            PlannedCommand {
+                program: "touch".to_string(),
+                args: vec!["/var/log/mihomo/mihomo.log".to_string()],
+                privileged: true,
+            },
+            PlannedCommand {
+                program: "chown".to_string(),
+                args: vec![
+                    "-R".to_string(),
+                    "mihomo:mihomo".to_string(),
+                    "/var/log/mihomo".to_string(),
+                    "/var/run/mihomo".to_string(),
+                ],
+                privileged: true,
+            },
+            PlannedCommand {
+                program: "chgrp".to_string(),
+                args: vec![
+                    "-R".to_string(),
+                    "mihomo".to_string(),
+                    ctx.paths.config_dir.display().to_string(),
+                ],
+                privileged: true,
+            },
+            PlannedCommand {
+                program: "chmod".to_string(),
+                args: vec![
+                    "g+x".to_string(),
+                    ctx.owner_home.display().to_string(),
+                    ctx.owner_home.join(".config").display().to_string(),
+                ],
+                privileged: true,
+            },
+            PlannedCommand {
+                program: "chmod".to_string(),
+                args: vec![
+                    "-R".to_string(),
+                    "g+rX,o-rwx".to_string(),
+                    ctx.paths.config_dir.display().to_string(),
+                ],
+                privileged: true,
+            },
+            PlannedCommand {
+                program: "find".to_string(),
+                args: vec![
+                    ctx.paths.config_dir.display().to_string(),
+                    "-type".to_string(),
+                    "d".to_string(),
+                    "-exec".to_string(),
+                    "chmod".to_string(),
+                    "g+ws".to_string(),
+                    "{}".to_string(),
+                    "+".to_string(),
+                ],
+                privileged: true,
+            },
+            PlannedCommand {
+                program: "find".to_string(),
+                args: vec![
+                    ctx.paths.config_dir.display().to_string(),
+                    "-type".to_string(),
+                    "f".to_string(),
+                    "-name".to_string(),
+                    "service-token".to_string(),
+                    "-exec".to_string(),
+                    "chown".to_string(),
+                    format!(
+                        "{}:{}",
+                        owner_uid.expect("system mode requires the owner's uid"),
+                        supplementary_group.expect("system mode requires the owner's primary gid")
+                    ),
+                    "{}".to_string(),
+                    "+".to_string(),
+                ],
+                privileged: true,
+            },
+            PlannedCommand {
+                program: "find".to_string(),
+                args: vec![
+                    ctx.paths.config_dir.display().to_string(),
+                    "-type".to_string(),
+                    "f".to_string(),
+                    "-name".to_string(),
+                    "service-token".to_string(),
+                    "-exec".to_string(),
+                    "chmod".to_string(),
+                    "0600".to_string(),
+                    "{}".to_string(),
+                    "+".to_string(),
+                ],
+                privileged: true,
+            },
+            PlannedCommand {
+                program: "chown".to_string(),
+                args: vec![
+                    "root:mihomo".to_string(),
+                    "/var/lib/mihomo-cli".to_string(),
+                ],
+                privileged: true,
+            },
+            PlannedCommand {
+                program: "chmod".to_string(),
+                args: vec!["0770".to_string(), "/var/lib/mihomo-cli".to_string()],
+                privileged: true,
+            },
             PlannedCommand {
                 program: "systemctl".to_string(),
                 args: vec!["daemon-reload".to_string()],
@@ -1132,6 +1557,51 @@ pub fn planned_service_plan(ctx: &InstanceContext, action: ServiceAction) -> Ins
     }
 }
 
+pub fn planned_generation_quiesce_plan(ctx: &InstanceContext) -> InstanceServicePlan {
+    match (ctx.os, ctx.mode) {
+        (TargetOs::Macos, _) => launchctl_bootout_plan(ctx, false),
+        _ => planned_service_plan(ctx, ServiceAction::Stop),
+    }
+}
+
+pub fn planned_generation_resume_plan(ctx: &InstanceContext) -> InstanceServicePlan {
+    if ctx.os != TargetOs::Macos {
+        return planned_service_plan(ctx, ServiceAction::Start);
+    }
+
+    let privileged = ctx.permissions == PermissionModel::PrivilegedSystem;
+    let (domain, plist) = match &ctx.service {
+        ServiceTarget::MacosLaunchDaemon {
+            domain_label,
+            plist,
+        }
+        | ServiceTarget::MacosLaunchAgent {
+            domain_label,
+            plist,
+        } => (domain_label.clone(), plist.display().to_string()),
+        _ => unreachable!("macOS context must use a launchd service"),
+    };
+    InstanceServicePlan {
+        commands: vec![
+            PlannedCommand {
+                program: "launchctl".to_string(),
+                args: vec![
+                    "bootstrap".to_string(),
+                    domain_parent(&domain).to_string(),
+                    plist,
+                ],
+                privileged,
+            },
+            PlannedCommand {
+                program: "launchctl".to_string(),
+                args: vec!["kickstart".to_string(), "-k".to_string(), domain],
+                privileged,
+            },
+        ],
+        remove_paths: Vec::new(),
+    }
+}
+
 fn launchctl_service_plan(
     ctx: &InstanceContext,
     restart: bool,
@@ -1209,18 +1679,6 @@ fn launchctl_uninstall_plan(ctx: &InstanceContext) -> InstanceServicePlan {
         mode: 0,
         privileged: false,
     });
-    if ctx.mode == InstanceMode::System {
-        plan.remove_paths.push(PlannedDirectory {
-            path: ctx
-                .paths
-                .config_file
-                .parent()
-                .unwrap_or(&ctx.paths.config_file)
-                .to_path_buf(),
-            mode: 0,
-            privileged: true,
-        });
-    }
 
     for path in [
         Some(ctx.paths.core_binary.clone()),
@@ -1317,18 +1775,6 @@ fn linux_uninstall_plan(ctx: &InstanceContext, privileged: bool) -> InstanceServ
         mode: 0,
         privileged: false,
     });
-    if ctx.mode == InstanceMode::System {
-        remove_paths.push(PlannedDirectory {
-            path: ctx
-                .paths
-                .config_file
-                .parent()
-                .unwrap_or(&ctx.paths.config_file)
-                .to_path_buf(),
-            mode: 0,
-            privileged: true,
-        });
-    }
     remove_paths.push(PlannedDirectory {
         path: ctx.paths.core_binary.clone(),
         mode: 0,
@@ -1593,6 +2039,13 @@ pub fn privilege_invocation_plan(command: PlannedCommand) -> Option<PrivilegeInv
 }
 
 fn manual_fallback_for_command(command: &PlannedCommand) -> String {
+    if command.program.eq_ignore_ascii_case("sc.exe") {
+        let direct = std::iter::once(command.program.as_str())
+            .chain(command.args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return format!("Run in an Administrator PowerShell/Terminal: {direct}");
+    }
     let mut parts = Vec::with_capacity(command.args.len() + 2);
     parts.push("sudo".to_string());
     parts.push(command.program.clone());
@@ -1990,18 +2443,17 @@ impl UserSettings {
     pub fn save(&self) -> anyhow::Result<()> {
         let path = Self::settings_path();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::utils::ensure_dir_all_no_follow(parent)?;
         }
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, json)?;
-        Ok(())
+        crate::utils::atomic_write_file_for_original_user(&path.display().to_string(), &json)
     }
 
     /// Path to the settings file: `~/.config/mihomo/settings.json`.
     pub fn settings_path() -> PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("~/.config"))
-            .join("mihomo/settings.json")
+        PathInputs::from_current_env()
+            .home
+            .join(".config/mihomo/settings.json")
     }
 
     /// Resolve the effective mode from settings, considering service presence.
@@ -2066,8 +2518,160 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    #[test]
+    fn daemon_credentials_are_canonical_identity_paths_on_all_platforms() {
+        let inputs = PathInputs::for_tests();
+        let unix = planned_daemon_credential_paths(TargetOs::Linux, &inputs);
+        assert_eq!(
+            unix.token,
+            PathBuf::from("/Users/alice/.config/mihomo/service-token")
+        );
+
+        let windows = planned_daemon_credential_paths(TargetOs::Windows, &inputs);
+        assert_eq!(
+            windows.token,
+            PathBuf::from(r"C:\ProgramData").join("mihomo/service-token")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn production_windows_credentials_ignore_forged_programdata_environment() {
+        let _guard = crate::utils::env_test_lock().lock().unwrap();
+        let old = std::env::var_os("ProgramData");
+        unsafe {
+            std::env::set_var("ProgramData", r"Z:\attacker-controlled");
+        }
+        let inputs = PathInputs::from_current_env();
+        let credentials = planned_daemon_credential_paths(TargetOs::Windows, &inputs);
+        assert_ne!(
+            inputs.program_data,
+            PathBuf::from(r"Z:\attacker-controlled")
+        );
+        assert_eq!(
+            credentials.token,
+            inputs.program_data.join("mihomo/service-token")
+        );
+        if let Some(value) = old {
+            unsafe {
+                std::env::set_var("ProgramData", value);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("ProgramData");
+            }
+        }
+    }
+
     fn inputs() -> PathInputs {
         PathInputs::for_tests()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_identity_prefers_sudo_uid_passwd_home_over_env() {
+        // sudo 场景：env 中的 home/uid 可能被伪造，必须以 SUDO_UID + passwd 为准
+        let resolved = resolve_identity_with(
+            0,
+            Some(1000),
+            Some("/home/victim".to_string()),
+            Some(1001),
+            |uid| {
+                assert_eq!(uid, 1000);
+                Some(PathBuf::from("/home/real"))
+            },
+            Some(0),
+            PathBuf::from("/root"),
+        )
+        .unwrap();
+        assert_eq!(resolved.home, PathBuf::from("/home/real"));
+        assert_eq!(resolved.uid, Some(1000));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_identity_fails_closed_when_sudo_passwd_lookup_fails() {
+        // sudo 场景 passwd 查询失败必须 fail-closed：绝不回退到可伪造的 env home
+        let err = resolve_identity_with(
+            0,
+            Some(1000),
+            Some("/home/victim".to_string()),
+            Some(1001),
+            |_| None,
+            Some(0),
+            PathBuf::from("/root"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot resolve passwd home for sudo uid 1000"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_identity_direct_root_without_sudo_keeps_env() {
+        let resolved = resolve_identity_with(
+            0,
+            None,
+            Some("/home/alice".to_string()),
+            Some(1000),
+            |_| None,
+            Some(0),
+            PathBuf::from("/root"),
+        )
+        .unwrap();
+        assert_eq!(resolved.home, PathBuf::from("/home/alice"));
+        assert_eq!(resolved.uid, Some(1000));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_identity_treats_sudo_to_root_as_direct_root() {
+        // sudo -i / sudo su（SUDO_UID=0）不构成"原始用户"场景
+        let resolved = resolve_identity_with(
+            0,
+            Some(0),
+            None,
+            None,
+            |_| None,
+            Some(0),
+            PathBuf::from("/root"),
+        )
+        .unwrap();
+        assert_eq!(resolved.home, PathBuf::from("/root"));
+        assert_eq!(resolved.uid, Some(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_identity_non_root_uses_env_then_fallback() {
+        let resolved = resolve_identity_with(
+            1000,
+            None,
+            Some("/home/alice".to_string()),
+            None,
+            |_| None,
+            Some(1000),
+            PathBuf::from("/home/fallback"),
+        )
+        .unwrap();
+        assert_eq!(resolved.home, PathBuf::from("/home/alice"));
+        assert_eq!(resolved.uid, Some(1000));
+
+        let resolved = resolve_identity_with(
+            1000,
+            None,
+            None,
+            None,
+            |_| None,
+            Some(1000),
+            PathBuf::from("/home/fallback"),
+        )
+        .unwrap();
+        assert_eq!(resolved.home, PathBuf::from("/home/fallback"));
+        assert_eq!(resolved.uid, Some(1000));
     }
 
     #[test]
@@ -2533,6 +3137,11 @@ mod tests {
         }
         assert!(plan.files.iter().all(|f| f.privileged));
         assert!(plan.commands.iter().all(|c| c.privileged));
+        assert_eq!(plan.commands[0].program, "sh");
+        assert_eq!(plan.commands[0].args[0], "-c");
+        assert!(plan.commands[0].args[1].contains("dscl . -read /Groups/mihomo"));
+        assert!(plan.commands[0].args[1].contains("/usr/sbin/dseditgroup"));
+        assert_eq!(plan.commands[1].program, "launchctl");
 
         let rendered = format!("{plan:#?}");
         for required in [
@@ -2568,6 +3177,13 @@ mod tests {
         assert!(plan.directories.iter().all(|d| !d.privileged));
         assert!(plan.files.iter().all(|f| !f.privileged));
         assert!(plan.commands.iter().all(|c| !c.privileged));
+        assert!(plan.commands.iter().all(|command| {
+            command.program != "sh"
+                && !command
+                    .args
+                    .iter()
+                    .any(|arg| arg.contains("dscl") || arg.contains("dseditgroup"))
+        }));
 
         let rendered = format!("{plan:#?}");
         for required in [
@@ -2644,14 +3260,57 @@ mod tests {
         }
         assert!(plan.files.iter().all(|f| f.privileged));
         assert!(plan.commands.iter().all(|c| c.privileged));
+        let touch_log = plan
+            .commands
+            .iter()
+            .position(|command| {
+                command.program == "touch" && command.args == ["/var/log/mihomo/mihomo.log"]
+            })
+            .expect("system install must pre-create the daemon/Core log file");
+        let chown_log_dir = plan
+            .commands
+            .iter()
+            .position(|command| {
+                command.program == "chown"
+                    && command.args.iter().any(|arg| arg == "/var/log/mihomo")
+            })
+            .expect("system install must assign the log directory to mihomo");
+        assert!(
+            touch_log < chown_log_dir,
+            "log file must exist before recursive ownership is applied"
+        );
+        let runtime_owner = plan
+            .commands
+            .iter()
+            .position(|command| {
+                command.program == "chown" && command.args == ["root:mihomo", "/var/lib/mihomo-cli"]
+            })
+            .expect("system runtime root must be owned by root and writable by the daemon group");
+        let runtime_mode = plan
+            .commands
+            .iter()
+            .position(|command| {
+                command.program == "chmod" && command.args == ["0770", "/var/lib/mihomo-cli"]
+            })
+            .expect("system runtime root must deny access to other users");
+        assert!(runtime_owner < runtime_mode);
         for required in [
             "/usr/local/lib/mihomo",
             "/etc/systemd/system/mihomo.service",
             "/Users/alice/.config/mihomo",
             "/usr/local/bin/mihomo-cli",
             "ExecStart=/usr/local/bin/mihomo-cli daemon",
+            "User=mihomo",
+            "Group=mihomo",
+            "SupplementaryGroups=20",
+            "Environment=MIHOMO_CLI_CONFIG_DIR=/Users/alice/.config/mihomo",
+            "WorkingDirectory=/var/lib/mihomo-cli",
+            "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE",
+            "AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE",
+            "NoNewPrivileges=true",
+            "ProtectSystem=strict",
             "RuntimeDirectory=mihomo",
-            "RuntimeDirectoryMode=0755",
+            "RuntimeDirectoryMode=0711",
             "StandardOutput=append:/var/log/mihomo/mihomo.log",
             "daemon-reload",
             "enable",
@@ -2680,6 +3339,7 @@ mod tests {
             "/Users/alice/.config/systemd/user/mihomo.service",
             "/Users/alice/.local/state/mihomo",
             "ExecStart=/Users/alice/.local/bin/mihomo -d /Users/alice/.config/mihomo",
+            "ExecStartPost=/Users/alice/.local/bin/mihomo-cli select --replay --user",
             "StandardOutput=append:/Users/alice/.local/state/mihomo/mihomo.log",
             "--user",
             "enable",
@@ -2782,6 +3442,34 @@ mod tests {
             vec!["kill", "SIGTERM", "gui/501/io.mihomo"]
         );
         assert!(!user_stop.commands[0].privileged);
+
+        let system_upgrade_stop = planned_generation_quiesce_plan(&system);
+        assert_eq!(system_upgrade_stop.commands.len(), 1);
+        assert_eq!(system_upgrade_stop.commands[0].program, "launchctl");
+        assert_eq!(
+            system_upgrade_stop.commands[0].args,
+            vec!["bootout", "system/io.mihomo"]
+        );
+        assert!(system_upgrade_stop.commands[0].privileged);
+
+        let system_upgrade_start = planned_generation_resume_plan(&system);
+        assert_eq!(system_upgrade_start.commands.len(), 2);
+        assert_eq!(
+            system_upgrade_start.commands[0].args,
+            vec![
+                "bootstrap",
+                "system",
+                "/Library/LaunchDaemons/io.mihomo.plist"
+            ]
+        );
+        assert_eq!(
+            system_upgrade_start.commands[1].args,
+            vec!["kickstart", "-k", "system/io.mihomo"]
+        );
+        assert!(system_upgrade_start
+            .commands
+            .iter()
+            .all(|command| command.privileged));
     }
 
     #[test]
@@ -2849,6 +3537,10 @@ mod tests {
             .remove_paths
             .iter()
             .any(|p| { p.path == Path::new("/Users/alice/.config/mihomo") && !p.privileged }));
+        assert!(!system_plan
+            .remove_paths
+            .iter()
+            .any(|p| { p.path == Path::new("/Users/alice/.config/mihomo") && p.privileged }));
         assert!(system_plan
             .remove_paths
             .iter()
@@ -2866,6 +3558,10 @@ mod tests {
             .remove_paths
             .iter()
             .any(|p| { p.path == Path::new("/Users/alice/.config/mihomo") && !p.privileged }));
+        assert!(!linux_system
+            .remove_paths
+            .iter()
+            .any(|p| { p.path == Path::new("/Users/alice/.config/mihomo") && p.privileged }));
         assert!(linux_system
             .remove_paths
             .iter()
@@ -3014,6 +3710,18 @@ mod tests {
             plan.manual_fallback,
             "sudo launchctl kickstart -k system/io.mihomo"
         );
+    }
+
+    #[test]
+    fn windows_privileged_invocation_never_suggests_sudo() {
+        let ctx = InstanceContext::planned(TargetOs::Windows, InstanceMode::System, &inputs());
+        let restart = planned_service_plan(&ctx, ServiceAction::Restart);
+
+        for command in restart.commands {
+            let fallback = privilege_invocation_plan(command).unwrap().manual_fallback;
+            assert!(fallback.contains("Administrator PowerShell/Terminal"));
+            assert!(!fallback.contains("sudo"));
+        }
     }
 
     #[test]

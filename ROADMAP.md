@@ -1,8 +1,6 @@
 # mihomo-cli ROADMAP
 
 > 顶层方向规划。实现细节见 `SPEC.md`、`docs/` 设计文档；具体任务用 GitHub Issues 追踪。
->
-> 历史详细记录（Bug Tracker、逐项 checklist）已归档到 `docs/archive/ROADMAP-2026-08-10.md`。
 
 ---
 
@@ -20,7 +18,7 @@
 |------|------|
 | **跨平台一致** | 三平台核心命令行为一致，路径/服务机制按平台原生实现 |
 | **单二进制零依赖** | 不依赖 Python/Node/系统包，`cargo install` 即用 |
-| **安装 + 控制合一** | `install → config → start → status` 一条龙，无第二工具 |
+| **安装 + 控制合一** | `install → config import/add → restart → status` 一条龙，无第二工具；TUN 仍需显式 `tun on/off` |
 | **AI-Ready** | 机器可读（`--json`）、确定性输出、幂等语义、非交互（`--yes`） |
 | **单内核专注** | 只管理 mihomo 内核，不引入 sing-box 等多内核 |
 | **安全加固** | TUN root 门控、配置隔离、token 认证、符号链接防护、日志脱敏 |
@@ -29,14 +27,14 @@
 
 | 里程碑 | 内容 | 版本 |
 |--------|------|------|
-| **核心功能** | install/start/stop/TUN/订阅/节点选择/延迟测试/退出 IP | v0.1.0 |
+| **核心功能** | install/restart/stop/TUN/订阅/节点选择/延迟测试/显式 exit-ip probe | v0.1.0 |
 | **规则管理** | `rule add/list/remove/clear/import/export/position` | 2026-07-09 |
 | **可排查性** | 统一诊断输出、install 预检、错误定位、日志修复 | 2026-07-10 |
 | **稳定性** | macOS user mode、TLS 证书修复、原子写操作、失败路径测试 | 2026-07-13 |
 | **写操作安全** | checked merge + 回滚、备份恢复、DNS 模板、系统代理 | 2026-07-16~17 |
-| **Instance Model** | 互斥双模式（User/System）自动检测、daemon IPC、路径矩阵、三平台 E2E | v0.3.0 |
-| **安全加固** | L1-L7 七层防护（TUN root / 配置隔离 / token / socket / daemon 非 root / 符号链接 / 日志脱敏） | v0.4.0 |
-| **Windows 服务** | SCM 协议、named pipe SDDL、TokenElevation、autostart、CI 验证 12/12 | v0.5.0 |
+| **Instance Model** | 互斥双模式（User/System）自动检测、daemon IPC、路径矩阵；跨平台行为按各自证据等级验证 | v0.3.0 |
+| **安全加固** | L1-L7 设计覆盖 TUN root / 配置隔离 / token / socket / daemon 非 root / 符号链接 / 日志脱敏；完整旅程和真实 data plane 仍按证据矩阵分别报告 | v0.4.0 |
+| **Windows 服务** | SCM 协议、named pipe SDDL、TokenElevation、autostart 设计；Windows service/TUN/full journey 不以单次 CI 或局部 contract 概括 | v0.5.0 |
 
 ## 方向里程碑
 
@@ -51,7 +49,7 @@
 - Secret 脱敏：订阅 token / mihomo secret / 节点凭据默认隐藏
 - Agent Skill 封装：供 Qwen / Claude / Codex 等上层 AI 调用
 
-**现状**：`status/version/config --validate --json` 已可用；config CLI 子命令化设计中（`docs/SPEC-config-cli.md`）。
+**现状**：`status/version/config --validate --json` 已有对应设计/实现边界；config CLI 子命令化设计见 `docs/SPEC-config-cli.md`。
 
 **验收**：核心命令（status/config/proxy/list/select/delay/doctor）全部支持 `--json`、错误码、幂等、脱敏；README/USAGE 有 AI 快速开始示例。
 
@@ -78,7 +76,7 @@
 - **Linux**：systemd 生命周期完善（✅ 完成）、真机回归（进行中）
 - **跨平台**：CI 矩阵覆盖三平台契约测试（规划）
 
-**现状**：Windows 服务已可用（二等公民，CI 验证）；macOS/Linux 真机 E2E 通过。
+**现状**：Windows SCM/权限/服务实现仍按对应 contract、真实 Core 和平台 E2E 证据分别报告；macOS/Linux 的服务生命周期也按平台和旅程证据分别报告，不能用设计存在或单次 CI 结果概括完整支持。
 
 **验收**：三平台核心命令契约测试全绿；Windows 服务日志可查、崩溃可恢复。
 
@@ -86,10 +84,10 @@
 
 **目标**：威胁模型驱动的纵深防御。
 
-- L1-L7 已完成：TUN root 门控、配置隔离、token 认证、socket 审计、daemon 非 root、符号链接防护、日志脱敏
-- 待评估：多用户 daemon 访问控制（IPC peer uid 扩展）、Partial install 事务/回滚
+- L1-L7 已纳入当前安全设计与实现边界：TUN root 门控、配置隔离、token 认证、socket 审计、daemon 非 root、符号链接防护、日志脱敏；各平台完整旅程和真实 data plane 仍按 `SPEC.md §0.4` 分层报告
+- 待评估/持续验证：多用户 daemon 访问控制、部分安装事务 crash points、跨平台真实 Core/TUN evidence
 
-**现状**：L1-L7 全部落地并真机验证；威胁模型见 `docs/SECURITY.md`。
+**现状**：L1-L7 已形成统一安全设计和对应实现/测试边界；具体平台、真实 Core、TUN 和 data plane 证据按 `docs/SECURITY.md` 与 `SPEC.md §0.4` 分层报告。
 
 **验收**：安全边界明确（`docs/SECURITY.md` §5），已知限制有缓解计划。
 
@@ -106,10 +104,11 @@
 
 ## 已知限制
 
-- **多用户 daemon 访问控制**：Unix 侧 IPC peer uid 校验仅验证 config owner，未限制哪些用户可以连接 daemon
-- **Config dir 权限歧义**：System mode daemon 以 root 运行但 config 在用户目录，0600 权限下 daemon 无法读取
-- **Partial install 无回滚**：install 中途失败可能留下不一致状态
-- **Stale systemd state 误判**：`systemctl is-active` 与实际进程状态可能不一致
+- **多用户 daemon 访问控制**：授权表、token 和 IPC peer 校验的完整跨平台行为仍需按平台证据验证
+- **跨平台 service 证据不对称**：Windows/macOS/Linux 的 service、Core/API、TUN 和真实 data plane 不能用同一层级的测试结果互相替代
+- **真实 TUN/data-plane fixture**：缺少同架构真实 Core、privileged netns 或外部 probe 时，只能报告 `Contract-tested`/`Planned`，不能报告 `Full-journey-tested`
+- **部分安装与 recovery**：journal/manifest/残留身份无法证明时必须 fail-closed 并返回 `RecoveryRequired`；实现和测试仍需覆盖所有 crash points
+- **运行态可观察性**：Core/API 不可达时 `runtime_tun`、live ports、rule mode 必须为 `unknown`，不能由磁盘 intent 或 daemon 缓存推断
 
 ## 待办入口
 
@@ -117,4 +116,3 @@
 
 - GitHub Issues（建议）：M1-M4 的拆分任务
 - `docs/SPEC-*.md`：功能设计文档
-- `docs/archive/ROADMAP-2026-08-10.md`：历史详细记录

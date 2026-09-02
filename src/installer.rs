@@ -499,15 +499,17 @@ pub(crate) fn install_downloaded_archive(
     bin_path: &Path,
     min_binary_size: u64,
 ) -> anyhow::Result<u64> {
-    if archive_ext == "zip" {
+    use std::io::Read;
+
+    let decompressed = if archive_ext == "zip" {
         let cursor = std::io::Cursor::new(bytes);
         let mut archive = zip::ZipArchive::new(cursor)?;
         let mut installed = false;
+        let mut content = Vec::new();
         for i in 0..archive.len() {
             let mut file = archive.by_index(i)?;
             if archive_entry_is_mihomo_exe(file.name()) {
-                let mut out = std::fs::File::create(bin_path)?;
-                std::io::copy(&mut file, &mut out)?;
+                file.read_to_end(&mut content)?;
                 installed = true;
                 break;
             }
@@ -515,30 +517,27 @@ pub(crate) fn install_downloaded_archive(
         if !installed {
             anyhow::bail!("Archive does not contain a mihomo Windows executable");
         }
+        content
     } else if archive_ext == "gz" {
         let mut decoder = GzDecoder::new(bytes);
-        let mut out = std::fs::File::create(bin_path)?;
-        std::io::copy(&mut decoder, &mut out)?;
+        let mut content = Vec::new();
+        decoder.read_to_end(&mut content)?;
+        content
     } else {
         anyhow::bail!("Unsupported mihomo archive format: {archive_ext}");
-    }
+    };
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut p = std::fs::metadata(bin_path)?.permissions();
-        p.set_mode(0o755);
-        std::fs::set_permissions(bin_path, p)?;
-    }
+    // no-follow fd 链写入 + fchmod 0755：拒绝符号链接目标与中间组件穿越
+    crate::utils::write_bytes_file_no_follow(bin_path, &decompressed, 0o755)?;
 
-    let decompressed_size = std::fs::metadata(bin_path)?.len();
+    let decompressed_size = decompressed.len() as u64;
     let too_small = if min_binary_size == 5_000_000 {
         is_suspiciously_small_binary(decompressed_size)
     } else {
         decompressed_size < min_binary_size
     };
     if too_small {
-        let _ = std::fs::remove_file(bin_path);
+        let _ = crate::utils::remove_file_if_exists(bin_path);
         anyhow::bail!(
             "Decompressed binary is suspiciously small ({decompressed_size} bytes) \
              — download was likely truncated.\n  \
@@ -566,44 +565,39 @@ pub fn validate_binary() -> anyhow::Result<()> {
 }
 
 pub fn validate_binary_at(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::io::Read;
+
     let bin = path.display().to_string();
+    let mut file = crate::utils::open_regular_file_no_follow(path).map_err(|err| {
+        anyhow::anyhow!(
+            "mihomo binary not found or unsafe at {bin}: {err}\n  Run: mihomo-cli install"
+        )
+    })?;
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic)?;
 
-    if !path.exists() {
-        anyhow::bail!("mihomo binary not found at {bin}\n  Run: mihomo-cli install");
-    }
-
-    // Step 1: Magic bytes 检查
     #[cfg(target_os = "linux")]
-    {
-        use std::io::Read;
-        let mut f = std::fs::File::open(&bin)?;
-        let mut magic = [0u8; 4];
-        f.read_exact(&mut magic)?;
-        if !is_valid_binary_magic(BinaryFormat::Elf, magic) {
-            anyhow::bail!(
-                "Binary at {bin} is not a valid ELF executable \
-                 (magic: {magic:#04x?})\n\
-                 This usually means the downloaded file is not a mihomo binary.\n\
-                 Run: mihomo-cli update"
-            );
-        }
+    if !is_valid_binary_magic(BinaryFormat::Elf, magic) {
+        anyhow::bail!(
+            "Binary at {bin} is not a valid ELF executable \
+             (magic: {magic:#04x?})\n\
+             This usually means the downloaded file is not a mihomo binary.\n\
+             Run: mihomo-cli update"
+        );
     }
 
     #[cfg(target_os = "macos")]
-    {
-        use std::io::Read;
-        let mut f = std::fs::File::open(&bin)?;
-        let mut magic = [0u8; 4];
-        f.read_exact(&mut magic)?;
-        // Mach-O magic: 0xFEEDFACF (64-bit) or 0xFEEDFACE (32-bit), both endian
-        if !is_valid_binary_magic(BinaryFormat::MachO, magic) {
-            anyhow::bail!(
-                "Binary at {bin} is not a valid Mach-O executable \
-                 (magic: {magic:#04x?})\n\
-                 This usually means the downloaded file is not a mihomo binary.\n\
-                 Run: mihomo-cli update"
-            );
-        }
+    if !is_valid_binary_magic(BinaryFormat::MachO, magic) {
+        anyhow::bail!(
+            "Binary at {bin} is not a valid Mach-O executable \
+             (magic: {magic:#04x?})\n\
+             This usually means the downloaded file is not a mihomo binary.\n\
+             Run: mihomo-cli update"
+        );
+    }
+
+    if crate::utils::is_path_in_original_user_home(path)? {
+        return Ok(());
     }
 
     // Step 2: -v smoke test — distinguish crash from other failures
@@ -704,24 +698,16 @@ async fn download_mihomo_with_plan_and_mirror(
     let bin_path = plan.bin_path.clone();
     if Path::new(&bin_path).exists() {
         println!("mihomo already installed at {bin_path}");
-        // Fix permissions if missing (defense against old installer)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(&bin_path) {
-                if meta.permissions().mode() & 0o111 == 0 {
-                    let mut p = meta.permissions();
-                    p.set_mode(0o755);
-                    let _ = std::fs::set_permissions(&bin_path, p);
+        if crate::utils::is_path_in_original_user_home(Path::new(&bin_path))? {
+            crate::utils::remove_file_if_exists(Path::new(&bin_path))?;
+        } else {
+            crate::utils::set_file_mode_no_follow(Path::new(&bin_path), 0o755)?;
+            match existing_binary_action(true, validate_binary_at(Path::new(&bin_path)).is_ok()) {
+                InstalledBinaryCheck::Ok => return Ok(()),
+                InstalledBinaryCheck::RemoveAndRedownload => {
+                    println!("Existing binary is corrupted, re-downloading...");
+                    let _ = crate::utils::remove_file_if_exists(Path::new(&bin_path));
                 }
-            }
-        }
-        // 层 4：验证已有二进制是否健康，损坏则删掉重新下载
-        match existing_binary_action(true, validate_binary_at(Path::new(&bin_path)).is_ok()) {
-            InstalledBinaryCheck::Ok => return Ok(()),
-            InstalledBinaryCheck::RemoveAndRedownload => {
-                println!("Existing binary is corrupted, re-downloading...");
-                let _ = std::fs::remove_file(&bin_path);
             }
         }
     }
@@ -730,14 +716,14 @@ async fn download_mihomo_with_plan_and_mirror(
     crate::log!("URL: {}", plan.url);
 
     let parent = Path::new(&bin_path).parent().unwrap();
-    std::fs::create_dir_all(parent)?;
+    crate::utils::ensure_dir_all_no_follow(parent)?;
 
     // Download with resume + retry, falling back through GitHub mirrors.
     let bytes = download_with_retry_fallback(&plan.url, github_mirror, &plan.part_path).await?;
 
     // Download complete — clean up .part immediately so a corrupt file
     // never lingers to poison the next resume attempt.
-    let _ = std::fs::remove_file(&plan.part_path);
+    let _ = crate::utils::remove_file_if_exists(Path::new(&plan.part_path));
 
     // Decompress & install
     let pb = ProgressBar::new_spinner();
@@ -750,7 +736,7 @@ async fn download_mihomo_with_plan_and_mirror(
 
     // 层 3：验证新下载的二进制可用。如果失败，删除损坏文件以免脏数据残留
     if let Err(e) = validate_binary_at(Path::new(&bin_path)) {
-        let _ = std::fs::remove_file(&bin_path);
+        let _ = crate::utils::remove_file_if_exists(Path::new(&bin_path));
         anyhow::bail!("Downloaded binary is corrupted: {e}");
     }
 
@@ -910,10 +896,7 @@ async fn download_body(
         pb.set_style(style);
     }
 
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(part_path)?;
+    let mut file = crate::utils::open_append_file_no_follow(Path::new(part_path))?;
 
     use futures::StreamExt;
 
@@ -935,9 +918,9 @@ async fn download_body(
 
 // ── GeoIP / GeoSite pre-download ──
 
-const GEOIP_URL: &str =
+pub(crate) const GEOIP_URL: &str =
     "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb";
-const GEOSITE_URL: &str =
+pub(crate) const GEOSITE_URL: &str =
     "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoSite.dat";
 
 /// Build default mirror URLs from the primary GitHub release asset URL.
@@ -1083,6 +1066,41 @@ fn gh_token() -> Option<String> {
     } else {
         None
     }
+}
+
+/// Download a single geo data file from a URL with timeout.
+/// Returns Ok(()) on success, Err with message on failure.
+/// Used by the Unix daemon for auto-recovery (ADR-24).
+#[cfg(unix)]
+pub(crate) async fn download_geo_file(url: &str, dest: &std::path::Path) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("failed to create HTTP client: {e}"))?;
+
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("download failed: {e}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!("download returned HTTP {}", response.status()));
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("failed to read response: {e}"))?;
+
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create directory {}: {e}", parent.display()))?;
+    }
+
+    std::fs::write(dest, &bytes).map_err(|e| format!("failed to write {}: {e}", dest.display()))?;
+
+    Ok(())
 }
 
 async fn download_geo_with_fallback(
@@ -1267,13 +1285,11 @@ async fn try_download_geo(
         );
 
         let open_mode = file_open_mode_for_download(actual_offset);
-        let mut file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .append(matches!(open_mode, FileOpenMode::Append))
-            .truncate(matches!(open_mode, FileOpenMode::Truncate))
-            .open(tmp)
-        {
+        let mut file = match if matches!(open_mode, FileOpenMode::Append) {
+            crate::utils::open_append_file_no_follow(Path::new(tmp))
+        } else {
+            crate::utils::open_truncate_file_no_follow(Path::new(tmp))
+        } {
             Ok(f) => f,
             Err(e) => {
                 crate::log!("    cannot open {tmp}: {e}");
@@ -2017,6 +2033,18 @@ mod target_tests {
             existing_binary_action(false, false),
             InstalledBinaryCheck::RemoveAndRedownload
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_binary_at_rejects_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let victim = temp.path().join("victim");
+        std::fs::write(&victim, b"\x7fELF").unwrap();
+        let link = temp.path().join("mihomo");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        assert!(validate_binary_at(&link).is_err());
     }
 
     #[test]

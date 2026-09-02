@@ -1,5 +1,7 @@
 # SPEC: Windows 支持完善方案（Windows Service + named pipe ACL）
 
+> **从属与状态：** 本文是 `../SPEC.md` 的平台实施补充，不是独立产品合同。Windows 的 install/config/restart、autostart、TUN、结果状态和证据等级必须服从 `../SPEC.md`；本文只定义 SCM、named pipe、token/ACL 和 Windows 服务生命周期实现细节。无订阅 `install --system --yes` 生成并校验 direct-only 配置；首次安装且没有运行实例时可启动普通 Core/API，但已有运行实例的升级只准备 pending generation，不停止 daemon/Core。后续配置和 pending generation 由显式 `restart` 应用。与正式 SPEC 冲突的旧命令或自动启动语义均不实施。
+
 - 状态: **草案 → 已评审修订**（2026-08-03 二轮 review 通过，有条件进入实施）
 - 日期: 2026-08-02
 - 范围: mihomo-cli Windows 二等公民支持完善——让 Windows System 模式服务可启动、安全、可管理
@@ -28,7 +30,7 @@ CI 三平台矩阵验证（cross-platform-e2e.yml）暴露 Windows System 模式
 
 ## 2. 参考
 
-`3rdparty/Proxy-RS`（同架构单二进制 + 子命令）的 Windows 服务实现：
+参考同类单二进制 CLI 的 Windows 服务实现：
 - `windows-service = "=0.8.1"`（Mullvad VPN 维护，SCM 协议封装）
 - `service-manager = "=0.11.0"`（跨平台服务安装/卸载）
 - named pipe 安全：**仅 token 校验**（`service_ipc.rs`），icacls 只用于 token 文件/目录 ACL
@@ -38,9 +40,9 @@ CI 三平台矩阵验证（cross-platform-e2e.yml）暴露 Windows System 模式
 
 ## 3. 方案设计
 
-### 3.0 新增：跨平台统一开机自启控制（`autostart` 命令）
+### 3.0 历史：跨平台统一开机自启控制（已 superseded）
 
-**目标**：macOS/Linux/Windows 三平台开机自启统一可配置，CLI 切换，**默认不开机自启**。
+> 本节原有的 autostart 命令矩阵和 install 默认行为是历史设计附录，不定义当前合同。当前规则：install 只安装基础设施；Core 需显式 `restart`；autostart 只控制 SCM/登录启动策略，不代表 Core/API ready 或 TUN runtime，也不能绕过有效配置、TUN snapshot/revision 或 recovery blocker；只读查询不得隐式启动或 recovery。保留以下内容仅供实现迁移参考，实施时必须按 `../SPEC.md` 重写并单独验证。
 
 **新增命令**：
 ```bash
@@ -92,8 +94,30 @@ mihomo-cli (单二进制)
     └── windows: 新增 SCM 协议层（windows-service crate）
          └── service_dispatcher::start → service_main
               └── service_control_handler::register（Stop/Shutdown）
-                   └── 原有 daemon 主循环（core 管理 + IPC）
+         └── 原有 daemon 主循环（core 管理 + IPC）
 ```
+
+### 3.1.1 运行中二进制更新：install/apply 分离
+
+Windows 运行中的 daemon 使用固定路径：
+
+```text
+%ProgramData%\mihomo\bin\mihomo-cli.exe
+```
+
+该文件可能被运行中的服务锁定，`Copy-Item -Force` 不能作为可靠的在线升级机制。因此 Windows 遵循以下顺序：
+
+```text
+install:
+  下载/校验 → 写入独立 pending generation → 不停止服务
+
+restart:
+  停止 Core → 停止 SCM service → 等待 STOPPED
+  → 替换 active .exe → 启动 service
+  → IPC 握手确认 daemon 版本/协议 → 启动并确认 Core API
+```
+
+若仅 Core 发生变化，daemon 保持运行，先通过 IPC 停止 Core，替换 Core `.exe` 后再通过 IPC 启动；只有 daemon 本身变化时才停止 SCM service。替换失败时必须保留 active/previous 版本并报告可恢复错误，不能留下半更新的 active 文件。
 
 ### 3.2 依赖（精确锁定，供应链安全）
 
@@ -162,9 +186,9 @@ mod windows_service_entry {
 }
 ```
 
-> **Windows recover 路径**（P2-6 修正）：手动 `daemon --recover` 走同步 dispatcher 前
-> 的检查——若 `--recover` 显式给出，说明用户手动恢复，允许走非 SCM raw loop
-> （现有 `recover_daemon`），并在文档说明其绕过 SCM 的限制。
+> **Windows recover 路径**（历史实现说明，当前统一服从 `../SPEC.md` §12.3 内部恢复边界，不作为独立 CLI 恢复契约）：手动 `daemon --recover` 曾用于走非 SCM raw loop 恢复 daemon，当前系统生命周期管理统一由 SCM / `stop --system` / `restart --system` 受管收敛。
+
+**Core API 转发边界：** named pipe 的 SDDL/token 只证明 daemon IPC 身份，不自动授权任意 Core API。Windows system 模式只有在 named-pipe peer 身份、token/ACL、目标 instance 和 `CoreApiRequest` 的 method/path/query/body/size allowlist 均验证通过后，才可转发当前 Core 的受权请求。该请求不是 lifecycle 或 TUN mutation：daemon 不得借此启动/重启 Core、下载/修复资源、访问其他 instance 或通过通用 API 修改 TUN；未知或尚未迁移的 method/path/body 必须拒绝。Core/API 未 ready 时返回 `Incomplete`/`Unknown`，并指向显式 `restart --system`，不能由 forwarding 隐式恢复。若 Windows 当前实现无法提供完整受权转发，StatusSnapshot 的 runtime 字段必须为 `unknown`，不得由 daemon 状态或用户 intent 回填。
 
 **停机链路修正（P0-2）**：现有 `run_daemon` 是无限 accept 循环，无 shutdown 通道。
 改造为接收 `tokio_util::sync::CancellationToken`：
@@ -234,17 +258,15 @@ fn is_process_elevated() -> bool {
 - token 生成/校验（长度、随机性、比对）
 - install/uninstall plan 含 token 文件路径断言
 
-**Windows CI E2E（cross-platform-e2e.yml）**：
-- System install → status（system service + daemon IPC running）
-- start → status（Core running）
+**Windows CI E2E（cross-platform-e2e.yml）：**
+- System install → `status`（仅断言声明的 service/daemon 控制面状态）
+- `restart --system` → `status`（Core/API readiness；不能由 status 推断公网或 TUN data plane）
 - **token 校验负测试**：用错误 token 连接 → 应被拒绝
-- stop → status（Core stopped）
-- uninstall → status（未安装）+ **token 文件清理验证**
-- 服务失败恢复（可选）：kill daemon → 验证 sc failure 重启
+- `stop` → 分层验证 `status`/诊断结果：SCM service 与 daemon IPC 停止，受管 Core 子进程已停止且归属可证明；如本实例曾启用 TUN，还必须检查 snapshot、journal、manifest 和网络残留是否已按停止/恢复合同收敛。Core stopped 或 service inactive 单独不能证明 TUN disabled、系统代理关闭或未知网络资产已清理。
+- uninstall → `status`（未安装）+ **token 文件清理验证**；同时验证受管 daemon/Core 已停止、残留 manifest/journal 的处理结果和凭据事务结果。
+- 服务失败恢复（可选）：kill daemon → 验证 SCM failure action 只恢复 daemon/IPC 基础设施；不得把恢复后的 service active 等同于 Core/API ready 或 TUN runtime 已恢复。
 
-**CI 参考**：Proxy-RS 的 CI 只做 cargo test + PowerShell 脚本单测，**不做真实服务 E2E**。
-我们已超出它（Windows System E2E 已验证到 CreateService SUCCESS），
-修好 W1 后将是真实服务启动 E2E。
+**证据边界：** 本节测试项是实现计划/验收清单，不自动表示已通过。Windows service/SCM、真实 Core、TUN data plane 和外部网络必须分别按 `SPEC.md §0.4` 标注 `Contract-tested`、`Real-Core-tested` 或 `Full-journey-tested`；缺少对应日志/断言时只能标为 `Planned`。
 
 ## 4. 实施顺序
 

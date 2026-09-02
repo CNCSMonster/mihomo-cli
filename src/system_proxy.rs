@@ -241,6 +241,151 @@ fn run_planned(cmd: &PlannedCommand) -> Result<()> {
     Ok(())
 }
 
+/// 系统代理状态查询结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SystemProxyState {
+    /// 系统代理已启用
+    Enabled,
+    /// 系统代理已禁用
+    Disabled,
+    /// 当前平台或桌面环境不支持查询
+    Unsupported,
+    /// 查询失败或无法解析
+    Unknown,
+}
+
+/// 查询当前系统代理状态（只读，不修改任何设置）
+pub fn query_system_proxy() -> SystemProxyState {
+    #[cfg(target_os = "linux")]
+    {
+        query_linux_system_proxy()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        query_macos_system_proxy()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        query_windows_system_proxy()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        SystemProxyState::Unsupported
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn query_linux_system_proxy() -> SystemProxyState {
+    // 查询 GNOME 系统代理模式
+    let output = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.system.proxy", "mode"])
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            let mode = String::from_utf8_lossy(&output.stdout);
+            let mode = mode.trim().trim_matches('\'');
+            match mode {
+                "manual" => SystemProxyState::Enabled,
+                "none" => SystemProxyState::Disabled,
+                _ => SystemProxyState::Unknown,
+            }
+        }
+        Ok(_) => SystemProxyState::Unknown,
+        Err(_) => SystemProxyState::Unsupported, // gsettings 不存在，可能不是 GNOME
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn query_macos_system_proxy() -> SystemProxyState {
+    // 查询所有启用的网络服务的代理状态
+    let services = match macos_enabled_network_services() {
+        Ok(s) => s,
+        Err(_) => return SystemProxyState::Unknown,
+    };
+
+    if services.is_empty() {
+        return SystemProxyState::Disabled;
+    }
+
+    // 检查任一服务是否启用了 Web Proxy
+    for service in &services {
+        let output = std::process::Command::new("networksetup")
+            .args(["-getwebproxy", service])
+            .output();
+
+        if let Ok(output) = output {
+            if output.status.success() {
+                let content = String::from_utf8_lossy(&output.stdout);
+                if content.contains("Enabled: Yes") {
+                    return SystemProxyState::Enabled;
+                }
+            }
+        }
+    }
+
+    SystemProxyState::Disabled
+}
+
+#[cfg(target_os = "windows")]
+fn query_windows_system_proxy() -> SystemProxyState {
+    use std::process::Command;
+
+    let output = Command::new("reg")
+        .args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            "/v",
+            "ProxyEnable",
+        ])
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            let content = String::from_utf8_lossy(&output.stdout);
+            if content.contains("0x1") {
+                SystemProxyState::Enabled
+            } else if content.contains("0x0") {
+                SystemProxyState::Disabled
+            } else {
+                SystemProxyState::Unknown
+            }
+        }
+        _ => SystemProxyState::Unknown,
+    }
+}
+
+/// Shell 代理状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ShellProxyState {
+    /// 环境变量中已配置代理
+    Configured,
+    /// 环境变量中未配置代理
+    NotConfigured,
+    /// 无法确定
+    Unknown,
+}
+
+/// 查询当前进程的 shell 代理环境（只读，不修改任何环境变量）
+pub fn query_shell_proxy() -> ShellProxyState {
+    let proxy_vars = [
+        "http_proxy",
+        "https_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "all_proxy",
+    ];
+
+    for var in &proxy_vars {
+        if std::env::var_os(var).is_some() {
+            return ShellProxyState::Configured;
+        }
+    }
+
+    ShellProxyState::NotConfigured
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;

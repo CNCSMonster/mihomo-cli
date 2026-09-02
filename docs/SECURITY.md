@@ -18,12 +18,13 @@
 
 | 维度 | clash-verge-rev | Proxy-RS | mihomo-cli 当前 | 评价 |
 |------|----------------|----------|----------------|------|
-| **IPC 认证** | ❌ 硬编码默认值 `"set-your-secret"` | ✅ 64 字符随机 token + 常量时间比较 | ⚠️ Windows 有 token，Unix 无 | Proxy-RS 完胜 |
-| **Socket 权限** | ❌ `0o666`（所有用户可访问） | ✅ `0o600`（仅安装者可访问） | ❌ `0o666` | Proxy-RS 完胜 |
-| **Token 文件保护** | ❌ 无保护 | ✅ `0o600` + owner + Windows SDDL | ⚠️ Windows 有，Unix 无 | Proxy-RS 完胜 |
-| **服务沙箱** | ❌ 无 | ✅ systemd 全套硬化 | ❌ 无 | Proxy-RS 完胜 |
-| **服务目录加固** | ❌ 无 | ✅ `root:root` + `0o700` + 原子替换 | ❌ 无 | Proxy-RS 完胜 |
-| **SO_PEERCRED** | ❌ 无 | ❌ 无 | ❌ 无 | 三者都缺失 |
+| **IPC 认证** | ❌ 硬编码默认值 `"set-your-secret"` | ✅ 64 字符随机 token + 常量时间比较 | ✅ Unix peer UID + per-user token + root-owned authorized-client table；Windows token/ACL | 当前方案按平台收敛 |
+| **Socket 权限** | ❌ `0o666`（所有用户可访问） | ✅ `0o600`（仅安装者可访问） | ⚠️ Unix transport 可连接但应用层必须 peer/token 授权；TUN mutation 还要求 root peer | transport 可见不等于命令授权 |
+| **Token 文件保护** | ❌ 无保护 | ✅ `0o600` + owner + Windows SDDL | ✅ Unix per-user token `0o600`、root table；Windows 双副本/ACL | 当前方案已定义 |
+| **服务沙箱** | ❌ 无 | ✅ systemd 全套硬化 | ✅ Linux 非 root daemon/Core + capabilities；macOS/Windows 使用平台特权服务边界 | 按平台适用 |
+| **服务目录加固** | ❌ 无 | ✅ `root:root` + `0o700` + 原子替换 | ✅ 受管路径、owner/mode/no-follow、snapshot root boundary | 当前方案已定义 |
+| **SO_PEERCRED** | ❌ 无 | ❌ 无 | ✅ Unix peer UID 是授权材料之一 | 不能只依赖 token |
+
 | **审计日志** | ❌ 无 | ❌ 无 | ❌ 无 | 三者都缺失 |
 | **多用户支持** | ❌ 单用户 GUI | ⚠️ 安装者绑定模型 | ✅ per-user core + system daemon | mihomo-cli 架构更成熟 |
 
@@ -44,7 +45,7 @@
 ```bash
 # 1. 攻击者攻破了低权限用户 user-a
 # 2. user-a 修改 mihomo-cli 配置，设置危险节点（攻击者控制的代理服务器）
-user-a$ mihomo-cli config import malicious-config.yaml
+user-a$ mihomo-cli config --import malicious-config.yaml
 user-a$ mihomo-cli select --group "Proxy" --node "attacker-server"
 
 # 3. user-a 开启 TUN（如果当前没有开启）
@@ -66,13 +67,13 @@ user-a$ mihomo-cli tun on
 
 ### 2.2 当前 mihomo-cli 的问题
 
-> 下表记录威胁模型分析阶段识别的问题。L1-L7 安全改进实施后，标 ✅ 的项已得到缓解；详见 §3 防护设计。
+> 下表记录威胁模型分析阶段识别的问题。当前缓解状态必须以正式 `SPEC.md` 和代码/测试证据为准；“已缓解”不等于完整 TUN data-plane 或 Full-journey-tested。
 
 | 问题 | 说明 | 风险等级 | 状态 |
 |------|------|---------|------|
-| **任何用户都可以修改配置** | config 目录是 per-user 的，每个用户都有自己的配置 | 🟡 中 | 按设计保留；系统敏感配置修改通过 L1 + L2 间接约束 |
-| **任何用户都可以 `tun on`（Unix 无认证）** | IPC socket `0o666`，无 token 认证 | 🔴 高 | ✅ 已缓解：L1（daemon peer UID 要求 root）+ L3（token + 授权表） |
-| **TUN 是系统级的，影响所有用户** | TUN 网卡是系统级单例，一旦开启，所有用户的流量都被拦截 | 🔴 高 | ✅ 已缓解：L1 限制仅 root 可开关；TUN 配置隔离（L2）降低配置篡改影响 |
+| **用户 intent 可被其 owner 修改** | per-user config 是用户配置源；system TUN 不直接信任可变路径，而是经 root revalidation 生成受保护 snapshot | 🟡 中 | 按设计保留；snapshot/candidate/revision/root peer gate 限制系统级应用边界 |
+| **未经授权的 TUN mutation** | transport socket 可连接不等于 mutation 授权；请求必须经过 token/peer 校验，TUN mutation 还必须 root peer | 🔴 高 | 已定义 peer UID + token + authorized-client table + CLI sudo re-exec；真实平台覆盖仍按证据矩阵报告 |
+| **TUN 是系统级的，影响所有用户** | TUN 网卡是系统级单例，一旦开启，所有用户流量可能被拦截 | 🔴 高 | system mode 单例、root peer gate、受保护 snapshot、runtime API 观察和隔离 data-plane 验收 |
 
 ### 2.3 Proxy-RS 能否防止此攻击？
 
@@ -90,7 +91,7 @@ user-a$ mihomo-cli tun on
 
 ```bash
 # 攻击者绕过 CLI，直接向 daemon IPC socket 发送命令
-attacker$ echo '{"EnableTun": {...}}' | nc -U /var/run/mihomo/service.sock
+attacker$ echo '{"ApplySystemTunSnapshot": {"expected_revision": "..."}}' | nc -U /var/run/mihomo/service.sock
 # TUN 被开启，无需任何认证
 ```
 
@@ -104,11 +105,13 @@ attacker$ echo '{"EnableTun": {...}}' | nc -U /var/run/mihomo/service.sock
 - ~~Unix 无 token 认证~~ ✅ 已实施 L3 方案 A
 - ~~无 peer UID 检查~~ ✅ 已实施 L3/L1
 
-#### 防护方案（已实施）
+#### 防护方案（当前合同）
 
-- Unix token 认证（方案 A）：root-only server token + per-user client token
-- Daemon 校验 client token 是否在授权表中，并校验 socket peer UID 等于授权表记录 UID
-- Daemon 侧 peer UID 检查（TUN 操作需要 root）
+- Unix token 认证：per-user client token + root 管理授权表 + peer UID 绑定。
+- `tun on/off` 由普通用户 CLI 内部 sudo re-exec；daemon 只接受 root peer 的 TUN mutation。
+- per-user `config.yaml` 是 intent 事实来源；system TUN config 是由 root peer gate 与受控事务生成、并收敛为 `mihomo:mihomo 0640` 的受保护派生 snapshot，不是第二事实来源。
+- snapshot 只能由经过原始用户 owner/no-follow/hash/revision 复检的 candidate 生成，并须经真实 Core 语义校验和 API runtime observation。
+
 
 ### 2.5 场景 3：配置文件篡改导致恶意规则注入
 
@@ -126,8 +129,11 @@ attacker$ echo "- DOMAIN-SUFFIX,google.com,PROXY" >> ~/.config/mihomo/rules.yaml
 
 #### 防护方案
 
-- L1：TUN 需要 root 权限
-- TUN 配置隔离：TUN config 独立存储，是 per-user config 的系统级快照
+- L1：TUN mutation 需要 root peer；普通用户命令通过 CLI 内部 sudo re-exec 完成授权。
+- per-user intent config 仍允许其 owner 修改，但 system TUN 不直接信任可变用户路径。
+- root 重新校验 owner、no-follow、内容/hash 与 expected revision 后，生成 candidate，并通过受控事务提交受保护、`mihomo:mihomo 0640` 的 `tun-config.yaml` 派生 snapshot。
+- snapshot 只作为 system TUN Core 的固定运行时输入，不是第二配置事实来源；事务由 journal、原子提交和 rollback 保护。
+- system TUN 的成功状态必须由当前 Core API runtime observation 证明，不能由磁盘配置或历史缓存推断。
 
 ### 2.6 场景 4：订阅 URL 泄露 + 中间人攻击
 
@@ -143,7 +149,7 @@ attacker$ echo "- DOMAIN-SUFFIX,google.com,PROXY" >> ~/.config/mihomo/rules.yaml
 
 #### 防护方案
 
-ADR-21 已决策——daemon 以非 root 用户运行，通过 AmbientCapabilities 获得精确权限。
+ADR-21 在 Linux 已实施：daemon 以 `mihomo` 用户运行，通过 AmbientCapabilities 获得精确权限。macOS system LaunchDaemon 仍为 root，Windows SCM 服务仍为 SYSTEM。
 
 ### 2.8 场景 6：token 文件泄露
 
@@ -153,7 +159,7 @@ ADR-21 已决策——daemon 以非 root 用户运行，通过 AmbientCapabiliti
 
 #### 防护方案
 
-- root-only server token + per-user client token：`/var/lib/mihomo-cli/service-token` 为 `0o600 root:root`；`~/.config/mihomo/service-token` 为 `0o600 user:user`
+- Unix 无独立 server token；`~/.config/mihomo/service-token` 为 `0o600 user:user`，并与 peer UID、root 管理的授权表联合校验
 - Daemon 侧 peer UID 检查（TUN 操作需要 root）
 
 ### 2.9 场景 7：符号链接攻击（Symlink Attack）
@@ -282,10 +288,10 @@ TOCTOU 攻击的前提是攻击者已经能够修改用户配置文件所在的�
 | 层级 | 措施 | 防止的攻击 | 优先级 | 状态 |
 |------|------|-----------|--------|------|
 | **L1** | TUN 操作需要 root 权限（CLI 自动 sudo + Daemon peer UID；Unix root peer gate） | 场景 1、3 | 🔴 必须 | ✅ 已实施（Unix） |
-| **L2** | TUN 配置隔离（TUN config 独立存储） | 场景 3 | 🔴 必须 | ✅ 已实施（Unix） |
+| **L2** | root peer gate 驱动的受保护 TUN snapshot + candidate/revision 事务 | 场景 3 | 🔴 必须 | Contract-defined；实现与真实 TUN 证据按矩阵报告 |
 | **L3** | Unix token 认证（方案 A） | 场景 2、6 | 🔴 必须 | ✅ 已实施 |
 | **L4** | Socket 权限审计：保留 `0o666` + L3 peer UID/token 认证 | 场景 2 | 🔴 必须 | ✅ 已审计：无需收紧 |
-| **L5** | daemon 非 root 运行（ADR-21） | 场景 5 | ✅ 已决策 | ✅ 已实施 |
+| **L5** | daemon 非 root 运行（ADR-21） | 场景 5 | ✅ 已决策 | Contract-defined；Linux 代码/安装与真实 Core/TUN 旅程按 `SPEC.md §0.4` 分别报告 |
 | **L6** | 符号链接攻击防护（O_NOFOLLOW + 检查） | 场景 7 | 🔴 必须 | ✅ 已实施 |
 | **L7** | 日志脱敏 + 级别控制 | 场景 10 | 🟡 推荐 | ✅ 已实施 |
 
@@ -317,11 +323,11 @@ async fn ensure_tun_privilege_or_reexec() -> anyhow::Result<()> {
 
 ```rust
 // daemon.rs:handle_daemon_command
-DaemonCommand::EnableTun { .. } | DaemonCommand::DisableTun { .. } => {
-    // Unix: 通过 getsockopt(SO_PEERCRED) 获取 peer UID，要求 peer_uid == 0。
-    // Windows: 依赖现有 Windows service / named pipe 权限；
-    // L1 root peer gate 仅适用于 Unix。
-    if !is_peer_root_or_daemon_user(peer_uid) {
+DaemonCommand::ApplySystemTunSnapshot { .. } | DaemonCommand::DisableTun { .. } => {
+    // Unix: 通过 getsockopt(SO_PEERCRED) 获取 peer UID，TUN mutation 只接受 peer_uid == 0。
+    // daemon 自身的非 root UID、普通授权用户和仅有 token 的连接均不得绕过 root peer gate。
+    // Windows: 依赖现有 Windows service / named pipe 权限；Unix root peer gate 不直接移植为 Windows UID 检查。
+    if !validate_tun_peer_is_root(peer_uid) {
         return DaemonResponse::Error {
             message: "TUN on/off requires root privileges".to_string(),
         };
@@ -370,7 +376,7 @@ if is_system_sensitive_config_change(&opts) {
         anyhow::bail!(
             "System-sensitive config changes require root privileges.\n  \
              Suggestions:\n  \
-               sudo mihomo-cli config import ...\n  \
+               sudo mihomo-cli config --import ...\n  \
                sudo mihomo-cli rule add ..."
         );
     }
@@ -442,6 +448,13 @@ std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o666))?;
 ```
 
 不改为 `0o600`/`0o660` 的原因：这会阻止非 daemon 用户连接 system IPC，破坏 `mihomo-cli access grant ...` 授权后的多用户控制路径；且 `0o660` 还要求额外的 daemon 组成员管理。
+systemd 的 `RuntimeDirectoryMode=0711` 只允许非 daemon 用户穿越目录到已知 socket，
+不允许列出目录内容；实际 IPC 权限仍由 socket 上的 token 与 peer UID 双重校验决定。
+
+Mihomo Core API socket 继续由 `mihomo` 用户私有。System 模式下，已授权普通用户的
+`list`、`select`、`delay`、`proxy` 等请求通过 daemon 的 method/path allowlist 转发；
+未授权用户在转发前即被 token + peer UID 校验拒绝。通用转发明确拒绝 `tun` patch，
+避免绕过 `ApplySystemTunSnapshot` / `DisableTun` 的 root peer gate。
 
 #### Token 文件保护
 
@@ -467,7 +480,7 @@ std::fs::set_permissions(token_path, std::fs::Permissions::from_mode(0o600))?;
 
 ### 4.2 权限模型
 
-- Token 文件权限 `0o600`：server token 为 `root:root`，per-user client token 为对应用户所有
+- Per-user client token 权限为 `0o600 user:user`；Linux 授权表为 `0o640 root:mihomo`，macOS 授权表为 `0o600 root:wheel`
 - Socket 权限 `0o666`：所有本机用户可连接，但必须提供授权表中匹配 peer UID 的 client token
 - TUN 操作需要 root：daemon 检查 peer UID
 - CLI 自动处理 sudo：用户不需要手动加 `sudo` 前缀
@@ -537,24 +550,27 @@ std::fs::set_permissions(token_path, std::fs::Permissions::from_mode(0o600))?;
 
 **优先级**：🟡 推荐
 
-### 6.3 阶段 3: TUN 配置隔离（L2）
+### 6.3 阶段 3: TUN 派生 snapshot 与事务边界（L2）
 
-**目标**：防止低权限用户修改影响系统流量的配置
+**目标**：防止低权限用户通过可变 intent 路径绕过授权，修改影响系统流量的运行时输入。
 
-**实现（Unix 已实施）**：
-- TUN config 独立存储在系统级位置：
-  - Linux: `/var/lib/mihomo-cli/tun-config.yaml`
-  - macOS: `/Library/Application Support/mihomo-cli/tun-config.yaml`
-  - Windows: `%ProgramData%\mihomo-cli\tun-config.yaml`
-- CLI 负责先更新启动用户的 per-user config，再将其复制为系统级 TUN config 快照
-- daemon 使用隔离后的 TUN config 启动/重载 core，避免直接依赖可变的 per-user config
-- Unix 权限语义：TUN config root 可写，daemon 可读
+**当前合同与证据边界**：
+- per-user `config.yaml` 是 intent 的唯一事实来源；system `tun-config.yaml` 不是独立配置事实。
+- CLI 只能提出 candidate，并携带 `expected_revision` 进入受权 system IPC；不得直接写 system snapshot 或直接调用 Core TUN API。
+- root/system context 重新校验原始用户文件的 owner、no-follow、内容/hash 和 revision，生成并原子提交受保护、`mihomo:mihomo 0640` 的派生 snapshot。
+- daemon/Core 使用固定 system context 和显式 `-f tun-config.yaml`；journal 管理 snapshot、Core 运行态和 rollback。
+- 成功必须由当前 Core API readiness 与 `/configs` runtime observation 证明；不可观察时返回 `Unknown`/失败，恢复不可证明时返回 `RecoveryRequired`。
+
+**平台路径**：
+- Linux: `/var/lib/mihomo-cli/tun-config.yaml`
+- macOS: `/Library/Application Support/mihomo-cli/tun-config.yaml`
+- Windows: `%ProgramData%/mihomo-cli/tun-config.yaml`
 
 **后续**：
 - Windows ProgramData ACL 明确化/测试
-- L6 符号链接防护完成后复核 privileged write 安全性（✅ 已完成，见 BUG-21）
+- 真实 Mihomo TUN/interface/data-plane 验证，不以 fake Core contract 代替
 
-**优先级**：🟡 推荐
+**优先级**：🟡 推荐；实现状态和验证等级必须按正式 SPEC 的证据矩阵报告。
 
 ### 6.4 阶段 4: 通知 + 审计（S3 + S4）
 
@@ -587,11 +603,10 @@ std::fs::set_permissions(token_path, std::fs::Permissions::from_mode(0o600))?;
 
 ### L3 Unix IPC 访问控制（方案 A，已实施）
 
-Unix system daemon 使用 root-only server token 与 per-user client token 分离：
+Unix system daemon 使用 per-user client token、peer UID 与 root 管理的授权表联合认证；不存在独立 Unix server token：
 
-- `/var/lib/mihomo-cli/service-token`：daemon/server token，`0o600 root:root`。
 - `~/.config/mihomo/service-token`：用户 client token，`0o600 user:user`。
-- `/var/lib/mihomo-cli/authorized-clients.json`：授权表，`0o600 root:root`。
+- `/var/lib/mihomo-cli/authorized-clients.json`：Linux 为 `0o640 root:mihomo`，macOS 为 `0o600 root:wheel`。
 
 Daemon 对每个 IPC 请求校验 client token 是否存在于授权表，并校验 Unix socket peer UID 与授权表中 token 归属 UID 一致；`tun on/off` 仍额外要求 root peer UID。
 

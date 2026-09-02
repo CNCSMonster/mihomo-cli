@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-use crate::utils;
 use std::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,58 +129,6 @@ impl PlannedCommand {
             privileged: true,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ServiceFilePlan {
-    path: String,
-    content: String,
-    privileged: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ServiceFileRemoval {
-    path: String,
-    privileged: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PrivilegedFileWritePlan {
-    program: String,
-    args: Vec<String>,
-    stdin: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ServiceInstallPlan {
-    cleanup_commands: Vec<PlannedCommand>,
-    cleanup_files: Vec<ServiceFileRemoval>,
-    pre_commands: Vec<PlannedCommand>,
-    files: Vec<ServiceFilePlan>,
-    commands: Vec<PlannedCommand>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ServiceUninstallPlan {
-    commands: Vec<PlannedCommand>,
-    files: Vec<ServiceFileRemoval>,
-    legacy_service_mode_marker: Option<ServiceFileRemoval>,
-}
-
-fn linux_system_unit_path() -> &'static str {
-    "/etc/systemd/system/mihomo.service"
-}
-
-fn linux_user_unit_path(home: &str) -> String {
-    format!("{home}/.config/systemd/user/mihomo.service")
-}
-
-fn macos_daemon_plist_path() -> &'static str {
-    "/Library/LaunchDaemons/io.mihomo.plist"
-}
-
-fn macos_agent_plist_path(home: &str) -> String {
-    format!("{home}/Library/LaunchAgents/io.mihomo.plist")
 }
 
 /// Returns the launchd GUI domain for the current user (e.g., "gui/501").
@@ -410,30 +357,6 @@ fn start_result_lines(api_ready: bool) -> Vec<String> {
     }
 }
 
-fn api_not_ready_warning_lines() -> Vec<String> {
-    vec![
-        "  ⚠ API not responding after 15s — mihomo may still be initializing.".to_string(),
-        crate::mihomo_api::socket_fix_suggestion(),
-    ]
-}
-
-fn socket_fix_applied_message() -> &'static str {
-    "  ⚠ Config was missing Unix socket controller — fixed."
-}
-
-#[cfg(unix)]
-fn stale_socket_cleanup_message() -> &'static str {
-    "  Cleaned up stale socket"
-}
-
-#[cfg(unix)]
-fn stale_socket_cleanup_failed_message(error: &str, sock: &str) -> String {
-    format!(
-        "  ⚠ Cannot remove stale socket: {error}
-      Run: sudo rm -f {sock}"
-    )
-}
-
 fn service_restart_commands(os: ServiceOs, mode: ServiceMode, _home: &str) -> Vec<PlannedCommand> {
     match (os, mode) {
         (ServiceOs::Linux, ServiceMode::User) => {
@@ -473,242 +396,6 @@ fn macos_service_loaded(label: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
-}
-
-fn launchd_plist(home: &str) -> String {
-    format!(
-        r#"<?xml version="1.0"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>io.mihomo</string>
-<key>ProgramArguments</key><array><string>{home}/.config/mihomo/start.sh</string></array>
-<key>RunAtLoad</key><false/><key>KeepAlive</key><dict><key>Crashed</key><true/></dict>
-<key>WorkingDirectory</key><string>{home}/.config/mihomo</string>
-<key>StandardOutPath</key><string>{home}/.config/mihomo/mihomo.log</string>
-<key>StandardErrorPath</key><string>{home}/.config/mihomo/mihomo.log</string>
-</dict></plist>
-"#
-    )
-}
-
-fn systemd_system_prepare_commands() -> Vec<PlannedCommand> {
-    vec![
-        PlannedCommand::privileged("sh", ["-c", "getent group mihomo >/dev/null || groupadd --system mihomo"]),
-        PlannedCommand::privileged("sh", ["-c", "id -u mihomo >/dev/null 2>&1 || useradd --system --gid mihomo --home-dir /var/lib/mihomo-cli --no-create-home --shell /usr/sbin/nologin mihomo"]),
-        PlannedCommand::privileged("install", ["-d", "-o", "mihomo", "-g", "mihomo", "-m", "0750", "/var/run/mihomo"]),
-        PlannedCommand::privileged("install", ["-d", "-o", "mihomo", "-g", "mihomo", "-m", "0750", "/var/log/mihomo"]),
-        PlannedCommand::privileged("install", ["-d", "-o", "root", "-g", "mihomo", "-m", "0750", "/var/lib/mihomo-cli"]),
-    ]
-}
-
-fn systemd_install_plan(
-    mode: ServiceMode,
-    home: &str,
-    user: Option<&str>,
-    old_other_mode_exists: bool,
-) -> ServiceInstallPlan {
-    match mode {
-        ServiceMode::System => {
-            let mut cleanup_commands = Vec::new();
-            if old_other_mode_exists {
-                cleanup_commands.extend([
-                    PlannedCommand::new("systemctl", ["--user", "stop", "mihomo"]),
-                    PlannedCommand::new("systemctl", ["--user", "disable", "mihomo"]),
-                    PlannedCommand::new("systemctl", ["--user", "daemon-reload"]),
-                ]);
-            }
-            ServiceInstallPlan {
-                cleanup_commands,
-                cleanup_files: if old_other_mode_exists {
-                    vec![ServiceFileRemoval {
-                        path: linux_user_unit_path(home),
-                        privileged: false,
-                    }]
-                } else {
-                    vec![]
-                },
-                pre_commands: systemd_system_prepare_commands(),
-                files: vec![ServiceFilePlan {
-                    path: linux_system_unit_path().to_string(),
-                    content: systemd_system_unit(home),
-                    privileged: true,
-                }],
-                commands: vec![
-                    PlannedCommand::privileged("systemctl", ["daemon-reload"]),
-                    PlannedCommand::privileged("systemctl", ["enable", "--now", "mihomo"]),
-                ],
-            }
-        }
-        ServiceMode::User => {
-            let mut cleanup_commands = Vec::new();
-            if old_other_mode_exists {
-                cleanup_commands.extend([
-                    PlannedCommand::privileged("systemctl", ["stop", "mihomo"]),
-                    PlannedCommand::privileged("systemctl", ["disable", "mihomo"]),
-                    PlannedCommand::privileged("rm", [linux_system_unit_path()]),
-                    PlannedCommand::privileged("systemctl", ["daemon-reload"]),
-                ]);
-            }
-            let mut commands = vec![
-                PlannedCommand::new("systemctl", ["--user", "daemon-reload"]),
-                PlannedCommand::new("systemctl", ["--user", "enable", "--now", "mihomo"]),
-            ];
-            if let Some(user) = user.filter(|u| !u.is_empty()) {
-                commands.push(PlannedCommand::privileged(
-                    "loginctl",
-                    ["enable-linger", user],
-                ));
-            }
-            ServiceInstallPlan {
-                cleanup_commands,
-                cleanup_files: if old_other_mode_exists {
-                    vec![ServiceFileRemoval {
-                        path: linux_system_unit_path().to_string(),
-                        privileged: true,
-                    }]
-                } else {
-                    vec![]
-                },
-                pre_commands: vec![],
-                files: vec![ServiceFilePlan {
-                    path: linux_user_unit_path(home),
-                    content: systemd_user_unit(home),
-                    privileged: false,
-                }],
-                commands,
-            }
-        }
-    }
-}
-
-fn launchd_install_plan(mode: ServiceMode, home: &str) -> ServiceInstallPlan {
-    match mode {
-        ServiceMode::System => ServiceInstallPlan {
-            cleanup_commands: vec![],
-            cleanup_files: vec![],
-            pre_commands: vec![],
-            files: vec![ServiceFilePlan {
-                path: macos_daemon_plist_path().to_string(),
-                content: launchd_plist(home),
-                privileged: true,
-            }],
-            commands: vec![
-                PlannedCommand::privileged("chmod", ["644", macos_daemon_plist_path()]),
-                PlannedCommand::privileged(
-                    "launchctl",
-                    ["bootstrap", "system", macos_daemon_plist_path()],
-                ),
-            ],
-        },
-        ServiceMode::User => ServiceInstallPlan {
-            cleanup_commands: vec![],
-            cleanup_files: vec![],
-            pre_commands: vec![],
-            files: vec![ServiceFilePlan {
-                path: macos_agent_plist_path(home),
-                content: launchd_plist(home),
-                privileged: false,
-            }],
-            commands: vec![PlannedCommand::new(
-                "launchctl",
-                [
-                    "bootstrap",
-                    &macos_gui_domain(),
-                    &macos_agent_plist_path(home),
-                ],
-            )],
-        },
-    }
-}
-
-fn systemd_uninstall_plan(
-    mode: ServiceMode,
-    home: &str,
-    marker_path: &str,
-) -> ServiceUninstallPlan {
-    match mode {
-        ServiceMode::System => ServiceUninstallPlan {
-            commands: vec![
-                PlannedCommand::privileged("systemctl", ["stop", "mihomo"]),
-                PlannedCommand::privileged("systemctl", ["disable", "mihomo"]),
-                PlannedCommand::privileged("systemctl", ["daemon-reload"]),
-            ],
-            files: vec![ServiceFileRemoval {
-                path: linux_system_unit_path().to_string(),
-                privileged: true,
-            }],
-            legacy_service_mode_marker: Some(ServiceFileRemoval {
-                path: marker_path.to_string(),
-                privileged: false,
-            }),
-        },
-        ServiceMode::User => ServiceUninstallPlan {
-            commands: vec![
-                PlannedCommand::new("systemctl", ["--user", "stop", "mihomo"]),
-                PlannedCommand::new("systemctl", ["--user", "disable", "mihomo"]),
-                PlannedCommand::new("systemctl", ["--user", "daemon-reload"]),
-            ],
-            files: vec![ServiceFileRemoval {
-                path: linux_user_unit_path(home),
-                privileged: false,
-            }],
-            legacy_service_mode_marker: Some(ServiceFileRemoval {
-                path: marker_path.to_string(),
-                privileged: false,
-            }),
-        },
-    }
-}
-
-fn launchd_uninstall_plan(
-    mode: ServiceMode,
-    home: &str,
-    marker_path: &str,
-) -> ServiceUninstallPlan {
-    match mode {
-        ServiceMode::System => ServiceUninstallPlan {
-            commands: vec![PlannedCommand::privileged(
-                "launchctl",
-                ["bootout", "system/io.mihomo"],
-            )],
-            files: vec![ServiceFileRemoval {
-                path: macos_daemon_plist_path().to_string(),
-                privileged: true,
-            }],
-            legacy_service_mode_marker: Some(ServiceFileRemoval {
-                path: marker_path.to_string(),
-                privileged: false,
-            }),
-        },
-        ServiceMode::User => ServiceUninstallPlan {
-            commands: vec![PlannedCommand::new(
-                "launchctl",
-                ["bootout", &format!("{}/io.mihomo", macos_gui_domain())],
-            )],
-            files: vec![ServiceFileRemoval {
-                path: macos_agent_plist_path(home),
-                privileged: false,
-            }],
-            legacy_service_mode_marker: Some(ServiceFileRemoval {
-                path: marker_path.to_string(),
-                privileged: false,
-            }),
-        },
-    }
-}
-
-fn windows_uninstall_plan(marker_path: &str) -> ServiceUninstallPlan {
-    ServiceUninstallPlan {
-        commands: vec![
-            PlannedCommand::new("sc.exe", ["stop", "mihomo"]),
-            PlannedCommand::new("sc.exe", ["delete", "mihomo"]),
-        ],
-        files: vec![],
-        legacy_service_mode_marker: Some(ServiceFileRemoval {
-            path: marker_path.to_string(),
-            privileged: false,
-        }),
-    }
 }
 
 fn windows_install_commands(config_dir: &str, bin_path: &str) -> Vec<PlannedCommand> {
@@ -777,10 +464,13 @@ pub fn windows_install_service(ctx: &crate::instance::InstanceContext) -> anyhow
     // Persist the installing user's SID — the daemon (running as SYSTEM) reads
     // it at startup to build the pipe SDDL (it cannot query its own token for
     // the installer's identity).
-    persist_installer_sid()?;
-    // Generate + persist the daemon IPC auth token (N1a: double copy —
-    // server %ProgramData%\mihomo\service-token, client <config_dir>\service-client-token).
-    persist_service_token(ctx)?;
+    let installer_sid = persist_installer_sid(ctx)?;
+    // Generate + atomically replace the single machine-level daemon IPC
+    // credential shared by the daemon and installing user's CLI.
+    persist_service_token(ctx, &installer_sid)?;
+    if let Err(error) = remove_legacy_windows_client_token() {
+        crate::log!("legacy Windows client token cleanup skipped: {error}");
+    }
 
     let manager = <dyn ServiceManager>::native()
         .map_err(|e| anyhow::anyhow!("failed to get service manager: {e}"))?;
@@ -823,8 +513,27 @@ pub fn windows_install_service(ctx: &crate::instance::InstanceContext) -> anyhow
 ///
 /// The daemon (SYSTEM) reads this at startup to build the pipe SDDL — it cannot
 /// query its own token for the installer's identity.
-fn persist_installer_sid() -> anyhow::Result<()> {
-    use windows_sys::Win32::Foundation::CloseHandle;
+fn persist_installer_sid(ctx: &crate::instance::InstanceContext) -> anyhow::Result<String> {
+    validate_canonical_windows_daemon_credentials(ctx)?;
+    let sid_string = current_windows_user_sid()?;
+    let installer_sid_path = ctx
+        .daemon_credentials
+        .token
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Windows service credential path has no parent"))?
+        .join("installer-sid");
+    write_windows_credential(
+        &installer_sid_path,
+        sid_string.as_bytes(),
+        WindowsCredentialAcl::InstallerMetadata,
+        &sid_string,
+    )?;
+    Ok(sid_string)
+}
+
+#[cfg(windows)]
+fn current_windows_user_sid() -> anyhow::Result<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
     use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -837,20 +546,49 @@ fn persist_installer_sid() -> anyhow::Result<()> {
 
         // First call gets required size.
         let mut size: u32 = 0;
-        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut size);
-        let mut buffer = vec![0u8; size as usize];
+        let probe_ok = GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut size);
+        let probe_error = GetLastError();
+        let words = match token_user_buffer_words(
+            probe_ok != 0,
+            probe_error,
+            size,
+            std::mem::size_of::<TOKEN_USER>(),
+        ) {
+            Ok(words) => words,
+            Err(error) => {
+                CloseHandle(token);
+                return Err(error);
+            }
+        };
+        // Vec<usize> guarantees pointer alignment suitable for TOKEN_USER.
+        let mut buffer = vec![0usize; words];
+        let buffer_bytes = buffer.len() * std::mem::size_of::<usize>();
+        let buffer_size = match u32::try_from(buffer_bytes) {
+            Ok(size) => size,
+            Err(error) => {
+                CloseHandle(token);
+                return Err(error.into());
+            }
+        };
+        let mut returned_size = size;
         if GetTokenInformation(
             token,
             TokenUser,
             buffer.as_mut_ptr() as *mut _,
-            size,
-            &mut size,
+            buffer_size,
+            &mut returned_size,
         ) == 0
         {
             CloseHandle(token);
             anyhow::bail!("GetTokenInformation(TokenUser) failed");
         }
-        let token_user = &*(buffer.as_ptr() as *const TOKEN_USER);
+        if returned_size < std::mem::size_of::<TOKEN_USER>() as u32
+            || returned_size as usize > buffer_bytes
+        {
+            CloseHandle(token);
+            anyhow::bail!("GetTokenInformation(TokenUser) returned an invalid length");
+        }
+        let token_user = std::ptr::read(buffer.as_ptr().cast::<TOKEN_USER>());
         let user_sid = token_user.User.Sid;
 
         let mut sid_string_ptr: *mut u16 = std::ptr::null_mut();
@@ -868,15 +606,260 @@ fn persist_installer_sid() -> anyhow::Result<()> {
         windows_sys::Win32::Foundation::LocalFree(sid_string_ptr as *mut _);
         CloseHandle(token);
 
-        // Write to %ProgramData%\mihomo\installer-sid
-        let program_data = std::env::var_os("ProgramData")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\ProgramData"));
-        let dir = program_data.join("mihomo");
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("installer-sid"), sid_string.as_bytes())?;
-        Ok(())
+        Ok(sid_string)
     }
+}
+
+fn token_user_buffer_words(
+    probe_succeeded: bool,
+    error_code: u32,
+    required_size: u32,
+    minimum_size: usize,
+) -> anyhow::Result<usize> {
+    const ERROR_INSUFFICIENT_BUFFER_CODE: u32 = 122;
+    if probe_succeeded || error_code != ERROR_INSUFFICIENT_BUFFER_CODE {
+        anyhow::bail!("GetTokenInformation(TokenUser) size probe failed with error {error_code}");
+    }
+    if (required_size as usize) < minimum_size {
+        anyhow::bail!(
+            "GetTokenInformation(TokenUser) returned undersized buffer length {required_size}"
+        );
+    }
+    let word_size = std::mem::size_of::<usize>();
+    Ok((required_size as usize)
+        .checked_add(word_size - 1)
+        .ok_or_else(|| anyhow::anyhow!("TokenUser buffer length overflow"))?
+        / word_size)
+}
+
+fn cleanup_credential_temp_after_check<T>(
+    temp_path: &std::path::Path,
+    result: anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    if result.is_err() {
+        let _ = std::fs::remove_file(temp_path);
+    }
+    result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsCredentialAcl {
+    InstallerMetadata,
+    Token,
+}
+
+fn windows_credential_sddl(kind: WindowsCredentialAcl, installer_sid: &str) -> String {
+    match kind {
+        WindowsCredentialAcl::InstallerMetadata => "D:P(A;;GA;;;SY)(A;;GA;;;BA)".to_string(),
+        WindowsCredentialAcl::Token => {
+            format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;{installer_sid})")
+        }
+    }
+}
+
+#[cfg(windows)]
+fn validate_canonical_windows_daemon_credentials(
+    ctx: &crate::instance::InstanceContext,
+) -> anyhow::Result<()> {
+    let canonical = crate::instance::planned_daemon_credential_paths(
+        crate::instance::TargetOs::Windows,
+        &crate::instance::PathInputs::from_current_env(),
+    );
+    if ctx.daemon_credentials != canonical {
+        anyhow::bail!("refusing non-canonical Windows daemon credential paths");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn inspect_windows_credential_target(
+    path: &std::path::Path,
+) -> anyhow::Result<Option<std::fs::Metadata>> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "cannot inspect credential path {}: {error}",
+                path.display()
+            ))
+        }
+    };
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        anyhow::bail!(
+            "refusing Windows credential path through a reparse point: {}",
+            path.display()
+        );
+    }
+    Ok(Some(metadata))
+}
+
+#[cfg(windows)]
+fn wide_path(path: &std::path::Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str().encode_wide().chain(Some(0)).collect()
+}
+
+#[cfg(windows)]
+fn write_windows_credential(
+    path: &std::path::Path,
+    bytes: &[u8],
+    acl: WindowsCredentialAcl,
+    installer_sid: &str,
+) -> anyhow::Result<()> {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, LocalFree, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FlushFileBuffers, MoveFileExW, WriteFile, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, MOVEFILE_REPLACE_EXISTING,
+        MOVEFILE_WRITE_THROUGH,
+    };
+
+    if !crate::instance::valid_windows_sid_string(installer_sid) {
+        anyhow::bail!("refusing malformed Windows installer SID");
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Windows credential path has no parent"))?;
+    std::fs::create_dir_all(parent).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to create Windows credential directory {}: {e}",
+            parent.display()
+        )
+    })?;
+    let parent_metadata = inspect_windows_credential_target(parent)?
+        .ok_or_else(|| anyhow::anyhow!("Windows credential directory disappeared"))?;
+    if !parent_metadata.is_dir() {
+        anyhow::bail!(
+            "Windows credential parent is not a directory: {}",
+            parent.display()
+        );
+    }
+    if let Some(metadata) = inspect_windows_credential_target(path)? {
+        if !metadata.is_file() {
+            anyhow::bail!(
+                "refusing to replace non-file Windows credential: {}",
+                path.display()
+            );
+        }
+    }
+
+    let suffix = generate_auth_token();
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Windows credential path has no file name"))?
+        .to_string_lossy();
+    let temp_path = parent.join(format!(".{file_name}.{}.tmp", &suffix[..16]));
+    let temp_wide = wide_path(&temp_path);
+    let target_wide = wide_path(path);
+    let mut sddl_wide = windows_credential_sddl(acl, installer_sid)
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let mut descriptor_size = 0u32;
+
+    let conversion_ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_wide.as_mut_ptr(),
+            1,
+            &mut descriptor,
+            &mut descriptor_size,
+        )
+    };
+    if conversion_ok == 0 {
+        return Err(std::io::Error::last_os_error())
+            .map_err(|e| anyhow::anyhow!("failed to build Windows credential ACL: {e}"));
+    }
+    let security_attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let handle = unsafe {
+        CreateFileW(
+            temp_wide.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_DELETE,
+            &security_attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe {
+        LocalFree(descriptor);
+    }
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error()).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to create protected Windows credential {}: {e}",
+                temp_path.display()
+            )
+        });
+    }
+
+    let write_result = (|| -> anyhow::Result<()> {
+        let mut written = 0u32;
+        if unsafe {
+            WriteFile(
+                handle,
+                bytes.as_ptr(),
+                bytes.len().try_into()?,
+                &mut written,
+                std::ptr::null_mut(),
+            )
+        } == 0
+            || written as usize != bytes.len()
+        {
+            return Err(std::io::Error::last_os_error()).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to write protected Windows credential {}: {e}",
+                    temp_path.display()
+                )
+            });
+        }
+        if unsafe { FlushFileBuffers(handle) } == 0 {
+            return Err(std::io::Error::last_os_error()).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to flush protected Windows credential {}: {e}",
+                    temp_path.display()
+                )
+            });
+        }
+        Ok(())
+    })();
+    unsafe {
+        CloseHandle(handle);
+    }
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error);
+    }
+
+    cleanup_credential_temp_after_check(&temp_path, inspect_windows_credential_target(path))?;
+    if unsafe {
+        MoveFileExW(
+            temp_wide.as_ptr(),
+            target_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        let error = std::io::Error::last_os_error();
+        let _ = std::fs::remove_file(&temp_path);
+        anyhow::bail!(
+            "failed to atomically install protected Windows credential {}: {error}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Generate a 32-byte random token as 64 lowercase hex chars — the daemon IPC
@@ -892,20 +875,56 @@ pub(crate) fn generate_auth_token() -> String {
 pub(crate) fn generate_and_write_token(token_path: &std::path::Path) -> anyhow::Result<String> {
     let token = generate_auth_token();
     if let Some(parent) = token_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::utils::ensure_dir_all_no_follow(parent)?;
     }
-    std::fs::write(token_path, token.as_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(token_path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    crate::utils::write_bytes_file_no_follow(token_path, token.as_bytes(), 0o600)?;
+    crate::utils::restore_original_user_config_ownership(token_path)?;
     Ok(token)
 }
 
 #[cfg(unix)]
 pub(crate) fn client_token_path_for_home(home: &std::path::Path) -> std::path::PathBuf {
-    home.join(".config").join("mihomo").join("service-token")
+    crate::instance::planned_unix_daemon_client_token_path(home)
+}
+
+#[cfg(unix)]
+pub(crate) fn validate_unix_client_token_target(
+    home: &std::path::Path,
+    target: &std::path::Path,
+) -> anyhow::Result<()> {
+    let expected = client_token_path_for_home(home);
+    if target != expected {
+        anyhow::bail!(
+            "refusing non-canonical daemon credential path {}; expected {}",
+            target.display(),
+            expected.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn grant_client_token_for_unix_identity(
+    home: &std::path::Path,
+    uid: u32,
+    gid: u32,
+) -> anyhow::Result<String> {
+    let token_path = client_token_path_for_home(home);
+    validate_unix_client_token_target(home, &token_path)?;
+    if let Some(dir) = token_path.parent() {
+        crate::utils::ensure_home_path_traversable(dir, home, gid)?;
+        crate::utils::ensure_dir_all_under_home_no_follow(dir, home)?;
+    }
+    let token = generate_auth_token();
+    crate::utils::write_bytes_file_under_home_no_follow(
+        &token_path,
+        home,
+        token.as_bytes(),
+        0o600,
+        uid,
+        gid,
+    )?;
+    Ok(token)
 }
 
 #[cfg(unix)]
@@ -914,21 +933,42 @@ pub(crate) fn generate_client_token_for_home(home: &std::path::Path) -> anyhow::
 }
 
 #[cfg(windows)]
-/// Generate a 32-byte random token and persist it in two copies (N1a):
-/// - server: `%ProgramData%\mihomo\service-token` (daemon reads for validation)
-/// - client: `<config_dir>\service-client-token` (CLI reads to attach)
-fn persist_service_token(ctx: &crate::instance::InstanceContext) -> anyhow::Result<()> {
-    let program_data = std::env::var_os("ProgramData")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\ProgramData"));
-    let token = generate_and_write_token(&program_data.join("mihomo").join("service-token"))?;
-
-    std::fs::create_dir_all(&ctx.paths.config_dir)?;
-    std::fs::write(
-        ctx.paths.config_dir.join("service-client-token"),
+/// Generate and atomically replace the single canonical Windows token at
+/// `%ProgramData%\mihomo\service-token`. Both daemon and CLI read this file.
+fn persist_service_token(
+    ctx: &crate::instance::InstanceContext,
+    installer_sid: &str,
+) -> anyhow::Result<()> {
+    validate_canonical_windows_daemon_credentials(ctx)?;
+    let token = generate_auth_token();
+    write_windows_credential(
+        &ctx.daemon_credentials.token,
         token.as_bytes(),
+        WindowsCredentialAcl::Token,
+        installer_sid,
     )?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn remove_legacy_windows_client_token() -> anyhow::Result<()> {
+    let inputs = crate::instance::PathInputs::from_current_env();
+    let legacy = inputs.app_data.join("mihomo/service-client-token");
+    let Some(metadata) = inspect_windows_credential_target(&legacy)? else {
+        return Ok(());
+    };
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "refusing to remove non-file legacy Windows credential {}",
+            legacy.display()
+        );
+    }
+    std::fs::remove_file(&legacy).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot remove legacy Windows credential {}: {error}",
+            legacy.display()
+        )
+    })
 }
 
 #[cfg(windows)]
@@ -1057,18 +1097,6 @@ fn run_planned_command_with_timeout(
             .status()
             .map(|s| s.success())
             .unwrap_or(false),
-    }
-}
-
-fn run_planned_command_best_effort(command: &PlannedCommand) {
-    let _ = run_planned_command(command);
-}
-
-fn remove_planned_file_best_effort(removal: &ServiceFileRemoval) {
-    if removal.privileged {
-        let _ = run_privileged(&["rm", &removal.path]);
-    } else {
-        let _ = std::fs::remove_file(&removal.path);
     }
 }
 
@@ -1308,31 +1336,18 @@ fn install_staged_file_privileged_non_root(
     bytes: &[u8],
     mode: u16,
 ) -> anyhow::Result<()> {
-    let temp_path = temp_payload_path(path);
+    let temp_dir = tempfile::Builder::new()
+        .prefix("mihomo-cli-privileged-write-")
+        .tempdir()?;
+    let temp_path = temp_dir.path().join("payload");
     write_temp_payload(&temp_path, bytes)?;
-    let cleanup = TempFileCleanup(temp_path.clone());
     let args: Vec<String> = privileged_install_args(&temp_path, mode, path);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let result = run_privileged(&arg_refs);
-    drop(cleanup);
-    result
+    run_privileged(&arg_refs)
 }
 
 #[cfg(unix)]
-/// Name of the staged temp file for a privileged write to `target`.
-fn temp_payload_path(target: &std::path::Path) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "mihomo-cli-privileged-write-{}-{}",
-        std::process::id(),
-        target
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("payload")
-    ))
-}
-
-#[cfg(unix)]
-/// Write the staged payload with O_NOFOLLOW protection and owner-only mode.
+/// Write staged bytes in a 0700 private temporary directory with owner-only mode.
 fn write_temp_payload(temp_path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::fs::OpenOptions;
     use std::io::Write;
@@ -1340,8 +1355,7 @@ fn write_temp_payload(temp_path: &std::path::Path, bytes: &[u8]) -> std::io::Res
 
     let mut file = OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .custom_flags(libc::O_NOFOLLOW)
         .mode(0o600)
         .open(temp_path)?;
@@ -1379,116 +1393,6 @@ pub fn remove_path_privileged(path: &str) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
         run_windows_elevated_powershell(&windows_remove_path_elevated_script(path))
-    }
-}
-
-fn privileged_file_write_plan(file: &ServiceFilePlan) -> PrivilegedFileWritePlan {
-    PrivilegedFileWritePlan {
-        program: "sudo".to_string(),
-        args: vec!["tee".to_string(), file.path.clone()],
-        stdin: file.content.clone(),
-    }
-}
-
-fn write_planned_file(file: &ServiceFilePlan) -> anyhow::Result<()> {
-    if file.privileged {
-        println!("Creating {} (sudo required)...", file.path);
-        let plan = privileged_file_write_plan(file);
-        let mut child = Command::new(&plan.program)
-            .args(&plan.args)
-            .stdin(std::process::Stdio::piped())
-            .spawn()?;
-        use std::io::Write;
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(plan.stdin.as_bytes())?;
-        let status = child.wait()?;
-        if !status.success() {
-            anyhow::bail!("Failed to write {} (exit: {})", file.path, status);
-        }
-        Ok(())
-    } else {
-        if let Some(parent) = std::path::Path::new(&file.path).parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&file.path, &file.content)?;
-        Ok(())
-    }
-}
-
-trait ServicePlanExecutor {
-    fn run(&mut self, command: &PlannedCommand) -> anyhow::Result<()>;
-    fn run_best_effort(&mut self, command: &PlannedCommand);
-    fn remove_best_effort(&mut self, removal: &ServiceFileRemoval);
-    fn write_file(&mut self, file: &ServiceFilePlan) -> anyhow::Result<()>;
-}
-
-struct SystemServicePlanExecutor;
-
-impl ServicePlanExecutor for SystemServicePlanExecutor {
-    fn run(&mut self, command: &PlannedCommand) -> anyhow::Result<()> {
-        run_planned_command(command)
-    }
-
-    fn run_best_effort(&mut self, command: &PlannedCommand) {
-        run_planned_command_best_effort(command);
-    }
-
-    fn remove_best_effort(&mut self, removal: &ServiceFileRemoval) {
-        remove_planned_file_best_effort(removal);
-    }
-
-    fn write_file(&mut self, file: &ServiceFilePlan) -> anyhow::Result<()> {
-        write_planned_file(file)
-    }
-}
-
-fn apply_service_install_plan(plan: &ServiceInstallPlan) -> anyhow::Result<()> {
-    let mut executor = SystemServicePlanExecutor;
-    apply_service_install_plan_with(plan, &mut executor)
-}
-
-fn apply_service_install_plan_with(
-    plan: &ServiceInstallPlan,
-    executor: &mut dyn ServicePlanExecutor,
-) -> anyhow::Result<()> {
-    for command in &plan.cleanup_commands {
-        executor.run_best_effort(command);
-    }
-    for removal in &plan.cleanup_files {
-        executor.remove_best_effort(removal);
-    }
-    for command in &plan.pre_commands {
-        executor.run(command)?;
-    }
-    for file in &plan.files {
-        executor.write_file(file)?;
-    }
-    for command in &plan.commands {
-        executor.run(command)?;
-    }
-    Ok(())
-}
-
-fn apply_service_uninstall_plan(plan: &ServiceUninstallPlan) {
-    let mut executor = SystemServicePlanExecutor;
-    apply_service_uninstall_plan_with(plan, &mut executor);
-}
-
-fn apply_service_uninstall_plan_with(
-    plan: &ServiceUninstallPlan,
-    executor: &mut dyn ServicePlanExecutor,
-) {
-    for command in &plan.commands {
-        executor.run_best_effort(command);
-    }
-    for file in &plan.files {
-        executor.remove_best_effort(file);
-    }
-    if let Some(marker) = &plan.legacy_service_mode_marker {
-        executor.remove_best_effort(marker);
     }
 }
 
@@ -1929,283 +1833,90 @@ pub(crate) fn start_script_content() -> String {
     start_script_content_for(&home, &socket_dir, &uid, &gid)
 }
 
-fn launchd_install_result_lines(mode: ServiceMode, running: bool, home: &str) -> Vec<String> {
-    match (mode, running) {
-        (ServiceMode::System, true) => {
-            vec!["LaunchDaemon installed and started — mihomo is running".to_string()]
-        }
-        (ServiceMode::User, true) => {
-            vec!["LaunchAgent installed and started — mihomo is running (user mode)".to_string()]
-        }
-        (ServiceMode::System, false) => vec![
-            "LaunchDaemon installed but mihomo may not be running.".to_string(),
-            format!("Check logs: tail -f {home}/.config/mihomo/mihomo.log"),
-        ],
-        (ServiceMode::User, false) => vec![
-            "LaunchAgent installed but mihomo may not be running.".to_string(),
-            format!("Check logs: tail -f {home}/.config/mihomo/mihomo.log"),
-        ],
-    }
-}
-
-fn launchd_removed_message(mode: ServiceMode) -> &'static str {
-    match mode {
-        ServiceMode::System => "LaunchDaemon removed",
-        ServiceMode::User => "LaunchAgent removed",
-    }
-}
-
-fn systemd_old_service_removal_message(mode: ServiceMode) -> &'static str {
-    match mode {
-        ServiceMode::System => "Removing old system service...",
-        ServiceMode::User => "Removing old user service...",
-    }
-}
-
-fn systemd_linger_message(user: &str) -> String {
-    format!("  Enabling linger for user '{user}' (service survives logout)...")
-}
-
-fn systemd_install_success_message(mode: ServiceMode) -> &'static str {
-    match mode {
-        ServiceMode::System => "systemd system service installed and started (system mode)",
-        ServiceMode::User => "systemd user service installed and started",
-    }
-}
-
-fn systemd_missing_service_message(mode: ServiceMode) -> &'static str {
-    match mode {
-        ServiceMode::System => "No system service found",
-        ServiceMode::User => "No user service found",
-    }
-}
-
-fn systemd_removed_message(mode: ServiceMode) -> &'static str {
-    match mode {
-        ServiceMode::System => "systemd system service removed",
-        ServiceMode::User => "systemd user service removed",
-    }
-}
-
-fn windows_install_success_message() -> &'static str {
-    "Windows service installed and started"
-}
-
-fn windows_removed_message() -> &'static str {
-    "Windows service removed"
-}
-
-// --- macOS ---
-
-fn install_launchdaemon() -> anyhow::Result<()> {
-    let home = dirs::home_dir().unwrap_or_default().display().to_string();
-    let plan = launchd_install_plan(ServiceMode::System, &home);
-    apply_service_install_plan(&plan)?;
-
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    let running = is_mihomo_process_running_with(MihomoProcessCheck::Pgrep);
-
-    for line in launchd_install_result_lines(ServiceMode::System, running, &home) {
-        println!("{line}");
-    }
-    Ok(())
-}
-
-#[allow(deprecated)]
-fn uninstall_launchdaemon() -> bool {
-    let p = macos_daemon_plist_path();
-    if !std::path::Path::new(p).exists() {
-        return false;
-    }
-    let home = dirs::home_dir().unwrap_or_default().display().to_string();
-    let marker = utils::legacy_service_mode_path();
-    let plan = launchd_uninstall_plan(ServiceMode::System, &home, &marker);
-    apply_service_uninstall_plan(&plan);
-    println!("{}", launchd_removed_message(ServiceMode::System));
-    true
-}
-
-fn install_launchagent() -> anyhow::Result<()> {
-    let home = dirs::home_dir().unwrap_or_default().display().to_string();
-    let plan = launchd_install_plan(ServiceMode::User, &home);
-    apply_service_install_plan(&plan)?;
-
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    let running = is_mihomo_process_running_with(MihomoProcessCheck::Pgrep);
-
-    for line in launchd_install_result_lines(ServiceMode::User, running, &home) {
-        println!("{line}");
-    }
-    Ok(())
-}
-
-#[allow(deprecated)]
-fn uninstall_launchagent() -> bool {
-    let home = dirs::home_dir().unwrap_or_default().display().to_string();
-    let p = macos_agent_plist_path(&home);
-    if !std::path::Path::new(&p).exists() {
-        return false;
-    }
-    let marker = utils::legacy_service_mode_path();
-    let plan = launchd_uninstall_plan(ServiceMode::User, &home, &marker);
-    apply_service_uninstall_plan(&plan);
-    println!("{}", launchd_removed_message(ServiceMode::User));
-    true
-}
-
-// --- Linux ---
-
-/// Generate systemd unit content for system service mode.
-fn systemd_system_unit(home: &str) -> String {
-    format!(
-        "[Unit]\n\
-         Description=Mihomo proxy\n\
-         After=network.target\n\n\
-         [Service]\n\
-         Type=simple\n\
-         User=mihomo\n\
-         Group=mihomo\n\
-         UMask=0027\n\
-         RuntimeDirectory=mihomo\n\
-         RuntimeDirectoryMode=0750\n\
-         CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE\n\
-         AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE\n\
-         NoNewPrivileges=true\n\
-         PrivateTmp=true\n\
-         ProtectHome=read-only\n\
-         ProtectSystem=strict\n\
-         ReadWritePaths=/var/run/mihomo /run/mihomo /var/log/mihomo {home}/.config/mihomo /var/lib/mihomo-cli\n\
-         ExecStart={home}/.local/bin/mihomo -d {home}/.config/mihomo\n\
-         StandardOutput=append:/var/log/mihomo/mihomo.log\n\
-         StandardError=append:/var/log/mihomo/mihomo.log\n\
-         Restart=on-failure\n\n\
-         [Install]\n\
-         WantedBy=multi-user.target\n"
-    )
-}
-
-/// Generate systemd unit content for user mode.
-fn systemd_user_unit(home: &str) -> String {
-    let log_path = format!("{home}/.config/mihomo/mihomo.log");
-    format!(
-        "[Unit]\n\
-         Description=Mihomo proxy\n\
-         After=network.target\n\n\
-         [Service]\n\
-         RuntimeDirectory=mihomo\n\
-         RuntimeDirectoryMode=0700\n\
-         ExecStart={home}/.local/bin/mihomo -d {home}/.config/mihomo\n\
-         StandardOutput=append:{log_path}\n\
-         StandardError=append:{log_path}\n\
-         Restart=on-failure\n\n\
-         [Install]\n\
-         WantedBy=default.target\n"
-    )
-}
-
-fn install_systemd_system() -> anyhow::Result<()> {
-    let home = dirs::home_dir().unwrap_or_default().display().to_string();
-    let old_user_unit = std::path::Path::new(&linux_user_unit_path(&home)).exists();
-    if old_user_unit {
-        println!("{}", systemd_old_service_removal_message(ServiceMode::User));
-    }
-    let plan = systemd_install_plan(ServiceMode::System, &home, None, old_user_unit);
-    apply_service_install_plan(&plan)?;
-    println!("{}", systemd_install_success_message(ServiceMode::System));
-    Ok(())
-}
-
-fn install_systemd_user() -> anyhow::Result<()> {
-    let home = dirs::home_dir().unwrap_or_default().display().to_string();
-    let old_system_unit = std::path::Path::new(linux_system_unit_path()).exists();
-    if old_system_unit {
-        println!(
-            "{}",
-            systemd_old_service_removal_message(ServiceMode::System)
-        );
-    }
-
-    let user = std::env::var("USER").unwrap_or_default();
-    let needs_linger = if user.is_empty() {
-        false
-    } else {
-        let linger_path = format!("/var/lib/systemd/linger/{user}");
-        !std::path::Path::new(&linger_path).exists()
-    };
-    if needs_linger {
-        println!("{}", systemd_linger_message(&user));
-    }
-
-    let plan = systemd_install_plan(
-        ServiceMode::User,
-        &home,
-        needs_linger.then_some(user.as_str()),
-        old_system_unit,
-    );
-    apply_service_install_plan(&plan)?;
-    println!("{}", systemd_install_success_message(ServiceMode::User));
-    Ok(())
-}
-
-#[allow(deprecated)]
-fn uninstall_systemd() -> anyhow::Result<()> {
-    let home = dirs::home_dir().unwrap_or_default().display().to_string();
-    let mode = match current_service_detection() {
-        ServiceDetection::Installed(mode) => mode,
-        ServiceDetection::NotInstalled => ServiceMode::User,
-    };
-    let unit_path = match mode {
-        ServiceMode::System => linux_system_unit_path().to_string(),
-        ServiceMode::User => linux_user_unit_path(&home),
-    };
-
-    if !std::path::Path::new(&unit_path).exists() {
-        println!("{}", systemd_missing_service_message(mode));
-        return Ok(());
-    }
-
-    let marker = utils::legacy_service_mode_path();
-    let plan = systemd_uninstall_plan(mode, &home, &marker);
-    apply_service_uninstall_plan(&plan);
-    println!("{}", systemd_removed_message(mode));
-    Ok(())
-}
-
-// --- Windows ---
-
-fn mihomo_dirs() -> (String, String, String) {
-    let local =
-        dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("C:\\ProgramData"));
-    let config_dir = format!("{}\\mihomo", local.display());
-    let bin_path = format!("{}\\mihomo.exe", config_dir);
-    let config_path = format!("{}\\config.yaml", config_dir);
-    (config_dir, bin_path, config_path)
-}
-
-fn install_windows() -> anyhow::Result<()> {
-    let (config_dir, bin_path, _) = mihomo_dirs();
-    std::fs::create_dir_all(&config_dir)?;
-
-    for command in windows_install_commands(&config_dir, &bin_path) {
-        run_planned_command(&command)?;
-    }
-
-    println!("{}", windows_install_success_message());
-    Ok(())
-}
-
-#[allow(deprecated)]
-fn uninstall_windows() -> anyhow::Result<()> {
-    let marker = utils::legacy_service_mode_path();
-    let plan = windows_uninstall_plan(&marker);
-    apply_service_uninstall_plan(&plan);
-    println!("{}", windows_removed_message());
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_installer_metadata_acl_is_protected_and_machine_only() {
+        let sddl =
+            windows_credential_sddl(WindowsCredentialAcl::InstallerMetadata, "S-1-5-21-1000");
+        assert!(sddl.starts_with("D:P"));
+        assert!(sddl.contains(";;;SY)"));
+        assert!(sddl.contains(";;;BA)"));
+        assert!(!sddl.contains("S-1-5-21-1000"));
+        for broad_principal in [";;;WD)", ";;;AU)", ";;;BU)"] {
+            assert!(!sddl.contains(broad_principal));
+        }
+    }
+
+    #[test]
+    fn windows_single_token_acl_is_protected_and_installer_readable() {
+        let sid = "S-1-5-21-1000";
+        let sddl = windows_credential_sddl(WindowsCredentialAcl::Token, sid);
+        assert!(sddl.starts_with("D:P"));
+        assert!(sddl.contains(";;;SY)"));
+        assert!(sddl.contains(";;;BA)"));
+        assert!(sddl.contains(&format!(";;;{sid})")));
+        for broad_principal in [";;;WD)", ";;;AU)", ";;;BU)"] {
+            assert!(!sddl.contains(broad_principal));
+        }
+    }
+
+    #[test]
+    fn windows_acl_planner_rejects_sddl_injection_as_an_installer_sid() {
+        assert!(crate::instance::valid_windows_sid_string("S-1-5-21-1000"));
+        assert!(!crate::instance::valid_windows_sid_string(
+            "S-1-5-21-1000)(A;;GA;;;WD"
+        ));
+        assert!(!crate::instance::valid_windows_sid_string("alice"));
+    }
+
+    #[test]
+    fn token_user_probe_requires_insufficient_buffer_and_aligned_storage() {
+        let words = token_user_buffer_words(false, 122, 40, 16).unwrap();
+        assert!(words * std::mem::size_of::<usize>() >= 40);
+        assert!(token_user_buffer_words(true, 0, 40, 16).is_err());
+        assert!(token_user_buffer_words(false, 5, 40, 16).is_err());
+        assert!(token_user_buffer_words(false, 122, 8, 16).is_err());
+    }
+
+    #[test]
+    fn failed_final_target_check_removes_staged_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join(".service-token.staged");
+        std::fs::write(&temp, b"new-token").unwrap();
+
+        let result: anyhow::Result<()> = cleanup_credential_temp_after_check(
+            &temp,
+            Err(anyhow::anyhow!("target became a reparse point")),
+        );
+        assert!(result.is_err());
+        assert!(!temp.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_single_token_replace_rotates_atomically_and_failure_keeps_old_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("service-token");
+        let sid = current_windows_user_sid().unwrap();
+        let old = generate_auth_token();
+        write_windows_credential(&path, old.as_bytes(), WindowsCredentialAcl::Token, &sid).unwrap();
+
+        let failed = write_windows_credential(
+            &path,
+            b"must-not-replace",
+            WindowsCredentialAcl::Token,
+            "malformed SID",
+        );
+        assert!(failed.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+
+        let new = generate_auth_token();
+        write_windows_credential(&path, new.as_bytes(), WindowsCredentialAcl::Token, &sid).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), new);
+    }
 
     #[test]
     fn auth_token_is_64_hex_chars() {
@@ -2253,59 +1964,20 @@ mod tests {
         );
     }
 
-    #[derive(Default)]
-    struct RecordingExecutor {
-        events: Vec<String>,
-        fail_write_path: Option<String>,
-        fail_run_program: Option<String>,
-    }
-
-    impl RecordingExecutor {
-        fn command_label(command: &PlannedCommand) -> String {
-            format!(
-                "{}{} {}",
-                if command.privileged { "sudo " } else { "" },
-                command.program,
-                command.args.join(" ")
-            )
-        }
-    }
-
-    impl ServicePlanExecutor for RecordingExecutor {
-        fn run(&mut self, command: &PlannedCommand) -> anyhow::Result<()> {
-            self.events
-                .push(format!("run:{}", Self::command_label(command)));
-            if self.fail_run_program.as_deref() == Some(command.program.as_str()) {
-                anyhow::bail!("simulated command failure");
-            }
-            Ok(())
-        }
-
-        fn run_best_effort(&mut self, command: &PlannedCommand) {
-            self.events
-                .push(format!("best-effort:{}", Self::command_label(command)));
-        }
-
-        fn remove_best_effort(&mut self, removal: &ServiceFileRemoval) {
-            self.events.push(format!(
-                "remove:{}{}",
-                if removal.privileged { "sudo " } else { "" },
-                removal.path
-            ));
-        }
-
-        fn write_file(&mut self, file: &ServiceFilePlan) -> anyhow::Result<()> {
-            self.events.push(format!(
-                "write:{}{}={}",
-                if file.privileged { "sudo " } else { "" },
-                file.path,
-                file.content
-            ));
-            if self.fail_write_path.as_deref() == Some(file.path.as_str()) {
-                anyhow::bail!("simulated write failure");
-            }
-            Ok(())
-        }
+    #[cfg(unix)]
+    #[test]
+    fn credential_write_target_must_match_canonical_identity_path() {
+        let home = std::path::Path::new("/home/alice");
+        assert!(validate_unix_client_token_target(
+            home,
+            std::path::Path::new("/home/alice/.config/mihomo/service-token")
+        )
+        .is_ok());
+        assert!(validate_unix_client_token_target(
+            home,
+            std::path::Path::new("/tmp/untrusted-config/service-token")
+        )
+        .is_err());
     }
 
     #[test]
@@ -2365,27 +2037,6 @@ mod tests {
         let remove = windows_remove_path_elevated_script(r"C:\ProgramData\mihomo");
         assert!(remove.contains("Remove-Item"));
         assert!(remove.contains(r"C:\ProgramData\mihomo"));
-    }
-
-    #[test]
-    fn privileged_file_write_plan_uses_sudo_tee_and_stdin_content() {
-        let file = ServiceFilePlan {
-            path: "/etc/systemd/system/mihomo.service".to_string(),
-            content: "[Unit]\nDescription=Mihomo\n".to_string(),
-            privileged: true,
-        };
-
-        assert_eq!(
-            privileged_file_write_plan(&file),
-            PrivilegedFileWritePlan {
-                program: "sudo".to_string(),
-                args: vec![
-                    "tee".to_string(),
-                    "/etc/systemd/system/mihomo.service".to_string(),
-                ],
-                stdin: "[Unit]\nDescription=Mihomo\n".to_string(),
-            }
-        );
     }
 
     #[cfg(unix)]
@@ -2586,50 +2237,6 @@ mod tests {
     }
 
     #[test]
-    fn systemd_system_unit_contains_log_directives() {
-        let unit = systemd_system_unit("/home/testuser");
-        assert!(
-            unit.contains("UMask=0027"),
-            "system mode should set UMask for readable logs"
-        );
-        assert!(unit.contains("StandardOutput=append:/var/log/mihomo/mihomo.log"));
-        assert!(unit.contains("StandardError=append:/var/log/mihomo/mihomo.log"));
-        assert!(unit.contains("User=mihomo"));
-        assert!(unit.contains("Group=mihomo"));
-        assert!(
-            unit.contains("CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE")
-        );
-        assert!(unit.contains("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE"));
-        assert!(unit.contains("NoNewPrivileges=true"));
-        assert!(unit.contains("PrivateTmp=true"));
-        assert!(unit.contains("ProtectHome=read-only"));
-        assert!(unit.contains("ProtectSystem=strict"));
-        assert!(unit.contains("ReadWritePaths=/var/run/mihomo /run/mihomo /var/log/mihomo /home/testuser/.config/mihomo /var/lib/mihomo-cli"));
-    }
-
-    #[test]
-    fn systemd_user_unit_contains_log_directives_no_umask() {
-        let unit = systemd_user_unit("/home/testuser");
-        assert!(!unit.contains("UMask="), "user mode should not set UMask");
-        assert!(unit.contains("StandardOutput=append:/home/testuser/.config/mihomo/mihomo.log"));
-        assert!(unit.contains("StandardError=append:/home/testuser/.config/mihomo/mihomo.log"));
-        assert!(
-            !unit.contains("User=root"),
-            "user mode should not have User=root"
-        );
-    }
-
-    #[test]
-    fn systemd_units_use_expanded_home_not_specifier() {
-        let unit = systemd_system_unit("/home/alice");
-        assert!(
-            !unit.contains("%h"),
-            "should use expanded home, not %h specifier"
-        );
-        assert!(unit.contains("/home/alice/.local/bin/mihomo"));
-    }
-
-    #[test]
     fn service_start_messages_are_planned_from_os_and_mode() {
         assert_eq!(
             service_start_message(ServiceOs::Linux, ServiceMode::User),
@@ -2698,74 +2305,6 @@ mod tests {
             false,
             ""
         ));
-    }
-
-    #[test]
-    fn platform_service_messages_are_planned() {
-        assert_eq!(
-            launchd_install_result_lines(ServiceMode::System, true, "/Users/alice"),
-            vec!["LaunchDaemon installed and started — mihomo is running".to_string()]
-        );
-        assert_eq!(
-            launchd_install_result_lines(ServiceMode::User, true, "/Users/alice"),
-            vec!["LaunchAgent installed and started — mihomo is running (user mode)".to_string()]
-        );
-        assert_eq!(
-            launchd_install_result_lines(ServiceMode::System, false, "/Users/alice"),
-            vec![
-                "LaunchDaemon installed but mihomo may not be running.".to_string(),
-                "Check logs: tail -f /Users/alice/.config/mihomo/mihomo.log".to_string(),
-            ]
-        );
-        assert_eq!(
-            launchd_removed_message(ServiceMode::System),
-            "LaunchDaemon removed"
-        );
-        assert_eq!(
-            launchd_removed_message(ServiceMode::User),
-            "LaunchAgent removed"
-        );
-        assert_eq!(
-            systemd_old_service_removal_message(ServiceMode::User),
-            "Removing old user service..."
-        );
-        assert_eq!(
-            systemd_old_service_removal_message(ServiceMode::System),
-            "Removing old system service..."
-        );
-        assert_eq!(
-            systemd_linger_message("alice"),
-            "  Enabling linger for user 'alice' (service survives logout)..."
-        );
-        assert_eq!(
-            systemd_install_success_message(ServiceMode::System),
-            "systemd system service installed and started (system mode)"
-        );
-        assert_eq!(
-            systemd_install_success_message(ServiceMode::User),
-            "systemd user service installed and started"
-        );
-        assert_eq!(
-            systemd_missing_service_message(ServiceMode::System),
-            "No system service found"
-        );
-        assert_eq!(
-            systemd_missing_service_message(ServiceMode::User),
-            "No user service found"
-        );
-        assert_eq!(
-            systemd_removed_message(ServiceMode::System),
-            "systemd system service removed"
-        );
-        assert_eq!(
-            systemd_removed_message(ServiceMode::User),
-            "systemd user service removed"
-        );
-        assert_eq!(
-            windows_install_success_message(),
-            "Windows service installed and started"
-        );
-        assert_eq!(windows_removed_message(), "Windows service removed");
     }
 
     #[test]
@@ -2860,23 +2399,6 @@ e"
             start_result_lines(false),
             vec!["  Check: mihomo-cli status".to_string()]
         );
-        assert_eq!(
-            api_not_ready_warning_lines()[0],
-            "  ⚠ API not responding after 15s — mihomo may still be initializing."
-        );
-        assert_eq!(
-            socket_fix_applied_message(),
-            "  ⚠ Config was missing Unix socket controller — fixed."
-        );
-        #[cfg(unix)]
-        {
-            assert_eq!(stale_socket_cleanup_message(), "  Cleaned up stale socket");
-            assert_eq!(
-                stale_socket_cleanup_failed_message("denied", "/tmp/mihomo.sock"),
-                "  ⚠ Cannot remove stale socket: denied
-      Run: sudo rm -f /tmp/mihomo.sock"
-            );
-        }
     }
 
     #[test]
@@ -2952,125 +2474,6 @@ e"
     }
 
     #[test]
-    fn systemd_system_install_plan_writes_privileged_unit_and_cleans_user_service() {
-        let plan = systemd_install_plan(ServiceMode::System, "/home/alice", Some("alice"), true);
-
-        assert_eq!(plan.files.len(), 1);
-        assert_eq!(plan.files[0].path, "/etc/systemd/system/mihomo.service");
-        assert!(plan.files[0].privileged);
-        assert!(plan.files[0].content.contains("User=mihomo"));
-        assert!(plan.files[0]
-            .content
-            .contains("ExecStart=/home/alice/.local/bin/mihomo -d /home/alice/.config/mihomo"));
-        assert_eq!(
-            plan.cleanup_commands,
-            vec![
-                PlannedCommand::new("systemctl", ["--user", "stop", "mihomo"]),
-                PlannedCommand::new("systemctl", ["--user", "disable", "mihomo"]),
-                PlannedCommand::new("systemctl", ["--user", "daemon-reload"]),
-            ]
-        );
-        assert_eq!(
-            plan.cleanup_files,
-            vec![ServiceFileRemoval {
-                path: "/home/alice/.config/systemd/user/mihomo.service".to_string(),
-                privileged: false,
-            }]
-        );
-        assert_eq!(
-            plan.commands,
-            vec![
-                PlannedCommand::privileged("systemctl", ["daemon-reload"]),
-                PlannedCommand::privileged("systemctl", ["enable", "--now", "mihomo"]),
-            ]
-        );
-    }
-
-    #[test]
-    fn systemd_user_install_plan_writes_user_unit_and_can_enable_linger() {
-        let plan = systemd_install_plan(ServiceMode::User, "/home/alice", Some("alice"), true);
-
-        assert_eq!(
-            plan.files[0].path,
-            "/home/alice/.config/systemd/user/mihomo.service"
-        );
-        assert!(!plan.files[0].privileged);
-        assert!(!plan.files[0].content.contains("User=root"));
-        assert_eq!(
-            plan.cleanup_commands,
-            vec![
-                PlannedCommand::privileged("systemctl", ["stop", "mihomo"]),
-                PlannedCommand::privileged("systemctl", ["disable", "mihomo"]),
-                PlannedCommand::privileged("rm", ["/etc/systemd/system/mihomo.service"]),
-                PlannedCommand::privileged("systemctl", ["daemon-reload"]),
-            ]
-        );
-        assert_eq!(
-            plan.cleanup_files,
-            vec![ServiceFileRemoval {
-                path: "/etc/systemd/system/mihomo.service".to_string(),
-                privileged: true,
-            }]
-        );
-        assert_eq!(
-            plan.commands,
-            vec![
-                PlannedCommand::new("systemctl", ["--user", "daemon-reload"]),
-                PlannedCommand::new("systemctl", ["--user", "enable", "--now", "mihomo"]),
-                PlannedCommand::privileged("loginctl", ["enable-linger", "alice"]),
-            ]
-        );
-    }
-
-    #[test]
-    fn launchd_install_plans_capture_daemon_and_agent_differences() {
-        let daemon = launchd_install_plan(ServiceMode::System, "/Users/alice");
-        assert_eq!(
-            daemon.files[0].path,
-            "/Library/LaunchDaemons/io.mihomo.plist"
-        );
-        assert!(daemon.files[0].privileged);
-        assert!(daemon.files[0]
-            .content
-            .contains("/Users/alice/.config/mihomo/start.sh"));
-        assert_eq!(
-            daemon.commands,
-            vec![
-                PlannedCommand::privileged(
-                    "chmod",
-                    ["644", "/Library/LaunchDaemons/io.mihomo.plist"]
-                ),
-                PlannedCommand::privileged(
-                    "launchctl",
-                    [
-                        "bootstrap",
-                        "system",
-                        "/Library/LaunchDaemons/io.mihomo.plist"
-                    ]
-                ),
-            ]
-        );
-
-        let agent = launchd_install_plan(ServiceMode::User, "/Users/alice");
-        assert_eq!(
-            agent.files[0].path,
-            "/Users/alice/Library/LaunchAgents/io.mihomo.plist"
-        );
-        assert!(!agent.files[0].privileged);
-        assert_eq!(
-            agent.commands,
-            vec![PlannedCommand::new(
-                "launchctl",
-                [
-                    "bootstrap",
-                    &macos_gui_domain(),
-                    "/Users/alice/Library/LaunchAgents/io.mihomo.plist"
-                ]
-            )]
-        );
-    }
-
-    #[test]
     fn windows_install_commands_quote_paths_with_spaces() {
         let commands = windows_install_commands(
             r"C:\Users\Alice Smith\AppData\Local\mihomo",
@@ -3089,209 +2492,6 @@ e"
         );
     }
 
-    #[test]
-    fn service_install_apply_runs_cleanup_writes_files_then_commands() {
-        let plan = ServiceInstallPlan {
-            cleanup_commands: vec![PlannedCommand::new(
-                "systemctl",
-                ["--user", "stop", "mihomo"],
-            )],
-            cleanup_files: vec![ServiceFileRemoval {
-                path: "/home/alice/old.service".to_string(),
-                privileged: false,
-            }],
-            pre_commands: vec![],
-            files: vec![ServiceFilePlan {
-                path: "/etc/systemd/system/mihomo.service".to_string(),
-                content: "unit".to_string(),
-                privileged: true,
-            }],
-            commands: vec![
-                PlannedCommand::privileged("systemctl", ["daemon-reload"]),
-                PlannedCommand::privileged("systemctl", ["enable", "--now", "mihomo"]),
-            ],
-        };
-        let mut executor = RecordingExecutor::default();
-
-        apply_service_install_plan_with(&plan, &mut executor).unwrap();
-
-        assert_eq!(
-            executor.events,
-            vec![
-                "best-effort:systemctl --user stop mihomo",
-                "remove:/home/alice/old.service",
-                "write:sudo /etc/systemd/system/mihomo.service=unit",
-                "run:sudo systemctl daemon-reload",
-                "run:sudo systemctl enable --now mihomo",
-            ]
-        );
-    }
-
-    #[test]
-    fn service_install_apply_stops_before_commands_when_file_write_fails() {
-        let plan = ServiceInstallPlan {
-            cleanup_commands: vec![PlannedCommand::new(
-                "systemctl",
-                ["--user", "stop", "mihomo"],
-            )],
-            cleanup_files: vec![],
-            pre_commands: vec![],
-            files: vec![ServiceFilePlan {
-                path: "/tmp/mihomo.service".to_string(),
-                content: "unit".to_string(),
-                privileged: false,
-            }],
-            commands: vec![PlannedCommand::new(
-                "systemctl",
-                ["--user", "enable", "mihomo"],
-            )],
-        };
-        let mut executor = RecordingExecutor {
-            fail_write_path: Some("/tmp/mihomo.service".to_string()),
-            ..Default::default()
-        };
-
-        let err = apply_service_install_plan_with(&plan, &mut executor).unwrap_err();
-
-        assert!(
-            err.to_string().contains("simulated write failure"),
-            "error was: {err}"
-        );
-        assert_eq!(
-            executor.events,
-            vec![
-                "best-effort:systemctl --user stop mihomo",
-                "write:/tmp/mihomo.service=unit",
-            ],
-            "commands and marker must not run after failed file write"
-        );
-    }
-
-    #[test]
-    fn service_uninstall_apply_is_best_effort_for_commands_files_and_marker() {
-        let plan = ServiceUninstallPlan {
-            commands: vec![
-                PlannedCommand::new("systemctl", ["--user", "stop", "mihomo"]),
-                PlannedCommand::new("systemctl", ["--user", "disable", "mihomo"]),
-            ],
-            files: vec![ServiceFileRemoval {
-                path: "/home/alice/.config/systemd/user/mihomo.service".to_string(),
-                privileged: false,
-            }],
-            legacy_service_mode_marker: Some(ServiceFileRemoval {
-                path: "/home/alice/.config/mihomo/service-mode".to_string(),
-                privileged: false,
-            }),
-        };
-        let mut executor = RecordingExecutor::default();
-
-        apply_service_uninstall_plan_with(&plan, &mut executor);
-
-        assert_eq!(
-            executor.events,
-            vec![
-                "best-effort:systemctl --user stop mihomo",
-                "best-effort:systemctl --user disable mihomo",
-                "remove:/home/alice/.config/systemd/user/mihomo.service",
-                "remove:/home/alice/.config/mihomo/service-mode",
-            ]
-        );
-    }
-
-    #[test]
-    fn systemd_uninstall_plans_capture_root_and_user_cleanup() {
-        let root = systemd_uninstall_plan(ServiceMode::System, "/home/alice", "/tmp/mode");
-        assert_eq!(
-            root.commands,
-            vec![
-                PlannedCommand::privileged("systemctl", ["stop", "mihomo"]),
-                PlannedCommand::privileged("systemctl", ["disable", "mihomo"]),
-                PlannedCommand::privileged("systemctl", ["daemon-reload"]),
-            ]
-        );
-        assert_eq!(
-            root.files,
-            vec![ServiceFileRemoval {
-                path: "/etc/systemd/system/mihomo.service".to_string(),
-                privileged: true,
-            }]
-        );
-        assert_eq!(
-            root.legacy_service_mode_marker,
-            Some(ServiceFileRemoval {
-                path: "/tmp/mode".to_string(),
-                privileged: false,
-            })
-        );
-
-        let user = systemd_uninstall_plan(ServiceMode::User, "/home/alice", "/tmp/mode");
-        assert_eq!(
-            user.commands,
-            vec![
-                PlannedCommand::new("systemctl", ["--user", "stop", "mihomo"]),
-                PlannedCommand::new("systemctl", ["--user", "disable", "mihomo"]),
-                PlannedCommand::new("systemctl", ["--user", "daemon-reload"]),
-            ]
-        );
-        assert_eq!(
-            user.files,
-            vec![ServiceFileRemoval {
-                path: "/home/alice/.config/systemd/user/mihomo.service".to_string(),
-                privileged: false,
-            }]
-        );
-    }
-
-    #[test]
-    fn launchd_and_windows_uninstall_plans_capture_commands_and_files() {
-        let daemon = launchd_uninstall_plan(ServiceMode::System, "/Users/alice", "/tmp/mode");
-        assert_eq!(
-            daemon.commands,
-            vec![PlannedCommand::privileged(
-                "launchctl",
-                ["bootout", "system/io.mihomo"]
-            )]
-        );
-        assert_eq!(
-            daemon.files,
-            vec![ServiceFileRemoval {
-                path: "/Library/LaunchDaemons/io.mihomo.plist".to_string(),
-                privileged: true,
-            }]
-        );
-
-        let agent = launchd_uninstall_plan(ServiceMode::User, "/Users/alice", "/tmp/mode");
-        assert_eq!(
-            agent.commands,
-            vec![PlannedCommand::new(
-                "launchctl",
-                ["bootout", &format!("{}/io.mihomo", macos_gui_domain())]
-            )]
-        );
-        assert_eq!(
-            agent.files,
-            vec![ServiceFileRemoval {
-                path: "/Users/alice/Library/LaunchAgents/io.mihomo.plist".to_string(),
-                privileged: false,
-            }]
-        );
-
-        let windows = windows_uninstall_plan(r"C:\tmp\service-mode");
-        assert_eq!(
-            windows.commands,
-            vec![
-                PlannedCommand::new("sc.exe", ["stop", "mihomo"]),
-                PlannedCommand::new("sc.exe", ["delete", "mihomo"]),
-            ]
-        );
-        assert_eq!(
-            windows.legacy_service_mode_marker,
-            Some(ServiceFileRemoval {
-                path: r"C:\tmp\service-mode".to_string(),
-                privileged: false,
-            })
-        );
-    }
     #[test]
     fn password_provider_result_classifies_dialoguer_outcomes() {
         assert_eq!(
@@ -3418,12 +2618,9 @@ e"
             "staged temp payload must be owner-only readable"
         );
 
-        // Simulate the install step finishing: cleanup must remove the file.
-        let cleanup = TempFileCleanup(temp_path.clone());
-        drop(cleanup);
         assert!(
-            !temp_path.exists(),
-            "staged temp payload must be cleaned up after install"
+            temp_path.exists(),
+            "private temporary directory owns cleanup after privileged install"
         );
     }
 }

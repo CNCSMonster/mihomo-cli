@@ -7,15 +7,31 @@
 //! on behalf of the unprivileged CLI.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CoreApiMethod {
+    Get,
+    Put,
+    Patch,
+    Delete,
+}
 
 /// Commands sent from CLI → Daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub enum DaemonCommand {
-    /// Start the mihomo core with the given config.
+    /// Start the system mihomo core with CLI-validated configuration content.
     StartCore {
-        config_path: PathBuf,
+        config_content: String,
+        config_revision: String,
+        /// Per-user config dir holding selection-state.yaml (SPEC-select-persistence).
+        /// The daemon replays pinned selections against the freshly started Core.
+        #[serde(default)]
+        selection_intent_dir: Option<String>,
+        /// Active subscription identity for selection replay.
+        #[serde(default)]
+        subscription_id: Option<String>,
         /// Windows-only auth token (None on unix — peer uid validation).
         #[serde(default)]
         token: Option<String>,
@@ -26,18 +42,47 @@ pub enum DaemonCommand {
         #[serde(default)]
         token: Option<String>,
     },
-    /// Restart the mihomo core.
+    /// Restart the system mihomo core with CLI-validated configuration content.
     RestartCore {
-        config_path: PathBuf,
+        config_content: String,
+        config_revision: String,
+        /// Per-user config dir holding selection-state.yaml (SPEC-select-persistence).
+        #[serde(default)]
+        selection_intent_dir: Option<String>,
+        /// Active subscription identity for selection replay.
+        #[serde(default)]
+        subscription_id: Option<String>,
         /// Windows-only auth token (None on unix — peer uid validation).
         #[serde(default)]
         token: Option<String>,
     },
-    /// Enable TUN mode.
-    EnableTun {
-        config_path: PathBuf,
+    /// Apply the daemon-owned system TUN snapshot for the expected revision.
+    ApplySystemTunSnapshot {
+        expected_revision: String,
         stack: Option<String>,
         dns_hijack: Option<String>,
+        /// Windows-only auth token (None on unix — peer uid validation).
+        #[serde(default)]
+        token: Option<String>,
+    },
+    /// Promote a fully validated system effective configuration and attest it.
+    PromoteSystemConfig {
+        config_content: String,
+        config_revision: String,
+        /// Per-user config dir holding selection-state.yaml (SPEC-select-persistence).
+        #[serde(default)]
+        selection_intent_dir: Option<String>,
+        /// Active subscription identity for selection replay.
+        #[serde(default)]
+        subscription_id: Option<String>,
+        /// Windows-only auth token (None on unix — peer uid validation).
+        #[serde(default)]
+        token: Option<String>,
+    },
+    /// Select a proxy group member through the daemon-owned runtime API.
+    SelectSystemProxy {
+        group: String,
+        node: String,
         /// Windows-only auth token (None on unix — peer uid validation).
         #[serde(default)]
         token: Option<String>,
@@ -54,11 +99,64 @@ pub enum DaemonCommand {
         #[serde(default)]
         token: Option<String>,
     },
+    /// Forward an authenticated, allowlisted request to the system Core API.
+    CoreApiRequest {
+        method: CoreApiMethod,
+        path: String,
+        #[serde(default)]
+        body: Option<serde_json::Value>,
+        #[serde(default)]
+        token: Option<String>,
+    },
     /// Enable/disable core autostart (ADR-19: daemon owns the marker so the
     /// root/sudo identity never skews the per-user config dir).
     SetAutostart {
         enabled: bool,
         /// Windows-only auth token (None on unix — peer uid validation).
+        #[serde(default)]
+        token: Option<String>,
+    },
+
+    // Transaction IPC commands (SPEC §12.2)
+    ValidatePreparedRuntime {
+        fence: crate::tun_transaction::TransactionFence,
+        expected_old_runtime_revision: String,
+        expected_old_runtime_tun: bool,
+        #[serde(default)]
+        token: Option<String>,
+    },
+    ApplyPromotedSnapshot {
+        fence: crate::tun_transaction::TransactionFence,
+        target_runtime_tun: bool,
+        #[serde(default)]
+        token: Option<String>,
+    },
+    QuiesceCandidateRuntime {
+        fence: crate::tun_transaction::TransactionFence,
+        #[serde(default)]
+        token: Option<String>,
+    },
+    RestoreOldRuntime {
+        fence: crate::tun_transaction::TransactionFence,
+        expected_old_runtime_revision: String,
+        expected_old_runtime_tun: bool,
+        #[serde(default)]
+        token: Option<String>,
+    },
+    AttestCurrentTransaction {
+        fence: crate::tun_transaction::TransactionFence,
+        expected_runtime_revision: String,
+        expected_runtime_tun: bool,
+        #[serde(default)]
+        token: Option<String>,
+    },
+    ApplyLegacyRecoveryTarget {
+        fence: crate::tun_transaction::TransactionFence,
+        expected_recovery_target_revision: String,
+        #[serde(default)]
+        token: Option<String>,
+    },
+    GetTransactionStatus {
         #[serde(default)]
         token: Option<String>,
     },
@@ -75,54 +173,70 @@ pub enum DaemonResponse {
     /// Status information.
     Status {
         running: bool,
-        tun_enabled: bool,
         core_pid: Option<u32>,
         config_path: Option<PathBuf>,
+        /// Revision of the daemon-managed system TUN snapshot, if readable.
+        #[serde(default)]
+        tun_snapshot_revision: Option<String>,
+        /// Revision of the configuration loaded when Core was launched.
+        #[serde(default)]
+        launched_config_revision: Option<String>,
         /// Whether core autostart is enabled (ADR-19, daemon-owned marker).
         #[serde(default)]
         autostart_enabled: bool,
+        /// SHA-256 of the executable backing the responding daemon process.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        daemon_executable_revision: Option<String>,
+        /// Durable TUN transaction state observed by the daemon.
+        #[serde(default)]
+        tun_journal_state: Option<crate::tun_transaction::JournalPhase>,
+        /// Diagnostic for an unreadable/unsupported active journal.
+        /// Optional so older daemon responses remain decodable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tun_journal_error: Option<String>,
+    },
+    /// Successful response from an allowlisted Core API request.
+    CoreApi { data: serde_json::Value },
+    /// Transaction structured response.
+    Transaction {
+        response: crate::tun_transaction::TransactionResponse,
     },
 }
 
-/// Read the per-user daemon IPC client token.
-#[cfg(windows)]
-pub fn windows_client_token(config_dir: &std::path::Path) -> Option<String> {
-    std::fs::read_to_string(config_dir.join("service-client-token"))
+pub(crate) fn managed_snapshot_revision(path: &Path) -> anyhow::Result<String> {
+    let bytes = std::fs::read(path)?;
+    Ok(crate::tun_transaction::sha256_revision(&bytes))
+}
+
+fn read_client_token(path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(path)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
-#[cfg(unix)]
-pub fn unix_client_token(config_dir: &std::path::Path) -> Option<String> {
-    std::fs::read_to_string(config_dir.join("service-token"))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClientTokenLocation {
+    pub(crate) token_path: PathBuf,
 }
 
-/// Windows-only server-side token for daemon IPC validation.
-///
-/// Reads `%ProgramData%\mihomo\service-token` (written at install time).
-/// None when absent (legacy install / unix) — validation is skipped then.
-///
-/// Reserved for token dual validation (see PLAN-windows-usability.md §2.3).
-#[cfg(windows)]
-#[allow(dead_code)]
-pub fn windows_service_token() -> Option<String> {
-    let program_data = std::env::var_os("ProgramData")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\ProgramData"));
-    std::fs::read_to_string(program_data.join("mihomo").join("service-token"))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+pub(crate) fn client_token_location_from_inputs(
+    os: crate::instance::TargetOs,
+    inputs: &crate::instance::PathInputs,
+) -> ClientTokenLocation {
+    ClientTokenLocation {
+        token_path: crate::instance::planned_daemon_credential_paths(os, inputs).token,
+    }
 }
 
-#[cfg(not(windows))]
-#[allow(dead_code)] // cross-platform symmetry stub; Windows builds use the real impl
-pub fn windows_service_token() -> Option<String> {
-    None
+pub(crate) fn client_token_location() -> ClientTokenLocation {
+    let inputs = crate::instance::PathInputs::from_current_env();
+    let os = crate::instance::TargetOs::current().unwrap_or(crate::instance::TargetOs::Linux);
+    client_token_location_from_inputs(os, &inputs)
+}
+
+pub(crate) fn current_client_token() -> Option<String> {
+    read_client_token(&client_token_location().token_path)
 }
 
 /// IPC socket path for the system service.
@@ -187,20 +301,12 @@ where
 }
 
 /// Send a command to the daemon and wait for a response.
-///
-/// Timeout boundary (aligned with clash-verge-service): the daemon's lifecycle
-/// operations (core spawn + readiness) must complete within 15s; the client
-/// waits up to 20s so it always receives the daemon's final business conclusion
-/// rather than a transport error.
 #[cfg(unix)]
 pub async fn send_command(cmd: &DaemonCommand) -> anyhow::Result<DaemonResponse> {
     use tokio::io::BufReader;
     use tokio::net::UnixStream;
 
-    let config_dir = crate::utils::AppPaths::from_system()
-        .config_dir()
-        .to_path_buf();
-    let token = unix_client_token(&config_dir);
+    let token = current_client_token();
     let cmd = with_ipc_token(cmd.clone(), token);
 
     let sock_path = system_service_socket_path();
@@ -224,7 +330,7 @@ pub async fn send_command(cmd: &DaemonCommand) -> anyhow::Result<DaemonResponse>
             anyhow::anyhow!(
                 "timed out waiting for the system service to respond after 20s.\n  \
                  The daemon may be busy with another lifecycle operation or stuck.\n  \
-                 Check: systemctl status mihomo  (or the service logs)"
+                 Inspect the system daemon service status or logs for this platform."
             )
         })?
 }
@@ -235,12 +341,7 @@ pub async fn send_command(cmd: &DaemonCommand) -> anyhow::Result<DaemonResponse>
     use tokio::io::BufReader;
     use tokio::net::windows::named_pipe::ClientOptions;
 
-    // Attach the Windows client token (auth for the daemon). config_dir is the
-    // default user config directory; the client copy lives there.
-    let config_dir = crate::utils::AppPaths::from_system()
-        .config_dir()
-        .to_path_buf();
-    let token = windows_client_token(&config_dir);
+    let token = current_client_token();
     let cmd = with_ipc_token(cmd.clone(), token);
 
     let pipe_path = system_service_socket_path();
@@ -273,23 +374,122 @@ pub async fn send_command(cmd: &DaemonCommand) -> anyhow::Result<DaemonResponse>
 fn with_ipc_token(cmd: DaemonCommand, token: Option<String>) -> DaemonCommand {
     use DaemonCommand::*;
     match cmd {
-        StartCore { config_path, .. } => StartCore { config_path, token },
+        StartCore {
+            config_content,
+            config_revision,
+            selection_intent_dir,
+            subscription_id,
+            ..
+        } => StartCore {
+            config_content,
+            config_revision,
+            selection_intent_dir,
+            subscription_id,
+            token,
+        },
         StopCore { .. } => StopCore { token },
-        RestartCore { config_path, .. } => RestartCore { config_path, token },
-        EnableTun {
-            config_path,
+        RestartCore {
+            config_content,
+            config_revision,
+            selection_intent_dir,
+            subscription_id,
+            ..
+        } => RestartCore {
+            config_content,
+            config_revision,
+            selection_intent_dir,
+            subscription_id,
+            token,
+        },
+        ApplySystemTunSnapshot {
+            expected_revision,
             stack,
             dns_hijack,
             ..
-        } => EnableTun {
-            config_path,
+        } => ApplySystemTunSnapshot {
+            expected_revision,
             stack,
             dns_hijack,
             token,
         },
+        PromoteSystemConfig {
+            config_content,
+            config_revision,
+            selection_intent_dir,
+            subscription_id,
+            ..
+        } => PromoteSystemConfig {
+            config_content,
+            config_revision,
+            selection_intent_dir,
+            subscription_id,
+            token,
+        },
+        SelectSystemProxy { group, node, .. } => SelectSystemProxy { group, node, token },
         DisableTun { .. } => DisableTun { token },
         GetStatus { .. } => GetStatus { token },
+        CoreApiRequest {
+            method, path, body, ..
+        } => CoreApiRequest {
+            method,
+            path,
+            body,
+            token,
+        },
         SetAutostart { enabled, .. } => SetAutostart { enabled, token },
+        ValidatePreparedRuntime {
+            fence,
+            expected_old_runtime_revision,
+            expected_old_runtime_tun,
+            ..
+        } => ValidatePreparedRuntime {
+            fence,
+            expected_old_runtime_revision,
+            expected_old_runtime_tun,
+            token,
+        },
+        ApplyPromotedSnapshot {
+            fence,
+            target_runtime_tun,
+            ..
+        } => ApplyPromotedSnapshot {
+            fence,
+            target_runtime_tun,
+            token,
+        },
+        QuiesceCandidateRuntime { fence, .. } => QuiesceCandidateRuntime { fence, token },
+        RestoreOldRuntime {
+            fence,
+            expected_old_runtime_revision,
+            expected_old_runtime_tun,
+            ..
+        } => RestoreOldRuntime {
+            fence,
+            expected_old_runtime_revision,
+            expected_old_runtime_tun,
+            token,
+        },
+        AttestCurrentTransaction {
+            fence,
+            expected_runtime_revision,
+            expected_runtime_tun,
+            ..
+        } => AttestCurrentTransaction {
+            fence,
+            expected_runtime_revision,
+            expected_runtime_tun,
+            token,
+        },
+        ApplyLegacyRecoveryTarget {
+            fence,
+            expected_recovery_target_revision,
+            ..
+        } => ApplyLegacyRecoveryTarget {
+            fence,
+            expected_recovery_target_revision,
+            token,
+        },
+        GetTransactionStatus { .. } => GetTransactionStatus { token },
     }
 }
 
@@ -344,41 +544,142 @@ mod tests {
     }
 
     #[test]
-    fn daemon_start_restart_commands_do_not_accept_client_supplied_core_binary() {
-        let start = DaemonCommand::StartCore {
-            config_path: PathBuf::from("/home/alice/.config/mihomo/config.yaml"),
+    fn core_api_command_roundtrip_keeps_request_shape() {
+        let command = DaemonCommand::CoreApiRequest {
+            method: CoreApiMethod::Get,
+            path: "/configs".to_string(),
+            body: None,
             token: None,
         };
-        let json = serde_json::to_string(&start).unwrap();
-        assert!(json.contains("\"type\":\"StartCore\""));
-        assert!(json.contains("config_path"));
-        assert!(!json.contains("core_binary"));
-
-        let restart = DaemonCommand::RestartCore {
-            config_path: PathBuf::from("/home/alice/.config/mihomo/config.yaml"),
-            token: None,
-        };
-        let json = serde_json::to_string(&restart).unwrap();
-        assert!(json.contains("\"type\":\"RestartCore\""));
-        assert!(json.contains("config_path"));
-        assert!(!json.contains("core_binary"));
+        let json = serde_json::to_string(&command).unwrap();
+        let decoded: DaemonCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            DaemonCommand::CoreApiRequest {
+                method: CoreApiMethod::Get,
+                ref path,
+                body: None,
+                token: None,
+            } if path == "/configs"
+        ));
     }
 
     #[test]
-    fn daemon_rejects_legacy_start_command_with_client_supplied_core_binary() {
-        let legacy = r#"{
-            "type": "StartCore",
-            "config_path": "/home/alice/.config/mihomo/config.yaml",
-            "core_binary": "/tmp/untrusted-mihomo"
-        }"#;
+    fn promotion_commands_roundtrip_without_client_paths() {
+        let promote = DaemonCommand::PromoteSystemConfig {
+            config_content: "mode: rule\n".to_string(),
+            config_revision: "0123456789abcdef".to_string(),
+            selection_intent_dir: None,
+            subscription_id: None,
+            token: None,
+        };
+        let promote_json = serde_json::to_string(&promote).unwrap();
+        assert!(promote_json.contains("PromoteSystemConfig"));
+        assert!(!promote_json.contains("config_path"));
+        assert!(matches!(
+            serde_json::from_str::<DaemonCommand>(&promote_json).unwrap(),
+            DaemonCommand::PromoteSystemConfig { config_revision, .. }
+                if config_revision == "0123456789abcdef"
+        ));
 
-        assert!(serde_json::from_str::<DaemonCommand>(legacy).is_err());
+        let select = DaemonCommand::SelectSystemProxy {
+            group: "Proxy".to_string(),
+            node: "NodeA".to_string(),
+            token: None,
+        };
+        let select_json = serde_json::to_string(&select).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<DaemonCommand>(&select_json).unwrap(),
+            DaemonCommand::SelectSystemProxy { group, node, .. }
+                if group == "Proxy" && node == "NodeA"
+        ));
     }
 
     #[test]
-    fn daemon_rejects_shutdown_command_not_in_v3_ipc_contract() {
-        let shutdown = r#"{ "type": "Shutdown" }"#;
-        assert!(serde_json::from_str::<DaemonCommand>(shutdown).is_err());
+    fn lifecycle_commands_carry_selection_intent_dir() {
+        // SPEC-select-persistence: lifecycle commands tell the daemon where
+        // the per-user selection-state.yaml lives so it can replay after
+        // Core (re)starts. Older daemons tolerate the field being absent.
+        for cmd in [
+            DaemonCommand::StartCore {
+                config_content: "mode: rule\n".to_string(),
+                config_revision: "rev".to_string(),
+                selection_intent_dir: Some("/home/alice/.config/mihomo".to_string()),
+                subscription_id: Some("sub-abcdef12".to_string()),
+                token: None,
+            },
+            DaemonCommand::RestartCore {
+                config_content: "mode: rule\n".to_string(),
+                config_revision: "rev".to_string(),
+                selection_intent_dir: Some("/home/alice/.config/mihomo".to_string()),
+                subscription_id: Some("sub-abcdef12".to_string()),
+                token: None,
+            },
+            DaemonCommand::PromoteSystemConfig {
+                config_content: "mode: rule\n".to_string(),
+                config_revision: "rev".to_string(),
+                selection_intent_dir: Some("/home/alice/.config/mihomo".to_string()),
+                subscription_id: Some("sub-abcdef12".to_string()),
+                token: None,
+            },
+        ] {
+            let json = serde_json::to_string(&cmd).unwrap();
+            let parsed = serde_json::from_str::<DaemonCommand>(&json).unwrap();
+            let intent_dir = match &parsed {
+                DaemonCommand::StartCore {
+                    selection_intent_dir,
+                    ..
+                }
+                | DaemonCommand::RestartCore {
+                    selection_intent_dir,
+                    ..
+                }
+                | DaemonCommand::PromoteSystemConfig {
+                    selection_intent_dir,
+                    ..
+                } => selection_intent_dir.as_deref(),
+                other => panic!("unexpected command variant: {other:?}"),
+            };
+            assert_eq!(intent_dir, Some("/home/alice/.config/mihomo"));
+        }
+
+        // Missing field (legacy CLI) must still deserialize via serde default.
+        let legacy =
+            r#"{"type":"StartCore","config_content":"mode: rule\n","config_revision":"rev"}"#;
+        assert!(matches!(
+            serde_json::from_str::<DaemonCommand>(legacy).unwrap(),
+            DaemonCommand::StartCore {
+                selection_intent_dir: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn system_tun_apply_command_has_no_client_path() {
+        let command = DaemonCommand::ApplySystemTunSnapshot {
+            expected_revision: "0123456789abcdef".to_string(),
+            stack: Some("system".to_string()),
+            dns_hijack: Some("any:53".to_string()),
+            token: None,
+        };
+        let json = serde_json::to_string(&command).unwrap();
+        assert!(json.contains("ApplySystemTunSnapshot"));
+        assert!(json.contains("expected_revision"));
+        assert!(!json.contains("config_path"));
+
+        let decoded: DaemonCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            DaemonCommand::ApplySystemTunSnapshot {
+                expected_revision,
+                stack: Some(stack),
+                dns_hijack: Some(dns_hijack),
+                token: None,
+            } if expected_revision == "0123456789abcdef"
+                && stack == "system"
+                && dns_hijack == "any:53"
+        ));
     }
 
     #[test]
@@ -391,25 +692,70 @@ mod tests {
 
         let resp = DaemonResponse::Status {
             running: true,
-            tun_enabled: false,
             core_pid: Some(1234),
             config_path: Some(PathBuf::from("/tmp/config.yaml")),
+            tun_snapshot_revision: Some("snapshot-revision".to_string()),
+            launched_config_revision: Some("launched-revision".to_string()),
             autostart_enabled: false,
+            daemon_executable_revision: Some("daemon-revision".to_string()),
+            tun_journal_state: Some(crate::tun_transaction::JournalPhase::IntentCommitted),
+            tun_journal_error: Some("unsupported active TUN journal schema 99".to_string()),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let deserialized: DaemonResponse = serde_json::from_str(&json).unwrap();
         if let DaemonResponse::Status {
             running,
-            tun_enabled,
             core_pid,
+            tun_snapshot_revision,
+            launched_config_revision,
+            tun_journal_error,
             ..
         } = deserialized
         {
             assert!(running);
-            assert!(!tun_enabled);
             assert_eq!(core_pid, Some(1234));
+            assert_eq!(tun_snapshot_revision.as_deref(), Some("snapshot-revision"));
+            assert_eq!(
+                launched_config_revision.as_deref(),
+                Some("launched-revision")
+            );
+            assert_eq!(
+                tun_journal_error.as_deref(),
+                Some("unsupported active TUN journal schema 99")
+            );
         } else {
             panic!("expected Status response");
+        }
+    }
+
+    #[test]
+    fn older_status_response_without_journal_error_remains_compatible() {
+        let json = r#"{
+            "type": "Status",
+            "running": false,
+            "core_pid": null,
+            "config_path": null,
+            "tun_snapshot_revision": null,
+            "launched_config_revision": null,
+            "autostart_enabled": false,
+            "tun_journal_state": "RecoveryRequired"
+        }"#;
+        let response: DaemonResponse = serde_json::from_str(json).unwrap();
+        match response {
+            DaemonResponse::Status {
+                tun_journal_state,
+                tun_journal_error,
+                daemon_executable_revision,
+                ..
+            } => {
+                assert_eq!(
+                    tun_journal_state,
+                    Some(crate::tun_transaction::JournalPhase::RecoveryRequired)
+                );
+                assert_eq!(tun_journal_error, None);
+                assert_eq!(daemon_executable_revision, None);
+            }
+            other => panic!("expected Status response, got {other:?}"),
         }
     }
 
@@ -441,23 +787,5 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("daemon command too large"));
-    }
-
-    #[test]
-    fn start_core_command_roundtrip() {
-        let cmd = DaemonCommand::StartCore {
-            config_path: PathBuf::from("/home/user/.config/mihomo/config.yaml"),
-            token: None,
-        };
-        let json = serde_json::to_string(&cmd).unwrap();
-        let deserialized: DaemonCommand = serde_json::from_str(&json).unwrap();
-        if let DaemonCommand::StartCore { config_path, .. } = deserialized {
-            assert_eq!(
-                config_path,
-                PathBuf::from("/home/user/.config/mihomo/config.yaml")
-            );
-        } else {
-            panic!("expected StartCore command");
-        }
     }
 }

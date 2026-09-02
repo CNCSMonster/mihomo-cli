@@ -33,33 +33,25 @@ cargo install --path .
 
 ## Minimal Recommended Workflow
 
-Daily use should not require remembering `--system`. Use normal/per-user proxy mode for browser/system-proxy workflows. When you need TUN/system-wide transparent proxying, run `mihomo-cli tun on`; the CLI guides system service installation and asks for an admin password when needed.
+Install the system infrastructure first. Without a subscription, install generates a validated direct-only config and starts ordinary Core/API with TUN disabled. `restart` proves only daemon/Core/API control-plane readiness; it does not prove public connectivity, DNS/DIRECT behavior, proxy-group egress, or TUN data-plane success. After readiness, enable TUN explicitly when system-wide transparent proxying is required; `tun on` is successful only after the managed transaction and current Core API runtime attestation prove the target state.
 
 ```bash
-mihomo-cli install                         # Interactive: normal proxy mode / TUN all-traffic mode
-mihomo-cli config -u '<your-subscription-url>'
-mihomo-cli start                           # Auto-detect and start the current instance
-mihomo-cli select                          # Pick a node (TUI: j/k or arrows, / filter; or --node non-interactive)
-mihomo-cli status                          # Concise status; use --verbose for diagnostic paths/probes
-mihomo-cli exit-ip --group "Proxy"          # Probe current group exit IP
-mihomo-cli exit-ip --url https://github.com # Estimate route exit IP for a URL
-mihomo-cli tun on                          # Enable TUN; guides system service setup if needed
-mihomo-cli tun status
-mihomo-cli tun off
+mihomo-cli uninstall --all --yes          # Optional: clean managed instances first
+mihomo-cli install --system --yes         # Generate direct-only config and start ordinary Core; TUN remains off
+mihomo-cli config --import ./config.yaml --activate --yes # Running system services promote the import immediately
+# Only when import reports pending/unknown/recovery, or to apply a pending generation:
+# mihomo-cli restart --system
+mihomo-cli select                          # Pick a node
+mihomo-cli status                          # Read-only status summary; unknown when runtime state is not provable
+mihomo-cli exit-ip --group "Proxy"        # Explicit data-plane exit probe
+mihomo-cli rule test baidu.com            # Check rule matching; not a data-plane probe
+mihomo-cli tun on --yes                    # Enable TUN; requires transaction and runtime attestation
+mihomo-cli tun status                      # Observe attested runtime state; unknown when unprovable
+mihomo-cli tun off                         # Explicitly disable TUN
+mihomo-cli restart --system                # Re-apply persistent state when needed
 ```
 
-Without admin rights, use `mihomo-cli install --user` for normal proxy mode. `--system` is still available for scripts, troubleshooting, or explicit system service targeting, but it is not the daily path.
-
-**Other common commands:**
-
-```bash
-mihomo-cli status      # Runtime status overview, including current general exit IP
-mihomo-cli rule test baidu.com  # Check which policy a domain matches
-mihomo-cli proxy on    # Set http_proxy env vars for current terminal (use eval)
-mihomo-cli restart     # Restart service
-mihomo-cli tun off        # Disable TUN
-mihomo-cli tun status     # Check TUN status
-```
+Without admin rights, use `mihomo-cli install --user` for normal proxy mode. `--system` selects the system service context; TUN is only available there. `start` remains a compatibility/advanced lifecycle command, while the normal workflow uses `restart`. Read-only commands do not implicitly start Core, request sudo, access the network, or perform recovery.
 
 ## Command Reference
 
@@ -67,8 +59,8 @@ mihomo-cli tun status     # Check TUN status
 
 | Command | Description |
 |---------|-------------|
-| `mihomo-cli install` | Download core + generate config + install boot service (interactive) |
-| `mihomo-cli config` | Configure subscription URL (supports vmess://, base64, Clash YAML) |
+| `mihomo-cli install --system` | Install system infrastructure, Core, Geo, and authorization prerequisites; without a subscription it generates direct-only config and starts ordinary Core/API with TUN disabled |
+| `mihomo-cli config --import <file> --activate --yes` | Validate and commit a user configuration; current implementation uses flat config action flags |
 | `mihomo-cli uninstall` | Remove service (optionally remove all files) |
 | `mihomo-cli update` | Update mihomo core binary for the resolved instance |
 
@@ -76,10 +68,10 @@ mihomo-cli tun status     # Check TUN status
 
 | Command | Description |
 |---------|-------------|
-| `mihomo-cli start` | Start mihomo service/core (auto-detects by default) |
-| `mihomo-cli stop` | Stop mihomo service/core (auto-detects by default) |
-| `mihomo-cli restart` | Restart mihomo service/core (auto-detects by default) |
-| `mihomo-cli status` | Runtime status overview (includes proxy probe) |
+| `mihomo-cli start` | Compatibility/advanced lifecycle command; the normal workflow uses explicit `restart` |
+| `mihomo-cli stop` | Stop the selected user or system service/core |
+| `mihomo-cli restart --system` | Explicitly start or restart the system Core and wait for daemon/Core API control-plane readiness; this does not prove public or TUN data-plane success |
+| `mihomo-cli status` | Read-only `StatusSnapshot` summary; no network probe or recovery, and runtime values are `unknown` when not provable |
 
 ### Daily Use
 
@@ -88,7 +80,7 @@ mihomo-cli tun status     # Check TUN status
 | `mihomo-cli select` | Interactive node selector (j/k navigate, / filter, Enter select) |
 | `mihomo-cli list` | List all proxy groups and current node |
 | `mihomo-cli delay [--refresh] [--fastest]` | Batch-test group latency, reuse fresh cache, optionally select fastest node |
-| `mihomo-cli tun on/off/status` | Enable/disable/check TUN virtual NIC (system service only) |
+| `mihomo-cli tun on/off/status` | Enable/disable/check TUN virtual NIC (system service only); `tun status` reports `unknown` unless the current runtime and revision attestation are provable |
 | `mihomo-cli proxy on/off` | Output shell proxy env vars (`eval "$(mihomo-cli proxy on)"`) |
 | `mihomo-cli conn` | View active connections (`--flush` to close all) |
 | `mihomo-cli rule/dns/backup/restore` | Manage per-user config for the auto-detected/resolved instance |
@@ -188,7 +180,7 @@ Merge semantics:
 
 ## Subscription UA negotiation
 
-When adding or refreshing a subscription URL, mihomo-cli tries a small set of Clash-compatible User-Agents sequentially and stops as soon as Clash YAML is returned, reducing rate-limit risk. Use `mihomo-cli config --probe <URL>` to inspect candidate UA responses, and `--user-agent` / `--set-ua` to pin a subscription to a fixed UA.
+When adding or refreshing a subscription URL, mihomo-cli tries a small set of Clash-compatible User-Agents sequentially and stops as soon as Clash YAML is returned, reducing rate-limit risk. Use `mihomo-cli config probe <URL>` to inspect candidate UA responses, `mihomo-cli config ua set <id> <ua|auto>` to pin or restore a subscription's UA, or the local `--user-agent` option for a single `config fetch/add/refresh` operation.
 
 Current boundary: UA probing is intentionally limited to Clash/Mihomo-compatible configurations. The goal is to obtain the provider's original Clash YAML; mihomo-cli does not probe non-Clash ecosystems such as Surge, Quantumult X, Shadowrocket, or v2rayN by default. Support for those ecosystems should be designed as a separate future extension.
 

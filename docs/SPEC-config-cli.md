@@ -1,12 +1,16 @@
 # SPEC: config CLI（subcommand-only）
 
+> **从属与状态：** 本文是 `../SPEC.md` 的配置 CLI **目标设计/待迁移实施补充**，不是当前命令表面的权威。命令主旅程、结果状态、配置事实来源、TUN-active 应用事务、弱网与 last-known-good 语义以 `../SPEC.md` 为准。本仓库当前实现仍保留 flat action flags（如 `config --import`、`config -u`、`config --validate`），并仅实现 `config fetch <url> -o <file>` 这一子命令；下文的 subcommand-only 表面、迁移映射和对应验收标准属于后续独立迁移工作，在实现完成前不得作为当前用户旅程或验收命令。旧 flat flags 若与当前实现/正式 SPEC 不一致，也不得据本文目标设计推断出不存在的当前入口。
+
 > 状态：设计稿  
 > 日期：2026-08-06  
 > 范围：重设计 `mihomo-cli config` 命令表面；不引入 profile/template/sub 新顶层概念。
 
+> `config` 子命令的结果必须遵守主 SPEC §12.2.1 的三层结果合同：intent transaction、control-plane 和 runtime attestation。本文中的 `runtime_applied`、`pending`、`failed`、`unknown` 只描述配置变更的运行时应用层，不代表公网或目标业务数据面成功；TUN active 时只有完整 promotion journal 与当前 Core API attestation 才能返回 `runtime_applied`。
+
 ## 1. 背景与问题
 
-当前 `config` 同时承担交互式 TUI、订阅管理、离线 fetch、UA 探测、配置验证/修复等职责，但 CLI 表面主要由一组 flat flags 组成：
+当前需要从 flat flags 迁移到明确的子命令；以下命令仅作为待迁移的历史示例，不能作为当前用户旅程、实现入口或验收命令：
 
 ```bash
 mihomo-cli config -u <url>
@@ -21,7 +25,6 @@ mihomo-cli config --set-ua <id> <ua|auto>
 mihomo-cli config --validate
 mihomo-cli config --fix
 mihomo-cli config --import <file>
-mihomo-cli config fetch <url> -o <file>
 ```
 
 这造成三个问题：
@@ -56,7 +59,10 @@ mihomo-cli config fetch <url> -o <file>
 - active subscription 是当前配置基底。
 - subscription cache 是订阅的 last known good 本地缓存。
 - `rules.yaml`、`dns-policy.yaml`、`dns-fake-ip-filter.yaml`、`override.yaml` 叠加在 active subscription 之上。
-- 写入/生成配置与运行时生效是两阶段：命令应明确报告是否 reload 成功；失败时给出 `mihomo-cli restart` 建议。
+- per-user `config.yaml` 是用户 intent 的唯一事实来源；system `tun-config.yaml` 只是受保护的派生 snapshot。
+- 写入/生成配置与运行时生效是两阶段。没有运行 Core 时，合法 import 仍须安全落盘，随后由用户显式执行 `restart`；不能因 reload 不可用丢失导入。
+- system TUN active 时，所有会改变 active effective config 的动作必须进入统一 promotion dispatcher，经 candidate/revision、root snapshot transaction 和 Core API runtime observation；不得只执行 per-user reload 或仅提示 restart。
+- refresh/add/switch 失败不得覆盖旧 active/cache/config/Core/TUN；失败时返回 `Incomplete`、`Failed` 或 `RecoveryRequired`，并给出唯一下一步。
 
 ## 3. 目标命令表面
 
@@ -114,10 +120,10 @@ Flags：
 - `--yes`：跳过“是否激活”等确认。
 - `--dry-run`：探测/校验但不写入。
 
-默认行为建议：
+默认行为：
 
-- 首个订阅默认激活。
-- 已存在 active subscription 时，人类交互可询问是否激活；非交互必须通过 `--activate`/`--no-activate` 或 `--yes` 表达选择，否则 fail-fast 并提示命令。
+- 当不存在 active subscription 时，首个合法订阅默认激活并生成 `UserEffectiveConfig`；`--no-activate` 显式覆盖该默认，仅保存非 active cache/metadata。
+- 已存在 active subscription 时，人类交互可询问是否激活；非交互必须通过 `--activate`/`--no-activate` 明确表达选择，`--yes` 只跳过确认，不替代激活选择，否则 fail-fast 并提示命令。
 
 #### `config import <file>`
 
@@ -129,7 +135,7 @@ mihomo-cli config import ./config.yaml --no-activate
 mihomo-cli config import ./config.yaml --dry-run
 ```
 
-语义与 `add` 类似，但输入来自本地文件，不访问远端 URL。
+语义与 `add` 相同，但输入来自本地文件，不访问远端 URL：无 active 时默认激活并生成 `UserEffectiveConfig`；已有 active 时非交互必须显式 `--activate` 或 `--no-activate`，`--yes` 只跳过确认。
 
 #### `config remove <id-or-name>`
 
@@ -142,9 +148,11 @@ mihomo-cli config remove 01H... --dry-run --json
 
 要求：
 
-- 删除 active subscription 时必须明确后续 active 状态：
-  - 若还有其它订阅，人类模式可选择切换目标；自动化模式应失败并提示先 `config switch <id>` 或使用未来显式 flag。
-  - 本阶段不引入复杂 `--activate-next`；保持安全、显式。
+- 删除 active subscription 时，不能先删除 active pointer、cache 或 metadata 再询问/猜测替代项。
+- 若还有其它合法订阅，人类交互可以选择替代目标；非交互调用必须显式提供替代 active 的选择（使用现有 `config switch <id>` 先切换，或使用实现定义且服从主 SPEC 的显式替代参数），否则 fail-fast。
+- 若没有合法替代项，命令非零返回并保持旧 active、`config.yaml`、Core/TUN 不变；不能把 active 状态隐式变成空配置或启动空 Core。
+- 删除与替代切换必须先校验 new candidate；system TUN active 时必须进入主 SPEC 规定的 `apply_active_intent` promotion dispatcher 和 durable journal，不能先删除本地文件再 reload per-user config。
+- 任一步应用或最终提交失败，必须保留 last-known-good 或返回 `RecoveryRequired`；不得把 cache/pointer 已删除称为成功。
 
 #### `config switch <id-or-name>`
 
@@ -159,7 +167,7 @@ mihomo-cli config switch 01H... --json
 
 - 不要求联网。
 - 若本地 cache 缺失或无效，应失败并建议 `config refresh <id>`。
-- 成功后尝试 reload，报告 reload 是否生效。
+- 成功后按当前实例状态应用：Core stopped 时只提交 intent 并提示显式 `mihomo-cli restart`；普通运行实例可按受管 reload/restart 合同应用；system TUN active 时必须进入 `apply_active_intent` promotion dispatcher，不能直接 reload per-user config。结果必须区分 `runtime_applied`、`pending`、`failed` 和 `unknown`。
 
 #### `config list`
 
@@ -204,7 +212,7 @@ mihomo-cli config refresh --dry-run --json
 要求：
 
 - 访问远端 URL，更新 subscription cache。
-- 如果刷新的是 active subscription，重新生成/校验 `config.yaml` 并尝试 reload。
+- 如果刷新的是 active subscription，重新生成/校验 `config.yaml` 并按当前实例应用；system TUN active 时必须走统一 promotion dispatcher，Core stopped 时保留合法新 intent 并提示 `mihomo-cli restart`。刷新失败不得覆盖 active subscription、旧 cache、`config.yaml`、system snapshot 或运行中的 Core。
 - 如果刷新非 active subscription，只更新缓存，不影响当前运行配置。
 
 #### `config refresh-all`
@@ -337,11 +345,15 @@ mihomo-cli config ua set hk-main 'clash-verge/v2.0.4'
 - stdout 只输出 JSON。
 - 诊断和进度进入 stderr。
 - 默认脱敏订阅 URL token、mihomo secret、节点凭据。
-- 写操作必须区分：
-  - `written`: 是否写入配置源/缓存。
-  - `generated`: 是否生成并校验 `config.yaml`。
-  - `runtime_applied`: 是否 reload 到运行中的 core。
-  - `suggested_commands`: reload 失败或需要下一步时给出可执行命令。
+- 写操作必须区分主 SPEC §12.2.1 的三层结果，并允许保留下列配置领域摘要字段：
+  - `intent`: 用户意图/配置事务结果，至少说明 candidate、active pointer、metadata、`config.yaml` 或 journal 是否安全提交；不得由该字段推导运行中的 Core 已应用。
+  - `control_plane`: 本命令声明的 daemon/Core/API、受管 reload/restart 或 TUN promotion control-plane 结果；Core stopped 时可为 `pending`，未执行或无法观察时不得伪造 ready。
+  - `runtime_attestation`: 当前 Core/API runtime 值与目标 revision、snapshot/intent revision、journal 和 instance 关联是否完整匹配；缺失、过期或不可达时为 `unknown`/未证明。
+  - `written`: 是否安全提交 intent/config source/cache；它是 `intent` 的兼容摘要，不代表 runtime 已应用。
+  - `generated`: 是否生成并通过校验 `config.yaml`；它是配置产物摘要，不代表当前 Core 已使用该版本。
+  - `runtime_apply`: `runtime_applied`、`pending`、`failed` 或 `unknown`；它是 `control_plane` 与 `runtime_attestation` 在配置命令中的兼容摘要，只有受管 reload/restart 或完整 TUN promotion、以及当前 Core/API 目标 revision 观察均成立时才可为 `runtime_applied`。
+  - `suggested_commands`: reload 未执行、Core stopped、观察未知或需要下一步时给出可执行命令；不能用建议命令代替本次成功证据。
+- `--json` 的三层字段必须与文本结果表达同一事实；不能只因为 `written=true` 或 `generated=true` 就输出 `runtime_apply=runtime_applied`。
 
 ## 6. 实施计划
 

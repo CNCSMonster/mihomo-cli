@@ -1,5 +1,7 @@
 use std::cell::Cell;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(any(windows, all(not(unix), not(windows))))]
+use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::io;
 use std::io::ErrorKind;
@@ -56,19 +58,38 @@ impl ConfigLock {
         }
 
         let lock_path = config_dir.join(".mihomo-cli.lock");
-        std::fs::create_dir_all(config_dir)?;
+        crate::utils::ensure_dir_all_no_follow(config_dir)?;
+        crate::utils::restore_original_user_config_ownership(config_dir)?;
 
         #[cfg(unix)]
         {
-            let file = OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(&lock_path)
-                .map_err(|e| {
-                    anyhow::anyhow!("Cannot open lock file {}: {}", lock_path.display(), e)
-                })?;
+            let deadline = Instant::now() + LOCK_TIMEOUT;
+            let file = loop {
+                match crate::utils::open_file_create_no_follow(&lock_path) {
+                    Ok(file) => break file,
+                    Err(error) if crate::utils::is_not_found_error(&error) => {
+                        if Instant::now() >= deadline {
+                            LOCK_DEPTH.with(|depth| depth.set(0));
+                            return Err(anyhow::anyhow!(
+                                "Cannot open lock file {}: {}",
+                                lock_path.display(),
+                                error
+                            ));
+                        }
+                        std::thread::sleep(POLL_INTERVAL);
+                    }
+                    Err(error) => {
+                        LOCK_DEPTH.with(|depth| depth.set(0));
+                        return Err(anyhow::anyhow!(
+                            "Cannot open lock file {}: {}",
+                            lock_path.display(),
+                            error
+                        ));
+                    }
+                }
+            };
 
+            crate::utils::restore_original_user_config_ownership(&lock_path)?;
             Self::lock_file(&file, &lock_path)?;
             Ok(ConfigLockGuard {
                 _file: Some(file),

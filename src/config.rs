@@ -36,6 +36,16 @@ pub fn generate_subscription_id() -> String {
     format!("sub-{hex}")
 }
 
+fn validate_subscription_id(id: &str) -> anyhow::Result<()> {
+    if id.len() != 12
+        || !id.starts_with("sub-")
+        || !id.as_bytes()[4..].iter().all(u8::is_ascii_hexdigit)
+    {
+        anyhow::bail!("invalid subscription ID: {id}");
+    }
+    Ok(())
+}
+
 /// Load subscription metadata from subscriptions.yaml
 pub fn load_subscriptions_at(paths: &AppPaths) -> anyhow::Result<Vec<SubscriptionMeta>> {
     let path = paths.subscriptions_meta_path();
@@ -52,10 +62,24 @@ pub fn load_subscriptions_at(paths: &AppPaths) -> anyhow::Result<Vec<Subscriptio
 /// Save subscription metadata to subscriptions.yaml (atomic write)
 pub fn save_subscriptions_at(paths: &AppPaths, subs: &[SubscriptionMeta]) -> anyhow::Result<()> {
     let path = paths.subscriptions_meta_path();
-    std::fs::create_dir_all(paths.config_dir())?;
+    ensure_config_directory(paths.config_dir())?;
     let content = serde_yaml::to_string(subs)?;
-    utils::atomic_write_file(&path.display().to_string(), &content)?;
+    utils::atomic_write_file_for_original_user(&path.display().to_string(), &content)?;
     Ok(())
+}
+
+fn ensure_config_directory(path: &std::path::Path) -> anyhow::Result<()> {
+    utils::ensure_dir_all_no_follow(path)?;
+    if let Some(parent) = path.parent() {
+        utils::restore_original_user_config_ownership(parent)?;
+    }
+    utils::restore_original_user_config_ownership(path)
+}
+
+fn ensure_subscriptions_directory(paths: &AppPaths) -> anyhow::Result<()> {
+    let path = paths.subscriptions_dir();
+    utils::ensure_dir_all_no_follow(&path)?;
+    utils::restore_original_user_config_ownership(&path)
 }
 
 /// Get the active subscription ID from subscriptions/active
@@ -77,8 +101,8 @@ pub fn get_active_id_at(paths: &AppPaths) -> anyhow::Result<Option<String>> {
 /// Set the active subscription ID in subscriptions/active
 pub fn set_active_id_at(paths: &AppPaths, id: &str) -> anyhow::Result<()> {
     let path = paths.active_file_path();
-    std::fs::create_dir_all(paths.subscriptions_dir())?;
-    utils::atomic_write_file(&path.display().to_string(), id)?;
+    ensure_subscriptions_directory(paths)?;
+    utils::atomic_write_file_for_original_user(&path.display().to_string(), id)?;
     Ok(())
 }
 
@@ -126,38 +150,18 @@ pub async fn add_subscription_at_with_user_agent(
         serde_yaml::from_str(&yaml_content).context("Subscription content is not valid YAML")?;
     validate_subscription_yaml(&yaml)?;
 
-    // Generate ID and save
+    // Generate ID and commit cache, metadata, and active pointer as one local transaction.
     let id = generate_subscription_id();
-    let sub_path = paths.subscription_file_path(&id);
-    std::fs::create_dir_all(paths.subscriptions_dir())?;
-    utils::atomic_write_file(&sub_path.display().to_string(), &yaml_content)?;
-
-    // Update metadata
     let mut subs = load_subscriptions_at(paths)?;
-    subs.push(SubscriptionMeta {
-        id: id.clone(),
-        url: url.to_string(),
-        updated: Utc::now(),
-        user_agent: user_agent.clone(),
-        user_agent_mode: Some(if user_agent.is_some() {
-            UserAgentMode::Fixed
-        } else {
-            UserAgentMode::Auto
-        }),
-    });
-    save_subscriptions_at(paths, &subs)?;
-
-    // Set as active based on control flag:
-    // - Some(true): force activate
-    // - Some(false): force skip
-    // - None: auto-activate only if first subscription
-    let should_activate = match activate {
-        Some(v) => v,
-        None => subs.len() == 1,
-    };
-    if should_activate {
-        set_active_id_at(paths, &id)?;
-    }
+    commit_new_subscription_at(
+        paths,
+        &id,
+        &yaml_content,
+        &mut subs,
+        url,
+        user_agent,
+        activate,
+    )?;
 
     crate::log!(
         "Added subscription {} with {} lines",
@@ -167,31 +171,153 @@ pub async fn add_subscription_at_with_user_agent(
     Ok(id)
 }
 
-/// Remove a subscription by ID
-pub fn remove_subscription_at(paths: &AppPaths, id: &str) -> anyhow::Result<()> {
-    let mut subs = load_subscriptions_at(paths)?;
+fn snapshot_optional_file(path: &std::path::Path) -> anyhow::Result<Option<String>> {
+    if path.exists() {
+        Ok(Some(std::fs::read_to_string(path)?))
+    } else {
+        Ok(None)
+    }
+}
 
-    // Find and remove from metadata
+fn restore_optional_file(path: &std::path::Path, snapshot: Option<String>) -> anyhow::Result<()> {
+    match snapshot {
+        Some(content) => {
+            utils::atomic_write_file_for_original_user(&path.display().to_string(), &content)?
+        }
+        None => utils::remove_file_if_exists(path)?,
+    }
+    Ok(())
+}
+
+pub(crate) fn commit_imported_subscription_at(
+    paths: &AppPaths,
+    id: &str,
+    yaml_content: &str,
+    url: &str,
+    activate: bool,
+) -> anyhow::Result<()> {
+    let mut subs = load_subscriptions_at(paths)?;
+    commit_new_subscription_at(
+        paths,
+        id,
+        yaml_content,
+        &mut subs,
+        url,
+        None,
+        Some(activate),
+    )
+}
+
+fn commit_new_subscription_at(
+    paths: &AppPaths,
+    id: &str,
+    yaml_content: &str,
+    subs: &mut Vec<SubscriptionMeta>,
+    url: &str,
+    user_agent: Option<String>,
+    activate: Option<bool>,
+) -> anyhow::Result<()> {
+    let cache_path = paths.subscription_file_path(id);
+    let metadata_path = paths.subscriptions_meta_path();
+    let active_path = paths.active_file_path();
+    let cache_snapshot = snapshot_optional_file(&cache_path)?;
+    let metadata_snapshot = snapshot_optional_file(&metadata_path)?;
+    let active_snapshot = snapshot_optional_file(&active_path)?;
+    let fixed_user_agent = user_agent.is_some();
+
+    ensure_subscriptions_directory(paths)?;
+    utils::atomic_write_file_for_original_user(&cache_path.display().to_string(), yaml_content)?;
+
+    subs.push(SubscriptionMeta {
+        id: id.to_string(),
+        url: url.to_string(),
+        updated: Utc::now(),
+        user_agent,
+        user_agent_mode: Some(if fixed_user_agent {
+            UserAgentMode::Fixed
+        } else {
+            UserAgentMode::Auto
+        }),
+    });
+    let should_activate = match activate {
+        Some(value) => value,
+        None => subs.len() == 1,
+    };
+
+    let result = (|| {
+        save_subscriptions_at(paths, subs)?;
+        if should_activate {
+            set_active_id_at(paths, id)?;
+        }
+        Ok::<(), anyhow::Error>(())
+    })();
+
+    if let Err(error) = result {
+        let mut rollback_errors = Vec::new();
+        if let Err(rollback_error) = restore_optional_file(&cache_path, cache_snapshot) {
+            rollback_errors.push(format!("subscription cache: {rollback_error}"));
+        }
+        if let Err(rollback_error) = restore_optional_file(&metadata_path, metadata_snapshot) {
+            rollback_errors.push(format!("subscriptions metadata: {rollback_error}"));
+        }
+        if let Err(rollback_error) = restore_optional_file(&active_path, active_snapshot) {
+            rollback_errors.push(format!("active subscription: {rollback_error}"));
+        }
+        if rollback_errors.is_empty() {
+            return Err(error);
+        }
+        anyhow::bail!(
+            "subscription add rollback incomplete: {}. Original error: {}",
+            rollback_errors.join("; "),
+            error
+        );
+    }
+    Ok(())
+}
+
+/// Remove a subscription by ID.
+pub fn remove_subscription_at(paths: &AppPaths, id: &str) -> anyhow::Result<()> {
+    validate_subscription_id(id)?;
+    let mut subs = load_subscriptions_at(paths)?;
+    let active = get_active_id_at(paths)?;
+
+    if active.as_deref() == Some(id) {
+        anyhow::bail!(
+            "cannot remove the active subscription directly; switch to another verified subscription first"
+        );
+    }
+
     let idx = subs
         .iter()
         .position(|s| s.id == id)
         .ok_or_else(|| anyhow::anyhow!("Subscription not found: {}", id))?;
+    let cache_path = paths.subscription_file_path(id);
+    let metadata_path = paths.subscriptions_meta_path();
+    let cache_snapshot = snapshot_optional_file(&cache_path)?;
+    let metadata_snapshot = snapshot_optional_file(&metadata_path)?;
     subs.remove(idx);
-    save_subscriptions_at(paths, &subs)?;
 
-    // Delete subscription file
-    let sub_path = paths.subscription_file_path(id);
-    if sub_path.exists() {
-        std::fs::remove_file(&sub_path)?;
-    }
-
-    // Clear active if this was the active subscription
-    let active = get_active_id_at(paths)?;
-    if active.as_deref() == Some(id) {
-        let active_path = paths.active_file_path();
-        if active_path.exists() {
-            std::fs::remove_file(&active_path)?;
+    let result = (|| {
+        save_subscriptions_at(paths, &subs)?;
+        utils::remove_file_if_exists(&cache_path)?;
+        Ok::<(), anyhow::Error>(())
+    })();
+    if let Err(error) = result {
+        let mut rollback_errors = Vec::new();
+        if let Err(rollback_error) = restore_optional_file(&cache_path, cache_snapshot) {
+            rollback_errors.push(format!("subscription cache: {rollback_error}"));
         }
+        if let Err(rollback_error) = restore_optional_file(&metadata_path, metadata_snapshot) {
+            rollback_errors.push(format!("subscriptions metadata: {rollback_error}"));
+        }
+        if rollback_errors.is_empty() {
+            return Err(error);
+        }
+        anyhow::bail!(
+            "subscription removal rollback incomplete: {}. Original error: {}",
+            rollback_errors.join("; "),
+            error
+        );
     }
 
     crate::log!("Removed subscription {}", id);
@@ -240,16 +366,32 @@ pub async fn refresh_subscription_at_with_user_agent(
         serde_yaml::from_str(&yaml_content).context("Downloaded content is not valid YAML")?;
     validate_subscription_yaml(&yaml)?;
 
-    // Overwrite subscription file
+    // Cache + metadata form one last-known-good transaction. If either write
+    // fails, restore both files so callers never observe a new cache paired
+    // with stale metadata (or the reverse).
     let sub_path = paths.subscription_file_path(id);
-    utils::atomic_write_file(&sub_path.display().to_string(), &yaml_content)?;
+    let meta_path = paths.subscriptions_meta_path();
+    let previous_cache = snapshot_file(&sub_path)?;
+    let previous_meta = snapshot_file(&meta_path)?;
+    utils::atomic_write_file_for_original_user(&sub_path.display().to_string(), &yaml_content)?;
 
     // Update metadata timestamp
     let mut subs = subs;
     if let Some(s) = subs.iter_mut().find(|s| s.id == id) {
         s.updated = Utc::now();
     }
-    save_subscriptions_at(paths, &subs)?;
+    if let Err(error) = save_subscriptions_at(paths, &subs) {
+        let cache_rollback = restore_file_snapshot(&sub_path, previous_cache);
+        let meta_rollback = restore_file_snapshot(&meta_path, previous_meta);
+        if let Err(rollback_error) = cache_rollback.and(meta_rollback) {
+            anyhow::bail!(
+                "Subscription refresh metadata write failed and rollback was incomplete: {rollback_error}.\n  Original error: {error}"
+            );
+        }
+        anyhow::bail!(
+            "Subscription refresh metadata write failed; restored last-known-good cache.\n  {error}"
+        );
+    }
 
     crate::log!(
         "Refreshed subscription {} with {} lines",
@@ -259,29 +401,66 @@ pub async fn refresh_subscription_at_with_user_agent(
     Ok(())
 }
 
-/// Refresh all subscriptions
-pub async fn refresh_all_at(paths: &AppPaths) -> anyhow::Result<()> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshAllReport {
+    pub refreshed: Vec<String>,
+    pub failed: Vec<(String, String)>,
+}
+
+impl RefreshAllReport {
+    pub fn is_complete(&self) -> bool {
+        self.failed.is_empty()
+    }
+
+    pub fn failure_summary(&self) -> String {
+        self.failed
+            .iter()
+            .map(|(id, error)| format!("{id}: {error}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+/// Refresh all subscriptions and report every individual outcome.
+pub async fn refresh_all_at(paths: &AppPaths) -> anyhow::Result<RefreshAllReport> {
     let subs = load_subscriptions_at(paths)?;
+    let mut report = RefreshAllReport {
+        refreshed: Vec::new(),
+        failed: Vec::new(),
+    };
     for sub in &subs {
         crate::log!("Refreshing subscription {}...", sub.id);
-        if let Err(e) = refresh_subscription_at(paths, &sub.id).await {
-            crate::log!("Failed to refresh {}: {}", sub.id, e);
-            // Continue with other subscriptions
+        match refresh_subscription_at(paths, &sub.id).await {
+            Ok(()) => report.refreshed.push(sub.id.clone()),
+            Err(error) => {
+                crate::log!("Failed to refresh {}: {}", sub.id, error);
+                report.failed.push((sub.id.clone(), error.to_string()));
+            }
         }
     }
-    Ok(())
+    Ok(report)
 }
 
 /// Switch to a subscription by ID by updating subscriptions/active.
 ///
-/// This function intentionally does not merge config.yaml; callers that change
-/// the active subscription should run `merge_user_config_checked_at()` and roll
-/// back the active file if validation fails.
+/// The cached subscription is validated before the active pointer changes, so
+/// a missing or malformed cache cannot create an invalid active state.
 pub fn switch_subscription_at(paths: &AppPaths, id: &str) -> anyhow::Result<()> {
     let subs = load_subscriptions_at(paths)?;
     if find_subscription(&subs, id).is_none() {
         anyhow::bail!("Subscription not found: {}", id);
     }
+
+    let cache_path = paths.subscription_file_path(id);
+    let content = std::fs::read_to_string(&cache_path)
+        .with_context(|| format!("Subscription cache not found: {}", cache_path.display()))?;
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&content).with_context(|| {
+        format!(
+            "Subscription cache is not valid YAML: {}",
+            cache_path.display()
+        )
+    })?;
+    validate_subscription_yaml(&yaml)?;
 
     set_active_id_at(paths, id)?;
 
@@ -411,9 +590,9 @@ fn fetch_subscription_content_to_file(
     validate_subscription_yaml(&yaml)?;
 
     if let Some(parent) = output_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)?;
+        utils::ensure_dir_all_no_follow(parent)?;
     }
-    utils::atomic_write_file(&output_path.display().to_string(), &yaml_content)?;
+    utils::atomic_write_file_for_original_user(&output_path.display().to_string(), &yaml_content)?;
 
     Ok(FetchSubscriptionReport {
         output_path: output_path.to_path_buf(),
@@ -970,13 +1149,31 @@ pub fn save_config_at(
     save_config_at_endpoint(paths, content, mihomo_path, &current_api_endpoint())
 }
 
+fn validation_rollback_error(
+    action: &str,
+    validation_error: &anyhow::Error,
+    rollback: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if let Err(rollback_error) = rollback {
+        anyhow::bail!(
+            "Config validation failed after {action}; rollback incomplete: {}.\n  Original error: {}",
+            rollback_error,
+            validation_error
+        );
+    }
+    anyhow::bail!(
+        "Config validation failed after {action}; rolled back config.yaml.\n  {}",
+        validation_error
+    )
+}
+
 pub fn save_config_at_endpoint(
     paths: &AppPaths,
     content: &str,
     mihomo_path: Option<&std::path::Path>,
     endpoint: &ApiEndpoint,
 ) -> anyhow::Result<()> {
-    std::fs::create_dir_all(paths.config_dir())?;
+    ensure_config_directory(paths.config_dir())?;
     let path = paths.config_path();
     let previous = snapshot_file(&path)?;
 
@@ -990,14 +1187,13 @@ pub fn save_config_at_endpoint(
     let normalized = serde_yaml::to_string(&yaml)?;
     let content = ensure_controller_for_endpoint(&normalized, endpoint)?;
 
-    utils::atomic_write_file(&path.display().to_string(), &content)?;
+    utils::atomic_write_file_for_original_user(&path.display().to_string(), &content)?;
 
     if let Err(validation_error) = validate_config_at(paths, mihomo_path) {
-        restore_file_snapshot(&path, previous)?;
-        anyhow::bail!(
-            "Config validation failed after save; rolled back config.yaml.
-  {}",
-            validation_error
+        return validation_rollback_error(
+            "save",
+            &validation_error,
+            restore_file_snapshot(&path, previous),
         );
     }
 
@@ -1036,15 +1232,14 @@ pub fn fix_existing_config_at(
     }
 
     let previous = Some(content);
-    utils::atomic_write_file(&path.display().to_string(), &fixed)?;
+    utils::atomic_write_file_for_original_user(&path.display().to_string(), &fixed)?;
 
     if let Err(validation_error) = validate_config_at(paths, mihomo_path) {
-        restore_file_snapshot(&path, previous)?;
-        anyhow::bail!(
-            "Config validation failed after fix; rolled back config.yaml.
-  {}",
-            validation_error
-        );
+        validation_rollback_error(
+            "fix",
+            &validation_error,
+            restore_file_snapshot(&path, previous),
+        )?;
     }
 
     Ok(true)
@@ -1066,15 +1261,14 @@ pub fn fix_existing_config_at_endpoint(
     }
 
     let previous = Some(content);
-    utils::atomic_write_file(&path.display().to_string(), &fixed)?;
+    utils::atomic_write_file_for_original_user(&path.display().to_string(), &fixed)?;
 
     if let Err(validation_error) = validate_config_at(paths, mihomo_path) {
-        restore_file_snapshot(&path, previous)?;
-        anyhow::bail!(
-            "Config validation failed after fix; rolled back config.yaml.
-  {}",
-            validation_error
-        );
+        validation_rollback_error(
+            "fix",
+            &validation_error,
+            restore_file_snapshot(&path, previous),
+        )?;
     }
 
     Ok(true)
@@ -1093,13 +1287,11 @@ fn restore_file_snapshot(path: &std::path::Path, snapshot: Option<String>) -> an
     match snapshot {
         Some(content) => {
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
+                utils::ensure_dir_all_no_follow(parent)?;
             }
-            utils::atomic_write_file(&path.display().to_string(), &content)?;
+            utils::atomic_write_file_for_original_user(&path.display().to_string(), &content)?;
         }
-        None => {
-            let _ = std::fs::remove_file(path);
-        }
+        None => utils::remove_file_if_exists(path)?,
     }
     Ok(())
 }
@@ -1178,6 +1370,27 @@ fn validate_subscription_yaml(yaml: &serde_yaml::Value) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Generate the initial direct-only user-effective configuration used before the first subscription.
+pub fn generate_direct_only_config_yaml_for_endpoint(
+    endpoint: &ApiEndpoint,
+    user_rules: &[String],
+    dns_policies: &[crate::dns::DnsPolicy],
+    fake_ip_filters: &[String],
+    rule_position: crate::rules::RulePosition,
+) -> anyhow::Result<String> {
+    let base = serde_yaml::from_str::<serde_yaml::Value>(
+        "mode: rule\nmixed-port: 7897\ntun:\n  enable: false\nproxies: []\nproxy-groups: []\nrules:\n  - MATCH,DIRECT\n",
+    )?;
+    generate_config_yaml_with_fake_ip_filters_for_endpoint(
+        &base,
+        user_rules,
+        dns_policies,
+        fake_ip_filters,
+        rule_position,
+        endpoint,
+    )
 }
 
 /// Generate final config.yaml from subscription + user rules + DNS policies.
@@ -1429,6 +1642,89 @@ fn apply_override_to_config_text_at_endpoint(
     Ok(serde_yaml::to_string(&config)?)
 }
 
+fn apply_groups_override_to_config_text(
+    paths: &AppPaths,
+    subscription_id: &str,
+    config_content: &str,
+) -> anyhow::Result<String> {
+    let overlay_path = paths.groups_override_path_for_subscription(subscription_id);
+    let overlay = crate::groups::GroupsOverlay::load(&overlay_path)?;
+    if overlay.prepend.is_empty() && overlay.append.is_empty() && overlay.delete.is_empty() {
+        return Ok(config_content.to_string());
+    }
+
+    let global_override_path = paths.override_path();
+    if global_override_path.exists() {
+        let global_content = std::fs::read_to_string(&global_override_path).with_context(|| {
+            format!(
+                "Failed to read override.yaml: {}",
+                global_override_path.display()
+            )
+        })?;
+        let global: serde_yaml::Value =
+            serde_yaml::from_str(&global_content).with_context(|| {
+                format!(
+                    "Failed to parse override.yaml: {}",
+                    global_override_path.display()
+                )
+            })?;
+        if global
+            .as_mapping()
+            .is_some_and(|map| map.contains_key(serde_yaml::Value::String("proxy-groups".into())))
+        {
+            anyhow::bail!(
+                "groups overlay cannot be applied while override.yaml defines proxy-groups; remove that section or edit it through its owning configuration"
+            );
+        }
+    }
+
+    let mut config: serde_yaml::Value = serde_yaml::from_str(config_content).map_err(|e| {
+        anyhow::anyhow!(
+            "Generated config is invalid YAML before groups overlay: {}",
+            e
+        )
+    })?;
+    let config_map = config
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("Generated config must be a YAML mapping"))?;
+    let original_groups = match config_map.remove(serde_yaml::Value::String("proxy-groups".into()))
+    {
+        Some(serde_yaml::Value::Sequence(groups)) => groups,
+        Some(value) => {
+            config_map.insert(serde_yaml::Value::String("proxy-groups".into()), value);
+            anyhow::bail!("Generated config proxy-groups must be a list")
+        }
+        None => Vec::new(),
+    };
+    let known_proxies = config_map
+        .get(serde_yaml::Value::String("proxies".into()))
+        .and_then(serde_yaml::Value::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter_map(|proxy| match proxy {
+            serde_yaml::Value::Mapping(map) => map
+                .get(serde_yaml::Value::String("name".into()))
+                .and_then(serde_yaml::Value::as_str),
+            serde_yaml::Value::String(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .map(str::to_owned)
+        .collect();
+    let known_providers = config_map
+        .get(serde_yaml::Value::String("proxy-providers".into()))
+        .and_then(serde_yaml::Value::as_mapping)
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, _)| name.as_str().map(str::to_owned))
+        .collect();
+    let merged = overlay.merged_groups(&original_groups, &known_proxies, &known_providers)?;
+    config_map.insert(
+        serde_yaml::Value::String("proxy-groups".into()),
+        serde_yaml::Value::Sequence(merged),
+    );
+    Ok(serde_yaml::to_string(&config)?)
+}
+
 /// Merge user-defined rules and DNS policies into config.yaml.
 ///
 /// New implementation: reads from subscriptions/<active-id>.yaml and generates config.yaml.
@@ -1505,6 +1801,7 @@ pub fn merge_user_config_at_endpoint(
             position,
             endpoint,
         )?;
+        let config_content = apply_groups_override_to_config_text(paths, &id, &config_content)?;
         let config_content =
             apply_override_to_config_text_at_endpoint(paths, &config_content, endpoint)?;
 
@@ -1512,7 +1809,10 @@ pub fn merge_user_config_at_endpoint(
         serde_yaml::from_str::<serde_yaml::Value>(&config_content)
             .map_err(|e| anyhow::anyhow!("Generated config is invalid YAML: {}", e))?;
 
-        utils::atomic_write_file(&paths.config_path().display().to_string(), &config_content)?;
+        utils::atomic_write_file_for_original_user(
+            &paths.config_path().display().to_string(),
+            &config_content,
+        )?;
 
         crate::log!(
             "Generated config from subscription {}: {} rules, {} DNS policies",
@@ -1520,13 +1820,11 @@ pub fn merge_user_config_at_endpoint(
             user_rules.len(),
             dns_policies.len()
         );
-    } else {
-        // Legacy flow: read from config.yaml directly (backward compatibility)
+    } else if paths.config_path().exists() {
+        // Preserve a manually imported legacy config until a subscription is activated.
         let config_path = paths.config_path();
-        if !config_path.exists() {
-            anyhow::bail!("No active subscription and no config.yaml found.\n  Run: mihomo-cli config --add <URL>");
-        }
-
+        let config_content = std::fs::read_to_string(&config_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read config.yaml: {e}"))?;
         let user_rules = if paths.rules_path().exists() {
             rules::load_rules_at(paths).unwrap_or_default()
         } else {
@@ -1537,42 +1835,62 @@ pub fn merge_user_config_at_endpoint(
         } else {
             Vec::new()
         };
-
-        let config_content = std::fs::read_to_string(&config_path)
-            .map_err(|e| anyhow::anyhow!("Failed to read config.yaml: {}", e))?;
-
         let position = rules::get_position_at(paths).unwrap_or(RulePosition::Front);
-
-        // Use the serde_yaml-validated marker editor for legacy flow
         use crate::yaml_editor::YamlEditor;
         let mut editor = YamlEditor::parse(&config_content)
-            .map_err(|e| anyhow::anyhow!("Failed to parse config.yaml: {}", e))?;
-
+            .map_err(|e| anyhow::anyhow!("Failed to parse config.yaml: {e}"))?;
         editor
             .merge_rules(&user_rules, matches!(position, RulePosition::Front))
-            .map_err(|e| anyhow::anyhow!("Failed to merge user rules: {}", e))?;
-
+            .map_err(|e| anyhow::anyhow!("Failed to merge user rules: {e}"))?;
         if !dns_policies.is_empty() {
             editor
                 .merge_dns_policies(&dns_policies)
-                .map_err(|e| anyhow::anyhow!("Failed to merge DNS policies: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to merge user DNS policies: {e}"))?;
         }
-
-        let result = editor.into_source();
-        let result = apply_override_to_config_text_at_endpoint(paths, &result, endpoint)?;
-
+        let result =
+            apply_override_to_config_text_at_endpoint(paths, &editor.into_source(), endpoint)?;
         serde_yaml::from_str::<serde_yaml::Value>(&result)
-            .map_err(|e| anyhow::anyhow!("Merged config is invalid YAML: {}", e))?;
-
+            .map_err(|e| anyhow::anyhow!("Merged config is invalid YAML: {e}"))?;
         if result != config_content {
-            utils::atomic_write_file(&config_path.display().to_string(), &result)?;
+            utils::atomic_write_file_for_original_user(
+                &config_path.display().to_string(),
+                &result,
+            )?;
         }
-
-        crate::log!(
-            "Legacy merge: {} rules, {} DNS policies",
-            user_rules.len(),
-            dns_policies.len()
-        );
+        crate::log!("Preserved legacy config without an active subscription");
+    } else {
+        let user_rules = if paths.rules_path().exists() {
+            rules::load_rules_at(paths).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let dns_policies = if paths.dns_policy_path().exists() {
+            crate::dns::load_policies_at(paths).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let fake_ip_filters = if paths.dns_fake_ip_filter_path().exists() {
+            crate::dns::load_fake_ip_filters_at(paths).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let position = rules::get_position_at(paths).unwrap_or(RulePosition::Front);
+        let config_content = generate_direct_only_config_yaml_for_endpoint(
+            endpoint,
+            &user_rules,
+            &dns_policies,
+            &fake_ip_filters,
+            position,
+        )?;
+        let config_content =
+            apply_override_to_config_text_at_endpoint(paths, &config_content, endpoint)?;
+        serde_yaml::from_str::<serde_yaml::Value>(&config_content)
+            .map_err(|e| anyhow::anyhow!("Generated direct-only config is invalid YAML: {e}"))?;
+        utils::atomic_write_file_for_original_user(
+            &paths.config_path().display().to_string(),
+            &config_content,
+        )?;
+        crate::log!("Generated direct-only config without an active subscription");
     }
 
     Ok(())
@@ -1611,13 +1929,19 @@ pub fn merge_user_config_checked_at_endpoint(
     merge_user_config_at_endpoint(paths, endpoint)?;
 
     if let Err(validation_error) = validate_config_at(paths, mihomo_path) {
-        match previous {
-            Some(content) => {
-                utils::atomic_write_file(&config_path.display().to_string(), &content)?;
-            }
-            None => {
-                let _ = std::fs::remove_file(&config_path);
-            }
+        let rollback = match previous {
+            Some(content) => utils::atomic_write_file_for_original_user(
+                &config_path.display().to_string(),
+                &content,
+            ),
+            None => utils::remove_file_if_exists(&config_path),
+        };
+        if let Err(rollback_error) = rollback {
+            anyhow::bail!(
+                "Config validation failed after write; rollback incomplete: {}.\n  Original error: {}",
+                rollback_error,
+                validation_error
+            );
         }
         anyhow::bail!(
             "Config validation failed after write; rolled back config.yaml.\n  {}",
@@ -2095,13 +2419,16 @@ external-controller-unix: /tmp/stale-user.sock
         f.write_all(b"new content that should not appear").unwrap();
         drop(f); // close handle without renaming
 
-        // Now atomic_write_file should overwrite .tmp AND rename
+        // The current writer uses a random O_EXCL temp name, so an interrupted
+        // legacy fixed .tmp cannot redirect or block the transaction.
         crate::utils::atomic_write_file(&target_str, "final content").unwrap();
 
         // Target should be "final content", not "original" or "new content"
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "final content");
-        // .tmp should NOT exist after atomic write
-        assert!(!std::path::Path::new(&tmp_path).exists());
+        assert_eq!(
+            std::fs::read_to_string(&tmp_path).unwrap(),
+            "new content that should not appear"
+        );
     }
 
     // ── Phase 2: Multi-subscription data layer tests ──
@@ -2661,12 +2988,13 @@ rules:
     }
 
     #[test]
-    fn test_remove_active_subscription() {
+    fn test_remove_active_subscription_requires_verified_replacement() {
         let tmp = TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());
 
         let sub1 = "sub-aaaa1111";
-        setup_test_subscription(&paths, sub1, "proxies: []");
+        let content = "proxies: []\nproxy-groups: []\nrules:\n  - MATCH,DIRECT\n";
+        setup_test_subscription(&paths, sub1, content);
 
         let subs = vec![SubscriptionMeta {
             id: sub1.to_string(),
@@ -2678,11 +3006,15 @@ rules:
         save_subscriptions_at(&paths, &subs).unwrap();
         set_active_id_at(&paths, sub1).unwrap();
 
-        // Remove the active subscription
-        remove_subscription_at(&paths, sub1).unwrap();
+        let error = remove_subscription_at(&paths, sub1).unwrap_err();
 
-        // Active should be cleared
-        assert_eq!(get_active_id_at(&paths).unwrap(), None);
+        assert!(error.to_string().contains("active subscription"));
+        assert_eq!(get_active_id_at(&paths).unwrap(), Some(sub1.to_string()));
+        assert_eq!(load_subscriptions_at(&paths).unwrap().len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(paths.subscription_file_path(sub1)).unwrap(),
+            content
+        );
     }
 
     #[test]
@@ -2693,6 +3025,36 @@ rules:
 
         let result = remove_subscription_at(&paths, "sub-nonexist");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_new_subscription_commit_writes_cache_metadata_and_active_pointer() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let mut subs = Vec::new();
+        let id = "sub-aaaa1111";
+        let yaml = "proxies: []\nproxy-groups: []\nrules:\n  - MATCH,DIRECT\n";
+
+        commit_new_subscription_at(
+            &paths,
+            id,
+            yaml,
+            &mut subs,
+            "file:///fixture.yaml",
+            None,
+            Some(true),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(paths.subscription_file_path(id)).unwrap(),
+            yaml
+        );
+        assert_eq!(get_active_id_at(&paths).unwrap(), Some(id.to_string()));
+        let saved = load_subscriptions_at(&paths).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].id, id);
+        assert_eq!(saved[0].url, "file:///fixture.yaml");
     }
 
     #[test]
@@ -2737,6 +3099,41 @@ rules:
         merge_user_config_checked_at(&paths, None).unwrap();
         let config = std::fs::read_to_string(paths.config_path()).unwrap();
         assert!(config.contains("mixed-port: 7891"));
+    }
+
+    #[test]
+    fn test_switch_missing_cache_keeps_previous_active_subscription() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let sub1 = "sub-aaaa1111";
+        let sub2 = "sub-bbbb2222";
+        setup_test_subscription(&paths, sub1, "proxies: []\n");
+        save_subscriptions_at(
+            &paths,
+            &[
+                SubscriptionMeta {
+                    id: sub1.to_string(),
+                    url: "https://a.com".to_string(),
+                    updated: Utc::now(),
+                    user_agent: None,
+                    user_agent_mode: Some(UserAgentMode::Auto),
+                },
+                SubscriptionMeta {
+                    id: sub2.to_string(),
+                    url: "https://b.com".to_string(),
+                    updated: Utc::now(),
+                    user_agent: None,
+                    user_agent_mode: Some(UserAgentMode::Auto),
+                },
+            ],
+        )
+        .unwrap();
+        set_active_id_at(&paths, sub1).unwrap();
+
+        let error = switch_subscription_at(&paths, sub2).unwrap_err();
+
+        assert!(error.to_string().contains("cache not found"));
+        assert_eq!(get_active_id_at(&paths).unwrap(), Some(sub1.to_string()));
     }
 
     #[test]
@@ -2950,6 +3347,41 @@ proxies: []
             std::fs::read_to_string(paths.config_path()).unwrap(),
             original
         );
+    }
+
+    #[test]
+    fn checked_merge_generates_direct_only_config_without_subscription() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+
+        merge_user_config_checked_at(&paths, None).unwrap();
+
+        let config: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(paths.config_path()).unwrap()).unwrap();
+        assert_eq!(config["mode"].as_str(), Some("rule"));
+        assert_eq!(config["proxies"].as_sequence().map(Vec::len), Some(0));
+        assert_eq!(config["proxy-groups"].as_sequence().map(Vec::len), Some(0));
+        assert_eq!(config["rules"][0].as_str(), Some("MATCH,DIRECT"));
+        assert!(config["mixed-port"].as_u64().is_some());
+        assert!(config["external-controller-unix"].as_str().is_some());
+    }
+
+    #[test]
+    fn checked_merge_preserves_legacy_config_without_subscription() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let original = "mode: rule\nmixed-port: 7890\nproxies: []\nrules:\n  - MATCH,DIRECT\n";
+        std::fs::write(paths.config_path(), original).unwrap();
+
+        merge_user_config_checked_at(&paths, None).unwrap();
+
+        let config: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(paths.config_path()).unwrap()).unwrap();
+        assert_eq!(config["mixed-port"].as_u64(), Some(7890));
+        assert_eq!(config["rules"][0].as_str(), Some("MATCH,DIRECT"));
+        assert!(config["external-controller-unix"].as_str().is_some());
     }
 
     #[test]

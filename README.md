@@ -49,25 +49,25 @@ cargo install --path .
 
 ## 最小核心流程（推荐）
 
-日常使用不需要记住 `--system`。普通代理模式走 per-user service；需要 TUN/全机透明代理时，直接执行 `mihomo-cli tun on`，CLI 会在需要时引导安装 system service 并请求一次管理员密码。
+普通用户先完成基础服务安装；即使没有订阅，install 也会生成 direct-only 基础配置并启动普通 Core/API。后续可以再导入/添加订阅并显式 restart；TUN 仍必须显式执行 `tun on`，CLI 会在 TUN 操作边界内执行必要的授权，不要求用户手工拼接 `sudo`。
 
 ```bash
-mihomo-cli install                         # 交互式选择：普通代理模式 / TUN 全机模式
-mihomo-cli config -u '<subscription-url>'  # 添加订阅（始终写入当前用户配置）
-mihomo-cli start                           # 自动检测当前实例并启动 core/service
+mihomo-cli uninstall --all --yes          # 可选：从零清理受管实例
+mihomo-cli install --system --yes         # 生成 direct-only 配置并启动普通 Core；TUN 仍关闭
+mihomo-cli status                          # 只读状态摘要；默认不触网、不 sudo、不写入
+mihomo-cli config --import ./config.yaml --activate --yes  # 可选：运行中的 system service 会立即受管 promotion
+# 仅当 import 输出 pending/unknown/recovery，或需要应用 pending generation 时：
+# mihomo-cli restart --system
 mihomo-cli select                          # 选择节点（TUI：j/k 或 ↑/↓，/ 过滤；或 --node 非交互切换）
-mihomo-cli status                          # 简洁查看运行态；--verbose 查看诊断路径/探针
-mihomo-cli exit-ip --group "节点选择"      # 查询某个代理组当前出口 IP
-mihomo-cli exit-ip --url https://github.com # 查询 URL 按规则会走到的出口估算
+mihomo-cli exit-ip --group "节点选择"      # 显式数据面探测某个代理组的出口 IP
 mihomo-cli rule test baidu.com             # 检查规则会走哪个策略
-mihomo-cli tun on                          # 开启 TUN；必要时自动引导安装 system service
-mihomo-cli tun status                      # 查看 TUN 状态
-mihomo-cli tun off                         # 关闭 TUN
-mihomo-cli autostart on                    # 开启开机自启（默认关闭，显式开启）
-mihomo-cli autostart status                # 查询自启状态
+mihomo-cli tun on --yes                    # 显式请求 TUN；成功须由 runtime attestation 证明，不等于目标数据面已验证
+mihomo-cli tun status                      # 查看真实运行态；不可观察时显示 unknown
+mihomo-cli tun off                         # 显式关闭 TUN
+mihomo-cli restart --system                # 需要时显式重启以应用持久配置
 ```
 
-没有管理员权限时可用 `mihomo-cli install --user` 安装普通代理模式。`--system` 仍保留给脚本、排障或显式指定 system service context，日常命令通常不需要。开机自启默认关闭（ADR-17），需 `mihomo-cli autostart on` 显式开启。
+没有管理员权限时可用 `mihomo-cli install --user` 安装普通代理模式。`--system` 用于 system service context；TUN 只能在 system 模式执行。`start` 保留为兼容/高级命令，普通用户主旅程优先使用 `restart`。`doctor`、`tun status` 和 `autostart status` 是只读/高级诊断入口，不替代 `config`、`restart` 或 `tun on` 的主流程。开机自启默认关闭，需显式开启。
 
 ## 文档
 
@@ -77,7 +77,7 @@ mihomo-cli autostart status                # 查询自启状态
 | [CHANGELOG.md](CHANGELOG.md) | 变更记录 |
 | [SPEC.md](SPEC.md) | 软件设计文档 |
 | [CONTEXT.md](CONTEXT.md) | 领域知识与术语表 |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | 贡献指南 |
+| [贡献指南](docs/contributing/README.md) | 贡献指南 |
 
 ## 平台支持
 
@@ -89,7 +89,7 @@ mihomo-cli autostart status                # 查询自启状态
 
 ## 核心设计理念
 
-- **安装 + 控制一体**：一个二进制完成从零部署到日常使用
+- **目标导向的基础旅程**：先安装基础设施、导入有效配置、显式 restart，再按需要显式开启 TUN；安装、查询和修复不要求用户管理 daemon/Core/socket 细节
 - **订阅自动转换**：自动识别并转换 vmess:// / base64 / Clash YAML 三种格式
 - **crossterm TUI 交互**：`select` 和 `config` 命令使用 crossterm 实现真正的键盘快捷键（j/k 导航、/ 过滤）
 - **零运行时依赖**：不依赖 curl、jq、python3、fzf 外部工具
@@ -159,7 +159,7 @@ dns:
 
 ## 订阅 UA 协商
 
-从 URL 添加/刷新订阅时，mihomo-cli 会用少量 Clash-compatible User-Agent 串行请求，拿到 Clash YAML 后立即停止，降低触发服务端限流的风险。可用 `mihomo-cli config --probe <URL>` 查看不同 UA 返回的格式和规则数量；可用 `--user-agent` 或 `--set-ua` 固定某个订阅的 UA。
+从 URL 添加/刷新订阅时，mihomo-cli 会用少量 Clash-compatible User-Agent 串行请求，拿到 Clash YAML 后立即停止，降低触发服务端限流的风险。可用 `mihomo-cli config probe <URL>` 查看不同 UA 返回的格式和规则数量；可用 `mihomo-cli config ua set <id> <ua|auto>` 固定或恢复某个订阅的 UA，也可在单次 `config fetch/add/refresh` 中使用局部 `--user-agent` 参数。
 
 当前边界：UA 探测只面向 Clash/Mihomo 兼容配置，目标是获取供应商原始 Clash YAML；不会默认探测 Surge、Quantumult X、Shadowrocket、v2rayN 等非 Clash 生态 UA。未来如需支持其它生态，应作为独立功能扩展设计。
 

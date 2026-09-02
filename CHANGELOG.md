@@ -4,6 +4,32 @@
 
 ---
 
+## 2026-09-03
+
+### ✨ Features
+
+- **代理组管理** — 新增 `group create/edit/add/remove/delete/list/show`，支持按订阅保存代理组覆盖、五种 Mihomo 代理组类型及成员与 provider 引用校验；Core 停止时合法修改会保存为 pending，待显式 `restart` 应用。
+- **节点选择持久化** — `select` 成功后按订阅保存代理组选择，Core reload/restart 后自动重放；支持取消固定选择，并明确报告节点或代理组缺失造成的 drift。
+- **分阶段系统升级** — 运行中的 system 实例可先准备完整、校验后的 pending generation，再由显式 `restart` 应用，避免安装或更新过程静默中断代理连接。
+- **统一状态快照** — `status`、TUN 状态和配置应用结果统一区分配置意图、daemon/Core 运行态、API 可达性及 revision 证明，无法观察时明确显示 unknown。
+
+### 🐛 Bug Fixes
+
+- **System 配置应用** — system 模式无论 TUN 是否开启都通过受管 promotion 应用配置，修复直接 reload 用户配置路径导致的失败。
+- **Restart 自动恢复** — `restart` 可修复受管配置所有权、daemon 授权、二进制版本漂移及可安全恢复的遗留 TUN 事务。
+- **TUN 生命周期收敛** — 修复 stale prepared transaction、snapshot 权限、Geo 数据权限以及 launched revision 不一致等导致的 TUN 开关或恢复失败。
+- **跨平台服务生命周期** — 修复 macOS 服务组创建、Darwin no-follow 文件操作及系统服务升级/卸载恢复流程。
+- **交互选择器取消** — 按 `Esc` 现在作为正常取消处理，不再被报告为命令错误；交互式与非交互式节点选择使用一致的受管分发路径。
+
+### 🔒 Security
+
+- **特权路径与身份校验加固** — 下载暂存、安装、更新、token、ACL 和用户 Core 校验统一使用 no-follow 与 fail-closed 身份解析，降低符号链接、路径重绑定和错误身份写入风险。
+- **System 状态权限收敛** — 加固共享状态目录、generation、TUN snapshot 和事务恢复的所有权与权限检查，避免跨权限域操作留下不可恢复状态。
+
+### 📚 Documentation
+
+- **运行态与恢复合同** — 更新中英文使用说明、架构、安全与用户旅程文档，明确 pending/runtime_applied/unknown 语义及 `restart` 的统一恢复入口。
+
 ## 0.5.0 (2026-08-09)
 
 ### 🔒 Security
@@ -117,8 +143,6 @@ mihomo-cli install --system
 ---
 
 ## 2026-07-22
-
-> 完整方案与实施细节见 [docs/archive/2026-07-22-bugfix-batch.md](docs/archive/2026-07-22-bugfix-batch.md)
 
 ### 🐛 Bug Fixes
 - **macOS socket 迁移** — socket 路径从 `/tmp/mihomo` 迁移到 `~/.config/mihomo/run`，消除 root/user 权限冲突和多用户抢占；迁移时检查旧 socket 活性
