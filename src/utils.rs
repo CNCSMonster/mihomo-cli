@@ -1053,6 +1053,19 @@ pub fn set_directory_mode_no_follow(path: &Path, mode: u16) -> anyhow::Result<()
         return Err(std::io::Error::last_os_error().into());
     }
     let dir = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(dir.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let stat = unsafe { stat.assume_init() };
+
+    let current_mode = stat.st_mode & 0o777;
+    let target_mode = mode as libc::mode_t & 0o777;
+    if current_mode == target_mode {
+        return Ok(());
+    }
+
     if unsafe { libc::fchmod(dir.as_raw_fd(), mode as libc::mode_t) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
@@ -1063,6 +1076,117 @@ pub fn set_directory_mode_no_follow(path: &Path, mode: u16) -> anyhow::Result<()
 #[allow(dead_code)]
 pub fn set_directory_mode_no_follow(_path: &Path, _mode: u16) -> anyhow::Result<()> {
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn is_managed_system_state_dir_present() -> bool {
+    Path::new("/var/lib/mihomo-cli").exists()
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub fn is_managed_system_state_dir_present() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+pub fn check_system_state_dir_needs_repair() -> anyhow::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    let path = Path::new("/var/lib/mihomo-cli");
+    if !path.exists() {
+        return Ok(false);
+    }
+    let dir = match open_directory_no_follow(path) {
+        Ok(dir) => dir,
+        Err(_) => return Ok(true),
+    };
+    let group = unsafe { libc::getgrnam(c"mihomo".as_ptr()) };
+    let user = unsafe { libc::getpwnam(c"mihomo".as_ptr()) };
+    if group.is_null() || user.is_null() {
+        return Ok(true);
+    }
+    let uid = unsafe { (*user).pw_uid };
+    let gid = unsafe { (*group).gr_gid };
+
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(dir.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Ok(true);
+    }
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_uid != 0 || stat.st_gid != gid || (stat.st_mode & 0o777) != 0o770 {
+        return Ok(true);
+    }
+
+    let transactions_path = path.join("transactions");
+    match open_directory_no_follow(&transactions_path) {
+        Ok(transaction_dir) => {
+            let mut transaction_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe { libc::fstat(transaction_dir.as_raw_fd(), transaction_stat.as_mut_ptr()) }
+                != 0
+            {
+                return Ok(true);
+            }
+            let transaction_stat = unsafe { transaction_stat.assume_init() };
+            if transaction_stat.st_uid != uid
+                || transaction_stat.st_gid != gid
+                || (transaction_stat.st_mode & 0o777) != 0o750
+            {
+                return Ok(true);
+            }
+        }
+        Err(_) => return Ok(true),
+    }
+
+    let gc_path = path.join("transactions/gc");
+    if let Ok(gc_dir) = open_directory_no_follow(&gc_path) {
+        let mut gc_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(gc_dir.as_raw_fd(), gc_stat.as_mut_ptr()) } != 0 {
+            return Ok(true);
+        }
+        let gc_stat = unsafe { gc_stat.assume_init() };
+        if gc_stat.st_uid != uid || gc_stat.st_gid != gid || (gc_stat.st_mode & 0o777) != 0o750 {
+            return Ok(true);
+        }
+    }
+
+    let active_transaction_path = path.join("transactions/active");
+    if let Ok(active_dir) = open_directory_no_follow(&active_transaction_path) {
+        let mut active_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(active_dir.as_raw_fd(), active_stat.as_mut_ptr()) } != 0 {
+            return Ok(true);
+        }
+        let active_stat = unsafe { active_stat.assume_init() };
+        if active_stat.st_uid != uid
+            || active_stat.st_gid != gid
+            || (active_stat.st_mode & 0o777) != 0o750
+        {
+            return Ok(true);
+        }
+    }
+
+    let snapshot_path = path.join("tun-config.yaml");
+    if let Ok(snapshot_file) = open_regular_file_no_follow(&snapshot_path) {
+        let mut snapshot_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(snapshot_file.as_raw_fd(), snapshot_stat.as_mut_ptr()) } != 0 {
+            return Ok(true);
+        }
+        let snapshot_stat = unsafe { snapshot_stat.assume_init() };
+        if snapshot_stat.st_uid != uid
+            || snapshot_stat.st_gid != gid
+            || (snapshot_stat.st_mode & 0o777) != 0o640
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub fn check_system_state_dir_needs_repair() -> anyhow::Result<bool> {
+    Ok(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -2205,7 +2329,7 @@ mod tests {
 
     #[test]
     fn sanitize_sensitive_masks_api_key() {
-        let msg = "api_key: test-placeholder";
+        let msg = "api_key: sk-1234567890abcdef";
         assert_eq!(sanitize_sensitive(msg), "api_key=***");
     }
 
@@ -2550,5 +2674,42 @@ mod tests {
         assert!(fp_a.is_some());
         assert_eq!(fp_a, fp_b);
         assert_ne!(fp_a, fp_c);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_set_directory_mode_no_follow_idempotent() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target_dir = temp.path().join("sub_dir");
+        std::fs::create_dir(&target_dir).unwrap();
+
+        // 第一次设置权限为 0750
+        set_directory_mode_no_follow(&target_dir, 0o750).unwrap();
+        let mode = std::fs::metadata(&target_dir).unwrap().mode();
+        assert_eq!(mode & 0o7777, 0o750);
+
+        // 第二次设置相同权限，测试幂等短路
+        set_directory_mode_no_follow(&target_dir, 0o750).unwrap();
+        let mode = std::fs::metadata(&target_dir).unwrap().mode();
+        assert_eq!(mode & 0o7777, 0o750);
+
+        // 测试包含 setgid 位 (0o2750) 时的幂等短路兼容性
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&target_dir, std::fs::Permissions::from_mode(0o2750));
+        let current_raw = std::fs::metadata(&target_dir).unwrap().mode();
+        if current_raw & 0o2000 != 0 {
+            // 支持 setgid 的环境下，传入 0o750 应当成功幂等短路且不破坏 setgid
+            set_directory_mode_no_follow(&target_dir, 0o750).unwrap();
+            let after_mode = std::fs::metadata(&target_dir).unwrap().mode();
+            assert_eq!(after_mode & 0o777, 0o750);
+            assert_eq!(after_mode & 0o2000, 0o2000);
+        }
+
+        // 修改为不同权限 0700
+        set_directory_mode_no_follow(&target_dir, 0o700).unwrap();
+        let mode = std::fs::metadata(&target_dir).unwrap().mode();
+        assert_eq!(mode & 0o7777, 0o700);
     }
 }

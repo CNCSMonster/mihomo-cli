@@ -6335,6 +6335,35 @@ fn ensure_system_config_ownership_for_lifecycle(
     Ok(())
 }
 
+#[cfg(unix)]
+fn ensure_system_state_ownership_for_lifecycle() -> anyhow::Result<()> {
+    if !utils::is_managed_system_state_dir_present() {
+        return Ok(());
+    }
+
+    let needs_repair = utils::check_system_state_dir_needs_repair().unwrap_or(true);
+    if !needs_repair {
+        return Ok(());
+    }
+
+    if is_current_process_root() {
+        utils::ensure_mihomo_system_state_dir()?;
+        println!("  ✓ Mihomo system state directory permissions repaired.");
+        return Ok(());
+    }
+
+    println!("  Detected a system state permission issue. Repairing it via sudo and continuing restart...");
+    let exe = std::env::current_exe()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let status = sudo_reexec_command(&exe, &args).status()?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+#[cfg(not(unix))]
+fn ensure_system_state_ownership_for_lifecycle() -> anyhow::Result<()> {
+    Ok(())
+}
+
 async fn cmd_lifecycle_instance_mode(
     mode: instance::InstanceMode,
     action: instance::ServiceAction,
@@ -6346,6 +6375,7 @@ async fn cmd_lifecycle_instance_mode(
 
     if mode == instance::InstanceMode::System {
         if action == instance::ServiceAction::Restart {
+            ensure_system_state_ownership_for_lifecycle()?;
             maybe_sudo_reexec_for_system_generation(&ctx)?;
             ensure_system_config_ownership_for_lifecycle(&ctx)?;
             maybe_auto_recover_active_transaction(
@@ -6363,6 +6393,7 @@ async fn cmd_lifecycle_instance_mode(
             instance::ServiceAction::Stop | instance::ServiceAction::Uninstall
         ) && prepare_system_transaction_recovery().await?
         {
+            ensure_system_state_ownership_for_lifecycle()?;
             maybe_auto_recover_active_transaction(
                 &ctx,
                 tun_transaction::RecoveryDirection::Abort,

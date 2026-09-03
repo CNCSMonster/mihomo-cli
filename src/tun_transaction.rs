@@ -364,7 +364,9 @@ impl CoordinatorLock {
     pub fn acquire(ctx: &InstanceContext) -> anyhow::Result<Self> {
         let lock_path = coordinator_lock_path(ctx);
         if let Some(parent) = lock_path.parent() {
-            ensure_system_dir(parent, 0o750)?;
+            if !parent.exists() {
+                ensure_system_dir(parent, 0o750)?;
+            }
         }
         #[cfg(unix)]
         {
@@ -1482,8 +1484,20 @@ struct LegacyTunJournal {
 pub fn check_and_migrate_legacy_journal(
     ctx: &InstanceContext,
 ) -> anyhow::Result<Option<TunJournal>> {
-    let _coordinator_lock = CoordinatorLock::acquire(ctx)?;
     let leg_j_path = legacy_journal_path(ctx);
+    let legacy_present = match std::fs::symlink_metadata(&leg_j_path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    };
+    if !legacy_present || active_dir(ctx).exists() {
+        return Ok(None);
+    }
+
+    let _coordinator_lock = CoordinatorLock::acquire(ctx)?;
+    if active_dir(ctx).exists() {
+        return Ok(None);
+    }
     let leg_c_path = legacy_candidate_path(ctx);
 
     let leg_bytes =
