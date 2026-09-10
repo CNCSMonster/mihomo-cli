@@ -63,34 +63,37 @@ src/
 
 ### docs/ 目录结构
 
-```text
+```
 docs/
-├── ci/                 CI 与覆盖率说明
-├── contributing/       贡献指南
-├── testing/            测试说明
-├── SECURITY.md         安全模型与边界
-├── architecture.md     架构说明
-├── SPEC-*.md           专项规格说明
-└── user-journeys.md    用户旅程与证据边界
+├── design/          设计文档 — 修复方案讨论稿，实施过程中可迭代修改
+├── archive/         归档文档 — 实施完成后从 design 整理归档
+├── testing/         测试相关文档
+├── ci/              CI 相关文档
+└── spec-*.md        专项规格说明
 ```
 
-设计决策应写入公开可访问的正式文档；历史版本由 Git 记录，不创建或引用未发布的内部归档。
+### 归档原则
+
+1. **`docs/design/`** — 修复方案讨论稿。在设计和实施过程中可以修改迭代。
+2. **`docs/archive/`** — 实施完成后的归档文档。命名格式 `YYYY-MM-DD-<主题>.md`。
+3. **归档文档创建后不做更改**。如需修正，应创建新的归档文档或勘误文档。
+4. **CHANGELOG.md 引用归档文档**。每批修复在 CHANGELOG 中添加条目，链接指向对应的归档文档。
+5. 归档文档应包含：日期、问题描述、方案决策、改动文件清单、验证结果。
 
 ## 代码风格
 
 - 遵循 `cargo fmt` 和 `cargo clippy` 默认规则
 - 函数/模块注释用中文
 - 日志用 `crate::log!()` 宏（可通过 `-v` / `--verbose` 启用）
-- API 端点路径变更时，核实 Mihomo 官方文档及公开的兼容客户端实现
 
 ## 提交流程
 
-1. 从 `main` 拉取最新代码
+1. 从 `main` 拉最新代码
 2. 创建功能分支
-3. 实现功能并运行测试与 Lint
-4. 提交符合项目约定的变更
-5. Push 功能分支到个人 fork
-6. 向公开仓库提交 Pull Request
+3. 实现 + 测试 + Lint
+4. 提交（Commit message 用中文描述变更）
+5. Push 到私有仓库
+6. 手动同步到公开仓库（参考 [RELEASE.md](../RELEASE.md)）
 
 ## 第三方参考
 

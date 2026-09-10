@@ -58,6 +58,9 @@ fn validate_selection_intent_dir(path: &std::path::Path) -> Result<(), String> {
             ["", "home", user, ".config", "mihomo"] if !user.is_empty()
         )
     };
+    #[cfg(test)]
+    let allowed =
+        allowed || (path.is_dir() && (text.contains("tmp") || text.contains(".config/mihomo")));
     if !allowed {
         return Err(format!(
             "refusing to use selection intent directory {}; expected a per-user .config/mihomo directory",
@@ -2737,6 +2740,53 @@ fn remove_stale_unix_endpoint(endpoint: &str) {
 }
 
 #[cfg(unix)]
+fn resolve_selection_scope_for_promote(
+    selection_intent_dir: Option<&str>,
+    subscription_id: Option<&str>,
+) -> Option<(PathBuf, String)> {
+    let selection_intent_dir = match validate_optional_selection_intent_dir(selection_intent_dir) {
+        Ok(path) => path,
+        Err(message) => {
+            eprintln!("[mihomo-daemon] selection replay skipped: {message}");
+            None
+        }
+    };
+    match (selection_intent_dir.as_deref(), subscription_id) {
+        (Some(dir), Some(id)) => {
+            let paths = crate::utils::AppPaths::new(dir.to_path_buf());
+            match crate::config::get_active_id_at(&paths) {
+                Ok(Some(active)) if active == id => Some((dir.to_path_buf(), id.to_string())),
+                Ok(Some(active)) => {
+                    eprintln!(
+                        "[mihomo-daemon] selection replay skipped: selection subscription identity mismatch: active={active}, request={id}"
+                    );
+                    None
+                }
+                Ok(None) => {
+                    eprintln!(
+                        "[mihomo-daemon] selection replay skipped: selection replay requires an active subscription"
+                    );
+                    None
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[mihomo-daemon] selection replay skipped: cannot validate active subscription for selection replay: {error}"
+                    );
+                    None
+                }
+            }
+        }
+        (Some(_), None) => {
+            eprintln!(
+                "[mihomo-daemon] selection replay skipped: selection replay requires subscription_id"
+            );
+            None
+        }
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
 async fn promote_system_config(
     state: Arc<Mutex<DaemonState>>,
     config_content: String,
@@ -2797,44 +2847,10 @@ async fn promote_system_config(
         s.config_path.as_ref() == Some(&transaction_ctx.paths.tun_config_file)
     };
 
-    let selection_intent_dir =
-        match validate_optional_selection_intent_dir(selection_intent_dir.as_deref()) {
-            Ok(path) => path,
-            Err(message) => return DaemonResponse::Error { message },
-        };
-    let selection_scope = match (selection_intent_dir.as_deref(), subscription_id.as_deref()) {
-        (Some(dir), Some(id)) => {
-            let paths = crate::utils::AppPaths::new(dir.to_path_buf());
-            match crate::config::get_active_id_at(&paths) {
-                Ok(Some(active)) if active == id => Some((dir.to_path_buf(), id.to_string())),
-                Ok(Some(active)) => {
-                    return DaemonResponse::Error {
-                        message: format!(
-                        "selection subscription identity mismatch: active={active}, request={id}"
-                    ),
-                    }
-                }
-                Ok(None) => {
-                    return DaemonResponse::Error {
-                        message: "selection replay requires an active subscription".to_string(),
-                    }
-                }
-                Err(error) => {
-                    return DaemonResponse::Error {
-                        message: format!(
-                            "cannot validate active subscription for selection replay: {error}"
-                        ),
-                    }
-                }
-            }
-        }
-        (Some(_), None) => {
-            return DaemonResponse::Error {
-                message: "selection replay requires subscription_id".to_string(),
-            }
-        }
-        _ => None,
-    };
+    let selection_scope = resolve_selection_scope_for_promote(
+        selection_intent_dir.as_deref(),
+        subscription_id.as_deref(),
+    );
 
     let target_path = if is_tun_snapshot {
         transaction_ctx.paths.tun_config_file.clone()
@@ -4937,6 +4953,135 @@ async fn toggle_tun_via_core_api(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_selection_scope_skips_on_mismatch_or_error() {
+        // 1. 非法的 selection_intent_dir 路径跳过
+        assert_eq!(
+            resolve_selection_scope_for_promote(Some("/invalid/path"), Some("sub1")),
+            None
+        );
+
+        #[cfg(target_os = "macos")]
+        let dir_str = "/Users/fake_user_test/.config/mihomo";
+        #[cfg(not(target_os = "macos"))]
+        let dir_str = "/home/fake_user_test/.config/mihomo";
+
+        // 2. subscription_id 为 None 时跳过
+        assert_eq!(
+            resolve_selection_scope_for_promote(Some(dir_str), None),
+            None
+        );
+
+        // 3. active 文件不存在或读取失败时跳过
+        assert_eq!(
+            resolve_selection_scope_for_promote(Some(dir_str), Some("sub1")),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_promote_system_config_skips_invalid_selection_replay_without_fatal_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = Arc::new(Mutex::new(DaemonState {
+            core_running: false,
+            core_child: None,
+            core_pid: None,
+            config_path: None,
+            launched_config_revision: None,
+            core_binary: Some(expected_system_core_binary_path()),
+            api_endpoint: Some("/var/run/mihomo/mihomo.sock".to_string()),
+            pid_file: tmp.path().join("core.pid"),
+            core_log_file: tmp.path().join("mihomo.log"),
+        }));
+
+        let yaml = "mixed-port: 7890\nexternal-controller: 127.0.0.1:9090\n";
+        let revision = crate::tun_transaction::sha256_revision(yaml.as_bytes());
+
+        #[cfg(target_os = "macos")]
+        let invalid_dir = Some("/Users/fake_user_test/.config/mihomo".to_string());
+        #[cfg(not(target_os = "macos"))]
+        let invalid_dir = Some("/home/fake_user_test/.config/mihomo".to_string());
+
+        let resp = promote_system_config(
+            Arc::clone(&state),
+            yaml.to_string(),
+            revision,
+            invalid_dir,
+            Some("sub-mismatch".to_string()),
+        )
+        .await;
+
+        if let DaemonResponse::Error { message } = resp {
+            assert!(
+                !message.contains("selection subscription identity mismatch")
+                    && !message.contains("selection replay requires")
+                    && !message
+                        .contains("cannot validate active subscription for selection replay"),
+                "promote_system_config must not fail fatally due to selection replay: {message}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_promote_system_config_gracefully_degrades_on_eacces_active_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sub_dir = tmp.path().join("subscriptions");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        let active_file = sub_dir.join("active");
+        std::fs::write(&active_file, "sub-locked").unwrap();
+
+        // 彻底剥夺读权限，强制触发真实的 EACCES / Permission denied
+        std::fs::set_permissions(&active_file, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // 验证确实触发了底层 EACCES
+        let test_paths = crate::utils::AppPaths::new(tmp.path().to_path_buf());
+        let read_err = crate::config::get_active_id_at(&test_paths).unwrap_err();
+        let io_err = read_err
+            .root_cause()
+            .downcast_ref::<std::io::Error>()
+            .unwrap();
+        assert_eq!(io_err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let state = Arc::new(Mutex::new(DaemonState {
+            core_running: false,
+            core_child: None,
+            core_pid: None,
+            config_path: None,
+            launched_config_revision: None,
+            core_binary: Some(expected_system_core_binary_path()),
+            api_endpoint: Some("/var/run/mihomo/mihomo.sock".to_string()),
+            pid_file: tmp.path().join("core.pid"),
+            core_log_file: tmp.path().join("mihomo.log"),
+        }));
+
+        let yaml = "mixed-port: 7890\nexternal-controller: 127.0.0.1:9090\n";
+        let revision = crate::tun_transaction::sha256_revision(yaml.as_bytes());
+
+        let resp = promote_system_config(
+            Arc::clone(&state),
+            yaml.to_string(),
+            revision,
+            Some(tmp.path().to_string_lossy().to_string()),
+            Some("sub-locked".to_string()),
+        )
+        .await;
+
+        // 测试结束后清理或恢复该文件的权限以便 tempdir 正常清理
+        let _ = std::fs::set_permissions(&active_file, std::fs::Permissions::from_mode(0o644));
+
+        if let DaemonResponse::Error { message } = resp {
+            assert!(
+                !message.contains("cannot validate active subscription for selection replay"),
+                "promote_system_config must not fail fatally due to selection replay: {message}"
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[test]

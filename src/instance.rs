@@ -1149,6 +1149,16 @@ pub fn planned_linux_install_plan(ctx: &InstanceContext) -> Option<InstanceInsta
             mode: 0o755,
             privileged: true,
         });
+        directories.push(PlannedDirectory {
+            path: PathBuf::from("/var/lib/mihomo-cli/transactions"),
+            mode: 0o750,
+            privileged: true,
+        });
+        directories.push(PlannedDirectory {
+            path: PathBuf::from("/var/lib/mihomo-cli/transactions/gc"),
+            mode: 0o750,
+            privileged: true,
+        });
     }
 
     let service_file = ctx.paths.service_file.clone()?;
@@ -1321,6 +1331,31 @@ pub fn planned_linux_install_plan(ctx: &InstanceContext) -> Option<InstanceInsta
             PlannedCommand {
                 program: "chmod".to_string(),
                 args: vec!["0770".to_string(), "/var/lib/mihomo-cli".to_string()],
+                privileged: true,
+            },
+            PlannedCommand {
+                program: "chown".to_string(),
+                args: vec![
+                    "-R".to_string(),
+                    "mihomo:mihomo".to_string(),
+                    "/var/lib/mihomo-cli/transactions".to_string(),
+                ],
+                privileged: true,
+            },
+            PlannedCommand {
+                program: "chmod".to_string(),
+                args: vec![
+                    "0750".to_string(),
+                    "/var/lib/mihomo-cli/transactions".to_string(),
+                ],
+                privileged: true,
+            },
+            PlannedCommand {
+                program: "chmod".to_string(),
+                args: vec![
+                    "0750".to_string(),
+                    "/var/lib/mihomo-cli/transactions/gc".to_string(),
+                ],
                 privileged: true,
             },
             PlannedCommand {
@@ -3249,6 +3284,9 @@ mod tests {
             PathBuf::from("/usr/local/bin"),
             PathBuf::from("/var/log/mihomo"),
             PathBuf::from("/etc/systemd/system"),
+            PathBuf::from("/var/lib/mihomo-cli"),
+            PathBuf::from("/var/lib/mihomo-cli/transactions"),
+            PathBuf::from("/var/lib/mihomo-cli/transactions/gc"),
         ] {
             assert!(
                 plan.directories
@@ -3294,6 +3332,24 @@ mod tests {
             })
             .expect("system runtime root must deny access to other users");
         assert!(runtime_owner < runtime_mode);
+        let tx_owner = plan
+            .commands
+            .iter()
+            .position(|command| {
+                command.program == "chown"
+                    && command.args == ["-R", "mihomo:mihomo", "/var/lib/mihomo-cli/transactions"]
+            })
+            .expect("transactions directory must be owned by mihomo:mihomo");
+        let tx_mode = plan
+            .commands
+            .iter()
+            .position(|command| {
+                command.program == "chmod"
+                    && command.args == ["0750", "/var/lib/mihomo-cli/transactions"]
+            })
+            .expect("transactions directory must be 0750");
+        assert!(runtime_mode < tx_owner);
+        assert!(tx_owner < tx_mode);
         for required in [
             "/usr/local/lib/mihomo",
             "/etc/systemd/system/mihomo.service",

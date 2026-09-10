@@ -76,10 +76,23 @@ fn ensure_config_directory(path: &std::path::Path) -> anyhow::Result<()> {
     utils::restore_original_user_config_ownership(path)
 }
 
-fn ensure_subscriptions_directory(paths: &AppPaths) -> anyhow::Result<()> {
+pub(crate) fn ensure_subscriptions_directory(paths: &AppPaths) -> anyhow::Result<()> {
     let path = paths.subscriptions_dir();
     utils::ensure_dir_all_no_follow(&path)?;
-    utils::restore_original_user_config_ownership(&path)
+    utils::restore_original_user_config_ownership(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let parent_has_setgid = path
+            .parent()
+            .and_then(|parent| std::fs::symlink_metadata(parent).ok())
+            .map(|meta| utils::mode_has_setgid(meta.permissions().mode()))
+            .unwrap_or(false);
+        if parent_has_setgid {
+            utils::set_directory_mode_no_follow(&path, 0o2755)?;
+        }
+    }
+    Ok(())
 }
 
 /// Get the active subscription ID from subscriptions/active
@@ -3568,5 +3581,49 @@ rules:
         assert!(err
             .to_string()
             .contains("override.yaml must be a YAML mapping"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ensure_subscriptions_directory_inherits_parent_setgid() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+
+        // 为父目录 (config_dir) 设置 setgid
+        let _ = utils::set_directory_mode_no_follow(paths.config_dir(), 0o2755);
+        let parent_meta = std::fs::metadata(paths.config_dir()).unwrap();
+        if utils::mode_has_setgid(parent_meta.mode()) {
+            ensure_subscriptions_directory(&paths).unwrap();
+            let sub_dir = paths.subscriptions_dir();
+            let sub_meta = std::fs::metadata(&sub_dir).unwrap();
+            assert!(utils::mode_has_setgid(sub_meta.mode()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_set_active_id_at_writes_group_readable_when_parent_setgid() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+
+        // 为父目录 (config_dir) 设置 setgid
+        let _ = utils::set_directory_mode_no_follow(paths.config_dir(), 0o2755);
+        let parent_meta = std::fs::metadata(paths.config_dir()).unwrap();
+        if utils::mode_has_setgid(parent_meta.mode()) {
+            crate::config::set_active_id_at(&paths, "sub-real-scene").unwrap();
+            let sub_dir = paths.subscriptions_dir();
+            let sub_meta = std::fs::metadata(&sub_dir).unwrap();
+            assert!(utils::mode_has_setgid(sub_meta.mode()));
+
+            let active_path = paths.active_file_path();
+            let active_meta = std::fs::metadata(&active_path).unwrap();
+            assert_eq!(active_meta.mode() & 0o777, 0o640);
+        }
     }
 }

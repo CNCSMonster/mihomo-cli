@@ -4,6 +4,14 @@
 
 ---
 
+## 2026-09-10
+
+### 🐛 Bug Fixes
+
+- **System 二进制一致性** — `restart` 自动检测 CLI 与 daemon 二进制版本漂移，发现不一致时准备并应用系统版本的修复方案，避免反序列化报错。
+- **Subscriptions 权限自愈** — 修复 subscriptions 文件权限导致的 restart EACCES，实现三层受控自愈与降级策略。
+- **Transactions 目录容错** — 容忍 transactions 状态目录缺失，安装计划补齐必要的目录创建。
+
 ## 2026-09-04
 
 ### 🐛 Bug Fixes

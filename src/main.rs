@@ -4208,7 +4208,8 @@ fn maybe_sudo_reexec_for_system_generation(ctx: &instance::InstanceContext) -> a
             ));
         }
     };
-    if state.pending.is_none() {
+    let has_pending = state.pending.is_some();
+    if !has_pending && !is_system_cli_skewed(ctx) {
         return Ok(());
     }
 
@@ -5069,6 +5070,36 @@ pub(crate) fn prepare_system_generation(
         .map_err(|e| anyhow::anyhow!("failed to stage pending generation: {e}"))?;
 
     Ok(gen_id)
+}
+
+pub(crate) fn maybe_prepare_cli_skew_generation(
+    ctx: &instance::InstanceContext,
+) -> anyhow::Result<bool> {
+    if ctx.mode != instance::InstanceMode::System {
+        return Ok(false);
+    }
+    if !is_system_cli_skewed(ctx) {
+        return Ok(false);
+    }
+    let store = system_generation_store(ctx);
+    if let Ok(state) = store.read_state() {
+        if state.pending.is_some() {
+            return Ok(false);
+        }
+    }
+    if !ctx.paths.core_binary.exists() {
+        anyhow::bail!(
+            "检测到当前 CLI 与系统 Daemon 二进制不一致，但系统 Core 二进制不存在 ({})。\n  请先运行: mihomo-cli install --system",
+            ctx.paths.core_binary.display()
+        );
+    }
+    let current_cli = std::env::current_exe()?;
+    let cli_bytes = std::fs::read(&current_cli)?;
+    let core_bytes = std::fs::read(&ctx.paths.core_binary)?;
+    println!("  检测到当前 CLI 与系统 Daemon 二进制不一致，正在自动同步更新...");
+    let gen_id = prepare_system_generation(ctx, &core_bytes, &cli_bytes, Vec::new())?;
+    println!("  ✅ 已准备待应用的系统版本: {gen_id}");
+    Ok(true)
 }
 
 pub(crate) async fn apply_pending_generation(
@@ -6283,32 +6314,384 @@ fn config_ownership_repair(
 }
 
 #[cfg(unix)]
+fn detect_config_assets_repair(
+    config_dir: &std::path::Path,
+    config_path: &std::path::Path,
+    expected_uid: u32,
+    is_root: bool,
+) -> anyhow::Result<ConfigOwnershipRepair> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !config_dir.exists() {
+        return Ok(ConfigOwnershipRepair::NotNeeded);
+    }
+
+    // 1. 检查 config_dir 自身
+    let dir_meta = match std::fs::symlink_metadata(config_dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Ok(if is_root {
+                ConfigOwnershipRepair::RepairAsRoot
+            } else {
+                ConfigOwnershipRepair::ReexecAsRoot
+            });
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if dir_meta.uid() != expected_uid {
+        if dir_meta.uid() == 0 {
+            return Ok(if is_root {
+                ConfigOwnershipRepair::RepairAsRoot
+            } else {
+                ConfigOwnershipRepair::ReexecAsRoot
+            });
+        } else {
+            anyhow::bail!(
+                "Mihomo configuration directory is owned by another user and cannot be repaired automatically"
+            );
+        }
+    }
+
+    // 2. 检查 config_path
+    if let Ok(metadata) = std::fs::symlink_metadata(config_path) {
+        let repair = config_ownership_repair(
+            is_root,
+            expected_uid,
+            metadata.uid(),
+            metadata.file_type().is_file(),
+            metadata.nlink(),
+        )?;
+        if repair != ConfigOwnershipRepair::NotNeeded {
+            return Ok(repair);
+        }
+    }
+
+    // 3. 检查 subscriptions_dir
+    let subscriptions_dir = config_dir.join("subscriptions");
+    if let Ok(sub_meta) = std::fs::symlink_metadata(&subscriptions_dir) {
+        if sub_meta.uid() != expected_uid {
+            if sub_meta.uid() == 0 {
+                return Ok(if is_root {
+                    ConfigOwnershipRepair::RepairAsRoot
+                } else {
+                    ConfigOwnershipRepair::ReexecAsRoot
+                });
+            } else {
+                anyhow::bail!(
+                    "Mihomo subscriptions directory is owned by another user and cannot be repaired automatically"
+                );
+            }
+        }
+    }
+
+    // 4. 遍历 subscriptions_dir 下的文件
+    if subscriptions_dir.exists() {
+        match std::fs::read_dir(&subscriptions_dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                            return Ok(if is_root {
+                                ConfigOwnershipRepair::RepairAsRoot
+                            } else {
+                                ConfigOwnershipRepair::ReexecAsRoot
+                            });
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
+                    let meta = match entry.metadata() {
+                        Ok(m) => m,
+                        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                            return Ok(if is_root {
+                                ConfigOwnershipRepair::RepairAsRoot
+                            } else {
+                                ConfigOwnershipRepair::ReexecAsRoot
+                            });
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
+                    if meta.uid() != expected_uid {
+                        if meta.uid() == 0 {
+                            return Ok(if is_root {
+                                ConfigOwnershipRepair::RepairAsRoot
+                            } else {
+                                ConfigOwnershipRepair::ReexecAsRoot
+                            });
+                        } else {
+                            anyhow::bail!(
+                                "Mihomo subscription asset is owned by another user and cannot be repaired automatically"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Ok(if is_root {
+                    ConfigOwnershipRepair::RepairAsRoot
+                } else {
+                    ConfigOwnershipRepair::ReexecAsRoot
+                });
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    // 5. 遍历 config_dir 下的其它常规文件
+    match std::fs::read_dir(config_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                        return Ok(if is_root {
+                            ConfigOwnershipRepair::RepairAsRoot
+                        } else {
+                            ConfigOwnershipRepair::ReexecAsRoot
+                        });
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                let meta = match entry.metadata() {
+                    Ok(m) => m,
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                        return Ok(if is_root {
+                            ConfigOwnershipRepair::RepairAsRoot
+                        } else {
+                            ConfigOwnershipRepair::ReexecAsRoot
+                        });
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                if meta.uid() != expected_uid {
+                    if meta.uid() == 0 {
+                        return Ok(if is_root {
+                            ConfigOwnershipRepair::RepairAsRoot
+                        } else {
+                            ConfigOwnershipRepair::ReexecAsRoot
+                        });
+                    } else {
+                        anyhow::bail!(
+                            "Mihomo configuration asset is owned by another user and cannot be repaired automatically"
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Ok(if is_root {
+                ConfigOwnershipRepair::RepairAsRoot
+            } else {
+                ConfigOwnershipRepair::ReexecAsRoot
+            });
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    Ok(ConfigOwnershipRepair::NotNeeded)
+}
+
+#[cfg(unix)]
+fn heal_local_config_permissions(
+    config_dir: &std::path::Path,
+    expected_uid: u32,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let subscriptions_dir = config_dir.join("subscriptions");
+    if let Ok(meta) = std::fs::symlink_metadata(&subscriptions_dir) {
+        if meta.is_dir()
+            && meta.uid() == expected_uid
+            && !utils::mode_has_setgid(meta.permissions().mode())
+        {
+            let _ = utils::set_directory_mode_no_follow(&subscriptions_dir, 0o2755);
+        }
+    }
+
+    let active_file = subscriptions_dir.join("active");
+    if let Ok(meta) = std::fs::symlink_metadata(&active_file) {
+        if meta.is_file() && meta.uid() == expected_uid && (meta.permissions().mode() & 0o040) == 0
+        {
+            let _ = utils::set_file_mode_no_follow(&active_file, 0o640);
+        }
+    }
+
+    if let Ok(entries) = std::fs::read_dir(&subscriptions_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Ok(meta) = std::fs::symlink_metadata(&path) {
+                if meta.is_file()
+                    && meta.uid() == expected_uid
+                    && (meta.permissions().mode() & 0o040) == 0
+                {
+                    let _ = utils::set_file_mode_no_follow(&path, 0o640);
+                }
+            }
+        }
+    }
+
+    let config_path = config_dir.join("config.yaml");
+    if let Ok(meta) = std::fs::symlink_metadata(&config_path) {
+        if meta.is_file() && meta.uid() == expected_uid && (meta.permissions().mode() & 0o040) == 0
+        {
+            let _ = utils::set_file_mode_no_follow(&config_path, 0o640);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn repair_config_tree_as_root(
+    config_dir: &std::path::Path,
+    expected_uid: u32,
+) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    if !config_dir.exists() {
+        return Ok(());
+    }
+
+    let Some((_, _, home)) = utils::original_user_identity()? else {
+        anyhow::bail!("cannot resolve original user home for repair");
+    };
+    if utils::canonical_original_user_home_path(config_dir, &home)?.is_none() {
+        anyhow::bail!(
+            "refusing to repair config directory outside user home: {}",
+            config_dir.display()
+        );
+    }
+
+    let service_gid = unsafe {
+        let gr = libc::getgrnam(c"mihomo".as_ptr());
+        if !gr.is_null() {
+            Some((*gr).gr_gid)
+        } else {
+            None
+        }
+    };
+
+    let target_gid = service_gid.unwrap_or_else(|| {
+        let user = unsafe { libc::getpwuid(expected_uid) };
+        if !user.is_null() {
+            unsafe { (*user).pw_gid }
+        } else {
+            !0 as libc::gid_t
+        }
+    });
+
+    let mut stack = vec![config_dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        if !current.starts_with(config_dir) {
+            continue;
+        }
+
+        let meta = match std::fs::symlink_metadata(&current) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+
+        if meta.is_dir() {
+            let fd = utils::open_directory_no_follow(&current)?;
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let stat = unsafe { stat.assume_init() };
+
+            let need_chown = stat.st_uid != expected_uid;
+            let need_chgrp = stat.st_gid != target_gid && target_gid != (!0 as libc::gid_t);
+            if need_chown || need_chgrp {
+                let new_uid = if need_chown {
+                    expected_uid
+                } else {
+                    !0 as libc::uid_t
+                };
+                let new_gid = if need_chgrp {
+                    target_gid
+                } else {
+                    !0 as libc::gid_t
+                };
+                if unsafe { libc::fchown(fd.as_raw_fd(), new_uid, new_gid) } != 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+            }
+
+            let _ = utils::set_directory_mode_no_follow(&current, 0o2755);
+
+            if let Ok(entries) = std::fs::read_dir(&current) {
+                for entry in entries.flatten() {
+                    stack.push(entry.path());
+                }
+            }
+        } else if meta.is_file() {
+            if meta.nlink() != 1 {
+                anyhow::bail!(
+                    "refusing to repair hard-linked configuration file: {}",
+                    current.display()
+                );
+            }
+            let file = utils::open_regular_file_no_follow(&current)?;
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let stat = unsafe { stat.assume_init() };
+
+            let need_chown = stat.st_uid != expected_uid;
+            let need_chgrp = stat.st_gid != target_gid && target_gid != (!0 as libc::gid_t);
+            if need_chown || need_chgrp {
+                let new_uid = if need_chown {
+                    expected_uid
+                } else {
+                    !0 as libc::uid_t
+                };
+                let new_gid = if need_chgrp {
+                    target_gid
+                } else {
+                    !0 as libc::gid_t
+                };
+                if unsafe { libc::fchown(file.as_raw_fd(), new_uid, new_gid) } != 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+            }
+
+            let _ = utils::set_file_mode_no_follow(&current, 0o640);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
 fn ensure_system_config_ownership_for_lifecycle(
     ctx: &instance::InstanceContext,
 ) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
+    let config_dir = &ctx.paths.config_dir;
     let config_path = lifecycle_system_config_path(ctx);
     let expected_uid = instance::PathInputs::from_current_env()
         .uid
         .ok_or_else(|| {
             anyhow::anyhow!("cannot determine the current user for configuration repair")
         })?;
-    let metadata = match std::fs::symlink_metadata(&config_path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    let repair = config_ownership_repair(
-        is_current_process_root(),
-        expected_uid,
-        metadata.uid(),
-        metadata.file_type().is_file(),
-        metadata.nlink(),
-    )?;
+
+    let is_root = is_current_process_root();
+    let repair = detect_config_assets_repair(config_dir, &config_path, expected_uid, is_root)?;
 
     match repair {
-        ConfigOwnershipRepair::NotNeeded => Ok(()),
+        ConfigOwnershipRepair::NotNeeded => {
+            heal_local_config_permissions(config_dir, expected_uid)?;
+            Ok(())
+        }
         ConfigOwnershipRepair::ReexecAsRoot => {
             println!("  Detected a Mihomo configuration permission issue. Repairing it and continuing restart...");
             let exe = std::env::current_exe()?;
@@ -6317,10 +6700,12 @@ fn ensure_system_config_ownership_for_lifecycle(
             std::process::exit(status.code().unwrap_or(1));
         }
         ConfigOwnershipRepair::RepairAsRoot => {
-            utils::restore_original_user_owned_regular_file_under_home(&config_path)?;
-            let repaired_uid = std::fs::symlink_metadata(&config_path)?.uid();
-            if repaired_uid != expected_uid {
-                anyhow::bail!("Mihomo configuration permission repair could not be verified");
+            repair_config_tree_as_root(config_dir, expected_uid)?;
+            if config_path.exists() {
+                let repaired_uid = std::fs::symlink_metadata(&config_path)?.uid();
+                if repaired_uid != expected_uid {
+                    anyhow::bail!("Mihomo configuration permission repair could not be verified");
+                }
             }
             println!("  ✓ Mihomo configuration permissions repaired.");
             Ok(())
@@ -6385,6 +6770,7 @@ async fn cmd_lifecycle_instance_mode(
                 prompt_runtime_reset,
             )
             .await?;
+            maybe_prepare_cli_skew_generation(&ctx)?;
             if apply_pending_generation(&ctx).await? {
                 return Ok(());
             }
@@ -6948,6 +7334,19 @@ async fn cmd_status_context_with_source(
     Ok(())
 }
 
+pub(crate) fn is_system_cli_skewed(ctx: &instance::InstanceContext) -> bool {
+    if ctx.mode != instance::InstanceMode::System {
+        return false;
+    }
+    if !ctx.paths.cli_binary.exists() {
+        return false;
+    }
+    let Ok(current_cli) = std::env::current_exe() else {
+        return false;
+    };
+    !utils::file_contents_equal(&current_cli, &ctx.paths.cli_binary)
+}
+
 pub(crate) fn check_and_warn_daemon_binary_skew(ctx: &instance::InstanceContext) {
     if ctx.mode != instance::InstanceMode::System {
         return;
@@ -6960,13 +7359,8 @@ pub(crate) fn check_and_warn_daemon_binary_skew(ctx: &instance::InstanceContext)
             return;
         }
     }
-    if !ctx.paths.cli_binary.exists() {
-        return;
-    }
-    let Ok(current_cli) = std::env::current_exe() else {
-        return;
-    };
-    if !utils::file_contents_equal(&current_cli, &ctx.paths.cli_binary) {
+    if is_system_cli_skewed(ctx) {
+        let current_cli = std::env::current_exe().unwrap_or_default();
         eprintln!("⚠ 提示: 当前 CLI 与系统 Daemon 二进制不一致。");
         eprintln!("  当前 CLI:   {}", current_cli.display());
         eprintln!("  系统 Daemon: {}", ctx.paths.cli_binary.display());
@@ -15197,6 +15591,118 @@ vmess://example"
         assert!(config_ownership_repair(false, 1000, 0, true, 2).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_heal_local_config_permissions_repairs_mode_and_setgid() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join(".config/mihomo");
+        let sub_dir = config_dir.join("subscriptions");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+
+        // 初始设置 subscriptions 目录为 0o755 (无 setgid)
+        let _ = utils::set_directory_mode_no_follow(&sub_dir, 0o755);
+
+        // 创建 active 文件，权限设置为 0o600 (缺少 group read)
+        let active_file = sub_dir.join("active");
+        std::fs::write(&active_file, "sub-test").unwrap();
+        let _ = utils::set_file_mode_no_follow(&active_file, 0o600);
+
+        // 创建一个订阅 yaml 文件，权限同样为 0o600
+        let sub_yaml = sub_dir.join("sub-test.yaml");
+        std::fs::write(&sub_yaml, "proxies: []\n").unwrap();
+        let _ = utils::set_file_mode_no_follow(&sub_yaml, 0o600);
+
+        let my_uid = unsafe { libc::geteuid() };
+        heal_local_config_permissions(&config_dir, my_uid).unwrap();
+
+        // 验证 subscriptions 目录已补上 setgid (如果系统支持)
+        let sub_meta = std::fs::metadata(&sub_dir).unwrap();
+        assert_eq!(sub_meta.mode() & 0o777, 0o755);
+        if utils::mode_has_setgid(0o2000) {
+            assert!(utils::mode_has_setgid(sub_meta.mode()));
+        }
+
+        // 验证 active 文件和订阅 yaml 文件的权限已收敛至 0o640
+        let active_meta = std::fs::metadata(&active_file).unwrap();
+        assert_eq!(active_meta.mode() & 0o777, 0o640);
+
+        let yaml_meta = std::fs::metadata(&sub_yaml).unwrap();
+        assert_eq!(yaml_meta.mode() & 0o777, 0o640);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_detect_config_assets_repair_detects_root_assets() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join(".config/mihomo");
+        let sub_dir = config_dir.join("subscriptions");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+
+        let config_path = config_dir.join("config.yaml");
+        std::fs::write(&config_path, "mixed-port: 7890\n").unwrap();
+
+        let my_uid = unsafe { libc::geteuid() };
+
+        // 当所有资产归属当前用户时，返回 NotNeeded
+        let repair = detect_config_assets_repair(&config_dir, &config_path, my_uid, false).unwrap();
+        assert_eq!(repair, ConfigOwnershipRepair::NotNeeded);
+
+        // 当期望 uid 与实际不匹配且实际 uid 不为 0 时，返回 Err
+        let fake_expected = my_uid + 9999;
+        assert!(
+            detect_config_assets_repair(&config_dir, &config_path, fake_expected, false).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ensure_system_config_ownership_end_to_end_heals_legacy_0600() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut inputs = instance::PathInputs::from_current_env();
+        inputs.home = temp.path().join("home");
+        let ctx = instance::InstanceContext::planned(
+            instance::TargetOs::Linux,
+            instance::InstanceMode::System,
+            &inputs,
+        );
+
+        let config_dir = &ctx.paths.config_dir;
+        let sub_dir = config_dir.join("subscriptions");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+
+        // 手动构造真实的 Bug 初始现场（遗留坏状态）：
+        // 创建 subscriptions 目录，赋权限 0o755（无 setgid）
+        let _ = utils::set_directory_mode_no_follow(&sub_dir, 0o755);
+
+        // 写入 subscriptions/active，赋权限 0o600（无 group 读权限）
+        let active_file = sub_dir.join("active");
+        std::fs::write(&active_file, "sub-legacy-0600").unwrap();
+        let _ = utils::set_file_mode_no_follow(&active_file, 0o600);
+
+        // 写入 config.yaml
+        let config_file = config_dir.join("config.yaml");
+        std::fs::write(&config_file, "mixed-port: 7890\n").unwrap();
+
+        // 调用顶层生命周期钩子
+        let result = ensure_system_config_ownership_for_lifecycle(&ctx);
+        assert!(result.is_ok());
+
+        // 验证 subscriptions/ 成功自愈补上了 setgid（系统支持时）
+        let sub_meta = std::fs::metadata(&sub_dir).unwrap();
+        assert_eq!(sub_meta.mode() & 0o777, 0o755);
+        if utils::mode_has_setgid(0o2000) {
+            assert!(utils::mode_has_setgid(sub_meta.mode()));
+        }
+
+        // 验证 active 文件成功自愈为 0o640
+        let active_meta = std::fs::metadata(&active_file).unwrap();
+        assert_eq!(active_meta.mode() & 0o777, 0o640);
+    }
+
     #[test]
     fn tun_on_existing_config_confirmation_defaults_no() {
         assert!(!should_update_existing_tun_answer(""));
@@ -16372,6 +16878,81 @@ tun:
         assert_eq!(
             action_abort,
             tun_transaction::RecoveryAction::RepairPhaseToSnapshotPromoted
+        );
+    }
+
+    #[test]
+    fn test_maybe_prepare_cli_skew_generation_flow() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let inputs = instance::PathInputs {
+            home: temp.path().join("home"),
+            uid: Some(1000),
+            gid: Some(1000),
+            xdg_runtime_dir: Some(temp.path().join("run/user/1000")),
+            program_data: temp.path().join("ProgramData"),
+            app_data: temp.path().join("AppData/Roaming"),
+            local_app_data: temp.path().join("AppData/Local"),
+            username_or_sid: "alice".to_string(),
+        };
+        let mut ctx = instance::InstanceContext::planned(
+            instance::TargetOs::Linux,
+            instance::InstanceMode::System,
+            &inputs,
+        );
+        ctx.paths.config_dir = temp.path().join("user-config");
+        ctx.paths.intent_config_file = ctx.paths.config_dir.join("config.yaml");
+        ctx.paths.tun_config_file = temp.path().join("system-data/tun-config.yaml");
+        ctx.paths.cli_binary = temp.path().join("bin/mihomo-cli");
+        ctx.paths.core_binary = temp.path().join("bin/mihomo");
+
+        std::fs::create_dir_all(ctx.paths.cli_binary.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(ctx.paths.tun_config_file.parent().unwrap()).unwrap();
+        std::fs::write(&ctx.paths.core_binary, b"core-content-v1").unwrap();
+
+        let current_cli = std::env::current_exe().unwrap();
+        let current_cli_bytes = std::fs::read(&current_cli).unwrap();
+
+        // 1. 当没有 skew 时（cli_binary 内容与 current_cli 一致），不生成 pending generation
+        std::fs::write(&ctx.paths.cli_binary, &current_cli_bytes).unwrap();
+        assert!(!is_system_cli_skewed(&ctx));
+        let prepared = maybe_prepare_cli_skew_generation(&ctx).unwrap();
+        assert!(!prepared);
+        let store = system_generation_store(&ctx);
+        let state = store.read_state().unwrap();
+        assert_eq!(state.pending, None);
+
+        // 2. 当存在 skew 且已有 pending generation 时，不覆盖已有的 pending generation
+        std::fs::write(&ctx.paths.cli_binary, b"old-cli-different-from-current").unwrap();
+        assert!(is_system_cli_skewed(&ctx));
+        let existing_gen_id =
+            prepare_system_generation(&ctx, b"existing-core", b"existing-cli", Vec::new()).unwrap();
+        let state = store.read_state().unwrap();
+        assert_eq!(state.pending, Some(existing_gen_id.clone()));
+
+        let prepared = maybe_prepare_cli_skew_generation(&ctx).unwrap();
+        assert!(!prepared);
+        let state = store.read_state().unwrap();
+        assert_eq!(state.pending, Some(existing_gen_id));
+
+        // 3. 当存在 skew 且没有 pending 时，成功创建 pending generation 并包含当前 CLI 内容
+        let mut state_to_clear = store.read_state().unwrap();
+        state_to_clear.pending = None;
+        store.write_state(&state_to_clear).unwrap();
+
+        let prepared = maybe_prepare_cli_skew_generation(&ctx).unwrap();
+        assert!(prepared);
+        let state = store.read_state().unwrap();
+        let new_pending_id = state
+            .pending
+            .expect("should have created pending generation");
+        let manifest = store.validate_generation(&new_pending_id).unwrap();
+        let gen_dir = store.generation_dir(&new_pending_id);
+        let pending_cli_file = gen_dir.join(&manifest.daemon.relative_path);
+        assert_eq!(std::fs::read(&pending_cli_file).unwrap(), current_cli_bytes);
+        let pending_core_file = gen_dir.join(&manifest.core.relative_path);
+        assert_eq!(
+            std::fs::read(&pending_core_file).unwrap(),
+            b"core-content-v1"
         );
     }
 }

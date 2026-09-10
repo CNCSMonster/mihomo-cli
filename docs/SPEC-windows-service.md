@@ -30,7 +30,7 @@ CI 三平台矩阵验证（cross-platform-e2e.yml）暴露 Windows System 模式
 
 ## 2. 参考
 
-参考同类单二进制 CLI 的 Windows 服务实现：
+同架构单二进制 + 子命令的参考实现（Proxy-RS）的 Windows 服务实现：
 - `windows-service = "=0.8.1"`（Mullvad VPN 维护，SCM 协议封装）
 - `service-manager = "=0.11.0"`（跨平台服务安装/卸载）
 - named pipe 安全：**仅 token 校验**（`service_ipc.rs`），icacls 只用于 token 文件/目录 ACL

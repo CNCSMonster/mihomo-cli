@@ -1,6 +1,6 @@
 //! Selection intent persistence (selection-state.yaml) and the per-instance
 //! selection lock that serializes select (kernel PUT + persist) with replay
-//! (re-read + PUT). See SPEC.md §3.8.
+//! (re-read + PUT).
 
 use crate::utils::AppPaths;
 use anyhow::{Context, Result};

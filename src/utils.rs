@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-fn mode_has_setgid(mode: u32) -> bool {
+pub(crate) fn mode_has_setgid(mode: u32) -> bool {
     #[cfg(target_os = "macos")]
     {
         mode & libc::S_ISGID as u32 != 0
@@ -10,6 +10,12 @@ fn mode_has_setgid(mode: u32) -> bool {
     {
         mode & libc::S_ISGID != 0
     }
+}
+
+#[cfg(not(unix))]
+#[allow(dead_code)]
+pub(crate) fn mode_has_setgid(_mode: u32) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -496,7 +502,19 @@ pub fn ensure_dir_all_no_follow(path: &Path) -> anyhow::Result<()> {
                 )
             });
         }
-        if unsafe { libc::mkdirat(fd.as_raw_fd(), name_c.as_ptr(), 0o755) } != 0 {
+        #[allow(clippy::unnecessary_cast)]
+        let parent_has_setgid = {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } == 0 {
+                let stat = unsafe { stat.assume_init() };
+                mode_has_setgid(stat.st_mode as u32)
+            } else {
+                false
+            }
+        };
+        let create_mode = if parent_has_setgid { 0o2755 } else { 0o755 };
+
+        if unsafe { libc::mkdirat(fd.as_raw_fd(), name_c.as_ptr(), create_mode) } != 0 {
             let err = std::io::Error::last_os_error();
             // 并发创建竞争：已存在则继续走 openat
             if err.raw_os_error() != Some(libc::EEXIST) {
@@ -524,6 +542,9 @@ pub fn ensure_dir_all_no_follow(path: &Path) -> anyhow::Result<()> {
                     err
                 )
             });
+        }
+        if parent_has_setgid {
+            let _ = unsafe { libc::fchmod(created, 0o2755) };
         }
         fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(created) };
     }
@@ -774,7 +795,10 @@ fn canonical_existing_ancestor(path: &Path) -> anyhow::Result<PathBuf> {
 
 /// canonical 后的目标必须位于原始用户 home 内（含 home 本身）。
 /// home 内的一切本来就归该用户所有/可写，symlink 逃逸出 home 才是提权边界。
-fn canonical_original_user_home_path(path: &Path, home: &Path) -> anyhow::Result<Option<PathBuf>> {
+pub(crate) fn canonical_original_user_home_path(
+    path: &Path,
+    home: &Path,
+) -> anyhow::Result<Option<PathBuf>> {
     let canonical_home = home.canonicalize()?;
     let path = canonical_existing_ancestor(path)?;
     if path == canonical_home || path.starts_with(&canonical_home) {
@@ -1015,7 +1039,19 @@ fn ensure_dir_all_from_dirfd(
         if open_err.kind() != std::io::ErrorKind::NotFound {
             return Err(open_err.into());
         }
-        if unsafe { libc::mkdirat(fd.as_raw_fd(), name_c.as_ptr(), 0o755) } != 0
+        #[allow(clippy::unnecessary_cast)]
+        let parent_has_setgid = {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } == 0 {
+                let stat = unsafe { stat.assume_init() };
+                mode_has_setgid(stat.st_mode as u32)
+            } else {
+                false
+            }
+        };
+        let create_mode = if parent_has_setgid { 0o2755 } else { 0o755 };
+
+        if unsafe { libc::mkdirat(fd.as_raw_fd(), name_c.as_ptr(), create_mode) } != 0
             && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST)
         {
             return Err(std::io::Error::last_os_error().into());
@@ -1029,6 +1065,9 @@ fn ensure_dir_all_from_dirfd(
         };
         if created < 0 {
             return Err(std::io::Error::last_os_error().into());
+        }
+        if parent_has_setgid {
+            let _ = unsafe { libc::fchmod(created, 0o2755) };
         }
         fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(created) };
     }
@@ -1060,8 +1099,9 @@ pub fn set_directory_mode_no_follow(path: &Path, mode: u16) -> anyhow::Result<()
     }
     let stat = unsafe { stat.assume_init() };
 
-    let current_mode = stat.st_mode & 0o777;
-    let target_mode = mode as libc::mode_t & 0o777;
+    let mask = if (mode & 0o7000) != 0 { 0o7777 } else { 0o777 };
+    let current_mode = stat.st_mode & mask;
+    let target_mode = mode as libc::mode_t & mask;
     if current_mode == target_mode {
         return Ok(());
     }
@@ -1091,16 +1131,11 @@ pub fn is_managed_system_state_dir_present() -> bool {
 
 #[cfg(target_os = "linux")]
 pub fn check_system_state_dir_needs_repair() -> anyhow::Result<bool> {
-    use std::os::fd::AsRawFd;
+    check_system_state_dir_needs_repair_at(Path::new("/var/lib/mihomo-cli"))
+}
 
-    let path = Path::new("/var/lib/mihomo-cli");
-    if !path.exists() {
-        return Ok(false);
-    }
-    let dir = match open_directory_no_follow(path) {
-        Ok(dir) => dir,
-        Err(_) => return Ok(true),
-    };
+#[cfg(target_os = "linux")]
+pub(crate) fn check_system_state_dir_needs_repair_at(path: &Path) -> anyhow::Result<bool> {
     let group = unsafe { libc::getgrnam(c"mihomo".as_ptr()) };
     let user = unsafe { libc::getpwnam(c"mihomo".as_ptr()) };
     if group.is_null() || user.is_null() {
@@ -1108,34 +1143,48 @@ pub fn check_system_state_dir_needs_repair() -> anyhow::Result<bool> {
     }
     let uid = unsafe { (*user).pw_uid };
     let gid = unsafe { (*group).gr_gid };
+    check_system_state_dir_needs_repair_with_identities(path, 0, uid, gid)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn check_system_state_dir_needs_repair_with_identities(
+    path: &Path,
+    root_uid: libc::uid_t,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+) -> anyhow::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    if !path.exists() {
+        return Ok(false);
+    }
+    let dir = match open_directory_no_follow(path) {
+        Ok(dir) => dir,
+        Err(_) => return Ok(true),
+    };
 
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     if unsafe { libc::fstat(dir.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
         return Ok(true);
     }
     let stat = unsafe { stat.assume_init() };
-    if stat.st_uid != 0 || stat.st_gid != gid || (stat.st_mode & 0o777) != 0o770 {
+    if stat.st_uid != root_uid || stat.st_gid != gid || (stat.st_mode & 0o777) != 0o770 {
         return Ok(true);
     }
 
     let transactions_path = path.join("transactions");
-    match open_directory_no_follow(&transactions_path) {
-        Ok(transaction_dir) => {
-            let mut transaction_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-            if unsafe { libc::fstat(transaction_dir.as_raw_fd(), transaction_stat.as_mut_ptr()) }
-                != 0
-            {
-                return Ok(true);
-            }
-            let transaction_stat = unsafe { transaction_stat.assume_init() };
-            if transaction_stat.st_uid != uid
-                || transaction_stat.st_gid != gid
-                || (transaction_stat.st_mode & 0o777) != 0o750
-            {
-                return Ok(true);
-            }
+    if let Ok(transaction_dir) = open_directory_no_follow(&transactions_path) {
+        let mut transaction_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(transaction_dir.as_raw_fd(), transaction_stat.as_mut_ptr()) } != 0 {
+            return Ok(true);
         }
-        Err(_) => return Ok(true),
+        let transaction_stat = unsafe { transaction_stat.assume_init() };
+        if transaction_stat.st_uid != uid
+            || transaction_stat.st_gid != gid
+            || (transaction_stat.st_mode & 0o777) != 0o750
+        {
+            return Ok(true);
+        }
     }
 
     let gc_path = path.join("transactions/gc");
@@ -1862,7 +1911,8 @@ fn normalize_macos_system_alias(path: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn original_user_identity() -> anyhow::Result<Option<(libc::uid_t, libc::gid_t, PathBuf)>> {
+pub(crate) fn original_user_identity() -> anyhow::Result<Option<(libc::uid_t, libc::gid_t, PathBuf)>>
+{
     if unsafe { libc::geteuid() } != 0 {
         return Ok(None);
     }
@@ -1914,6 +1964,7 @@ pub fn restore_original_user_ownership(_path: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
+#[allow(dead_code)]
 pub fn restore_original_user_owned_regular_file_under_home(path: &Path) -> anyhow::Result<()> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
@@ -2711,5 +2762,77 @@ mod tests {
         set_directory_mode_no_follow(&target_dir, 0o700).unwrap();
         let mode = std::fs::metadata(&target_dir).unwrap().mode();
         assert_eq!(mode & 0o7777, 0o700);
+    }
+
+    #[test]
+    fn test_set_directory_mode_no_follow_upgrades_to_setgid() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target_dir = temp.path().join("sub_dir");
+        std::fs::create_dir(&target_dir).unwrap();
+
+        // 初始设置为 0o755
+        set_directory_mode_no_follow(&target_dir, 0o755).unwrap();
+        let mode = std::fs::metadata(&target_dir).unwrap().mode();
+        assert_eq!(mode & 0o777, 0o755);
+
+        // 提升为 0o2755 (包含 setgid 位)
+        set_directory_mode_no_follow(&target_dir, 0o2755).unwrap();
+        let mode_after = std::fs::metadata(&target_dir).unwrap().mode();
+        assert_eq!(mode_after & 0o777, 0o755);
+        assert!(mode_has_setgid(mode_after));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_check_system_state_dir_tolerates_missing_transactions() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("mihomo-cli");
+        let current_uid = unsafe { libc::geteuid() };
+        let current_gid = unsafe { libc::getegid() };
+
+        // 1. 状态目录不存在时，返回 false（不需要修复）
+        assert!(!check_system_state_dir_needs_repair_with_identities(
+            &state_dir,
+            current_uid,
+            current_uid,
+            current_gid
+        )
+        .unwrap());
+
+        // 2. 状态目录存在（模拟正确的 0o770），transactions 目录尚不存在 -> 必须返回 false（容忍缺失）
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(!check_system_state_dir_needs_repair_with_identities(
+            &state_dir,
+            current_uid,
+            current_uid,
+            current_gid
+        )
+        .unwrap());
+
+        // 3. transactions 存在且权限合规 (0o750) -> 必须返回 false
+        let tx = state_dir.join("transactions");
+        std::fs::create_dir(&tx).unwrap();
+        std::fs::set_permissions(&tx, std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(!check_system_state_dir_needs_repair_with_identities(
+            &state_dir,
+            current_uid,
+            current_uid,
+            current_gid
+        )
+        .unwrap());
+
+        // 4. transactions 存在但权限不合规 (如 0o777) -> 必须正确识别为需要修复 (true)
+        std::fs::set_permissions(&tx, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(check_system_state_dir_needs_repair_with_identities(
+            &state_dir,
+            current_uid,
+            current_uid,
+            current_gid
+        )
+        .unwrap());
     }
 }
