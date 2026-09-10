@@ -122,7 +122,7 @@ jobs:
               mkdir -p "$CFG_DIR"
               printf 'mixed-port: 18789\nlog-level: info\nexternal-controller: 127.0.0.1:18790\n' > "$CFG_DIR/config.yaml" ;;
           esac
-          $CLI install --user --skip-config
+          $CLI install --user --skip-config --yes
           echo "=== status after install ==="
           $CLI status
 
@@ -206,7 +206,7 @@ jobs:
               mkdir -p "$CFG_DIR"
               printf 'mixed-port: 18789\nlog-level: info\nexternal-controller: 127.0.0.1:18790\n' > "$CFG_DIR/config.yaml" ;;
           esac
-          $CLI install --system --skip-config
+          $CLI install --system --skip-config --yes
           echo "=== status after install ==="
           $CLI status
           # N1c: strong assertion — service must be installed (system service)
