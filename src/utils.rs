@@ -2764,6 +2764,7 @@ mod tests {
         assert_eq!(mode & 0o7777, 0o700);
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_set_directory_mode_no_follow_upgrades_to_setgid() {
         use std::os::unix::fs::MetadataExt;
