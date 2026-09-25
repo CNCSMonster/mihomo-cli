@@ -55,7 +55,6 @@ src/
 | [README.md](../../README.md) | 项目入口 |
 | [USAGE.md](../../USAGE.md) | 命令参考 |
 | [SPEC.md](../../SPEC.md) | 软件设计 |
-| [CONTEXT.md](../../CONTEXT.md) | 领域知识与术语 |
 | [ROADMAP.md](../../ROADMAP.md) | 规划与 Bug |
 | [CHANGELOG.md](../../CHANGELOG.md) | 变更记录 |
 
@@ -65,27 +64,23 @@ src/
 
 ```
 docs/
-├── design/          设计文档 — 修复方案讨论稿，实施过程中可迭代修改
-├── archive/         归档文档 — 实施完成后从 design 整理归档
 ├── testing/         测试相关文档
 ├── ci/              CI 相关文档
 └── spec-*.md        专项规格说明
 ```
 
-### 归档原则
+### 文档维护原则
 
-1. **`docs/design/`** — 修复方案讨论稿。在设计和实施过程中可以修改迭代。
-2. **`docs/archive/`** — 实施完成后的归档文档。命名格式 `YYYY-MM-DD-<主题>.md`。
-3. **归档文档创建后不做更改**。如需修正，应创建新的归档文档或勘误文档。
-4. **CHANGELOG.md 引用归档文档**。每批修复在 CHANGELOG 中添加条目，链接指向对应的归档文档。
-5. 归档文档应包含：日期、问题描述、方案决策、改动文件清单、验证结果。
+1. **不维护独立归档目录** — 历史版本由 git 历史保留，需要旧内容用 `git show <commit>:<path>` 取回。
+2. **设计讨论稿在定稿前可持续迭代**，定稿后并入正式文档（SPEC.md 等）。
+3. **每批修复在 CHANGELOG.md 添加条目**，记录问题描述、方案决策、改动文件清单与验证结果。
 
 ## 代码风格
 
 - 遵循 `cargo fmt` 和 `cargo clippy` 默认规则
 - 函数/模块注释用中文
 - 日志用 `crate::log!()` 宏（可通过 `-v` / `--verbose` 启用）
-- API 端点路径变更时，核实 `3rdparty/clash-verge-rev/` 和 `3rdparty/mihomo-cli/` 的参考实现
+- API 端点路径变更时，对照 mihomo 内核与第三方参考实现核实端点路径
 
 ## 提交流程
 
@@ -93,8 +88,7 @@ docs/
 2. 创建功能分支
 3. 实现 + 测试 + Lint
 4. 提交（Commit message 用中文描述变更）
-5. Push 到私有仓库
-6. 手动同步到公开仓库（参考 [RELEASE.md](../RELEASE.md)）
+5. Push 到远端仓库
 
 ## 第三方参考
 

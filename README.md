@@ -11,17 +11,17 @@
 
 ## 核心工作流（Agent 必读）
 
-### 设计方案前，强制先读 CONTEXT.md
+### 设计方案前，先确认领域知识
 
-**所有 agent（包括 AI 助手）在设计方案或回答领域问题前，必须先读 `CONTEXT.md`**——特别是"代理/网络"、"实例模式"、"文件路径约定"等部分。
+**所有 agent（包括 AI 助手）在设计方案或回答领域问题前，必须先确认相关领域知识**——特别是"代理/网络"、"实例模式"、"文件路径约定"等部分。
 
 **原因**：避免基于错误知识设计。例如：系统代理（L7 应用层）和 TUN（L3 网络层）是两种不同的代理机制，混淆会导致设计错误。
 
 **流程**：
-1. **设计方案前**：读 CONTEXT.md 确认领域知识
-2. **发现 CONTEXT.md 不完整**：立即补充，不要等用户指出
+1. **设计方案前**：先读项目文档确认领域知识
+2. **发现文档不完整**：立即补充，不要等用户指出
 3. **不确定时**：用 tavily 搜索确认，不要基于猜测回答
-4. **plan mode 下**：第一步读 CONTEXT.md，作为强制流程
+4. **plan mode 下**：第一步确认领域知识，作为强制流程
 
 ---
 
@@ -76,7 +76,6 @@ mihomo-cli restart --system                # 需要时显式重启以应用持�
 | [USAGE.md](USAGE.md) | 完整命令参考与使用示例 |
 | [CHANGELOG.md](CHANGELOG.md) | 变更记录 |
 | [SPEC.md](SPEC.md) | 软件设计文档 |
-| [CONTEXT.md](CONTEXT.md) | 领域知识与术语表 |
 | [贡献指南](docs/contributing/README.md) | 贡献指南 |
 
 ## 平台支持
@@ -94,7 +93,7 @@ mihomo-cli restart --system                # 需要时显式重启以应用持�
 - **crossterm TUI 交互**：`select` 和 `config` 命令使用 crossterm 实现真正的键盘快捷键（j/k 导航、/ 过滤）
 - **零运行时依赖**：不依赖 curl、jq、python3、fzf 外部工具
 - **完善 CLI 体验**：clap derive 提供类型化参数解析、`--help` 文档
-- **真正的跨平台**：macOS LaunchDaemon/LaunchAgent + Linux systemd system/user + Windows service/user process，统一命令接口；**Windows 为二等公民**（验证走 pub 仓库 CI runner）
+- **真正的跨平台**：macOS LaunchDaemon/LaunchAgent + Linux systemd system/user + Windows service/user process，统一命令接口；**Windows 为二等公民**（验证走 GitHub Actions CI runner）
 
 ## 构建
 

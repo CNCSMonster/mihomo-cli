@@ -93,7 +93,7 @@
 ### ⚠️ Breaking Changes
 
 - **TUN 操作需要 root 权限** — `tun on/off` 现在需要 root 权限，CLI 会自动调用 sudo。普通用户执行时会提示输入密码
-- **版本号改为 0.0.0-dev** — dev 仓库版本号改为 mock 开发版本号，发版时由同步流程替换为真实版本号
+- **版本号改为 0.0.0-dev** — 开发构建使用占位版本号 0.0.0-dev，发版时替换为真实版本号
 
 ### 📚 Documentation
 
@@ -175,7 +175,7 @@ mihomo-cli install --system
 - **M4 Linux E2E 完成** — colima VM（Ubuntu 24.04 + systemd 255）User + System 全流程 + TUN（2026-08-01）
 
 ### 📝 Docs
-- **Windows 二等公民决策** — Windows 验证改走 pub 仓库 CI runner，不占用真机（e0cf3ec）
+- **Windows 二等公民决策** — Windows 验证改走 GitHub CI runner，不占用真机（e0cf3ec）
 - **conn vs logs 用途区分** — `conn` 只显示瞬时活跃连接，历史连接查 `logs`（e92fa2f）
 
 ---
@@ -282,7 +282,7 @@ mihomo-cli install --system
 - **config --import** — 支持从本地文件导入配置，自动检测 base64/vmess 格式并转换。解决 DNS 污染环境下无法获取配置的问题
 
 ### 📚 Documentation
-- **设计原则** — "不要假设，验证它" 写入 CONTEXT.md
+- **设计原则** — "不要假设，验证它" 写入项目领域知识文档
 - **日志体系** — 添加日志原则和错误信息标准
 - **ROADMAP** — 添加 BUG-05 到 BUG-10 记录
 

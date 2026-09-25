@@ -30,7 +30,7 @@ CI 三平台矩阵验证（cross-platform-e2e.yml）暴露 Windows System 模式
 
 ## 2. 参考
 
-`3rdparty/Proxy-RS`（同架构单二进制 + 子命令）的 Windows 服务实现：
+`Proxy-RS`（同架构单二进制 + 子命令）的 Windows 服务实现：
 - `windows-service = "=0.8.1"`（Mullvad VPN 维护，SCM 协议封装）
 - `service-manager = "=0.11.0"`（跨平台服务安装/卸载）
 - named pipe 安全：**仅 token 校验**（`service_ipc.rs`），icacls 只用于 token 文件/目录 ACL
@@ -283,8 +283,7 @@ fn is_process_elevated() -> bool {
 
 > **CI gate 策略**（审查 P1-5 修正）：S2-S6 每步完成后**立即触发 CI**（手动 dispatch），
 > Windows System E2E 是本 spec 的红-绿验证目标，不允许攒到最后才跑。
-> **注意**：cross-platform-e2e.yml 在 **pub 仓库**——每步验证需先 sync dev→pub
-> （rsync src + commit + push）再触发（P2-7 修正）。
+> **注意**：cross-platform-e2e.yml 为手动触发工作流——每步验证需等变更推送到 CI 所在仓库后立即触发（P2-7 修正）。
 
 ## 5. 决策点
 

@@ -990,7 +990,7 @@ YAML 编辑失败显式报错，不静默降级。
 
 **状态**: ✅ 已决策 (2026-08-02)
 
-参考 `3rdparty/clash-cli.rs` 时发现其内置了"AI 修改规则"功能，判断为错误方向，不借鉴。
+参考 `clash-cli.rs` 时发现其内置了"AI 修改规则"功能，判断为错误方向，不借鉴。
 
 mihomo-cli 的 AI 原生正确方向是作为**工具提供给上层 AI 使用**：
 - 合适的 CLI 接口设计（机器可解析、确定性输出，未来可补 `--json` 结构化输出）
@@ -1004,7 +1004,7 @@ mihomo-cli 的 AI 原生正确方向是作为**工具提供给上层 AI 使用**
 
 **状态**: ✅ 已决策 (2026-08-02)
 
-参考 `3rdparty/Proxy-RS`（sing-box + mihomo 双内核管理器，Ratatui TUI）后确认：**当前目标只做好 mihomo 内核**，多内核管理方向不做。
+参考 `Proxy-RS`（sing-box + mihomo 双内核管理器，Ratatui TUI）后确认：**当前目标只做好 mihomo 内核**，多内核管理方向不做。
 
 **Why**: 双内核增加管理复杂度（两套路径/服务/配置模型）、测试矩阵翻倍、维护成本高；当前用户场景（mihomo 单内核）没有多内核需求。
 
@@ -1263,7 +1263,7 @@ TUN 是系统级功能，一旦开启会影响所有用户流量。system TUN �
 
 > **历史正文边界：** 从本节“背景”开始的自动恢复决策、实施步骤、示例错误消息和验收条目均为历史材料，仅供追溯，不得作为当前实现目标或用户行为合同。当前规则是：无订阅 install 生成并校验 direct-only 配置后启动普通 Core/API；`restart --system` 是显式 Core/API readiness 入口；只读命令不隐式启动或 recovery；已配置且明确要求运行态的命令必须通过受管 lifecycle/promotion dispatcher，并遵守固定 snapshot、root peer、revision attestation 和 `Unknown/RecoveryRequired` 边界。
 
-**背景（历史，仅供追溯）**: System Service 模式下 daemon 和 core 是独立进程（CONTEXT.md 运行时状态模型）。多个用户旅程（install → tun on、upgrade → select、reboot → tun on）在 daemon 运行但 core 停止时失败，报错 "core is not running" 且无修复指引。
+**背景（历史，仅供追溯）**: System Service 模式下 daemon 和 core 是独立进程（运行时状态模型）。多个用户旅程（install → tun on、upgrade → select、reboot → tun on）在 daemon 运行但 core 停止时失败，报错 "core is not running" 且无修复指引。
 
 根因分析发现 "core 在跑" 这个不变量有 5 个断裂点：
 1. install early return 不启动 core

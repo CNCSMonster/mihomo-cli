@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Smoke test for docs/design/SPEC-clash-verge-like-ux.md.
+# Smoke test for the clash-verge-like UX surface.
 #
 # Default mode is non-destructive: it validates the CLI binary, help text, and
 # read-only commands. Set MIHOMO_CLI_SMOKE_DESTRUCTIVE=1 to run the real
