@@ -1,6 +1,6 @@
-//! Selection intent persistence (selection-state.yaml) and the per-instance
+//! Selection intent persistence (selections/<subscription_id>.yaml) and the per-instance
 //! selection lock that serializes select (kernel PUT + persist) with replay
-//! (re-read + PUT).
+//! (re-read + PUT). See SPEC.md §3.8.1.
 
 use crate::utils::AppPaths;
 use anyhow::{Context, Result};
@@ -19,19 +19,9 @@ pub fn active_selection_scope(paths: &AppPaths) -> Result<SelectionScope> {
     let id = match crate::config::get_active_id_at(paths)? {
         Some(id) => id,
         None => {
-            #[cfg(test)]
-            {
-                return Ok(SelectionScope {
-                    subscription_id: "test-legacy".to_string(),
-                    path: paths.selection_state_path(),
-                });
-            }
-            #[cfg(not(test))]
-            {
-                return Err(anyhow::anyhow!(
-                    "No active subscription. Run: mihomo-cli config --add <URL> or --import <FILE>"
-                ));
-            }
+            return Err(anyhow::anyhow!(
+                "No active subscription. Run: mihomo-cli config --add <URL> or --import <FILE>"
+            ));
         }
     };
     if !id.starts_with("sub-")
@@ -71,6 +61,19 @@ fn migrate_legacy_selection_if_needed(paths: &AppPaths, id: &str) -> Result<()> 
     let state: SelectionStateFile = serde_yaml::from_str(&content)
         .with_context(|| "Failed to parse legacy selection-state.yaml")?;
     crate::utils::ensure_dir_all_no_follow(&paths.selections_dir())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let selections_dir = paths.selections_dir();
+        let parent_has_setgid = selections_dir
+            .parent()
+            .and_then(|p| std::fs::symlink_metadata(p).ok())
+            .map(|meta| crate::utils::mode_has_setgid(meta.permissions().mode()))
+            .unwrap_or(false);
+        if parent_has_setgid {
+            let _ = crate::utils::set_directory_mode_no_follow(&selections_dir, 0o2755);
+        }
+    }
     let serialized = serde_yaml::to_string(&state)?;
     crate::utils::atomic_write_file_for_original_user(&target.display().to_string(), &serialized)?;
     let migrated = paths.config_dir().join("selection-state.yaml.legacy");
@@ -96,6 +99,41 @@ pub fn load_selection_state_for_scope(scope: &SelectionScope) -> Result<BTreeMap
     load_selection_state_path(&scope.path)
 }
 
+/// Hard cap for selection map entries accepted from IPC pushes (mirror contract).
+#[cfg(any(unix, windows))]
+const SELECTION_MAP_ENTRY_LIMIT: usize = 512;
+
+/// Parse and validate a selection-state YAML payload (single `group → node`
+/// mapping). Used by the daemon to validate `RecordSelectionIntent` pushes
+/// before writing the fixed-runtime mirror.
+#[cfg(any(unix, windows))]
+pub fn parse_selection_map(bytes: &[u8]) -> Result<BTreeMap<String, String>> {
+    let state: SelectionStateFile =
+        serde_yaml::from_slice(bytes).with_context(|| "Failed to parse selection state payload")?;
+    if state.selections.len() > SELECTION_MAP_ENTRY_LIMIT {
+        anyhow::bail!(
+            "selection state payload exceeds {} entries",
+            SELECTION_MAP_ENTRY_LIMIT
+        );
+    }
+    for (group, node) in &state.selections {
+        if group.trim().is_empty() || node.trim().is_empty() {
+            anyhow::bail!("selection state payload contains an empty group or node name");
+        }
+    }
+    Ok(state.selections)
+}
+
+/// Serialize a selection map back to the canonical YAML payload form.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn format_selection_map(map: &BTreeMap<String, String>) -> String {
+    serde_yaml::to_string(&SelectionStateFile {
+        selections: map.clone(),
+    })
+    .expect("selection state serialization cannot fail")
+}
+
 fn load_selection_state_path(path: &std::path::Path) -> Result<BTreeMap<String, String>> {
     if !path.exists() {
         return Ok(BTreeMap::new());
@@ -111,7 +149,20 @@ pub fn save_selection_state_for_scope(
     scope: &SelectionScope,
     selections: &BTreeMap<String, String>,
 ) -> Result<()> {
-    crate::utils::ensure_dir_all_no_follow(scope.path.parent().unwrap())?;
+    let selections_dir = scope.path.parent().unwrap();
+    crate::utils::ensure_dir_all_no_follow(selections_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let parent_has_setgid = selections_dir
+            .parent()
+            .and_then(|p| std::fs::symlink_metadata(p).ok())
+            .map(|meta| crate::utils::mode_has_setgid(meta.permissions().mode()))
+            .unwrap_or(false);
+        if parent_has_setgid {
+            let _ = crate::utils::set_directory_mode_no_follow(selections_dir, 0o2755);
+        }
+    }
     let state = SelectionStateFile {
         selections: selections.clone(),
     };
@@ -124,35 +175,6 @@ pub fn remember_selection_for_scope(scope: &SelectionScope, group: &str, node: &
     let mut selections = load_selection_state_for_scope(scope)?;
     selections.insert(group.to_string(), node.to_string());
     save_selection_state_for_scope(scope, &selections)
-}
-
-#[cfg(test)]
-pub fn load_selection_state_at(paths: &AppPaths) -> Result<BTreeMap<String, String>> {
-    load_selection_state_path(&paths.selection_state_path())
-}
-
-#[cfg(test)]
-pub fn save_selection_state_at(
-    paths: &AppPaths,
-    selections: &BTreeMap<String, String>,
-) -> Result<()> {
-    crate::utils::ensure_dir_all_no_follow(paths.config_dir())?;
-    let state = SelectionStateFile {
-        selections: selections.clone(),
-    };
-    let content = serde_yaml::to_string(&state)?;
-    crate::utils::atomic_write_file_for_original_user(
-        &paths.selection_state_path().display().to_string(),
-        &format!("# Last selections made by mihomo-cli; used only for drift warnings.\n{content}"),
-    )?;
-    Ok(())
-}
-
-#[cfg(test)]
-pub fn remember_selection_at(paths: &AppPaths, group: &str, node: &str) -> Result<()> {
-    let mut selections = load_selection_state_at(paths)?;
-    selections.insert(group.to_string(), node.to_string());
-    save_selection_state_at(paths, &selections)
 }
 
 pub fn unpin_selection_for_scope(scope: &SelectionScope, group: &str) -> Result<bool> {
@@ -174,39 +196,6 @@ pub fn unpin_all_selections_for_scope(scope: &SelectionScope) -> Result<usize> {
         }
         Err(_) => {
             save_selection_state_for_scope(scope, &BTreeMap::new())?;
-            Ok(0)
-        }
-    }
-}
-
-/// Remove one group's persisted selection; returns true if a record existed.
-/// Never touches runtime state (SPEC §4-5).
-#[cfg(test)]
-pub fn unpin_selection_at(paths: &AppPaths, group: &str) -> Result<bool> {
-    let _guard = acquire_selection_lock_at(paths)?;
-    let mut selections = load_selection_state_at(paths)?;
-    let removed = selections.remove(group).is_some();
-    if removed {
-        save_selection_state_at(paths, &selections)?;
-    }
-    Ok(removed)
-}
-
-/// Remove all persisted selections; returns how many were removed.
-/// A corrupt intent file is reset to empty: this is the documented repair
-/// path for parse failures (SPEC §3.3-5), so it must not fail on them.
-#[cfg(test)]
-pub fn unpin_all_selections_at(paths: &AppPaths) -> Result<usize> {
-    let _guard = acquire_selection_lock_at(paths)?;
-    match load_selection_state_at(paths) {
-        Ok(selections) if selections.is_empty() => Ok(0),
-        Ok(selections) => {
-            let removed = selections.len();
-            save_selection_state_at(paths, &BTreeMap::new())?;
-            Ok(removed)
-        }
-        Err(_) => {
-            save_selection_state_at(paths, &BTreeMap::new())?;
             Ok(0)
         }
     }
@@ -405,15 +394,6 @@ pub async fn replay_selections_at(
     replay_selections_until(paths, client, Instant::now() + REPLAY_TOTAL_BUDGET).await
 }
 
-#[cfg(unix)]
-pub async fn replay_scope_until(
-    scope: &SelectionScope,
-    client: &impl crate::mihomo_api::MihomoApiClient,
-    deadline: Instant,
-) -> Result<ReplayReport> {
-    replay_scope_with_deadline(scope, client, deadline, REPLAY_PER_GROUP_TIMEOUT).await
-}
-
 async fn replay_scope_with_deadline(
     scope: &SelectionScope,
     client: &impl crate::mihomo_api::MihomoApiClient,
@@ -433,11 +413,32 @@ async fn replay_scope_with_deadline(
             });
         }
     };
+    replay_map_with_deadline(&selections, client, deadline, per_group_timeout).await
+}
+
+/// Replay an in-memory selection map (fixed-runtime mirror path). The caller
+/// guarantees API readiness; an empty map yields an empty report.
+#[cfg(any(unix, windows))]
+pub async fn replay_map_until(
+    selections: &BTreeMap<String, String>,
+    client: &impl crate::mihomo_api::MihomoApiClient,
+    deadline: Instant,
+) -> Result<ReplayReport> {
+    replay_map_with_deadline(selections, client, deadline, REPLAY_PER_GROUP_TIMEOUT).await
+}
+
+async fn replay_map_with_deadline(
+    selections: &BTreeMap<String, String>,
+    client: &impl crate::mihomo_api::MihomoApiClient,
+    deadline: Instant,
+    per_group_timeout: Duration,
+) -> Result<ReplayReport> {
     if selections.is_empty() {
         return Ok(ReplayReport::default());
     }
     let mut results = Vec::new();
-    for (group, node) in selections {
+    for (group, node) in selections.iter() {
+        let (group, node) = (group.clone(), node.clone());
         if Instant::now() >= deadline {
             results.push(ReplayGroupResult {
                 group,
@@ -583,13 +584,83 @@ proxy-groups:
         let _guard2 = acquire_selection_lock_at(&paths).unwrap();
     }
 
+    fn setup_test_active_subscription(paths: &AppPaths, id: &str) -> SelectionScope {
+        let subs_dir = paths.subscriptions_dir();
+        std::fs::create_dir_all(&subs_dir).unwrap();
+        std::fs::write(paths.active_file_path(), id).unwrap();
+        std::fs::write(
+            paths.subscriptions_meta_path(),
+            format!("- id: {id}\n  url: file://{id}.yaml\n  updated: 2026-09-01T00:00:00Z\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            paths.subscription_file_path(id),
+            "proxies: []\nproxy-groups: []\nrules: []\n",
+        )
+        .unwrap();
+        SelectionScope {
+            subscription_id: id.to_string(),
+            path: paths.selection_state_path_for_subscription(id),
+        }
+    }
+
+    #[test]
+    fn active_selection_scope_fails_fast_when_no_active_subscription() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let err = active_selection_scope(&paths).unwrap_err();
+        assert!(err.to_string().contains("No active subscription"));
+    }
+
+    #[test]
+    fn active_selection_scope_resolves_correct_scope() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let sub_id = "sub-11111111";
+        setup_test_active_subscription(&paths, sub_id);
+
+        let scope = active_selection_scope(&paths).unwrap();
+        assert_eq!(scope.subscription_id, sub_id);
+        assert_eq!(
+            scope.path,
+            paths.selection_state_path_for_subscription(sub_id)
+        );
+    }
+
+    #[test]
+    fn active_selection_scope_migrates_legacy_file_and_archives() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let sub_id = "sub-aaaaaaaa";
+        setup_test_active_subscription(&paths, sub_id);
+
+        let legacy_file = paths.selection_state_path();
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(&legacy_file, "selections:\n  Proxy: NodeA\n").unwrap();
+
+        let scope = active_selection_scope(&paths).unwrap();
+        assert_eq!(scope.subscription_id, sub_id);
+
+        // Legacy file archived
+        assert!(!legacy_file.exists());
+        assert!(paths
+            .config_dir()
+            .join("selection-state.yaml.legacy")
+            .exists());
+
+        // Target selections file contains migrated data
+        let selections = load_selection_state_for_scope(&scope).unwrap();
+        assert_eq!(selections.get("Proxy"), Some(&"NodeA".to_string()));
+    }
+
     #[test]
     fn remember_selection_round_trips_under_lock() {
         let tmp = TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());
+        let scope = setup_test_active_subscription(&paths, "sub-12345678");
         let _guard = acquire_selection_lock_at(&paths).unwrap();
-        remember_selection_at(&paths, "OpenAI", "US-01").unwrap();
-        let selections = load_selection_state_at(&paths).unwrap();
+        remember_selection_for_scope(&scope, "OpenAI", "US-01").unwrap();
+        let selections = load_selection_state_for_scope(&scope).unwrap();
         assert_eq!(selections.get("OpenAI"), Some(&"US-01".to_string()));
     }
 
@@ -670,6 +741,7 @@ proxy-groups:
     async fn replay_without_intent_file_returns_empty() {
         let tmp = TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());
+        setup_test_active_subscription(&paths, "sub-11111111");
         let client = ReplayFakeClient::new();
         let report = replay_selections_at(&paths, &client).await.unwrap();
         assert_eq!(report, ReplayReport::default());
@@ -680,8 +752,9 @@ proxy-groups:
     async fn replay_applies_all_groups() {
         let tmp = TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());
-        remember_selection_at(&paths, "A", "a1").unwrap();
-        remember_selection_at(&paths, "B", "b1").unwrap();
+        let scope = setup_test_active_subscription(&paths, "sub-11111111");
+        remember_selection_for_scope(&scope, "A", "a1").unwrap();
+        remember_selection_for_scope(&scope, "B", "b1").unwrap();
         let client = ReplayFakeClient::new()
             .with_group("A", "a2", &["a1", "a2"])
             .with_group("B", "b1", &["b1"]);
@@ -705,10 +778,40 @@ proxy-groups:
     }
 
     #[tokio::test]
+    async fn sub_a_and_sub_b_selections_are_completely_isolated() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let scope_a = setup_test_active_subscription(&paths, "sub-aaaaaaaa");
+        remember_selection_for_scope(&scope_a, "Proxy", "Node-A").unwrap();
+
+        let scope_b = setup_test_active_subscription(&paths, "sub-bbbbbbbb");
+        remember_selection_for_scope(&scope_b, "Proxy", "Node-B").unwrap();
+
+        // sub-a selections preserved
+        let sel_a = load_selection_state_for_scope(&scope_a).unwrap();
+        assert_eq!(sel_a.get("Proxy"), Some(&"Node-A".to_string()));
+
+        // sub-b selections preserved
+        let sel_b = load_selection_state_for_scope(&scope_b).unwrap();
+        assert_eq!(sel_b.get("Proxy"), Some(&"Node-B".to_string()));
+
+        // unpin on sub-a does not touch sub-b
+        unpin_selection_for_scope(&scope_a, "Proxy").unwrap();
+        assert!(load_selection_state_for_scope(&scope_a).unwrap().is_empty());
+        assert_eq!(
+            load_selection_state_for_scope(&scope_b)
+                .unwrap()
+                .get("Proxy"),
+            Some(&"Node-B".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn replay_skips_missing_node_and_reports_current() {
         let tmp = TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());
-        remember_selection_at(&paths, "A", "gone").unwrap();
+        let scope = setup_test_active_subscription(&paths, "sub-11111111");
+        remember_selection_for_scope(&scope, "A", "gone").unwrap();
         let client = ReplayFakeClient::new().with_group("A", "a2", &["a1", "a2"]);
         let report = replay_selections_at(&paths, &client).await.unwrap();
         assert_eq!(
@@ -720,7 +823,7 @@ proxy-groups:
         assert!(client.puts().is_empty());
         // Intent is preserved so a returning node replays later.
         assert_eq!(
-            load_selection_state_at(&paths).unwrap().get("A"),
+            load_selection_state_for_scope(&scope).unwrap().get("A"),
             Some(&"gone".to_string())
         );
         assert_eq!(
@@ -736,7 +839,8 @@ proxy-groups:
     async fn replay_skips_missing_group() {
         let tmp = TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());
-        remember_selection_at(&paths, "Ghost", "g1").unwrap();
+        let scope = setup_test_active_subscription(&paths, "sub-11111111");
+        remember_selection_for_scope(&scope, "Ghost", "g1").unwrap();
         let client = ReplayFakeClient::new();
         let report = replay_selections_at(&paths, &client).await.unwrap();
         assert_eq!(
@@ -750,8 +854,9 @@ proxy-groups:
     async fn replay_continues_after_single_group_put_failure() {
         let tmp = TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());
-        remember_selection_at(&paths, "A", "a1").unwrap();
-        remember_selection_at(&paths, "B", "b1").unwrap();
+        let scope = setup_test_active_subscription(&paths, "sub-11111111");
+        remember_selection_for_scope(&scope, "A", "a1").unwrap();
+        remember_selection_for_scope(&scope, "B", "b1").unwrap();
         let client = ReplayFakeClient::new()
             .with_group("A", "a1", &["a1"])
             .with_group("B", "b1", &["b1"])
@@ -768,8 +873,9 @@ proxy-groups:
     async fn replay_corrupt_intent_degrades_without_api_calls() {
         let tmp = TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());
-        crate::utils::ensure_dir_all_no_follow(paths.config_dir()).unwrap();
-        std::fs::write(paths.selection_state_path(), "selections: [not: a map").unwrap();
+        let scope = setup_test_active_subscription(&paths, "sub-11111111");
+        crate::utils::ensure_dir_all_no_follow(&paths.selections_dir()).unwrap();
+        std::fs::write(&scope.path, "selections: [not: a map").unwrap();
         let client = ReplayFakeClient::new();
         let report = replay_selections_at(&paths, &client).await.unwrap();
         assert!(report.intent_error.is_some());
@@ -778,14 +884,15 @@ proxy-groups:
         assert!(lines[0].starts_with("⚠ Selection intent not replayed:"));
         assert!(lines[1].contains("select --unpin --all"));
         // Corrupt file is preserved for inspection.
-        assert!(paths.selection_state_path().exists());
+        assert!(scope.path.exists());
     }
 
     #[tokio::test]
     async fn replay_applies_after_node_returns() {
         let tmp = TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());
-        remember_selection_at(&paths, "A", "a1").unwrap();
+        let scope = setup_test_active_subscription(&paths, "sub-11111111");
+        remember_selection_for_scope(&scope, "A", "a1").unwrap();
         let missing = ReplayFakeClient::new().with_group("A", "a2", &["a2"]);
         let first = replay_selections_at(&paths, &missing).await.unwrap();
         assert!(matches!(
@@ -797,17 +904,12 @@ proxy-groups:
         assert_eq!(second.results[0].outcome, ReplayOutcome::Applied);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn replay_zero_budget_marks_all_budget_exceeded() {
-        let tmp = TempDir::new().unwrap();
-        let paths = AppPaths::for_test(tmp.path());
-        remember_selection_at(&paths, "A", "a1").unwrap();
         let client = ReplayFakeClient::new().with_group("A", "a1", &["a1"]);
-        let report = replay_scope_until(
-            &SelectionScope {
-                subscription_id: "test-legacy".to_string(),
-                path: paths.selection_state_path(),
-            },
+        let report = replay_map_until(
+            &std::collections::BTreeMap::from([("A".to_string(), "a1".to_string())]),
             &client,
             Instant::now() + Duration::ZERO,
         )
@@ -835,7 +937,8 @@ proxy-groups:
     async fn replay_deadline_is_shared_by_all_requests() {
         let tmp = TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());
-        remember_selection_at(&paths, "A", "a1").unwrap();
+        let scope = setup_test_active_subscription(&paths, "sub-11111111");
+        remember_selection_for_scope(&scope, "A", "a1").unwrap();
         let client = ReplayFakeClient::new().with_group("A", "a1", &["a1"]);
         let report = replay_selections_until(&paths, &client, Instant::now())
             .await
@@ -848,11 +951,12 @@ proxy-groups:
     fn unpin_removes_only_the_named_group() {
         let tmp = TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());
-        remember_selection_at(&paths, "A", "a1").unwrap();
-        remember_selection_at(&paths, "B", "b1").unwrap();
-        assert!(unpin_selection_at(&paths, "A").unwrap());
-        assert!(!unpin_selection_at(&paths, "A").unwrap());
-        let selections = load_selection_state_at(&paths).unwrap();
+        let scope = setup_test_active_subscription(&paths, "sub-11111111");
+        remember_selection_for_scope(&scope, "A", "a1").unwrap();
+        remember_selection_for_scope(&scope, "B", "b1").unwrap();
+        assert!(unpin_selection_for_scope(&scope, "A").unwrap());
+        assert!(!unpin_selection_for_scope(&scope, "A").unwrap());
+        let selections = load_selection_state_for_scope(&scope).unwrap();
         assert!(!selections.contains_key("A"));
         assert_eq!(selections.get("B"), Some(&"b1".to_string()));
     }
@@ -861,14 +965,39 @@ proxy-groups:
     fn unpin_all_clears_and_resets_corrupt_intent() {
         let tmp = TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());
-        remember_selection_at(&paths, "A", "a1").unwrap();
-        remember_selection_at(&paths, "B", "b1").unwrap();
-        assert_eq!(unpin_all_selections_at(&paths).unwrap(), 2);
-        assert!(load_selection_state_at(&paths).unwrap().is_empty());
+        let scope = setup_test_active_subscription(&paths, "sub-11111111");
+        remember_selection_for_scope(&scope, "A", "a1").unwrap();
+        remember_selection_for_scope(&scope, "B", "b1").unwrap();
+        assert_eq!(unpin_all_selections_for_scope(&scope).unwrap(), 2);
+        assert!(load_selection_state_for_scope(&scope).unwrap().is_empty());
 
-        crate::utils::ensure_dir_all_no_follow(paths.config_dir()).unwrap();
-        std::fs::write(paths.selection_state_path(), "selections: [not: a map").unwrap();
-        assert_eq!(unpin_all_selections_at(&paths).unwrap(), 0);
-        assert!(load_selection_state_at(&paths).unwrap().is_empty());
+        crate::utils::ensure_dir_all_no_follow(&paths.selections_dir()).unwrap();
+        std::fs::write(&scope.path, "selections: [not: a map").unwrap();
+        assert_eq!(unpin_all_selections_for_scope(&scope).unwrap(), 0);
+        assert!(load_selection_state_for_scope(&scope).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_selection_inherits_parent_setgid() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+
+        let _ = crate::utils::set_directory_mode_no_follow(paths.config_dir(), 0o2755);
+        let parent_meta = std::fs::metadata(paths.config_dir()).unwrap();
+        if crate::utils::mode_has_setgid(parent_meta.mode()) {
+            let scope = SelectionScope {
+                subscription_id: "sub-setgid-test".to_string(),
+                path: paths.selections_dir().join("sub-setgid-test.yaml"),
+            };
+            save_selection_state_for_scope(&scope, &BTreeMap::new()).unwrap();
+
+            let sel_dir = paths.selections_dir();
+            let sel_meta = std::fs::metadata(&sel_dir).unwrap();
+            assert!(crate::utils::mode_has_setgid(sel_meta.mode()));
+        }
     }
 }

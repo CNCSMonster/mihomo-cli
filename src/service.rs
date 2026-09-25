@@ -448,6 +448,57 @@ fn sudo_pkill_mihomo_command() -> PlannedCommand {
     PlannedCommand::new("sudo", ["pkill", "-9", "-x", "mihomo"])
 }
 
+/// Dependency-free probe marker for "systemd is the running init".
+/// The directory is created by systemd PID 1 only (same signal as `sd_booted()`),
+/// so its absence means systemctl commands cannot work (WSL2 default, containers,
+/// minimal distros). Diagnosis only — never changes ServiceTarget selection.
+const SYSTEMD_RUNTIME_MARKER: &str = "/run/systemd/system";
+
+/// Runtime availability of the platform service manager for system mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServiceRuntimeState {
+    /// Linux host without a running systemd — no system lifecycle can work.
+    SystemdUnavailable,
+    /// Service manager is available but the mihomo unit is not installed.
+    NotInstalled,
+    /// Unit installed but the service is not running (stopped or not enabled).
+    InstalledNotRunning,
+    /// Unit installed and the service is running.
+    Running,
+}
+
+/// Probe whether systemd is the running init (Linux only; other OSes have no
+/// systemd concept and always report available).
+pub(crate) fn systemd_runtime_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new(SYSTEMD_RUNTIME_MARKER).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
+/// Pure classification of the system service runtime state — the injection
+/// point that lets unit tests cover every diagnosis without a live service
+/// manager. Precedence: no service manager → not installed → not running.
+pub(crate) fn classify_service_runtime(
+    service_manager_available: bool,
+    unit_installed: bool,
+    unit_running: bool,
+) -> ServiceRuntimeState {
+    if !service_manager_available {
+        ServiceRuntimeState::SystemdUnavailable
+    } else if !unit_installed {
+        ServiceRuntimeState::NotInstalled
+    } else if unit_running {
+        ServiceRuntimeState::Running
+    } else {
+        ServiceRuntimeState::InstalledNotRunning
+    }
+}
+
 pub(crate) fn windows_service_query_indicates_installed(stdout: &[u8]) -> bool {
     String::from_utf8_lossy(stdout).contains("STATE")
 }
@@ -925,6 +976,37 @@ pub(crate) fn grant_client_token_for_unix_identity(
         gid,
     )?;
     Ok(token)
+}
+
+#[cfg(unix)]
+pub(crate) fn setup_unix_system_owner_credentials(
+    ctx: &crate::instance::InstanceContext,
+) -> anyhow::Result<()> {
+    let uid = ctx.owner_uid.ok_or_else(|| {
+        anyhow::anyhow!("cannot resolve original user uid for owner authorization")
+    })?;
+    let gid = ctx.owner_gid.ok_or_else(|| {
+        anyhow::anyhow!("cannot resolve original user gid for owner authorization")
+    })?;
+    let home = &ctx.owner_home;
+    let token = grant_client_token_for_unix_identity(home, uid, gid)?;
+    let token_sha256 = crate::tun_transaction::sha256_revision(token.as_bytes());
+    let record = crate::daemon::OwnerRecord { uid, token_sha256 };
+    let owner_path = crate::daemon::owner_record_path();
+    let is_real_system_path = owner_path == std::path::Path::new("/var/lib/mihomo-cli/owner");
+    if is_root() || !is_real_system_path {
+        crate::daemon::write_owner_record_to(&owner_path, &record)?;
+    } else {
+        let bytes = serde_json::to_vec_pretty(&record)?;
+        #[cfg(target_os = "linux")]
+        let mode = 0o640;
+        #[cfg(not(target_os = "linux"))]
+        let mode = 0o600;
+        PrivilegeExecutor::write_file(&owner_path, &bytes, mode)?;
+        #[cfg(target_os = "linux")]
+        PrivilegeExecutor::run(&["chgrp", "mihomo", &owner_path.display().to_string()])?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1962,6 +2044,60 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_unix_system_owner_credentials_writes_home_token_and_owner_record() {
+        let has_mihomo_group = unsafe { !libc::getgrnam(c"mihomo".as_ptr()).is_null() };
+        if !has_mihomo_group {
+            eprintln!("skipped: mihomo service group not present");
+            return;
+        }
+
+        let home_dir = tempfile::tempdir().unwrap();
+        let owner_dir = tempfile::tempdir().unwrap();
+        let owner_file = owner_dir.path().join("owner");
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+
+        let mut ctx =
+            crate::instance::planned_current_context(crate::instance::InstanceMode::System)
+                .unwrap();
+        ctx.owner_home = home_dir.path().to_path_buf();
+        ctx.owner_uid = Some(uid);
+        ctx.owner_gid = Some(gid);
+
+        let _guard = crate::utils::env_test_lock().lock().unwrap();
+        let old = std::env::var_os("MIHOMO_CLI_OWNER_PATH");
+        unsafe {
+            std::env::set_var("MIHOMO_CLI_OWNER_PATH", &owner_file);
+        }
+
+        setup_unix_system_owner_credentials(&ctx).unwrap();
+
+        let token_path = client_token_path_for_home(home_dir.path());
+        assert!(token_path.exists());
+        let token = std::fs::read_to_string(&token_path).unwrap();
+        assert_eq!(token.trim().len(), 64);
+
+        assert!(owner_file.exists());
+        let record = crate::daemon::read_owner_record_from(&owner_file).unwrap();
+        assert_eq!(record.uid, uid);
+        assert_eq!(
+            record.token_sha256,
+            crate::tun_transaction::sha256_revision(token.trim().as_bytes())
+        );
+
+        if let Some(v) = old {
+            unsafe {
+                std::env::set_var("MIHOMO_CLI_OWNER_PATH", v);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("MIHOMO_CLI_OWNER_PATH");
+            }
+        }
     }
 
     #[cfg(unix)]

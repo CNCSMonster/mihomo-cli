@@ -1070,8 +1070,8 @@ fn gh_token() -> Option<String> {
 
 /// Download a single geo data file from a URL with timeout.
 /// Returns Ok(()) on success, Err with message on failure.
-/// Used by the Unix daemon for auto-recovery (ADR-24).
-#[cfg(unix)]
+/// Used by the daemon for auto-recovery (ADR-24).
+#[cfg(any(unix, windows))]
 pub(crate) async fn download_geo_file(url: &str, dest: &std::path::Path) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))

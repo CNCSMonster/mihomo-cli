@@ -24,8 +24,9 @@
 │  - 发送 IPC 命令给 daemon                                        │
 │  ⚠ 不需要 root 权限                                              │
 └──────────────────────────┬──────────────────────────────────────┘
-                           │ Unix Socket IPC
+                           │ IPC 传输：Unix Socket（Linux/macOS）
                            │ (/var/run/mihomo/service.sock)
+                           │ Windows 为 named pipe（非 Unix socket）
                            ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │         mihomo-cli daemon (后台守护进程, 非 root)  [ADR-21]       │
@@ -88,7 +89,7 @@ The forwarding contract is deny-by-default:
 - `GET` is limited to explicitly listed read-only resources required by the current CLI, including `/configs`, `/proxies`, `/connections`, and other paths only when added to the formal SPEC.
 - `PUT`/`PATCH` are limited to explicitly listed non-TUN runtime mutations. Each method/path/query/body field, target instance, and body size is validated against the command-specific allowlist.
 - `POST`, `DELETE`, unknown methods, unknown paths, cross-instance endpoints, query fields, body fields, oversized bodies, config paths, and arbitrary configuration bytes are rejected unless the formal SPEC explicitly lists them.
-- Any `tun`, `dns-hijack`, system-route, config-path, or equivalent TUN-control input is rejected by the generic proxy. TUN changes use only the dedicated root-peer `ApplySystemTunSnapshot`/`DisableTun` transaction with candidate, revision, fixed snapshot, and runtime attestation.
+- Any `tun`, `dns-hijack`, system-route, config-path, or equivalent TUN-control input is rejected by the generic proxy. TUN changes use only the dedicated root-peer `ApplySystemTunSnapshot`/`DisableTun` transaction with candidate, revision, fixed snapshot, and runtime attestation. **R1.3 注记**：该对变体已定 legacy，daemon 侧 deprecation 拒绝已实现；枚举变体删除待 SPEC §1.4 同步（drift 条目 5）。
 - If Core/API is not ready, the request returns `Incomplete` or `Unknown` with the explicit `mihomo-cli restart [--system]` next step; it never starts Core implicitly.
 
 An existing protocol enum, legacy handler, or client helper is not permission to forward that operation. Until an old branch is migrated to this contract, it must fail closed. Tests must cover rejection of unknown methods/paths/query/body fields, TUN-shaped generic mutations, lifecycle side effects, and requests made while Core is stopped.
@@ -149,6 +150,8 @@ User          CLI Client              Daemon                  mihomo core
  │<──────────────│                      │                         │
 ```
 
+> **R1.3 注记**：图中 `ApplySystemTunSnapshot` 为 legacy 变体，daemon 侧 deprecation 拒绝已实现；枚举变体删除待 SPEC §1.4 同步（drift 条目 5）。
+
 CLI 不直接写 system snapshot，也不直接调用 Core API。daemon 不以任意用户路径替代固定 system context，且不得用通用 `PATCH /configs` 伪造 TUN 事务；所有 system TUN 变更必须携带 candidate/revision，经 root revalidation、受保护 snapshot 提交和当前 Core API runtime observation。任一步骤失败时优先按 journal 执行回滚或继续恢复；无法证明精确恢复但能证明相关 runtime、事务和进程属于当前 mihomo instance 时，由既有 `restart`/TUN/清理命令在确认后执行受管 runtime reset，保留用户 intent；归属不可证明时才返回 `RecoveryRequired`，且不得要求用户手工操作内部文件。
 
 ## 受管 runtime reset（用户态自愈）
@@ -189,7 +192,7 @@ reset 的白名单只包含当前 instance 管理且可重建的运行态资产�
   → 成功或按 journal 恢复 old revision
 ```
 
-preflight 阻断时不写配置、snapshot、journal、路由或 TUN；事务、Core/API readiness 或 runtime observation 失败时执行受管回滚，无法证明恢复则返回 `RecoveryRequired`。成功结论只能来自当前 Core API；API 不可达时为 `unknown`/失败，不能由 `tun.enable` 或 daemon 缓存推断。
+preflight 阻断时不写配置、snapshot、journal、路由或 TUN；事务、Core/API readiness 或 runtime observation 失败时执行受管回滚，无法证明恢复则返回 `RecoveryRequired`。成功结论只能来自当前 Core API；API 不可达时为 `unknown`/失败，不能由 `tun.enable` 或 daemon 缓存推断。**R1.3 注记**：上文 `ApplySystemTunSnapshot` 为 legacy 变体，daemon 侧 deprecation 拒绝已实现；变体删除待 SPEC §1.4 同步（drift 条目 5）。
 
 ## 配置与运行时文件路径 (Linux System 模式)
 

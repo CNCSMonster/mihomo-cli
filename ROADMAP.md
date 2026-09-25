@@ -1,6 +1,8 @@
 # mihomo-cli ROADMAP
 
 > 顶层方向规划。实现细节见 `SPEC.md`、`docs/` 设计文档；具体任务用 GitHub Issues 追踪。
+>
+> 详细的历史记录由 git 历史保留。
 
 ---
 
@@ -85,7 +87,7 @@
 **目标**：威胁模型驱动的纵深防御。
 
 - L1-L7 已纳入当前安全设计与实现边界：TUN root 门控、配置隔离、token 认证、socket 审计、daemon 非 root、符号链接防护、日志脱敏；各平台完整旅程和真实 data plane 仍按 `SPEC.md §0.4` 分层报告
-- 待评估/持续验证：多用户 daemon 访问控制、部分安装事务 crash points、跨平台真实 Core/TUN evidence
+- 待评估/持续验证：单 owner 绑定的 daemon 访问控制（owner record + token hash + peer UID）、部分安装事务 crash points、跨平台真实 Core/TUN evidence
 
 **现状**：L1-L7 已形成统一安全设计和对应实现/测试边界；具体平台、真实 Core、TUN 和 data plane 证据按 `docs/SECURITY.md` 与 `SPEC.md §0.4` 分层报告。
 
@@ -104,7 +106,7 @@
 
 ## 已知限制
 
-- **多用户 daemon 访问控制**：授权表、token 和 IPC peer 校验的完整跨平台行为仍需按平台证据验证
+- **单 owner 访问控制**：owner record（token hash + uid）和 IPC peer 校验的完整跨平台行为仍需按平台证据验证；per-user 并存实例与多 core 不在当前支持范围
 - **跨平台 service 证据不对称**：Windows/macOS/Linux 的 service、Core/API、TUN 和真实 data plane 不能用同一层级的测试结果互相替代
 - **真实 TUN/data-plane fixture**：缺少同架构真实 Core、privileged netns 或外部 probe 时，只能报告 `Contract-tested`/`Planned`，不能报告 `Full-journey-tested`
 - **部分安装与 recovery**：journal/manifest/残留身份无法证明时必须 fail-closed 并返回 `RecoveryRequired`；实现和测试仍需覆盖所有 crash points

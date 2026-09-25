@@ -26,13 +26,23 @@
 | **SO_PEERCRED** | ❌ 无 | ❌ 无 | ✅ Unix peer UID 是授权材料之一 | 不能只依赖 token |
 
 | **审计日志** | ❌ 无 | ❌ 无 | ❌ 无 | 三者都缺失 |
-| **多用户支持** | ❌ 单用户 GUI | ⚠️ 安装者绑定模型 | ✅ per-user core + system daemon | mihomo-cli 架构更成熟 |
+| **多用户访问模型** | ❌ 单用户 GUI | ⚠️ 安装者绑定模型 | 单 owner 绑定（安装时固定 owner uid + token hash） | 授权路径按平台收敛；不标 ✅ |
 
 ### 1.3 结论
 
 - **clash-verge-rev**：安全设计最弱，不适合借鉴
 - **Proxy-RS**：安全设计最强，**值得借鉴**（Token 认证 + Socket 权限 + 服务沙箱）
-- **mihomo-cli**：架构层面（per-user core + system daemon）比两者都成熟，但 IPC 安全需要补齐
+- **mihomo-cli**：架构层面（system daemon 单实例 + 单 owner 绑定）比两者都清晰，但 IPC 安全需要补齐
+
+### 1.4 多用户三概念辨析
+
+「多用户」在文档中曾被混用，实际对应三个不同层次，禁止互相标 ✅：
+
+| 概念 | 实现状态 | 文档口径 |
+|------|---------|---------|
+| ① 单 owner 绑定（owner record） | **已实现** | 安装时绑定 owner uid + token hash |
+| ② per-user 并存实例 | **不支持**（路径/端口矩阵为单实例互斥语义） | 明确标「不支持」 |
+| ③ 多 core 并存 | **零代码，远期** | ADR-18 远期演进，非当前目标 |
 
 ---
 
@@ -93,6 +103,8 @@ user-a$ mihomo-cli tun on
 # 攻击者绕过 CLI，直接向 daemon IPC socket 发送命令
 attacker$ echo '{"ApplySystemTunSnapshot": {"expected_revision": "..."}}' | nc -U /var/run/mihomo/service.sock
 # TUN 被开启，无需任何认证
+# R1.3 注记：ApplySystemTunSnapshot / DisableTun 已定 legacy，daemon 侧 deprecation 拒绝已实现；
+# 枚举变体删除待 SPEC §1.4 同步（drift 条目 5）。
 ```
 
 #### 风险等级
@@ -107,7 +119,7 @@ attacker$ echo '{"ApplySystemTunSnapshot": {"expected_revision": "..."}}' | nc -
 
 #### 防护方案（当前合同）
 
-- Unix token 认证：per-user client token + root 管理授权表 + peer UID 绑定。
+- Unix token 认证：per-user client token（用户侧明文）+ daemon 侧 owner record（sha256 hash + owner uid）+ peer UID 绑定。
 - `tun on/off` 由普通用户 CLI 内部 sudo re-exec；daemon 只接受 root peer 的 TUN mutation。
 - per-user `config.yaml` 是 intent 事实来源；system TUN config 是由 root peer gate 与受控事务生成、并收敛为 `mihomo:mihomo 0640` 的受保护派生 snapshot，不是第二事实来源。
 - snapshot 只能由经过原始用户 owner/no-follow/hash/revision 复检的 candidate 生成，并须经真实 Core 语义校验和 API runtime observation。
@@ -159,7 +171,7 @@ ADR-21 在 Linux 已实施：daemon 以 `mihomo` 用户运行，通过 AmbientCa
 
 #### 防护方案
 
-- Unix 无独立 server token；`~/.config/mihomo/service-token` 为 `0o600 user:user`，并与 peer UID、root 管理的授权表联合校验
+- Unix 无独立 server token；`~/.config/mihomo/service-token` 为 `0o600 user:user`，daemon 侧仅存其 sha256 hash（`/var/lib/mihomo-cli/owner`），与 peer UID 联合校验
 - Daemon 侧 peer UID 检查（TUN 操作需要 root）
 
 ### 2.9 场景 7：符号链接攻击（Symlink Attack）
@@ -323,6 +335,8 @@ async fn ensure_tun_privilege_or_reexec() -> anyhow::Result<()> {
 
 ```rust
 // daemon.rs:handle_daemon_command
+// R1.3 注记：ApplySystemTunSnapshot / DisableTun 已定 legacy，daemon 侧 deprecation 拒绝已实现；
+// 枚举变体删除待 SPEC §1.4 同步（drift 条目 5）。
 DaemonCommand::ApplySystemTunSnapshot { .. } | DaemonCommand::DisableTun { .. } => {
     // Unix: 通过 getsockopt(SO_PEERCRED) 获取 peer UID，TUN mutation 只接受 peer_uid == 0。
     // daemon 自身的非 root UID、普通授权用户和仅有 token 的连接均不得绕过 root peer gate。
@@ -439,7 +453,7 @@ if let Some(server_token) = crate::ipc::service_token() {
 
 #### Socket 权限审计
 
-L3 采用“方案 A”：per-user client token + daemon 授权表 + peer UID 绑定校验。由于 system daemon socket 需要允许已授权的普通用户发起连接，socket 权限保持 `0o666`；真正的授权边界在 daemon 应用层认证，而不是 Unix socket 文件模式。
+L3 采用"方案 A"：per-user client token + daemon 侧 owner record（sha256 hash + owner uid）+ peer UID 绑定校验。单 owner 模型——安装时绑定 owner uid，仅该用户可操作 system daemon。Socket 权限保持 `0o666`，允许所有本机用户连接；真正的授权边界在 daemon 应用层认证（token hash 比对 + peer UID 匹配），而不是 Unix socket 文件模式。
 
 ```rust
 // daemon.rs:1020
@@ -447,14 +461,14 @@ L3 采用“方案 A”：per-user client token + daemon 授权表 + peer UID �
 std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o666))?;
 ```
 
-不改为 `0o600`/`0o660` 的原因：这会阻止非 daemon 用户连接 system IPC，破坏 `mihomo-cli access grant ...` 授权后的多用户控制路径；且 `0o660` 还要求额外的 daemon 组成员管理。
+不改为 `0o600`/`0o660` 的原因：改为 `0o600` 会阻止 owner 用户（非 root）连接 system daemon socket；`0o660` 需要 owner 加入 daemon 组，增加管理负担。当前 `0o666` + token hash + peer UID 双重校验已提供足够的应用层授权保障。
 systemd 的 `RuntimeDirectoryMode=0711` 只允许非 daemon 用户穿越目录到已知 socket，
 不允许列出目录内容；实际 IPC 权限仍由 socket 上的 token 与 peer UID 双重校验决定。
 
 Mihomo Core API socket 继续由 `mihomo` 用户私有。System 模式下，已授权普通用户的
 `list`、`select`、`delay`、`proxy` 等请求通过 daemon 的 method/path allowlist 转发；
 未授权用户在转发前即被 token + peer UID 校验拒绝。通用转发明确拒绝 `tun` patch，
-避免绕过 `ApplySystemTunSnapshot` / `DisableTun` 的 root peer gate。
+避免绕过 `ApplySystemTunSnapshot` / `DisableTun` 的 root peer gate。两变体已定 legacy，daemon 侧 deprecation 拒绝已实现；变体删除待 SPEC §1.4 同步（drift 条目 5）。
 
 #### Token 文件保护
 
@@ -480,8 +494,8 @@ std::fs::set_permissions(token_path, std::fs::Permissions::from_mode(0o600))?;
 
 ### 4.2 权限模型
 
-- Per-user client token 权限为 `0o600 user:user`；Linux 授权表为 `0o640 root:mihomo`，macOS 授权表为 `0o600 root:wheel`
-- Socket 权限 `0o666`：所有本机用户可连接，但必须提供授权表中匹配 peer UID 的 client token
+- Per-user client token 权限为 `0o600 user:user`；daemon 侧 owner record（`/var/lib/mihomo-cli/owner`）Linux 为 `0o640 root:mihomo`，macOS 为 `0o600 root:wheel`
+- Socket 权限 `0o666`：所有本机用户可连接，但 daemon 应用层校验 client token hash + peer UID 匹配后才放行
 - TUN 操作需要 root：daemon 检查 peer UID
 - CLI 自动处理 sudo：用户不需要手动加 `sudo` 前缀
 
@@ -603,11 +617,11 @@ std::fs::set_permissions(token_path, std::fs::Permissions::from_mode(0o600))?;
 
 ### L3 Unix IPC 访问控制（方案 A，已实施）
 
-Unix system daemon 使用 per-user client token、peer UID 与 root 管理的授权表联合认证；不存在独立 Unix server token：
+Unix system daemon 使用 per-user client token 与 daemon 侧 owner record（sha256 hash + owner uid）联合 peer UID 认证；不存在独立 Unix server token：
 
-- `~/.config/mihomo/service-token`：用户 client token，`0o600 user:user`。
-- `/var/lib/mihomo-cli/authorized-clients.json`：Linux 为 `0o640 root:mihomo`，macOS 为 `0o600 root:wheel`。
+- `~/.config/mihomo/service-token`：用户 client token，`0o600 user:user`。CLI 连接时携带明文 token，daemon 计算其 sha256 后与 owner record 比对。
+- `/var/lib/mihomo-cli/owner`：daemon 侧 owner record（JSON: `{uid, token_sha256}`）。Linux 为 `0o640 root:mihomo`，macOS 为 `0o600 root:wheel`。安装时由 `mihomo-cli install --system` 生成。
 
-Daemon 对每个 IPC 请求校验 client token 是否存在于授权表，并校验 Unix socket peer UID 与授权表中 token 归属 UID 一致；`tun on/off` 仍额外要求 root peer UID。
+Daemon 对每个 IPC 请求校验 client token 的 sha256 与 owner record 一致，并校验 Unix socket peer UID 与 owner record 中 uid 一致；`tun on/off` 仍额外要求 root peer UID。
 
-管理命令：`mihomo-cli access grant --user <name>`、`access revoke --user <name>`、`access list`、`access status`。
+诊断：`mihomo-cli doctor --system` 输出认证状态（`Daemon 授权` check）。

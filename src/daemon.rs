@@ -6,17 +6,19 @@
 //! The daemon is started by `mihomo-cli install --system` and managed by
 //! the system's service manager (systemd/launchd/Windows Service).
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::instance::ApiEndpoint;
 use crate::instance::{SystemPaths, TargetOs};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::ipc::CoreApiMethod;
 #[cfg(any(unix, windows))]
 use crate::ipc::{DaemonCommand, DaemonResponse};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::mihomo_api;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::mihomo_api::MihomoApiClient;
+#[cfg(any(unix, windows))]
+use std::path::Path;
 use std::path::PathBuf;
 #[cfg(any(unix, windows))]
 use std::process::Stdio;
@@ -31,53 +33,43 @@ use tokio::sync::Mutex;
 #[cfg(any(unix, windows))]
 use tokio_util::sync::CancellationToken;
 
-#[cfg(unix)]
-fn validate_selection_intent_dir(path: &std::path::Path) -> Result<(), String> {
-    if !path.is_absolute() {
-        return Err(format!(
-            "refusing to use non-absolute selection intent directory {}",
-            path.display()
-        ));
-    }
-    let text = path.to_string_lossy().replace('\\', "/");
-    if text.contains("/../") || text.contains("/./") {
-        return Err(format!(
-            "refusing to use selection intent directory {}; path must not contain . or .. components",
-            path.display()
-        ));
-    }
-    let parts: Vec<&str> = text.split('/').collect();
-    let allowed = if cfg!(target_os = "macos") {
-        matches!(
-            parts.as_slice(),
-            ["", "Users", user, ".config", "mihomo"] if !user.is_empty()
-        ) || matches!(parts.as_slice(), ["", "var", "root", ".config", "mihomo"])
+/// Fixed system runtime directory text per platform, normalized to forward
+/// slashes. Must stay in sync with `instance::planned_tun_config_file`
+/// (Linux `/var/lib/mihomo-cli`, macOS `/Library/Application Support/mihomo-cli`,
+/// Windows `%ProgramData%/mihomo-cli`); a drift here silently rejects the
+/// daemon's own runtime configs (Bug #12).
+#[cfg(any(unix, windows))]
+fn managed_runtime_dir_text() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "/Library/Application Support/mihomo-cli"
+    } else if cfg!(windows) {
+        "/ProgramData/mihomo-cli"
     } else {
-        matches!(
-            parts.as_slice(),
-            ["", "home", user, ".config", "mihomo"] if !user.is_empty()
-        )
-    };
-    #[cfg(test)]
-    let allowed =
-        allowed || (path.is_dir() && (text.contains("tmp") || text.contains(".config/mihomo")));
-    if !allowed {
-        return Err(format!(
-            "refusing to use selection intent directory {}; expected a per-user .config/mihomo directory",
-            path.display()
-        ));
+        "/var/lib/mihomo-cli"
     }
-    Ok(())
 }
 
-#[cfg(unix)]
-fn validate_optional_selection_intent_dir(path: Option<&str>) -> Result<Option<PathBuf>, String> {
-    let Some(path) = path else {
-        return Ok(None);
+/// Shape check for managed runtime files, evaluated against a normalized
+/// (backslash→slash) path text. Testable for every platform's runtime dir on
+/// any host so the macOS/Windows branches cannot silently diverge from Linux.
+/// The comparison is anchored: only a single Windows drive prefix may be
+/// stripped, so no unrelated path can `ends_with` its way into acceptance.
+#[cfg(any(unix, windows))]
+fn runtime_config_text_allowed(text: &str, file_name: Option<&str>, runtime_dir: &str) -> bool {
+    let suffix = match file_name {
+        Some("tun-config.yaml") => "/tun-config.yaml",
+        Some("active-config.yaml") => "/active-config.yaml",
+        Some("recovery-target.yaml") => "/transactions/active/recovery-target.yaml",
+        _ => return false,
     };
-    let path = PathBuf::from(path);
-    validate_selection_intent_dir(&path)?;
-    Ok(Some(path))
+    let candidate = format!("{runtime_dir}{suffix}");
+    let anchored = match text.split_once(':') {
+        Some((drive, rest)) if drive.chars().count() == 1 && rest.starts_with('/') => {
+            rest.to_string()
+        }
+        _ => text.to_string(),
+    };
+    anchored == candidate
 }
 
 #[cfg(any(unix, windows))]
@@ -109,75 +101,36 @@ fn validate_daemon_config_path_shape(config_path: &std::path::Path) -> Result<()
         ));
     }
 
-    let allowed = if cfg!(target_os = "windows") {
+    let runtime_allowed = runtime_config_text_allowed(&text, file_name, managed_runtime_dir_text());
+    let user_config_ok = if cfg!(target_os = "windows") {
         // User config: %APPDATA%/mihomo/config.yaml
-        let user_config_ok = (text.ends_with("/AppData/Roaming/mihomo/config.yaml")
+        (text.ends_with("/AppData/Roaming/mihomo/config.yaml")
             || text.ends_with("/AppData/Roaming/Mihomo/config.yaml"))
-            && (text.contains(":/") || text.starts_with("//"));
-        // TUN config: %ProgramData%/mihomo-cli/tun-config.yaml
-        let tun_config_ok =
-            is_tun_config && text.ends_with("/ProgramData/mihomo-cli/tun-config.yaml");
-        user_config_ok || tun_config_ok
-    } else {
+            && (text.contains(":/") || text.starts_with("//"))
+    } else if cfg!(target_os = "macos") {
+        // User config: /Users/<user>/.config/mihomo/config.yaml
         let parts: Vec<&str> = text.split('/').collect();
-        if cfg!(target_os = "macos") {
-            // User config: /Users/<user>/.config/mihomo/config.yaml
-            let user_config_ok = matches!(
-                parts.as_slice(),
-                ["", "Users", user, ".config", "mihomo", "config.yaml"] if !user.is_empty()
-            ) || matches!(
-                parts.as_slice(),
-                ["", "var", "root", ".config", "mihomo", "config.yaml"]
-            );
-            // TUN config: /Library/Application Support/mihomo-cli/tun-config.yaml
-            let tun_config_ok = is_tun_config
-                && matches!(
-                    parts.as_slice(),
-                    [
-                        "",
-                        "Library",
-                        "Application Support",
-                        "mihomo-cli",
-                        "tun-config.yaml"
-                    ]
-                );
-            user_config_ok || tun_config_ok
-        } else {
-            // Linux
-            // User config: /home/<user>/.config/mihomo/config.yaml
-            let user_config_ok = matches!(
-                parts.as_slice(),
-                ["", "home", user, ".config", "mihomo", "config.yaml"] if !user.is_empty()
-            );
-            // TUN config: /var/lib/mihomo-cli/tun-config.yaml
-            let tun_config_ok = is_tun_config
-                && matches!(
-                    parts.as_slice(),
-                    ["", "var", "lib", "mihomo-cli", "tun-config.yaml"]
-                );
-            let managed_recovery_config_ok = is_managed_recovery_config
-                && matches!(
-                    parts.as_slice(),
-                    ["", "var", "lib", "mihomo-cli", "active-config.yaml"]
-                        | [
-                            "",
-                            "var",
-                            "lib",
-                            "mihomo-cli",
-                            "transactions",
-                            "active",
-                            "recovery-target.yaml"
-                        ]
-                );
-            user_config_ok || tun_config_ok || managed_recovery_config_ok
-        }
+        matches!(
+            parts.as_slice(),
+            ["", "Users", user, ".config", "mihomo", "config.yaml"] if !user.is_empty()
+        ) || matches!(
+            parts.as_slice(),
+            ["", "var", "root", ".config", "mihomo", "config.yaml"]
+        )
+    } else {
+        // Linux user config: /home/<user>/.config/mihomo/config.yaml
+        let parts: Vec<&str> = text.split('/').collect();
+        matches!(
+            parts.as_slice(),
+            ["", "home", user, ".config", "mihomo", "config.yaml"] if !user.is_empty()
+        )
     };
 
-    if allowed {
+    if runtime_allowed || user_config_ok {
         Ok(())
     } else {
         Err(format!(
-            "refusing to use config path {}; system daemon only accepts per-user config.yaml or system-level tun-config.yaml",
+            "refusing to use config path {}; system daemon only accepts per-user config.yaml or managed runtime configs",
             config_path.display()
         ))
     }
@@ -237,66 +190,83 @@ fn validate_config_owner_for_peer(
 }
 
 #[cfg(windows)]
-#[allow(dead_code)]
 fn validate_daemon_config_path_for_peer(
     config_path: &std::path::Path,
     _peer_uid: Option<u32>,
 ) -> Result<(), String> {
+    // Mirror the Unix branch's pre-check: reject internal recovery config
+    // paths before shape validation so clients cannot submit these paths via
+    // Core API forwarding.
+    if matches!(
+        config_path.file_name().and_then(|name| name.to_str()),
+        Some("active-config.yaml") | Some("recovery-target.yaml")
+    ) {
+        return Err(format!(
+            "refusing to use internal recovery config path {} through daemon IPC",
+            config_path.display()
+        ));
+    }
     validate_daemon_config_path_shape(config_path)
 }
 
 #[cfg(unix)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub(crate) struct AuthorizedClient {
-    pub user: String,
+pub(crate) struct OwnerRecord {
     pub uid: u32,
-    pub token: String,
+    pub token_sha256: String,
 }
 
 #[cfg(unix)]
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default, PartialEq, Eq)]
-pub(crate) struct AuthorizedClients {
-    pub clients: Vec<AuthorizedClient>,
-}
-
-#[cfg(unix)]
-pub(crate) fn authorized_clients_path() -> PathBuf {
+pub(crate) fn owner_record_path() -> PathBuf {
     // 提权上下文（root）下忽略可伪造的环境变量覆盖，避免 root 借它写到任意路径
+    if unsafe { libc::geteuid() } == 0 {
+        return PathBuf::from("/var/lib/mihomo-cli/owner");
+    }
+    std::env::var_os("MIHOMO_CLI_OWNER_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/lib/mihomo-cli/owner"))
+}
+
+#[cfg(unix)]
+pub(crate) fn legacy_authorized_clients_path() -> PathBuf {
     if unsafe { libc::geteuid() } == 0 {
         return PathBuf::from("/var/lib/mihomo-cli/authorized-clients.json");
     }
-    std::env::var_os("MIHOMO_CLI_AUTHORIZED_CLIENTS_PATH")
+    std::env::var_os("MIHOMO_CLI_LEGACY_AUTHORIZED_CLIENTS_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/var/lib/mihomo-cli/authorized-clients.json"))
 }
 
 #[cfg(unix)]
-pub(crate) fn revoke_authorized_client(
-    table: &mut AuthorizedClients,
-    uid: u32,
-    token: &str,
-) -> anyhow::Result<bool> {
-    if token.is_empty() {
-        anyhow::bail!("refusing to revoke an empty client token");
-    }
-    let matches: Vec<usize> = table
-        .clients
-        .iter()
-        .enumerate()
-        .filter(|(_, client)| client.uid == uid && constant_time_token_eq(&client.token, token))
-        .map(|(index, _)| index)
-        .collect();
-    if matches.len() > 1 {
-        anyhow::bail!("authorized-client table has duplicate UID/token entries");
-    }
-    if matches.is_empty() {
-        return Ok(false);
-    }
-    table.clients.remove(matches[0]);
-    Ok(true)
+pub(crate) fn legacy_migration_warning(path: &std::path::Path) -> String {
+    format!(
+        "提示：检测到旧版授权配置文件 {}。系统服务现已采用单所有者模型，此文件中的非所有者条目将不再生效。",
+        path.display()
+    )
 }
 
 #[cfg(unix)]
+pub(crate) fn check_legacy_authorized_clients_migration_notice() -> Option<String> {
+    let legacy_path = legacy_authorized_clients_path();
+    if legacy_path.exists() {
+        Some(legacy_migration_warning(&legacy_path))
+    } else {
+        None
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn check_and_warn_legacy_authorized_clients() {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if let Some(notice) = check_legacy_authorized_clients_migration_notice() {
+            eprintln!("{notice}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[allow(dead_code)]
 pub(crate) fn read_client_token_for_home(home: &std::path::Path) -> anyhow::Result<String> {
     use std::io::Read;
     let path = crate::service::client_token_path_for_home(home);
@@ -311,18 +281,16 @@ pub(crate) fn read_client_token_for_home(home: &std::path::Path) -> anyhow::Resu
 }
 
 #[cfg(unix)]
-pub(crate) fn read_authorized_clients_from(
-    path: &std::path::Path,
-) -> anyhow::Result<AuthorizedClients> {
+pub(crate) fn read_owner_record_from(path: &std::path::Path) -> anyhow::Result<OwnerRecord> {
     if !path.exists() {
-        return Ok(AuthorizedClients::default());
+        anyhow::bail!("owner record file does not exist: {}", path.display());
     }
     let text = std::fs::read_to_string(path)?;
     Ok(serde_json::from_str(&text)?)
 }
 
 #[cfg(unix)]
-fn write_root_authorized_clients_file(
+fn write_root_owner_record_file(
     path: &std::path::Path,
     bytes: &[u8],
     mode: u16,
@@ -331,28 +299,27 @@ fn write_root_authorized_clients_file(
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
 
-    if unsafe { libc::geteuid() } != 0 || path != authorized_clients_path() {
+    if unsafe { libc::geteuid() } != 0 || path != owner_record_path() {
         anyhow::bail!(
-            "refusing privileged authorized-client write outside {}",
-            authorized_clients_path().display()
+            "refusing privileged owner record write outside {}",
+            owner_record_path().display()
         );
     }
     let parent = path
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("authorized-clients path has no parent"))?;
+        .ok_or_else(|| anyhow::anyhow!("owner record path has no parent"))?;
     if !parent.is_dir() {
         anyhow::bail!(
-            "authorized-client state directory is missing: {}. Reinstall the system service",
+            "owner record state directory is missing: {}. Reinstall the system service",
             parent.display()
         );
     }
     let dir = crate::utils::open_directory_no_follow(parent)?;
     let name = path
         .file_name()
-        .ok_or_else(|| anyhow::anyhow!("authorized-clients path has no file name"))?;
+        .ok_or_else(|| anyhow::anyhow!("owner record path has no file name"))?;
     let name = std::ffi::CString::new(name.as_bytes())?;
-    let temp_name =
-        std::ffi::CString::new(format!(".authorized-clients.{}.tmp", std::process::id()))?;
+    let temp_name = std::ffi::CString::new(format!(".owner.{}.tmp", std::process::id()))?;
     let fd = unsafe {
         libc::openat(
             dir.as_raw_fd(),
@@ -401,19 +368,18 @@ fn write_root_authorized_clients_file(
 }
 
 #[cfg(unix)]
-pub(crate) fn write_authorized_clients_to(
+pub(crate) fn write_owner_record_to(
     path: &std::path::Path,
-    table: &AuthorizedClients,
+    record: &OwnerRecord,
 ) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     let mode = 0o640;
     #[cfg(not(target_os = "linux"))]
     let mode = 0o600;
-    let bytes = serde_json::to_vec_pretty(table)?;
-    let privileged_system_path =
-        unsafe { libc::geteuid() } == 0 && path == authorized_clients_path();
+    let bytes = serde_json::to_vec_pretty(record)?;
+    let privileged_system_path = unsafe { libc::geteuid() } == 0 && path == owner_record_path();
     if privileged_system_path {
-        write_root_authorized_clients_file(path, &bytes, mode)?;
+        write_root_owner_record_file(path, &bytes, mode)?;
     } else {
         if let Some(parent) = path.parent() {
             crate::utils::ensure_dir_all_no_follow(parent)?;
@@ -451,18 +417,20 @@ pub(crate) fn validate_client_token_for_peer(
     if peer_uid == Some(0) {
         return Ok(());
     }
-    let token = token.ok_or_else(|| "invalid or missing auth token".to_string())?;
+    let token = token
+        .filter(|t| !t.trim().is_empty())
+        .ok_or_else(|| "invalid or missing auth token".to_string())?;
     let uid = peer_uid.ok_or_else(|| "cannot determine IPC peer uid".to_string())?;
-    let table = read_authorized_clients_from(&authorized_clients_path())
-        .map_err(|e| format!("cannot read authorized clients: {e}"))?;
-    match table
-        .clients
-        .iter()
-        .find(|c| constant_time_token_eq(&c.token, token))
-    {
-        Some(c) if c.uid == uid => Ok(()),
-        Some(_) => Err("auth token does not belong to IPC peer uid".to_string()),
-        None => Err("invalid or missing auth token".to_string()),
+    let record = read_owner_record_from(&owner_record_path())
+        .map_err(|e| format!("cannot read owner record: {e}"))?;
+    if uid != record.uid {
+        return Err("auth token does not belong to IPC peer uid".to_string());
+    }
+    let token_sha256 = crate::tun_transaction::sha256_revision(token.as_bytes());
+    if constant_time_token_eq(&token_sha256, &record.token_sha256) {
+        Ok(())
+    } else {
+        Err("invalid or missing auth token".to_string())
     }
 }
 
@@ -554,7 +522,44 @@ fn validate_system_core_binary_request(core_binary: &std::path::Path) -> Result<
 pub async fn run_daemon(pipe_path: PathBuf, cancel: CancellationToken) -> anyhow::Result<()> {
     let _ = daemon_executable_revision();
     let pipe_name = pipe_path.display().to_string();
-    let state = Arc::new(Mutex::new(WindowsDaemonState::default()));
+    let state = Arc::new(Mutex::new(DaemonState::default()));
+
+    // ADR-19: if core autostart is enabled, start the core automatically on
+    // daemon startup (e.g. boot). The marker is daemon-owned at the
+    // authoritative config dir — NOT the CLI's possibly-elevated home.
+    let autostart_marker = daemon_config_dir().join("autostart");
+    if autostart_marker.exists() {
+        let config_path = system_runtime_data_dir().join("active-config.yaml");
+        if config_path.exists() {
+            eprintln!("[mihomo-daemon] autostart marker present; starting core");
+            let core_binary =
+                crate::instance::planned_current_context(crate::instance::InstanceMode::System)
+                    .map(|ctx| ctx.paths.core_binary.clone())
+                    .unwrap_or_else(|| std::path::PathBuf::from(crate::utils::mihomo_path()));
+            let resp = start_core(Arc::clone(&state), config_path, core_binary).await;
+            if let DaemonResponse::Error { message } = &resp {
+                eprintln!("[mihomo-daemon] autostart core failed: {message}");
+            }
+        } else {
+            eprintln!(
+                "[mihomo-daemon] autostart marker present but no config.yaml; skipping core start"
+            );
+        }
+    }
+
+    // SPEC §3.8.1 mirror contract: if a core ended up running at startup,
+    // replay the selection mirror once — idempotent and best-effort.
+    let core_running_at_startup = state.lock().await.core_running;
+    if core_running_at_startup {
+        if let Some(subscription_id) = read_mirror_active_id() {
+            for line in replay_mirror_selection_intent(&state, &subscription_id).await {
+                eprintln!("[mihomo-daemon] {line}");
+            }
+        } else {
+            eprintln!("[mihomo-daemon] selection mirror unavailable; startup replay skipped");
+        }
+    }
+
     eprintln!("[mihomo-daemon] listening on {pipe_name}");
 
     // first_pipe_instance only for the first create (P1-2).
@@ -566,7 +571,7 @@ pub async fn run_daemon(pipe_path: PathBuf, cancel: CancellationToken) -> anyhow
                 eprintln!("[mihomo-daemon] shutdown requested, exiting accept loop");
                 // Stop the managed core child before exiting — dropping the
                 // Child alone does NOT kill the process (P1-1).
-                let _ = stop_windows_core(Arc::clone(&state)).await;
+                let _ = stop_core(Arc::clone(&state)).await;
                 return Ok(());
             }
             accepted = accept_one_pipe_connection(&pipe_name, first_instance) => {
@@ -873,20 +878,9 @@ mod windows_service_entry {
 }
 
 #[cfg(windows)]
-#[derive(Default)]
-struct WindowsDaemonState {
-    core_running: bool,
-    core_child: Option<tokio::process::Child>,
-    core_pid: Option<u32>,
-    config_path: Option<PathBuf>,
-    launched_config_revision: Option<String>,
-    core_binary: Option<PathBuf>,
-}
-
-#[cfg(windows)]
 async fn handle_windows_pipe(
     mut pipe: tokio::net::windows::named_pipe::NamedPipeServer,
-    state: Arc<Mutex<WindowsDaemonState>>,
+    state: Arc<Mutex<DaemonState>>,
 ) -> anyhow::Result<()> {
     let cmd_buf = crate::ipc::read_json_payload(&mut pipe, "daemon command").await?;
     let cmd = match parse_daemon_command(&cmd_buf) {
@@ -896,383 +890,71 @@ async fn handle_windows_pipe(
             return Ok(());
         }
     };
-    let response = process_windows_command(cmd, state).await;
+    let peer = PeerAuth {
+        uid: None,
+        elevated: windows_pipe_client_is_elevated(&pipe),
+    };
+    // Mirrors the Unix connection handler: lifecycle commands serialize
+    // end-to-end under OWNER_LIFECYCLE_LOCK while non-lifecycle commands stay
+    // lock-free (Issue #020).
+    let response = if is_lifecycle_command(&cmd) {
+        let lock = OWNER_LIFECYCLE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
+        let _guard = lock.lock().await;
+        process_command(cmd, state, peer).await
+    } else {
+        process_command(cmd, state, peer).await
+    };
     crate::ipc::write_json_message(&mut pipe, &response).await?;
     Ok(())
 }
 
 #[cfg(windows)]
-async fn promote_system_config_windows(
-    _state: Arc<Mutex<WindowsDaemonState>>,
-    _config_content: String,
-    _config_revision: String,
-    _selection_intent_dir: Option<String>,
-) -> DaemonResponse {
-    DaemonResponse::Error {
-        message: "system configuration promotion is not supported by the Windows service yet"
-            .to_string(),
-    }
-}
+/// Whether the named-pipe client runs with an elevated (Administrator) token.
+/// Windows counterpart of the Unix root-only TUN gate. Fail closed: any lookup
+/// failure denies.
+fn windows_pipe_client_is_elevated(
+    pipe: &tokio::net::windows::named_pipe::NamedPipeServer,
+) -> bool {
+    use std::os::windows::io::AsRawHandle;
 
-#[cfg(windows)]
-async fn process_windows_command(
-    cmd: DaemonCommand,
-    state: Arc<Mutex<WindowsDaemonState>>,
-) -> DaemonResponse {
-    // Token auth (N1a): reject commands whose token does not match the
-    // server-side copy. Skipped when the server has no token (legacy install).
-    let client_token = match &cmd {
-        DaemonCommand::StartCore { token, .. }
-        | DaemonCommand::RestartCore { token, .. }
-        | DaemonCommand::ApplySystemTunSnapshot { token, .. }
-        | DaemonCommand::PromoteSystemConfig { token, .. }
-        | DaemonCommand::SelectSystemProxy { token, .. }
-        | DaemonCommand::StopCore { token }
-        | DaemonCommand::DisableTun { token }
-        | DaemonCommand::GetStatus { token }
-        | DaemonCommand::CoreApiRequest { token, .. }
-        | DaemonCommand::SetAutostart { token, .. }
-        | DaemonCommand::ValidatePreparedRuntime { token, .. }
-        | DaemonCommand::ApplyPromotedSnapshot { token, .. }
-        | DaemonCommand::QuiesceCandidateRuntime { token, .. }
-        | DaemonCommand::RestoreOldRuntime { token, .. }
-        | DaemonCommand::AttestCurrentTransaction { token, .. }
-        | DaemonCommand::ApplyLegacyRecoveryTarget { token, .. }
-        | DaemonCommand::GetTransactionStatus { token } => token.as_deref(),
-    };
-    if let Err(message) = validate_client_token_for_peer(client_token, None) {
-        return DaemonResponse::Error { message };
-    }
-    match cmd {
-        DaemonCommand::GetStatus { .. } => {
-            let mut s = state.lock().await;
-            reap_exited_windows_core(&mut s);
-            let (tun_journal_state, tun_journal_error) = active_journal_status();
-            DaemonResponse::Status {
-                running: s.core_running,
-                core_pid: s.core_pid,
-                config_path: s.config_path.clone(),
-                tun_snapshot_revision: managed_system_tun_snapshot_path()
-                    .ok()
-                    .and_then(|path| crate::ipc::managed_snapshot_revision(&path).ok()),
-                launched_config_revision: s.launched_config_revision.clone(),
-                autostart_enabled: daemon_config_dir().join("autostart").exists(),
-                daemon_executable_revision: daemon_executable_revision(),
-                tun_journal_state,
-                tun_journal_error,
-            }
-        }
-        DaemonCommand::PromoteSystemConfig {
-            config_content,
-            config_revision,
-            selection_intent_dir,
-            ..
-        } => {
-            promote_system_config_windows(
-                state,
-                config_content,
-                config_revision,
-                selection_intent_dir,
-            )
-            .await
-        }
-        DaemonCommand::SelectSystemProxy { group, node, .. } => {
-            let _ = (group, node);
-            DaemonResponse::Error {
-                message: "system proxy selection is not supported by the Windows service yet"
-                    .to_string(),
-            }
-        }
-        DaemonCommand::CoreApiRequest { .. } => DaemonResponse::Error {
-            message: "Core API forwarding is not supported by the Windows service yet".to_string(),
-        },
-        // ADR-19: daemon owns the autostart marker.
-        DaemonCommand::SetAutostart { enabled, .. } => {
-            let marker = daemon_config_dir().join("autostart");
-            let result: std::io::Result<()> = if enabled {
-                let dir_result = marker
-                    .parent()
-                    .map(std::fs::create_dir_all)
-                    .unwrap_or(Ok(()));
-                match dir_result {
-                    Ok(()) => std::fs::write(&marker, b"enabled\n"),
-                    Err(e) => Err(e),
-                }
-            } else {
-                match std::fs::remove_file(&marker) {
-                    Ok(()) => Ok(()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Err(e) => Err(e),
-                }
-            };
-            match result {
-                Ok(()) => DaemonResponse::Success {
-                    message: if enabled {
-                        "core autostart enabled".to_string()
-                    } else {
-                        "core autostart disabled".to_string()
-                    },
-                },
-                Err(e) => DaemonResponse::Error {
-                    message: format!("failed to update autostart marker: {e}"),
-                },
-            }
-        }
-        DaemonCommand::StartCore {
-            config_content,
-            config_revision,
-            selection_intent_dir,
-            ..
-        } => {
-            promote_system_config_windows(
-                state,
-                config_content,
-                config_revision,
-                selection_intent_dir,
-            )
-            .await
-        }
-        DaemonCommand::StopCore { .. } => stop_windows_core(state).await,
-        DaemonCommand::RestartCore {
-            config_content,
-            config_revision,
-            selection_intent_dir,
-            ..
-        } => {
-            promote_system_config_windows(
-                state,
-                config_content,
-                config_revision,
-                selection_intent_dir,
-            )
-            .await
-        }
-        DaemonCommand::ApplySystemTunSnapshot { .. } | DaemonCommand::DisableTun { .. } => {
-            DaemonResponse::Error {
-                message:
-                    "legacy TUN commands are deprecated; please use transaction-based tun on/off"
-                        .to_string(),
-            }
-        }
-        DaemonCommand::ValidatePreparedRuntime { .. }
-        | DaemonCommand::ApplyPromotedSnapshot { .. }
-        | DaemonCommand::QuiesceCandidateRuntime { .. }
-        | DaemonCommand::RestoreOldRuntime { .. }
-        | DaemonCommand::AttestCurrentTransaction { .. }
-        | DaemonCommand::ApplyLegacyRecoveryTarget { .. }
-        | DaemonCommand::GetTransactionStatus { .. } => DaemonResponse::Error {
-            message: "TUN transaction recovery is not implemented on Windows yet".to_string(),
-        },
-    }
-}
-
-#[cfg(windows)]
-fn reap_exited_windows_core(s: &mut WindowsDaemonState) {
-    let Some(child) = s.core_child.as_mut() else {
-        s.core_running = false;
-        s.core_pid = None;
-        return;
-    };
-    match child.try_wait() {
-        Ok(Some(_)) | Err(_) => {
-            s.core_child = None;
-            s.core_running = false;
-            s.core_pid = None;
-            s.config_path = None;
-            s.core_binary = None;
-        }
-        Ok(None) => {
-            s.core_running = true;
-            s.core_pid = child.id();
-        }
-    }
-}
-
-#[cfg(windows)]
-async fn start_windows_core(
-    state: Arc<Mutex<WindowsDaemonState>>,
-    config_path: PathBuf,
-    core_binary: PathBuf,
-) -> DaemonResponse {
-    let config_path = match system_runtime_config_path(&config_path) {
-        Ok(path) => path,
-        Err(error) => {
-            return DaemonResponse::Error {
-                message: format!("failed to prepare system runtime config: {error}"),
-            };
-        }
-    };
-    let mut s = state.lock().await;
-    if let Some(child) = s.core_child.as_mut() {
-        match child.try_wait() {
-            Ok(None) => {
-                s.core_running = true;
-                return DaemonResponse::Error {
-                    message: "core is already running".to_string(),
-                };
-            }
-            Ok(Some(_)) | Err(_) => {
-                s.core_child = None;
-                s.core_pid = None;
-                s.core_running = false;
-                s.launched_config_revision = None;
-            }
-        }
-    }
-
-    let api_endpoint = match preflight_system_core_start_request(&config_path, &core_binary) {
-        Ok(endpoint) => endpoint,
-        Err(message) => return DaemonResponse::Error { message },
-    };
-    let config_revision = match config_content_revision(&config_path) {
-        Ok(revision) => revision,
-        Err(error) => {
-            return DaemonResponse::Error {
-                message: format!("failed to read Core config revision: {error}"),
-            }
-        }
-    };
-    if endpoint_is_connectable(&api_endpoint) {
-        return DaemonResponse::Error {
-            message: duplicate_core_endpoint_message(&api_endpoint),
+    // SAFETY: handles are null-checked and closed on every path; no pointer
+    // escapes this function.
+    unsafe {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
         };
-    }
-
-    let log_file = windows_core_log_file_path();
-    let stdout_log = match open_append_log_file(&log_file) {
-        Ok(file) => file,
-        Err(e) => {
-            return DaemonResponse::Error {
-                message: format!("failed to open core log file {}: {e}", log_file.display()),
-            };
-        }
-    };
-    let stderr_log = match stdout_log.try_clone() {
-        Ok(file) => file,
-        Err(e) => {
-            return DaemonResponse::Error {
-                message: format!("failed to clone core log file {}: {e}", log_file.display()),
-            };
-        }
-    };
-
-    let mut cmd = tokio::process::Command::new(&core_binary);
-    cmd.args(core_command_args(
-        &config_path,
-        &runtime_data_dir_for_config(&config_path),
-    ))
-    .stdin(Stdio::null())
-    .stdout(Stdio::from(stdout_log))
-    .stderr(Stdio::from(stderr_log));
-
-    match cmd.spawn() {
-        Ok(mut child) => {
-            let pid = child.id();
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            match child.try_wait() {
-                Ok(Some(status)) => DaemonResponse::Error {
-                    message: early_exit_message(status, &core_binary, &log_file),
-                },
-                Err(e) => DaemonResponse::Error {
-                    message: format!(
-                        "failed to inspect started core process: {e}\n  Logs: {}",
-                        log_file.display()
-                    ),
-                },
-                Ok(None) => {
-                    s.core_running = true;
-                    s.config_path = Some(config_path.clone());
-                    s.launched_config_revision = Some(config_revision);
-                    s.core_binary = Some(core_binary.clone());
-                    s.core_pid = pid;
-                    s.core_child = Some(child);
-                    DaemonResponse::Success {
-                        message: format!("core started with config {}", config_path.display()),
-                    }
-                }
-            }
-        }
-        Err(e) => DaemonResponse::Error {
-            message: format!("failed to start core {}: {e}", core_binary.display()),
-        },
-    }
-}
-
-#[cfg(windows)]
-async fn stop_windows_core(state: Arc<Mutex<WindowsDaemonState>>) -> DaemonResponse {
-    let mut s = state.lock().await;
-    let Some(mut child) = s.core_child.take() else {
-        s.core_running = false;
-        s.core_pid = None;
-        s.config_path = None;
-        s.launched_config_revision = None;
-        s.core_binary = None;
-        return DaemonResponse::Error {
-            message: "core is not running".to_string(),
+        use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
         };
-    };
 
-    let kill_result = child.kill().await;
-    let _ = child.wait().await;
-    s.core_running = false;
-    s.core_pid = None;
-    s.config_path = None;
-    s.core_binary = None;
-
-    match kill_result {
-        Ok(()) => DaemonResponse::Success {
-            message: "core stopped".to_string(),
-        },
-        Err(e) => DaemonResponse::Error {
-            message: format!("failed to stop core: {e}"),
-        },
-    }
-}
-
-#[cfg(windows)]
-#[allow(dead_code)]
-async fn toggle_windows_tun_by_restart(
-    state: Arc<Mutex<WindowsDaemonState>>,
-    config_path: PathBuf,
-    enable: bool,
-    stack: Option<&str>,
-    dns_hijack: Option<&str>,
-) -> DaemonResponse {
-    let core_binary = {
-        let mut s = state.lock().await;
-        reap_exited_windows_core(&mut s);
-        if !s.core_running {
-            return DaemonResponse::Error {
-                message: format!(
-                    "core is not running, cannot {} TUN",
-                    if enable { "enable" } else { "disable" }
-                ),
-            };
+        let pipe_handle = pipe.as_raw_handle() as HANDLE;
+        let mut client_pid: u32 = 0;
+        if GetNamedPipeClientProcessId(pipe_handle, &mut client_pid) == 0 {
+            return false;
         }
-        match s.core_binary.clone() {
-            Some(path) => path,
-            None => {
-                return DaemonResponse::Error {
-                    message:
-                        "daemon does not know the core binary path; restart the system service"
-                            .to_string(),
-                };
-            }
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, client_pid);
+        if process.is_null() {
+            return false;
         }
-    };
-
-    if let Err(e) = set_tun_in_config_file(&config_path, enable, stack, dns_hijack) {
-        return DaemonResponse::Error {
-            message: format!("failed to update TUN config {}: {e}", config_path.display()),
-        };
-    }
-
-    let _ = stop_windows_core(Arc::clone(&state)).await;
-    match start_windows_core(Arc::clone(&state), config_path, core_binary).await {
-        DaemonResponse::Success { .. } => DaemonResponse::Success {
-            message: format!("TUN {}", if enable { "enabled" } else { "disabled" }),
-        },
-        other => other,
+        let mut token: HANDLE = std::ptr::null_mut();
+        let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token);
+        CloseHandle(process);
+        if opened == 0 {
+            return false;
+        }
+        let mut elevation: TOKEN_ELEVATION = std::mem::zeroed();
+        let mut returned: u32 = 0;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            &mut elevation as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        );
+        CloseHandle(token);
+        ok != 0 && elevation.TokenIsElevated != 0
     }
 }
 
@@ -1285,13 +967,11 @@ fn windows_core_log_file_path() -> PathBuf {
         .join("mihomo.log")
 }
 
-#[cfg(unix)]
 /// Global lifecycle lock — serializes all lifecycle commands (start/stop/restart/
 /// TUN toggle) end-to-end, aligned with clash-verge-service OWNER_LIFECYCLE_LOCK.
 static OWNER_LIFECYCLE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
     std::sync::OnceLock::new();
 
-#[cfg(unix)]
 /// Daemon state shared across connections.
 struct DaemonState {
     /// Whether the mihomo core is currently running.
@@ -1315,7 +995,6 @@ struct DaemonState {
     core_log_file: PathBuf,
 }
 
-#[cfg(unix)]
 impl Default for DaemonState {
     fn default() -> Self {
         Self {
@@ -1355,41 +1034,161 @@ fn daemon_config_dir() -> std::path::PathBuf {
     system_runtime_data_dir()
 }
 
-/// Durable record of the per-user config dir holding selection-state.yaml, so
-/// the daemon can replay pinned selections after a daemon restart or boot-time
-/// autostart (the pid file lives on tmpfs and does not survive boot).
-#[cfg(unix)]
-fn selection_intent_dir_state_path() -> PathBuf {
-    daemon_config_dir().join("selection-intent-dir")
+/// Issue #012: test-only override for the privileged runtime directory.
+/// On machines where the system service is installed, `/var/lib/mihomo-cli`
+/// is root-owned mode 0770 and unit tests reading it fail with EACCES.
+/// Tests that exercise `process_command` (journal gate) call
+/// [`isolate_daemon_runtime_for_tests`] to point runtime resolution at an
+/// isolated directory. Production code paths are unaffected (`#[cfg(test)]`).
+#[cfg(test)]
+pub(crate) static TEST_RUNTIME_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn isolate_daemon_runtime_for_tests() {
+    TEST_RUNTIME_DIR.get_or_init(|| {
+        let dir =
+            std::env::temp_dir().join(format!("mihomo-cli-test-runtime-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create isolated test runtime dir");
+        dir
+    });
 }
 
-#[cfg(unix)]
-fn persist_selection_intent_dir(intent_dir: &std::path::Path) {
-    let path = selection_intent_dir_state_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+// ---------------- Selection intent mirror (fixed runtime) ----------------
+// The daemon never reads the user home tree. CLI pushes selection intent
+// copies via RecordSelectionIntent / RecordActiveSubscription; the daemon is
+// the only writer of this mirror and replays from it after restart/autostart
+// (SPEC §3.8.1 mirror contract).
+
+fn selection_mirror_dir_in(base: &std::path::Path) -> PathBuf {
+    base.join("selections")
+}
+
+fn selection_mirror_active_path_in(base: &std::path::Path) -> PathBuf {
+    selection_mirror_dir_in(base).join("active")
+}
+
+fn selection_mirror_file_path_in(base: &std::path::Path, subscription_id: &str) -> PathBuf {
+    selection_mirror_dir_in(base).join(format!("{subscription_id}.yaml"))
+}
+
+fn valid_mirror_subscription_id(subscription_id: &str) -> bool {
+    subscription_id.starts_with("sub-")
+        && subscription_id.len() == 12
+        && subscription_id.as_bytes()[4..]
+            .iter()
+            .all(u8::is_ascii_hexdigit)
+}
+
+fn write_selection_mirror_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("selection mirror path has no parent"))?;
+    if !dir.is_dir() {
+        std::fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750));
+        }
     }
-    let _ = std::fs::write(&path, format!("{}\n", intent_dir.display()));
+    crate::utils::atomic_write_bytes_no_follow(path, bytes, 0o640)
 }
 
-#[cfg(unix)]
-fn read_persisted_selection_intent_dir() -> Option<PathBuf> {
-    let raw = std::fs::read_to_string(selection_intent_dir_state_path()).ok()?;
-    let trimmed = raw.trim();
-    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+fn record_selection_mirror_in(
+    base: &std::path::Path,
+    subscription_id: &str,
+    content_yaml: &str,
+) -> anyhow::Result<()> {
+    if !valid_mirror_subscription_id(subscription_id) {
+        anyhow::bail!("invalid subscription id for selection mirror: {subscription_id}");
+    }
+    // Validate schema before persisting anything.
+    crate::selection::parse_selection_map(content_yaml.as_bytes())?;
+    write_selection_mirror_file(
+        &selection_mirror_file_path_in(base, subscription_id),
+        content_yaml.as_bytes(),
+    )
+}
+
+fn record_selection_mirror(subscription_id: &str, content_yaml: &str) -> anyhow::Result<()> {
+    record_selection_mirror_in(&daemon_config_dir(), subscription_id, content_yaml)
+}
+
+fn record_active_subscription_mirror_in(
+    base: &std::path::Path,
+    subscription_id: &str,
+) -> anyhow::Result<()> {
+    if !valid_mirror_subscription_id(subscription_id) {
+        anyhow::bail!("invalid subscription id for active mirror: {subscription_id}");
+    }
+    write_selection_mirror_file(
+        &selection_mirror_active_path_in(base),
+        subscription_id.as_bytes(),
+    )
+}
+
+fn record_active_subscription_mirror(subscription_id: &str) -> anyhow::Result<()> {
+    record_active_subscription_mirror_in(&daemon_config_dir(), subscription_id)
+}
+
+fn read_mirror_active_id_in(base: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(selection_mirror_active_path_in(base)).ok()?;
+    let id = raw.trim();
+    valid_mirror_subscription_id(id).then(|| id.to_string())
+}
+
+fn read_mirror_active_id() -> Option<String> {
+    read_mirror_active_id_in(&daemon_config_dir())
+}
+
+fn read_mirror_selection_map_in(
+    base: &std::path::Path,
+    subscription_id: &str,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let raw = std::fs::read(selection_mirror_file_path_in(base, subscription_id)).ok()?;
+    crate::selection::parse_selection_map(&raw).ok()
+}
+
+fn read_mirror_selection_map(
+    subscription_id: &str,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    read_mirror_selection_map_in(&daemon_config_dir(), subscription_id)
+}
+
+/// Content revisions of selection mirror files for reconciliation (R3.2).
+/// `None` per id means the mirror file is absent. Ids that would not be
+/// accepted for recording are rejected wholesale (fail-closed, no path
+/// traversal into the mirror directory).
+fn selection_mirror_revisions_in(
+    base: &std::path::Path,
+    subscription_ids: &[String],
+) -> anyhow::Result<std::collections::BTreeMap<String, Option<String>>> {
+    if let Some(invalid) = subscription_ids
+        .iter()
+        .find(|id| !valid_mirror_subscription_id(id))
+    {
+        anyhow::bail!("invalid subscription id for selection mirror query: {invalid}");
+    }
+    Ok(subscription_ids
+        .iter()
+        .map(|id| {
+            let revision = std::fs::read(selection_mirror_file_path_in(base, id))
+                .ok()
+                .map(|bytes| crate::tun_transaction::content_revision(&bytes));
+            (id.clone(), revision)
+        })
+        .collect())
 }
 
 /// Best-effort replay of persisted selection intent against the running Core
 /// (SPEC-select-persistence §3.2/§3.3). Returns user-facing report lines;
 /// failures degrade to warning lines instead of failing the caller. Holds no
 /// state lock while awaiting (replay has its own ≤5s budget).
-#[cfg(unix)]
 struct DaemonSelectionApiClient {
     state: Arc<Mutex<DaemonState>>,
     inner: mihomo_api::EndpointMihomoApiClient,
 }
 
-#[cfg(unix)]
 impl mihomo_api::MihomoApiClient for DaemonSelectionApiClient {
     async fn get(&self, path: &str) -> anyhow::Result<serde_json::Value> {
         self.inner.get(path).await
@@ -1425,7 +1224,6 @@ impl mihomo_api::MihomoApiClient for DaemonSelectionApiClient {
     }
 }
 
-#[cfg(unix)]
 fn percent_decode_proxy_segment(value: &str) -> anyhow::Result<String> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -1446,10 +1244,8 @@ fn percent_decode_proxy_segment(value: &str) -> anyhow::Result<String> {
     Ok(String::from_utf8(decoded)?)
 }
 
-#[cfg(unix)]
-async fn replay_selection_intent(
+async fn replay_mirror_selection_intent(
     state: &Arc<Mutex<DaemonState>>,
-    intent_dir: &std::path::Path,
     subscription_id: &str,
 ) -> Vec<String> {
     let api_endpoint = {
@@ -1463,11 +1259,9 @@ async fn replay_selection_intent(
     let Some(api_endpoint) = api_endpoint else {
         return Vec::new();
     };
-    let ep = ApiEndpoint::UnixSocket(
-        endpoint_unix_path(&api_endpoint)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(api_endpoint)),
-    );
+    let Some(ep) = api_endpoint_transport(&api_endpoint) else {
+        return vec!["⚠ Selections not replayed: unsupported Core API endpoint".to_string()];
+    };
     let client = mihomo_api::EndpointMihomoApiClient::new(ep);
     let deadline = std::time::Instant::now() + crate::selection::REPLAY_TOTAL_BUDGET;
     loop {
@@ -1482,16 +1276,17 @@ async fn replay_selection_intent(
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
-    let paths = crate::utils::AppPaths::new(intent_dir.to_path_buf());
-    let scope = crate::selection::SelectionScope {
-        subscription_id: subscription_id.to_string(),
-        path: paths.selection_state_path_for_subscription(subscription_id),
+    let Some(selections) = read_mirror_selection_map(subscription_id) else {
+        return vec![
+            "⚠ Selections not replayed: selection mirror unavailable; run any selection command to rebuild it"
+                .to_string(),
+        ];
     };
     let replay_client = DaemonSelectionApiClient {
         state: Arc::clone(state),
         inner: client,
     };
-    match crate::selection::replay_scope_until(&scope, &replay_client, deadline).await {
+    match crate::selection::replay_map_until(&selections, &replay_client, deadline).await {
         Ok(report) => report.format_lines(),
         Err(err) => vec![format!("⚠ Selections not replayed: {err:#}")],
     }
@@ -1500,6 +1295,10 @@ async fn replay_selection_intent(
 fn daemon_transaction_context() -> Option<crate::instance::InstanceContext> {
     let mut ctx = crate::instance::planned_current_context(crate::instance::InstanceMode::System)?;
     let config_dir = daemon_config_dir();
+    #[cfg(test)]
+    if let Some(dir) = TEST_RUNTIME_DIR.get() {
+        ctx.paths.tun_config_file = dir.join("tun-config.yaml");
+    }
     ctx.paths.config_dir = config_dir.clone();
     ctx.paths.config_file = config_dir.join("config.yaml");
     ctx.paths.intent_config_file = config_dir.join("config.yaml");
@@ -1528,11 +1327,12 @@ fn journal_status_from_result(
     }
 }
 
-#[cfg(unix)]
 fn allowed_with_unreadable_journal(cmd: &DaemonCommand) -> bool {
     matches!(
         cmd,
-        DaemonCommand::GetStatus { .. } | DaemonCommand::GetTransactionStatus { .. }
+        DaemonCommand::GetStatus { .. }
+            | DaemonCommand::GetTransactionStatus { .. }
+            | DaemonCommand::GetSelectionMirrorRevisions { .. }
     )
 }
 
@@ -1557,6 +1357,8 @@ pub async fn run_daemon(socket_path: PathBuf, cancel: CancellationToken) -> anyh
 
     // Remove stale socket
     let _ = std::fs::remove_file(&socket_path);
+
+    check_and_warn_legacy_authorized_clients();
 
     let listener = UnixListener::bind(&socket_path)?;
 
@@ -1606,17 +1408,17 @@ pub async fn run_daemon(socket_path: PathBuf, cancel: CancellationToken) -> anyh
     }
 
     // If a core ended up running (pid-file recovery or autostart), replay the
-    // persisted selection intent once — idempotent and best-effort
-    // (SPEC-select-persistence §3.2 daemon lifecycle hook).
+    // selection mirror once — idempotent and best-effort (SPEC §3.8.1 mirror
+    // contract). The daemon never reads the user home tree; a missing mirror
+    // degrades to a warning instead of a fallback read.
     let core_running_at_startup = state.lock().await.core_running;
     if core_running_at_startup {
-        if let Some(intent_dir) = read_persisted_selection_intent_dir() {
-            let paths = crate::utils::AppPaths::new(intent_dir.clone());
-            if let Ok(Some(subscription_id)) = crate::config::get_active_id_at(&paths) {
-                for line in replay_selection_intent(&state, &intent_dir, &subscription_id).await {
-                    eprintln!("[mihomo-daemon] {line}");
-                }
+        if let Some(subscription_id) = read_mirror_active_id() {
+            for line in replay_mirror_selection_intent(&state, &subscription_id).await {
+                eprintln!("[mihomo-daemon] {line}");
             }
+        } else {
+            eprintln!("[mihomo-daemon] selection mirror unavailable; startup replay skipped");
         }
     }
 
@@ -1678,6 +1480,28 @@ pub async fn run_daemon(socket_path: PathBuf, cancel: CancellationToken) -> anyh
     }
 }
 
+/// Determines if a command performs mutating lifecycle or transaction operations
+/// that require exclusive serialization under OWNER_LIFECYCLE_LOCK.
+/// Non-lifecycle commands (GetStatus, CoreApiRequest, SelectSystemProxy, RecordSelectionIntent, etc.)
+/// do not hold the lifecycle lock, avoiding head-of-line blocking (Issue #020).
+pub(crate) fn is_lifecycle_command(cmd: &DaemonCommand) -> bool {
+    matches!(
+        cmd,
+        DaemonCommand::StartCore { .. }
+            | DaemonCommand::StopCore { .. }
+            | DaemonCommand::RestartCore { .. }
+            | DaemonCommand::ApplySystemTunSnapshot { .. }
+            | DaemonCommand::DisableTun { .. }
+            | DaemonCommand::PromoteSystemConfig { .. }
+            | DaemonCommand::ValidatePreparedRuntime { .. }
+            | DaemonCommand::ApplyPromotedSnapshot { .. }
+            | DaemonCommand::QuiesceCandidateRuntime { .. }
+            | DaemonCommand::RestoreOldRuntime { .. }
+            | DaemonCommand::AttestCurrentTransaction { .. }
+            | DaemonCommand::ApplyLegacyRecoveryTarget { .. }
+    )
+}
+
 #[cfg(unix)]
 /// Handle a single IPC connection.
 async fn handle_connection(
@@ -1685,6 +1509,10 @@ async fn handle_connection(
     state: Arc<Mutex<DaemonState>>,
 ) -> anyhow::Result<()> {
     let peer_uid = stream.peer_cred().ok().map(|cred| cred.uid());
+    let peer = PeerAuth {
+        uid: peer_uid,
+        elevated: false,
+    };
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
@@ -1709,20 +1537,18 @@ async fn handle_connection(
     };
 
     // Aligned with clash-verge-service OWNER_LIFECYCLE_LOCK:
-    // lifecycle commands (start/stop/restart/TUN toggle) are serialized by a
-    // single global mutex held for the *entire* operation — including core
-    // spawn and readiness wait — so concurrent clients cannot interleave.
-    // GetStatus is read-only and does not take the lifecycle lock.
-    let is_lifecycle = !matches!(
-        cmd,
-        DaemonCommand::GetStatus { .. } | DaemonCommand::GetTransactionStatus { .. }
-    );
+    // lifecycle commands (start/stop/restart/TUN toggle/transactions) are serialized by a
+    // single global mutex held for the entire operation — including core spawn and
+    // readiness wait — so concurrent clients cannot interleave lifecycle transitions.
+    // Non-lifecycle commands (GetStatus, CoreApiRequest, SelectSystemProxy, etc.)
+    // do not take the lifecycle lock, avoiding head-of-line blocking (Issue #020).
+    let is_lifecycle = is_lifecycle_command(&cmd);
     let response = if is_lifecycle {
         let lock = OWNER_LIFECYCLE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
         let _guard = lock.lock().await;
-        process_command(cmd, state, peer_uid).await
+        process_command(cmd, state, peer).await
     } else {
-        process_command(cmd, state, peer_uid).await
+        process_command(cmd, state, peer).await
     };
 
     // Send response
@@ -1748,9 +1574,28 @@ fn daemon_executable_revision() -> Option<String> {
         .clone()
 }
 
-#[cfg(unix)]
-/// Only root (uid 0) may toggle TUN on/off.
-fn validate_tun_peer_is_root(peer_uid: Option<u32>) -> Result<(), String> {
+/// Authenticated IPC peer identity. Unix supplies the peer uid; named pipes
+/// expose no uid, so Windows carries the client's token elevation instead.
+#[derive(Debug, Clone, Copy)]
+struct PeerAuth {
+    uid: Option<u32>,
+    elevated: bool,
+}
+
+/// Pure TUN privilege decision, split from the per-OS peer probing so every
+/// branch is testable on any host (Issue #017).
+fn tun_peer_privilege_allowed(
+    is_windows: bool,
+    peer_uid: Option<u32>,
+    peer_elevated: bool,
+) -> Result<(), String> {
+    if is_windows {
+        return if peer_elevated {
+            Ok(())
+        } else {
+            Err("TUN on/off requires an elevated (Administrator) client".to_string())
+        };
+    }
     match peer_uid {
         Some(0) => Ok(()),
         Some(_) => Err("TUN on/off requires root privileges".to_string()),
@@ -1760,17 +1605,25 @@ fn validate_tun_peer_is_root(peer_uid: Option<u32>) -> Result<(), String> {
     }
 }
 
-#[cfg(unix)]
+/// Only root (uid 0) may toggle TUN on/off; on Windows only an elevated
+/// (Administrator) client may.
+fn validate_tun_peer_is_root(peer: PeerAuth) -> Result<(), String> {
+    tun_peer_privilege_allowed(cfg!(windows), peer.uid, peer.elevated)
+}
+
 async fn process_command(
     cmd: DaemonCommand,
     state: Arc<Mutex<DaemonState>>,
-    peer_uid: Option<u32>,
+    peer: PeerAuth,
 ) -> DaemonResponse {
     let client_token = match &cmd {
         DaemonCommand::StartCore { token, .. }
         | DaemonCommand::RestartCore { token, .. }
         | DaemonCommand::ApplySystemTunSnapshot { token, .. }
         | DaemonCommand::PromoteSystemConfig { token, .. }
+        | DaemonCommand::RecordSelectionIntent { token, .. }
+        | DaemonCommand::RecordActiveSubscription { token, .. }
+        | DaemonCommand::GetSelectionMirrorRevisions { token, .. }
         | DaemonCommand::SelectSystemProxy { token, .. }
         | DaemonCommand::StopCore { token }
         | DaemonCommand::DisableTun { token }
@@ -1785,14 +1638,14 @@ async fn process_command(
         | DaemonCommand::ApplyLegacyRecoveryTarget { token, .. }
         | DaemonCommand::GetTransactionStatus { token } => token.as_deref(),
     };
-    if let Err(message) = validate_client_token_for_peer(client_token, peer_uid) {
+    if let Err(message) = validate_client_token_for_peer(client_token, peer.uid) {
         return DaemonResponse::Error { message };
     }
     if matches!(
         cmd,
         DaemonCommand::ApplySystemTunSnapshot { .. } | DaemonCommand::DisableTun { .. }
     ) {
-        if let Err(message) = validate_tun_peer_is_root(peer_uid) {
+        if let Err(message) = validate_tun_peer_is_root(peer) {
             return DaemonResponse::Error { message };
         }
     }
@@ -1845,7 +1698,8 @@ async fn process_command(
                                     == crate::tun_transaction::JournalPhase::RecoveryRequired
                         }
                         DaemonCommand::GetTransactionStatus { .. }
-                        | DaemonCommand::GetStatus { .. } => true,
+                        | DaemonCommand::GetStatus { .. }
+                        | DaemonCommand::GetSelectionMirrorRevisions { .. } => true,
                         _ => false,
                     };
 
@@ -1899,23 +1753,53 @@ async fn process_command(
         }
         DaemonCommand::CoreApiRequest {
             method, path, body, ..
-        } => process_core_api_request(method, path, body, state, peer_uid).await,
+        } => process_core_api_request(method, path, body, state, peer.uid).await,
         DaemonCommand::PromoteSystemConfig {
             config_content,
             config_revision,
-            selection_intent_dir,
             subscription_id,
+            change_kind,
             ..
         } => {
             promote_system_config(
                 state,
                 config_content,
                 config_revision,
-                selection_intent_dir,
                 subscription_id,
+                change_kind,
             )
             .await
         }
+        DaemonCommand::RecordSelectionIntent {
+            subscription_id,
+            content_yaml,
+            ..
+        } => match record_selection_mirror(&subscription_id, &content_yaml) {
+            Ok(()) => DaemonResponse::Success {
+                message: "selection intent mirror recorded".to_string(),
+            },
+            Err(err) => DaemonResponse::Error {
+                message: format!("failed to record selection intent mirror: {err:#}"),
+            },
+        },
+        DaemonCommand::RecordActiveSubscription {
+            subscription_id, ..
+        } => match record_active_subscription_mirror(&subscription_id) {
+            Ok(()) => DaemonResponse::Success {
+                message: "active subscription mirror recorded".to_string(),
+            },
+            Err(err) => DaemonResponse::Error {
+                message: format!("failed to record active subscription mirror: {err:#}"),
+            },
+        },
+        DaemonCommand::GetSelectionMirrorRevisions {
+            subscription_ids, ..
+        } => match selection_mirror_revisions_in(&daemon_config_dir(), &subscription_ids) {
+            Ok(revisions) => DaemonResponse::SelectionMirrorRevisions { revisions },
+            Err(err) => DaemonResponse::Error {
+                message: format!("failed to read selection mirror revisions: {err:#}"),
+            },
+        },
         DaemonCommand::SelectSystemProxy { group, node, .. } => {
             select_system_proxy(state, group, node).await
         }
@@ -1956,7 +1840,6 @@ async fn process_command(
         DaemonCommand::StartCore {
             config_content,
             config_revision,
-            selection_intent_dir,
             subscription_id,
             ..
         } => {
@@ -1964,8 +1847,8 @@ async fn process_command(
                 state,
                 config_content,
                 config_revision,
-                selection_intent_dir,
                 subscription_id,
+                Some(crate::config::ChangeKind::Promote),
             )
             .await
         }
@@ -1973,7 +1856,6 @@ async fn process_command(
         DaemonCommand::RestartCore {
             config_content,
             config_revision,
-            selection_intent_dir,
             subscription_id,
             ..
         } => {
@@ -1981,8 +1863,8 @@ async fn process_command(
                 state,
                 config_content,
                 config_revision,
-                selection_intent_dir,
                 subscription_id,
+                Some(crate::config::ChangeKind::Promote),
             )
             .await
         }
@@ -2011,7 +1893,7 @@ async fn process_command(
                 fence,
                 expected_old_runtime_revision,
                 expected_old_runtime_tun,
-                peer_uid,
+                peer,
             )
             .await
         }
@@ -2019,9 +1901,9 @@ async fn process_command(
             fence,
             target_runtime_tun,
             ..
-        } => handle_apply_promoted_snapshot(state, fence, target_runtime_tun, peer_uid).await,
+        } => handle_apply_promoted_snapshot(state, fence, target_runtime_tun, peer).await,
         DaemonCommand::QuiesceCandidateRuntime { fence, .. } => {
-            handle_quiesce_candidate_runtime(state, fence, peer_uid).await
+            handle_quiesce_candidate_runtime(state, fence, peer).await
         }
         DaemonCommand::RestoreOldRuntime {
             fence,
@@ -2034,7 +1916,7 @@ async fn process_command(
                 fence,
                 expected_old_runtime_revision,
                 expected_old_runtime_tun,
-                peer_uid,
+                peer,
             )
             .await
         }
@@ -2049,7 +1931,7 @@ async fn process_command(
                 fence,
                 expected_runtime_revision,
                 expected_runtime_tun,
-                peer_uid,
+                peer,
             )
             .await
         }
@@ -2062,7 +1944,7 @@ async fn process_command(
                 state,
                 fence,
                 expected_recovery_target_revision,
-                peer_uid,
+                peer,
             )
             .await
         }
@@ -2070,32 +1952,43 @@ async fn process_command(
     }
 }
 
-#[cfg(unix)]
 fn reap_exited_core(s: &mut DaemonState) {
     let Some(child) = s.core_child.as_mut() else {
-        if let Some(metadata) = read_pid_file(&s.pid_file)
-            .filter(pid_metadata_is_trusted_system_core)
-            .filter(|metadata| process_alive(metadata.pid))
+        // Orphan recovery from the pid file (with process identity probing) is
+        // Unix-only for now; Windows stays child-tracked (Issue #017).
+        #[cfg(unix)]
         {
-            s.core_running = true;
-            s.core_pid = Some(metadata.pid);
-            if s.config_path.is_none() {
-                s.config_path = non_empty_path(metadata.config_path.clone());
+            if let Some(metadata) = read_pid_file(&s.pid_file)
+                .filter(pid_metadata_is_trusted_system_core)
+                .filter(|metadata| process_alive(metadata.pid))
+            {
+                s.core_running = true;
+                s.core_pid = Some(metadata.pid);
+                if s.config_path.is_none() {
+                    s.config_path = non_empty_path(metadata.config_path.clone());
+                }
+                if s.core_binary.is_none() {
+                    s.core_binary = non_empty_path(metadata.core_binary.clone());
+                }
+                if s.api_endpoint.is_none() {
+                    s.api_endpoint = metadata.api_endpoint.clone();
+                }
+                s.launched_config_revision = metadata.config_revision.clone();
+            } else {
+                s.core_running = false;
+                s.core_pid = None;
+                s.launched_config_revision = None;
+                remove_pid_file(&s.pid_file);
             }
-            if s.core_binary.is_none() {
-                s.core_binary = non_empty_path(metadata.core_binary.clone());
-            }
-            if s.api_endpoint.is_none() {
-                s.api_endpoint = metadata.api_endpoint.clone();
-            }
-            s.launched_config_revision = metadata.config_revision.clone();
-        } else {
+            return;
+        }
+        #[cfg(windows)]
+        {
             s.core_running = false;
             s.core_pid = None;
             s.launched_config_revision = None;
-            remove_pid_file(&s.pid_file);
+            return;
         }
-        return;
     };
     match child.try_wait() {
         Ok(Some(_)) | Err(_) => {
@@ -2115,7 +2008,6 @@ fn reap_exited_core(s: &mut DaemonState) {
     }
 }
 
-#[cfg(unix)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 struct CorePidMetadata {
     pid: u32,
@@ -2126,14 +2018,26 @@ struct CorePidMetadata {
     config_revision: Option<String>,
 }
 
-#[cfg(unix)]
 fn core_pid_file_path() -> PathBuf {
-    PathBuf::from("/var/run/mihomo/core.pid")
+    #[cfg(unix)]
+    {
+        PathBuf::from("/var/run/mihomo/core.pid")
+    }
+    #[cfg(windows)]
+    {
+        windows_core_log_file_path().with_file_name("core.pid")
+    }
 }
 
-#[cfg(unix)]
 fn core_log_file_path() -> PathBuf {
-    PathBuf::from("/var/log/mihomo/mihomo.log")
+    #[cfg(unix)]
+    {
+        PathBuf::from("/var/log/mihomo/mihomo.log")
+    }
+    #[cfg(windows)]
+    {
+        windows_core_log_file_path()
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -2147,7 +2051,6 @@ fn open_append_log_file(path: &std::path::Path) -> std::io::Result<std::fs::File
         .open(path)
 }
 
-#[cfg(unix)]
 fn format_pid_metadata(metadata: &CorePidMetadata) -> String {
     serde_json::to_string_pretty(metadata).unwrap_or_else(|_| format!("{}\n", metadata.pid))
 }
@@ -2178,7 +2081,6 @@ fn read_pid_file(path: &std::path::Path) -> Option<CorePidMetadata> {
         .and_then(|content| parse_pid_file_content(&content))
 }
 
-#[cfg(unix)]
 fn write_pid_file(path: &std::path::Path, metadata: &CorePidMetadata) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -2186,7 +2088,6 @@ fn write_pid_file(path: &std::path::Path, metadata: &CorePidMetadata) {
     let _ = std::fs::write(path, format_pid_metadata(metadata));
 }
 
-#[cfg(unix)]
 fn remove_pid_file(path: &std::path::Path) {
     let _ = std::fs::remove_file(path);
 }
@@ -2357,6 +2258,19 @@ fn endpoint_windows_pipe_path(endpoint: &str) -> Option<&str> {
     endpoint
         .strip_prefix("pipe://")
         .or_else(|| endpoint.starts_with(r"\\.\pipe\").then_some(endpoint))
+}
+
+/// Map a configured Core API endpoint string to the cross-platform transport.
+/// Unix socket paths (plain or `unix://`) and named pipes (`pipe://` or
+/// `\\.\pipe\...`) are accepted; anything else (e.g. plain TCP) is refused.
+fn api_endpoint_transport(endpoint: &str) -> Option<ApiEndpoint> {
+    if let Some(path) = endpoint_unix_path(endpoint) {
+        return Some(ApiEndpoint::UnixSocket(PathBuf::from(path)));
+    }
+    if let Some(pipe) = endpoint_windows_pipe_path(endpoint) {
+        return Some(ApiEndpoint::WindowsNamedPipe(pipe.to_string()));
+    }
+    None
 }
 
 #[cfg(any(unix, windows))]
@@ -2556,7 +2470,6 @@ fn classify_core_startup_failure(log_tail: &str) -> CoreFailure {
 
 /// Try to auto-download missing geo data and retry core start (ADR-24).
 /// Returns the retry result, or the original error if recovery doesn't apply.
-#[cfg(unix)]
 async fn try_geo_recovery_and_retry(
     state: &Arc<Mutex<DaemonState>>,
     failure: &CoreFailure,
@@ -2652,18 +2565,12 @@ fn format_core_failure_message(failure: &CoreFailure, log_file: &std::path::Path
     }
 }
 
-#[cfg(windows)]
-fn early_exit_message(
-    _status: std::process::ExitStatus,
-    _core_binary: &std::path::Path,
-    log_file: &std::path::Path,
-) -> String {
-    let log_tail = read_log_tail(log_file, 40);
-    format_core_failure_message(&classify_core_startup_failure(&log_tail), log_file)
-}
-
 #[cfg(any(unix, windows))]
 fn system_runtime_data_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = TEST_RUNTIME_DIR.get() {
+        return dir.clone();
+    }
     crate::instance::planned_current_context(crate::instance::InstanceMode::System)
         .and_then(|ctx| ctx.paths.tun_config_file.parent().map(PathBuf::from))
         .unwrap_or_else(|| {
@@ -2739,60 +2646,112 @@ fn remove_stale_unix_endpoint(endpoint: &str) {
     }
 }
 
-#[cfg(unix)]
-fn resolve_selection_scope_for_promote(
-    selection_intent_dir: Option<&str>,
+fn resolve_mirror_selection_scope_in(
+    base: &std::path::Path,
     subscription_id: Option<&str>,
-) -> Option<(PathBuf, String)> {
-    let selection_intent_dir = match validate_optional_selection_intent_dir(selection_intent_dir) {
-        Ok(path) => path,
-        Err(message) => {
-            eprintln!("[mihomo-daemon] selection replay skipped: {message}");
-            None
+) -> Option<String> {
+    let subscription_id = match subscription_id {
+        Some(id) if valid_mirror_subscription_id(id) => id,
+        Some(id) => {
+            eprintln!("[mihomo-daemon] selection replay skipped: invalid subscription id {id}");
+            return None;
+        }
+        None => {
+            eprintln!("[mihomo-daemon] selection replay skipped: selection replay requires subscription_id");
+            return None;
         }
     };
-    match (selection_intent_dir.as_deref(), subscription_id) {
-        (Some(dir), Some(id)) => {
-            let paths = crate::utils::AppPaths::new(dir.to_path_buf());
-            match crate::config::get_active_id_at(&paths) {
-                Ok(Some(active)) if active == id => Some((dir.to_path_buf(), id.to_string())),
-                Ok(Some(active)) => {
-                    eprintln!(
-                        "[mihomo-daemon] selection replay skipped: selection subscription identity mismatch: active={active}, request={id}"
-                    );
-                    None
-                }
-                Ok(None) => {
-                    eprintln!(
-                        "[mihomo-daemon] selection replay skipped: selection replay requires an active subscription"
-                    );
-                    None
-                }
-                Err(error) => {
-                    eprintln!(
-                        "[mihomo-daemon] selection replay skipped: cannot validate active subscription for selection replay: {error}"
-                    );
-                    None
-                }
-            }
-        }
-        (Some(_), None) => {
+    match read_mirror_active_id_in(base) {
+        Some(active) if active == subscription_id => Some(subscription_id.to_string()),
+        Some(active) => {
             eprintln!(
-                "[mihomo-daemon] selection replay skipped: selection replay requires subscription_id"
+                "[mihomo-daemon] selection replay skipped: selection subscription identity mismatch: mirror_active={active}, request={subscription_id}"
             );
             None
         }
-        _ => None,
+        None => {
+            eprintln!(
+                "[mihomo-daemon] selection replay skipped: selection mirror has no active subscription"
+            );
+            None
+        }
     }
 }
 
-#[cfg(unix)]
+fn resolve_mirror_selection_scope(subscription_id: Option<&str>) -> Option<String> {
+    resolve_mirror_selection_scope_in(&daemon_config_dir(), subscription_id)
+}
+
+fn merge_tun_block_into_config_yaml(
+    config_content: &str,
+    tun_block: &serde_yaml::Value,
+) -> anyhow::Result<(String, String)> {
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(config_content)
+        .map_err(|e| anyhow::anyhow!("system configuration YAML is invalid: {e}"))?;
+    if let serde_yaml::Value::Mapping(ref mut root_map) = doc {
+        root_map.insert(
+            serde_yaml::Value::String("tun".to_string()),
+            tun_block.clone(),
+        );
+    } else {
+        anyhow::bail!("system configuration root must be a YAML mapping");
+    }
+    let promoted = serde_yaml::to_string(&doc).map_err(|e| {
+        anyhow::anyhow!("failed to serialize promoted system configuration with TUN: {e}")
+    })?;
+    let revision = crate::tun_transaction::sha256_revision(promoted.as_bytes());
+    Ok((promoted, revision))
+}
+
+fn prepare_promoted_system_config_content(
+    config_content: &str,
+    config_revision: &str,
+    is_tun_snapshot: bool,
+    old_content_backup: Option<&[u8]>,
+) -> anyhow::Result<(String, String)> {
+    if is_tun_snapshot {
+        let existing_tun_block = old_content_backup.and_then(|bytes| {
+            let val: serde_yaml::Value = serde_yaml::from_slice(bytes).ok()?;
+            val.get("tun").cloned()
+        });
+
+        if let Some(existing_tun) = existing_tun_block {
+            return merge_tun_block_into_config_yaml(config_content, &existing_tun);
+        } else {
+            anyhow::bail!(
+                "active system TUN snapshot is missing or lacks a valid 'tun' block. Fix: mihomo-cli restart --system or mihomo-cli tun on --yes"
+            );
+        }
+    }
+    Ok((config_content.to_string(), config_revision.to_string()))
+}
+
+async fn restore_last_known_good(
+    state: &Arc<Mutex<DaemonState>>,
+    target_path: &Path,
+    core_binary: &Path,
+    old_content_backup: Option<&[u8]>,
+) {
+    if let Some(old_bytes) = old_content_backup {
+        let _ = std::fs::write(target_path, old_bytes);
+        let _ = stop_core(Arc::clone(state)).await;
+        let _ = start_core(
+            Arc::clone(state),
+            target_path.to_path_buf(),
+            core_binary.to_path_buf(),
+        )
+        .await;
+    } else {
+        let _ = std::fs::remove_file(target_path);
+    }
+}
+
 async fn promote_system_config(
     state: Arc<Mutex<DaemonState>>,
     config_content: String,
     config_revision: String,
-    selection_intent_dir: Option<String>,
     subscription_id: Option<String>,
+    explicit_change_kind: Option<crate::config::ChangeKind>,
 ) -> DaemonResponse {
     if config_content.is_empty() || config_content.len() > 16 * 1024 * 1024 {
         return DaemonResponse::Error {
@@ -2844,13 +2803,23 @@ async fn promote_system_config(
     let is_tun_snapshot = {
         let mut s = state.lock().await;
         reap_exited_core(&mut s);
-        s.config_path.as_ref() == Some(&transaction_ctx.paths.tun_config_file)
+        if s.config_path.as_ref() == Some(&transaction_ctx.paths.tun_config_file) {
+            transaction_ctx.paths.tun_config_file.exists()
+                && std::fs::read(&transaction_ctx.paths.tun_config_file)
+                    .ok()
+                    .and_then(|bytes| serde_yaml::from_slice::<serde_yaml::Value>(&bytes).ok())
+                    .and_then(|val| {
+                        val.get("tun")
+                            .and_then(|t| t.get("enable"))
+                            .and_then(|e| e.as_bool())
+                    })
+                    .unwrap_or(false)
+        } else {
+            false
+        }
     };
 
-    let selection_scope = resolve_selection_scope_for_promote(
-        selection_intent_dir.as_deref(),
-        subscription_id.as_deref(),
-    );
+    let selection_scope = resolve_mirror_selection_scope(subscription_id.as_deref());
 
     let target_path = if is_tun_snapshot {
         transaction_ctx.paths.tun_config_file.clone()
@@ -2858,7 +2827,33 @@ async fn promote_system_config(
         crate::tun_transaction::active_config_path(&transaction_ctx)
     };
 
-    let endpoint = match read_api_endpoint_from_content(&config_content) {
+    let old_content_backup = if target_path.exists() {
+        std::fs::read(&target_path).ok()
+    } else {
+        None
+    };
+
+    if let Err(error) = serde_yaml::from_str::<serde_yaml::Value>(&config_content) {
+        return DaemonResponse::Error {
+            message: format!("system configuration YAML is invalid: {error}"),
+        };
+    }
+
+    let (final_content, expected_revision) = match prepare_promoted_system_config_content(
+        &config_content,
+        &config_revision,
+        is_tun_snapshot,
+        old_content_backup.as_deref(),
+    ) {
+        Ok(res) => res,
+        Err(error) => {
+            return DaemonResponse::Error {
+                message: error.to_string(),
+            };
+        }
+    };
+
+    let endpoint = match read_api_endpoint_from_content(&final_content) {
         Some(endpoint) => endpoint,
         None => {
             return DaemonResponse::Error {
@@ -2870,13 +2865,14 @@ async fn promote_system_config(
     if let Err(message) = validate_system_core_api_endpoint(&endpoint) {
         return DaemonResponse::Error { message };
     }
-    if let Err(error) = serde_yaml::from_str::<serde_yaml::Value>(&config_content) {
-        return DaemonResponse::Error {
-            message: format!("system configuration YAML is invalid: {error}"),
-        };
-    }
 
-    if let Err(e) = std::fs::write(&target_path, config_content.as_bytes()) {
+    if let Some(parent) = target_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&target_path, final_content.as_bytes()) {
+        if let Some(old_bytes) = old_content_backup.as_ref() {
+            let _ = std::fs::write(&target_path, old_bytes);
+        }
         return DaemonResponse::Error {
             message: format!("failed to persist promoted system configuration: {e}"),
         };
@@ -2884,11 +2880,86 @@ async fn promote_system_config(
 
     let core_binary = expected_system_core_binary_path();
     if let Err(message) = preflight_system_core_start_request(&target_path, &core_binary) {
+        restore_last_known_good(
+            &state,
+            &target_path,
+            &core_binary,
+            old_content_backup.as_deref(),
+        )
+        .await;
         return DaemonResponse::Error { message };
     }
 
+    let (core_running, current_endpoint) = {
+        let mut s = state.lock().await;
+        reap_exited_core(&mut s);
+        (s.core_child.is_some(), s.api_endpoint.clone())
+    };
+
+    let change_kind = explicit_change_kind.unwrap_or_else(|| {
+        if !is_tun_snapshot {
+            if let Some(old_bytes) = old_content_backup.as_deref() {
+                if let Ok(old_str) = std::str::from_utf8(old_bytes) {
+                    crate::config::ChangeKind::classify_diff(old_str, &final_content)
+                } else {
+                    crate::config::ChangeKind::Promote
+                }
+            } else {
+                crate::config::ChangeKind::Promote
+            }
+        } else {
+            crate::config::ChangeKind::Promote
+        }
+    });
+
+    if core_running && change_kind == crate::config::ChangeKind::HotReload {
+        if let Some(ep) = current_endpoint.as_deref().and_then(api_endpoint_transport) {
+            let client = mihomo_api::EndpointMihomoApiClient::new(ep);
+            let reload_result =
+                mihomo_api::reload_configs_with_client(&client, &target_path.display().to_string())
+                    .await;
+
+            match reload_result {
+                Ok(()) => {
+                    let mut state_guard = state.lock().await;
+                    reap_exited_core(&mut state_guard);
+                    state_guard.launched_config_revision = Some(expected_revision.clone());
+                    state_guard.config_path = Some(target_path.clone());
+                    if let Some(pid) = state_guard.core_child.as_ref().and_then(|c| c.id()) {
+                        write_pid_file(
+                            &state_guard.pid_file,
+                            &CorePidMetadata {
+                                pid,
+                                config_path: target_path.clone(),
+                                core_binary: core_binary.clone(),
+                                api_endpoint: state_guard.api_endpoint.clone(),
+                                config_revision: Some(expected_revision.clone()),
+                            },
+                        );
+                    }
+                    drop(state_guard);
+
+                    let mut message =
+                        "system configuration promoted and runtime applied".to_string();
+                    if let Some(subscription_id) = selection_scope {
+                        for line in replay_mirror_selection_intent(&state, &subscription_id).await {
+                            message.push('\n');
+                            message.push_str(&line);
+                        }
+                    }
+                    return DaemonResponse::Success { message };
+                }
+                Err(reload_err) => {
+                    crate::log!(
+                        "system config hot-reload failed ({reload_err:#}); failing open to promotion"
+                    );
+                }
+            }
+        }
+    }
+
     let _ = stop_core(Arc::clone(&state)).await;
-    match start_core(Arc::clone(&state), target_path.clone(), core_binary).await {
+    match start_core(Arc::clone(&state), target_path.clone(), core_binary.clone()).await {
         DaemonResponse::Success { .. } => {
             let mut state_guard = state.lock().await;
             reap_exited_core(&mut state_guard);
@@ -2896,33 +2967,73 @@ async fn promote_system_config(
                 .launched_config_revision
                 .clone()
                 .unwrap_or_default();
+            let api_endpoint = state_guard.api_endpoint.clone();
             drop(state_guard);
-            if runtime_revision != config_revision {
+            if runtime_revision != expected_revision {
+                restore_last_known_good(
+                    &state,
+                    &target_path,
+                    &core_binary,
+                    old_content_backup.as_deref(),
+                )
+                .await;
                 return DaemonResponse::Error {
                     message: "system configuration was loaded but its runtime revision could not be attested"
                         .to_string(),
                 };
             }
+            if is_tun_snapshot {
+                let tun_attested =
+                    if let Some(ep) = api_endpoint.as_deref().and_then(api_endpoint_transport) {
+                        let client = mihomo_api::EndpointMihomoApiClient::new(ep);
+                        match client.get("/configs").await {
+                            Ok(config) => config["tun"]["enable"].as_bool() == Some(true),
+                            Err(_) => false,
+                        }
+                    } else {
+                        false
+                    };
+                if !tun_attested {
+                    restore_last_known_good(
+                        &state,
+                        &target_path,
+                        &core_binary,
+                        old_content_backup.as_deref(),
+                    )
+                    .await;
+                    return DaemonResponse::Error {
+                        message: "promoted configuration was loaded but TUN runtime attestation failed: tun.enable is not true".to_string(),
+                    };
+                }
+            }
             let mut message = "system configuration promoted and runtime applied".to_string();
-            // D6: replay persisted selection intent synchronously (≤5s budget)
-            // so start/restart report restored selections in the same response.
-            if let Some((intent_dir, subscription_id)) = selection_scope {
-                persist_selection_intent_dir(&intent_dir);
-                for line in replay_selection_intent(&state, &intent_dir, &subscription_id).await {
+            // Replay the fixed-runtime selection mirror synchronously (≤5s
+            // budget) so start/restart report restored selections in the same
+            // response. The daemon never falls back to the user tree.
+            if let Some(subscription_id) = selection_scope {
+                for line in replay_mirror_selection_intent(&state, &subscription_id).await {
                     message.push('\n');
                     message.push_str(&line);
                 }
             }
             DaemonResponse::Success { message }
         }
-        DaemonResponse::Error { message } => DaemonResponse::Error { message },
+        DaemonResponse::Error { message } => {
+            restore_last_known_good(
+                &state,
+                &target_path,
+                &core_binary,
+                old_content_backup.as_deref(),
+            )
+            .await;
+            DaemonResponse::Error { message }
+        }
         response => response,
     }
 }
 
 // ---------------- Transaction IPC Handlers ----------------
 
-#[cfg(unix)]
 async fn get_runtime_observation(
     state: &Arc<Mutex<DaemonState>>,
 ) -> crate::tun_transaction::RuntimeObservation {
@@ -2937,21 +3048,21 @@ async fn get_runtime_observation(
 
     let (api_ready, runtime_tun) =
         if let (true, Some(api_endpoint)) = (core_running, api_endpoint_str.as_deref()) {
-            let ep = ApiEndpoint::UnixSocket(
-                endpoint_unix_path(api_endpoint)
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from(api_endpoint)),
-            );
-            let client = mihomo_api::EndpointMihomoApiClient::new(ep);
-            match client.get("/configs").await {
-                Ok(val) => {
-                    let tun_enabled = val
-                        .get("tun")
-                        .and_then(|v| v.get("enable"))
-                        .and_then(|v| v.as_bool());
-                    (true, tun_enabled)
+            match api_endpoint_transport(api_endpoint) {
+                Some(ep) => {
+                    let client = mihomo_api::EndpointMihomoApiClient::new(ep);
+                    match client.get("/configs").await {
+                        Ok(val) => {
+                            let tun_enabled = val
+                                .get("tun")
+                                .and_then(|v| v.get("enable"))
+                                .and_then(|v| v.as_bool());
+                            (true, tun_enabled)
+                        }
+                        Err(_) => (false, None),
+                    }
                 }
-                Err(_) => (false, None),
+                None => (false, None),
             }
         } else {
             (false, None)
@@ -2971,15 +3082,14 @@ async fn get_runtime_observation(
     }
 }
 
-#[cfg(unix)]
 async fn handle_validate_prepared_runtime(
     state: Arc<Mutex<DaemonState>>,
     fence: crate::tun_transaction::TransactionFence,
     expected_old_runtime_revision: String,
     expected_old_runtime_tun: bool,
-    peer_uid: Option<u32>,
+    peer: PeerAuth,
 ) -> DaemonResponse {
-    if let Err(message) = validate_tun_peer_is_root(peer_uid) {
+    if let Err(message) = validate_tun_peer_is_root(peer) {
         return DaemonResponse::Error { message };
     }
     let Some(ctx) = daemon_transaction_context() else {
@@ -3078,14 +3188,13 @@ async fn handle_validate_prepared_runtime(
     }
 }
 
-#[cfg(unix)]
 async fn handle_apply_promoted_snapshot(
     state: Arc<Mutex<DaemonState>>,
     fence: crate::tun_transaction::TransactionFence,
     target_runtime_tun: bool,
-    peer_uid: Option<u32>,
+    peer: PeerAuth,
 ) -> DaemonResponse {
-    if let Err(message) = validate_tun_peer_is_root(peer_uid) {
+    if let Err(message) = validate_tun_peer_is_root(peer) {
         return DaemonResponse::Error { message };
     }
     let Some(ctx) = daemon_transaction_context() else {
@@ -3412,13 +3521,12 @@ async fn handle_apply_promoted_snapshot(
     }
 }
 
-#[cfg(unix)]
 async fn handle_quiesce_candidate_runtime(
     state: Arc<Mutex<DaemonState>>,
     fence: crate::tun_transaction::TransactionFence,
-    peer_uid: Option<u32>,
+    peer: PeerAuth,
 ) -> DaemonResponse {
-    if let Err(message) = validate_tun_peer_is_root(peer_uid) {
+    if let Err(message) = validate_tun_peer_is_root(peer) {
         return DaemonResponse::Error { message };
     }
     let Some(ctx) = daemon_transaction_context() else {
@@ -3569,15 +3677,14 @@ async fn handle_quiesce_candidate_runtime(
     }
 }
 
-#[cfg(unix)]
 async fn handle_restore_old_runtime(
     state: Arc<Mutex<DaemonState>>,
     fence: crate::tun_transaction::TransactionFence,
     expected_old_runtime_revision: String,
     expected_old_runtime_tun: bool,
-    peer_uid: Option<u32>,
+    peer: PeerAuth,
 ) -> DaemonResponse {
-    if let Err(message) = validate_tun_peer_is_root(peer_uid) {
+    if let Err(message) = validate_tun_peer_is_root(peer) {
         return DaemonResponse::Error { message };
     }
     let Some(ctx) = daemon_transaction_context() else {
@@ -3845,15 +3952,14 @@ async fn handle_restore_old_runtime(
     }
 }
 
-#[cfg(unix)]
 async fn handle_attest_current_transaction(
     state: Arc<Mutex<DaemonState>>,
     fence: crate::tun_transaction::TransactionFence,
     expected_runtime_revision: String,
     expected_runtime_tun: bool,
-    peer_uid: Option<u32>,
+    peer: PeerAuth,
 ) -> DaemonResponse {
-    if let Err(message) = validate_tun_peer_is_root(peer_uid) {
+    if let Err(message) = validate_tun_peer_is_root(peer) {
         return DaemonResponse::Error { message };
     }
     let Some(ctx) = daemon_transaction_context() else {
@@ -3935,14 +4041,13 @@ async fn handle_attest_current_transaction(
     }
 }
 
-#[cfg(unix)]
 async fn handle_apply_legacy_recovery_target(
     state: Arc<Mutex<DaemonState>>,
     fence: crate::tun_transaction::TransactionFence,
     expected_recovery_target_revision: String,
-    peer_uid: Option<u32>,
+    peer: PeerAuth,
 ) -> DaemonResponse {
-    if let Err(message) = validate_tun_peer_is_root(peer_uid) {
+    if let Err(message) = validate_tun_peer_is_root(peer) {
         return DaemonResponse::Error { message };
     }
     let Some(ctx) = daemon_transaction_context() else {
@@ -4194,7 +4299,6 @@ async fn handle_apply_legacy_recovery_target(
     }
 }
 
-#[cfg(unix)]
 fn transaction_status_response(
     obs: crate::tun_transaction::RuntimeObservation,
     journal_result: anyhow::Result<Option<crate::tun_transaction::TunJournal>>,
@@ -4272,7 +4376,6 @@ fn transaction_status_response(
     }
 }
 
-#[cfg(unix)]
 async fn handle_get_transaction_status(state: Arc<Mutex<DaemonState>>) -> DaemonResponse {
     let obs = get_runtime_observation(&state).await;
     let journal_result = if let Some(ctx) = daemon_transaction_context() {
@@ -4283,7 +4386,6 @@ async fn handle_get_transaction_status(state: Arc<Mutex<DaemonState>>) -> Daemon
     transaction_status_response(obs, journal_result)
 }
 
-#[cfg(unix)]
 async fn select_system_proxy(
     state: Arc<Mutex<DaemonState>>,
     group: String,
@@ -4304,16 +4406,12 @@ async fn select_system_proxy(
         }
         state_guard.api_endpoint.clone()
     };
-    let Some(socket) = endpoint
-        .as_deref()
-        .and_then(endpoint_unix_path)
-        .map(PathBuf::from)
-    else {
+    let Some(core_endpoint) = endpoint.as_deref().and_then(api_endpoint_transport) else {
         return DaemonResponse::Error {
-            message: "system Core has no usable Unix API endpoint".to_string(),
+            message: "system Core has no usable API endpoint".to_string(),
         };
     };
-    let client = mihomo_api::EndpointMihomoApiClient::new(ApiEndpoint::UnixSocket(socket));
+    let client = mihomo_api::EndpointMihomoApiClient::new(core_endpoint);
     if let Err(error) = mihomo_api::select_proxy_with_client(&client, &group, &node).await {
         return DaemonResponse::Error {
             message: format!("failed to select proxy {group} → {node}: {error}"),
@@ -4336,7 +4434,6 @@ async fn select_system_proxy(
     }
 }
 
-#[cfg(unix)]
 fn encode_proxy_path_segment(value: &str) -> String {
     value.bytes().fold(String::new(), |mut encoded, byte| {
         if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
@@ -4348,7 +4445,6 @@ fn encode_proxy_path_segment(value: &str) -> String {
     })
 }
 
-#[cfg(unix)]
 async fn start_core(
     state: Arc<Mutex<DaemonState>>,
     config_path: PathBuf,
@@ -4396,6 +4492,7 @@ async fn start_core(
             }
         }
     };
+    #[cfg(unix)]
     remove_stale_unix_endpoint(&api_endpoint);
 
     let stdout_log = match open_append_log_file(&s.core_log_file) {
@@ -4478,12 +4575,11 @@ async fn start_core(
                     // declaring success. This moves the readiness contract from the
                     // CLI client into the daemon (aligned with clash-verge-service:
                     // the client receives Success only once the core is actually ready).
-                    let endpoint = ApiEndpoint::UnixSocket(
-                        endpoint_unix_path(&api_endpoint)
-                            .map(PathBuf::from)
-                            .unwrap_or_else(|| PathBuf::from(&api_endpoint)),
-                    );
-                    let ready = mihomo_api::wait_for_api_ready_at_endpoint(&endpoint, 15).await;
+                    let endpoint = api_endpoint_transport(&api_endpoint);
+                    let ready = match &endpoint {
+                        Some(ep) => mihomo_api::wait_for_api_ready_at_endpoint(ep, 15).await,
+                        None => false,
+                    };
                     if !ready {
                         // Core spawned but did not become ready; kill it and report failure.
                         if let Some(mut child) = s.core_child.take() {
@@ -4536,39 +4632,43 @@ async fn start_core(
     }
 }
 
-#[cfg(unix)]
 async fn stop_core(state: Arc<Mutex<DaemonState>>) -> DaemonResponse {
     let mut s = state.lock().await;
     let Some(mut child) = s.core_child.take() else {
-        if let Some(metadata) = read_pid_file(&s.pid_file)
-            .filter(pid_metadata_is_trusted_system_core)
-            .filter(|metadata| process_alive(metadata.pid))
+        // Orphan termination via pid-file identity probing is Unix-only for
+        // now (Issue #017); Windows has no process_cmdline equivalent yet.
+        #[cfg(unix)]
         {
-            if !pid_metadata_matches_state(&metadata, &s)
-                || !process_matches_core_metadata(&metadata)
+            if let Some(metadata) = read_pid_file(&s.pid_file)
+                .filter(pid_metadata_is_trusted_system_core)
+                .filter(|metadata| process_alive(metadata.pid))
             {
-                return DaemonResponse::Error {
-                    message: format!(
-                        "refusing to terminate orphan core process {} because pid metadata/process identity does not match daemon state",
-                        metadata.pid
-                    ),
+                if !pid_metadata_matches_state(&metadata, &s)
+                    || !process_matches_core_metadata(&metadata)
+                {
+                    return DaemonResponse::Error {
+                        message: format!(
+                            "refusing to terminate orphan core process {} because pid metadata/process identity does not match daemon state",
+                            metadata.pid
+                        ),
+                    };
+                }
+                let pid = metadata.pid;
+                let result = terminate_process(pid);
+                remove_pid_file(&s.pid_file);
+                s.core_running = false;
+                s.core_pid = None;
+                s.launched_config_revision = None;
+                s.api_endpoint = None;
+                return match result {
+                    Ok(()) => DaemonResponse::Success {
+                        message: format!("orphan core process {pid} terminated"),
+                    },
+                    Err(e) => DaemonResponse::Error {
+                        message: format!("failed to terminate orphan core process {pid}: {e}"),
+                    },
                 };
             }
-            let pid = metadata.pid;
-            let result = terminate_process(pid);
-            remove_pid_file(&s.pid_file);
-            s.core_running = false;
-            s.core_pid = None;
-            s.launched_config_revision = None;
-            s.api_endpoint = None;
-            return match result {
-                Ok(()) => DaemonResponse::Success {
-                    message: format!("orphan core process {pid} terminated"),
-                },
-                Err(e) => DaemonResponse::Error {
-                    message: format!("failed to terminate orphan core process {pid}: {e}"),
-                },
-            };
         }
         let orphan_endpoint = s
             .api_endpoint
@@ -4609,7 +4709,6 @@ async fn stop_core(state: Arc<Mutex<DaemonState>>) -> DaemonResponse {
     }
 }
 
-#[cfg(unix)]
 fn validate_core_api_request(
     method: CoreApiMethod,
     path: &str,
@@ -4659,7 +4758,6 @@ fn validate_core_api_request(
     Ok(())
 }
 
-#[cfg(unix)]
 fn core_api_mutation_requires_promotion(
     method: CoreApiMethod,
     path: &str,
@@ -4719,7 +4817,6 @@ mod core_api_mutation_tests {
     }
 }
 
-#[cfg(unix)]
 async fn process_core_api_request(
     method: CoreApiMethod,
     path: String,
@@ -4740,18 +4837,44 @@ async fn process_core_api_request(
         }
         state.api_endpoint.clone()
     };
-    let Some(socket) = endpoint
-        .as_deref()
-        .and_then(endpoint_unix_path)
-        .map(PathBuf::from)
-    else {
+    let Some(core_endpoint) = endpoint.as_deref().and_then(api_endpoint_transport) else {
         return DaemonResponse::Error {
-            message:
-                "system Core has no usable Unix API endpoint. Fix: mihomo-cli restart --system"
-                    .to_string(),
+            message: "system Core has no usable API endpoint. Fix: mihomo-cli restart --system"
+                .to_string(),
         };
     };
-    let client = mihomo_api::EndpointMihomoApiClient::new(ApiEndpoint::UnixSocket(socket));
+
+    if method == CoreApiMethod::Put && path.starts_with("/proxies/") {
+        let group_segment = path
+            .strip_prefix("/proxies/")
+            .unwrap_or_default()
+            .trim_end_matches('/');
+        let decoded_group = percent_decode_proxy_segment(group_segment)
+            .ok()
+            .or_else(|| {
+                if !group_segment.is_empty() {
+                    Some(group_segment.to_string())
+                } else {
+                    None
+                }
+            });
+        let node_name = body
+            .as_ref()
+            .and_then(|b| b.get("name").and_then(|n| n.as_str().map(str::to_string)));
+        if let (Some(group), Some(node)) = (decoded_group, node_name) {
+            if !group.is_empty() && !node.is_empty() {
+                return match select_system_proxy(Arc::clone(&state), group, node).await {
+                    DaemonResponse::Success { .. } => DaemonResponse::CoreApi {
+                        data: serde_json::Value::Null,
+                    },
+                    DaemonResponse::Error { message } => DaemonResponse::Error { message },
+                    other => other,
+                };
+            }
+        }
+    }
+
+    let client = mihomo_api::EndpointMihomoApiClient::new(core_endpoint);
     let runtime_tun = if matches!(method, CoreApiMethod::Put | CoreApiMethod::Patch)
         && (path == "/configs" || path.starts_with("/proxies/"))
     {
@@ -4951,39 +5074,392 @@ async fn toggle_tun_via_core_api(
 }
 
 #[cfg(all(test, unix))]
+fn peer_with_uid(uid: Option<u32>) -> PeerAuth {
+    PeerAuth {
+        uid,
+        elevated: false,
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
+    #[test]
+    fn runtime_shape_allows_managed_configs_on_every_platform() {
+        // Bug #12 regression: the daemon starts Core from
+        // <runtime>/active-config.yaml (autostart/promotion) and
+        // <runtime>/transactions/active/recovery-target.yaml (recovery) on all
+        // platforms; previously only Linux accepted them.
+        const LINUX: &str = "/var/lib/mihomo-cli";
+        const MACOS: &str = "/Library/Application Support/mihomo-cli";
+        const WINDOWS: &str = "/ProgramData/mihomo-cli";
+
+        for runtime in [LINUX, MACOS, WINDOWS] {
+            assert!(
+                runtime_config_text_allowed(
+                    &format!("{runtime}/tun-config.yaml"),
+                    Some("tun-config.yaml"),
+                    runtime
+                ),
+                "tun-config must be accepted under {runtime}"
+            );
+            assert!(
+                runtime_config_text_allowed(
+                    &format!("{runtime}/active-config.yaml"),
+                    Some("active-config.yaml"),
+                    runtime
+                ),
+                "active-config must be accepted under {runtime}"
+            );
+            assert!(
+                runtime_config_text_allowed(
+                    &format!("{runtime}/transactions/active/recovery-target.yaml"),
+                    Some("recovery-target.yaml"),
+                    runtime
+                ),
+                "recovery-target must be accepted under {runtime}"
+            );
+        }
+
+        // Windows paths arrive backslash-normalized with a drive prefix.
+        assert!(runtime_config_text_allowed(
+            "C:/ProgramData/mihomo-cli/active-config.yaml",
+            Some("active-config.yaml"),
+            WINDOWS
+        ));
+    }
+
+    #[test]
+    fn runtime_shape_rejects_lookalike_and_unknown_paths() {
+        const LINUX: &str = "/var/lib/mihomo-cli";
+        // Prefix smuggling must not pass the anchored comparison.
+        assert!(!runtime_config_text_allowed(
+            "/tmp/fake/var/lib/mihomo-cli/active-config.yaml",
+            Some("active-config.yaml"),
+            LINUX
+        ));
+        assert!(!runtime_config_text_allowed(
+            "/var/lib/mihomo-cli/transactions/active/evil.yaml",
+            Some("evil.yaml"),
+            LINUX
+        ));
+        // recovery-target is only valid under transactions/active, not at root.
+        assert!(!runtime_config_text_allowed(
+            "/var/lib/mihomo-cli/recovery-target.yaml",
+            Some("recovery-target.yaml"),
+            LINUX
+        ));
+        // A macOS runtime file is not accepted when checking the Linux runtime.
+        assert!(!runtime_config_text_allowed(
+            "/Library/Application Support/mihomo-cli/active-config.yaml",
+            Some("active-config.yaml"),
+            LINUX
+        ));
+    }
+
+    #[test]
+    fn test_promote_preserves_tun_block_when_tun_snapshot() {
+        let old_yaml = r#"
+mixed-port: 7890
+external-controller: 127.0.0.1:9090
+tun:
+  enable: true
+  stack: mixed
+  auto-route: true
+  dns-hijack:
+    - any:53
+"#;
+        let new_yaml = r#"
+mixed-port: 7891
+external-controller: 127.0.0.1:9090
+rules:
+  - DOMAIN-SUFFIX,example.com,DIRECT
+"#;
+        let new_revision = crate::tun_transaction::sha256_revision(new_yaml.as_bytes());
+        let (promoted_content, promoted_revision) = prepare_promoted_system_config_content(
+            new_yaml,
+            &new_revision,
+            true,
+            Some(old_yaml.as_bytes()),
+        )
+        .expect("promotion should succeed");
+
+        let doc: serde_yaml::Value = serde_yaml::from_str(&promoted_content).unwrap();
+        assert_eq!(doc["mixed-port"].as_i64(), Some(7891));
+        assert_eq!(doc["tun"]["enable"].as_bool(), Some(true));
+        assert_eq!(doc["tun"]["stack"].as_str(), Some("mixed"));
+        assert_eq!(doc["tun"]["auto-route"].as_bool(), Some(true));
+        assert_eq!(
+            doc["rules"][0].as_str(),
+            Some("DOMAIN-SUFFIX,example.com,DIRECT")
+        );
+        assert_ne!(promoted_revision, new_revision);
+        assert_eq!(
+            promoted_revision,
+            crate::tun_transaction::sha256_revision(promoted_content.as_bytes())
+        );
+
+        // Also test that if new_yaml had tun: enable: false, it is replaced by active tun block
+        let new_yaml_with_disabled_tun = r#"
+mixed-port: 7891
+external-controller: 127.0.0.1:9090
+tun:
+  enable: false
+"#;
+        let new_rev2 =
+            crate::tun_transaction::sha256_revision(new_yaml_with_disabled_tun.as_bytes());
+        let (promoted2, _) = prepare_promoted_system_config_content(
+            new_yaml_with_disabled_tun,
+            &new_rev2,
+            true,
+            Some(old_yaml.as_bytes()),
+        )
+        .expect("promotion should replace inactive tun with snapshot tun");
+        let doc2: serde_yaml::Value = serde_yaml::from_str(&promoted2).unwrap();
+        assert_eq!(doc2["tun"]["enable"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn test_promote_does_not_inject_tun_when_inactive() {
+        let old_yaml = r#"
+mixed-port: 7890
+external-controller: 127.0.0.1:9090
+tun:
+  enable: true
+"#;
+        let new_yaml = r#"
+mixed-port: 7891
+external-controller: 127.0.0.1:9090
+"#;
+        let new_revision = crate::tun_transaction::sha256_revision(new_yaml.as_bytes());
+        let (promoted_content, promoted_revision) = prepare_promoted_system_config_content(
+            new_yaml,
+            &new_revision,
+            false,
+            Some(old_yaml.as_bytes()),
+        )
+        .expect("promotion should succeed");
+
+        let doc: serde_yaml::Value = serde_yaml::from_str(&promoted_content).unwrap();
+        assert_eq!(doc["mixed-port"].as_i64(), Some(7891));
+        assert!(doc.get("tun").is_none());
+        assert_eq!(promoted_revision, new_revision);
+        assert_eq!(promoted_content, new_yaml);
+    }
+
+    #[test]
+    fn test_promote_fails_fast_when_tun_snapshot_missing_tun_block() {
+        let new_yaml = r#"
+mixed-port: 7891
+external-controller: 127.0.0.1:9090
+"#;
+        let new_revision = crate::tun_transaction::sha256_revision(new_yaml.as_bytes());
+
+        // Case 1: no backup content at all
+        let err1 = prepare_promoted_system_config_content(new_yaml, &new_revision, true, None)
+            .unwrap_err();
+        assert!(err1.to_string().contains("active system TUN snapshot"));
+
+        // Case 2: backup content exists but lacks 'tun' key
+        let backup_without_tun = b"mixed-port: 7890\n";
+        let err2 = prepare_promoted_system_config_content(
+            new_yaml,
+            &new_revision,
+            true,
+            Some(backup_without_tun),
+        )
+        .unwrap_err();
+        assert!(err2.to_string().contains("active system TUN snapshot"));
+    }
+
+    #[tokio::test]
+    async fn test_restore_last_known_good_restores_backup_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target_path = tmp.path().join("tun-config.yaml");
+        let core_binary = tmp.path().join("mihomo");
+        let old_content = b"mixed-port: 7890\ntun:\n  enable: true\n";
+
+        // 初始写入被污染/失败的新配置
+        std::fs::write(&target_path, b"corrupted-new-config").unwrap();
+
+        let state = Arc::new(Mutex::new(DaemonState {
+            core_running: false,
+            ..DaemonState::default()
+        }));
+
+        restore_last_known_good(&state, &target_path, &core_binary, Some(old_content)).await;
+
+        let restored = std::fs::read(&target_path).unwrap();
+        assert_eq!(
+            restored, old_content,
+            "target config must be restored to last-known-good backup"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restore_last_known_good_removes_file_when_no_backup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target_path = tmp.path().join("config.yaml");
+        let core_binary = tmp.path().join("mihomo");
+
+        std::fs::write(&target_path, b"failed-first-time-config").unwrap();
+
+        let state = Arc::new(Mutex::new(DaemonState {
+            core_running: false,
+            ..DaemonState::default()
+        }));
+
+        restore_last_known_good(&state, &target_path, &core_binary, None).await;
+
+        assert!(
+            !target_path.exists(),
+            "target config must be removed if no prior backup existed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_core_api_request_put_proxies_requires_running_core() {
+        let state = Arc::new(Mutex::new(DaemonState {
+            core_running: false,
+            ..DaemonState::default()
+        }));
+
+        let response = process_core_api_request(
+            CoreApiMethod::Put,
+            "/proxies/GLOBAL".to_string(),
+            Some(serde_json::json!({"name": "DIRECT"})),
+            state,
+            Some(1000),
+        )
+        .await;
+
+        match response {
+            DaemonResponse::Error { message } => {
+                assert!(
+                    message.contains("restart --system"),
+                    "unexpected error: {message}"
+                );
+            }
+            other => panic!("expected stopped-core error, got {other:?}"),
+        }
+    }
+
     #[cfg(unix)]
     #[test]
-    fn test_resolve_selection_scope_skips_on_mismatch_or_error() {
-        // 1. 非法的 selection_intent_dir 路径跳过
+    fn test_mirror_record_read_roundtrip_and_schema_validation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let yaml = "selections:\n  自动选择: AA-02\n";
+        record_selection_mirror_in(base, "sub-abcdef12", yaml).unwrap();
+        record_active_subscription_mirror_in(base, "sub-abcdef12").unwrap();
+
         assert_eq!(
-            resolve_selection_scope_for_promote(Some("/invalid/path"), Some("sub1")),
+            read_mirror_active_id_in(base).as_deref(),
+            Some("sub-abcdef12")
+        );
+        let map = read_mirror_selection_map_in(base, "sub-abcdef12").unwrap();
+        assert_eq!(map.get("自动选择").map(String::as_str), Some("AA-02"));
+
+        // Round-trip through the canonical payload helpers.
+        let reparsed = crate::selection::parse_selection_map(
+            crate::selection::format_selection_map(&map).as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(reparsed, map);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_mirror_rejects_invalid_id_and_schema() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        assert!(record_selection_mirror_in(base, "sub-xyz", "selections: {}\n").is_err());
+        assert!(record_active_subscription_mirror_in(base, "not-a-sub").is_err());
+        assert!(record_selection_mirror_in(base, "sub-abcdef12", "not yaml: [").is_err());
+        assert!(
+            record_selection_mirror_in(base, "sub-abcdef12", "selections:\n  '': node\n").is_err()
+        );
+        // Mirror files must not be written for rejected payloads.
+        assert!(read_mirror_selection_map_in(base, "sub-abcdef12").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_selection_mirror_revisions_report_missing_and_drift() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let yaml = "selections:\n  自动选择: AA-02\n";
+        let expected = crate::tun_transaction::content_revision(yaml.as_bytes());
+        record_selection_mirror_in(base, "sub-abcdef12", yaml).unwrap();
+
+        let ids = || vec!["sub-abcdef12".to_string(), "sub-0000ff00".to_string()];
+        let revisions = selection_mirror_revisions_in(base, &ids()).unwrap();
+        assert_eq!(
+            revisions.get("sub-abcdef12").and_then(|r| r.as_deref()),
+            Some(expected.as_str()),
+            "recorded mirror must report the exact pushed-content revision"
+        );
+        assert_eq!(
+            revisions.get("sub-0000ff00"),
+            Some(&None),
+            "absent mirror must report None, not an error"
+        );
+
+        // Drift after an out-of-band mirror rewrite changes the revision.
+        write_selection_mirror_file(
+            &selection_mirror_file_path_in(base, "sub-abcdef12"),
+            "selections:\n  自动选择: BB-01\n".as_bytes(),
+        )
+        .unwrap();
+        let drifted = selection_mirror_revisions_in(base, &ids()).unwrap();
+        assert_ne!(
+            drifted.get("sub-abcdef12").and_then(|r| r.as_deref()),
+            Some(expected.as_str())
+        );
+
+        // Invalid ids are rejected wholesale (fail-closed).
+        assert!(selection_mirror_revisions_in(base, &["../escape".to_string()]).is_err());
+        assert!(selection_mirror_revisions_in(base, &[]).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_mirror_selection_scope_skips_on_mismatch_or_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        // subscription_id 为 None / 非法 id 时跳过
+        assert_eq!(resolve_mirror_selection_scope_in(base, None), None);
+        assert_eq!(resolve_mirror_selection_scope_in(base, Some("sub1")), None);
+
+        // 镜像缺失 active 时跳过
+        assert_eq!(
+            resolve_mirror_selection_scope_in(base, Some("sub-abcdef12")),
             None
         );
 
-        #[cfg(target_os = "macos")]
-        let dir_str = "/Users/fake_user_test/.config/mihomo";
-        #[cfg(not(target_os = "macos"))]
-        let dir_str = "/home/fake_user_test/.config/mihomo";
-
-        // 2. subscription_id 为 None 时跳过
+        // active 不匹配时跳过
+        record_active_subscription_mirror_in(base, "sub-abcdef99").unwrap();
         assert_eq!(
-            resolve_selection_scope_for_promote(Some(dir_str), None),
+            resolve_mirror_selection_scope_in(base, Some("sub-abcdef12")),
             None
         );
 
-        // 3. active 文件不存在或读取失败时跳过
+        // active 匹配时返回作用域
+        record_active_subscription_mirror_in(base, "sub-abcdef12").unwrap();
         assert_eq!(
-            resolve_selection_scope_for_promote(Some(dir_str), Some("sub1")),
-            None
+            resolve_mirror_selection_scope_in(base, Some("sub-abcdef12")),
+            Some("sub-abcdef12".to_string())
         );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_promote_system_config_skips_invalid_selection_replay_without_fatal_error() {
+    async fn test_promote_system_config_skips_missing_mirror_replay_without_fatal_error() {
         let tmp = tempfile::TempDir::new().unwrap();
         let state = Arc::new(Mutex::new(DaemonState {
             core_running: false,
@@ -5000,84 +5476,21 @@ mod tests {
         let yaml = "mixed-port: 7890\nexternal-controller: 127.0.0.1:9090\n";
         let revision = crate::tun_transaction::sha256_revision(yaml.as_bytes());
 
-        #[cfg(target_os = "macos")]
-        let invalid_dir = Some("/Users/fake_user_test/.config/mihomo".to_string());
-        #[cfg(not(target_os = "macos"))]
-        let invalid_dir = Some("/home/fake_user_test/.config/mihomo".to_string());
-
+        // Mirror has no record for this subscription: replay must be skipped
+        // without failing the promotion fatally.
         let resp = promote_system_config(
             Arc::clone(&state),
             yaml.to_string(),
             revision,
-            invalid_dir,
-            Some("sub-mismatch".to_string()),
+            Some("sub-ffffff01".to_string()),
+            None,
         )
         .await;
 
         if let DaemonResponse::Error { message } = resp {
             assert!(
                 !message.contains("selection subscription identity mismatch")
-                    && !message.contains("selection replay requires")
-                    && !message
-                        .contains("cannot validate active subscription for selection replay"),
-                "promote_system_config must not fail fatally due to selection replay: {message}"
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_promote_system_config_gracefully_degrades_on_eacces_active_file() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmp = tempfile::TempDir::new().unwrap();
-        let sub_dir = tmp.path().join("subscriptions");
-        std::fs::create_dir_all(&sub_dir).unwrap();
-        let active_file = sub_dir.join("active");
-        std::fs::write(&active_file, "sub-locked").unwrap();
-
-        // 彻底剥夺读权限，强制触发真实的 EACCES / Permission denied
-        std::fs::set_permissions(&active_file, std::fs::Permissions::from_mode(0o000)).unwrap();
-
-        // 验证确实触发了底层 EACCES
-        let test_paths = crate::utils::AppPaths::new(tmp.path().to_path_buf());
-        let read_err = crate::config::get_active_id_at(&test_paths).unwrap_err();
-        let io_err = read_err
-            .root_cause()
-            .downcast_ref::<std::io::Error>()
-            .unwrap();
-        assert_eq!(io_err.kind(), std::io::ErrorKind::PermissionDenied);
-
-        let state = Arc::new(Mutex::new(DaemonState {
-            core_running: false,
-            core_child: None,
-            core_pid: None,
-            config_path: None,
-            launched_config_revision: None,
-            core_binary: Some(expected_system_core_binary_path()),
-            api_endpoint: Some("/var/run/mihomo/mihomo.sock".to_string()),
-            pid_file: tmp.path().join("core.pid"),
-            core_log_file: tmp.path().join("mihomo.log"),
-        }));
-
-        let yaml = "mixed-port: 7890\nexternal-controller: 127.0.0.1:9090\n";
-        let revision = crate::tun_transaction::sha256_revision(yaml.as_bytes());
-
-        let resp = promote_system_config(
-            Arc::clone(&state),
-            yaml.to_string(),
-            revision,
-            Some(tmp.path().to_string_lossy().to_string()),
-            Some("sub-locked".to_string()),
-        )
-        .await;
-
-        // 测试结束后清理或恢复该文件的权限以便 tempdir 正常清理
-        let _ = std::fs::set_permissions(&active_file, std::fs::Permissions::from_mode(0o644));
-
-        if let DaemonResponse::Error { message } = resp {
-            assert!(
-                !message.contains("cannot validate active subscription for selection replay"),
+                    && !message.contains("selection replay requires"),
                 "promote_system_config must not fail fatally due to selection replay: {message}"
             );
         }
@@ -5104,8 +5517,8 @@ mod tests {
             &DaemonCommand::PromoteSystemConfig {
                 config_content: "tun:\n  enable: false\n".to_string(),
                 config_revision: "revision".to_string(),
-                selection_intent_dir: None,
                 subscription_id: None,
+                change_kind: None,
                 token: None,
             }
         ));
@@ -5165,27 +5578,66 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn daemon_tun_peer_uid_requires_root() {
-        assert!(validate_tun_peer_is_root(Some(0)).is_ok());
-        assert!(validate_tun_peer_is_root(Some(1000)).is_err());
-        assert!(validate_tun_peer_is_root(None)
+        assert!(validate_tun_peer_is_root(peer_with_uid(Some(0))).is_ok());
+        assert!(validate_tun_peer_is_root(peer_with_uid(Some(1000))).is_err());
+        assert!(validate_tun_peer_is_root(peer_with_uid(None))
             .unwrap_err()
             .contains("cannot determine IPC peer uid"));
     }
 
     #[test]
-    fn authorized_clients_table_roundtrip_sets_daemon_readable_mode() {
+    fn api_endpoint_transport_maps_supported_endpoints() {
+        assert!(matches!(
+            api_endpoint_transport("/var/run/mihomo/mihomo.sock"),
+            Some(ApiEndpoint::UnixSocket(p))
+                if p == std::path::Path::new("/var/run/mihomo/mihomo.sock")
+        ));
+        assert!(matches!(
+            api_endpoint_transport("unix:///tmp/mihomo.sock"),
+            Some(ApiEndpoint::UnixSocket(p))
+                if p == std::path::Path::new("/tmp/mihomo.sock")
+        ));
+        assert!(matches!(
+            api_endpoint_transport(r"\\.\pipe\mihomo-core"),
+            Some(ApiEndpoint::WindowsNamedPipe(p))
+                if p == r"\\.\pipe\mihomo-core"
+        ));
+        assert!(matches!(
+            api_endpoint_transport(r"pipe://\\.\pipe\mihomo-core"),
+            Some(ApiEndpoint::WindowsNamedPipe(p))
+                if p == r"\\.\pipe\mihomo-core"
+        ));
+        assert!(api_endpoint_transport("http://127.0.0.1:9090").is_none());
+    }
+
+    #[test]
+    fn tun_peer_privilege_allowed_covers_both_platforms() {
+        // Windows: elevation is the only gate; uid is unavailable on pipes.
+        assert!(tun_peer_privilege_allowed(true, None, true).is_ok());
+        assert!(tun_peer_privilege_allowed(true, None, false)
+            .unwrap_err()
+            .contains("elevated (Administrator)"));
+        // Unix: root uid is the gate.
+        assert!(tun_peer_privilege_allowed(false, Some(0), false).is_ok());
+        assert!(tun_peer_privilege_allowed(false, Some(1000), true)
+            .unwrap_err()
+            .contains("TUN on/off requires root privileges"));
+        assert!(tun_peer_privilege_allowed(false, None, false)
+            .unwrap_err()
+            .contains("cannot determine IPC peer uid"));
+    }
+
+    #[test]
+    fn owner_record_roundtrip_sets_daemon_readable_mode() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("authorized-clients.json");
-        let table = AuthorizedClients {
-            clients: vec![AuthorizedClient {
-                user: "alice".into(),
-                uid: 1000,
-                token: "tok".into(),
-            }],
+        let path = dir.path().join("owner");
+        let record = OwnerRecord {
+            uid: 1000,
+            token_sha256: crate::tun_transaction::sha256_revision(b"test-secret-token"),
         };
-        write_authorized_clients_to(&path, &table).unwrap();
-        assert_eq!(read_authorized_clients_from(&path).unwrap(), table);
+        write_owner_record_to(&path, &record).unwrap();
+        assert_eq!(read_owner_record_from(&path).unwrap(), record);
         #[cfg(target_os = "linux")]
         let expected_mode = 0o640;
         #[cfg(not(target_os = "linux"))]
@@ -5197,93 +5649,188 @@ mod tests {
     }
 
     #[test]
-    fn revoke_authorized_client_matches_uid_and_token_only() {
-        let mut table = AuthorizedClients {
-            clients: vec![
-                AuthorizedClient {
-                    user: "alice".into(),
-                    uid: 1000,
-                    token: "alice-token".into(),
-                },
-                AuthorizedClient {
-                    user: "bob".into(),
-                    uid: 1001,
-                    token: "bob-token".into(),
-                },
-            ],
-        };
-        assert!(revoke_authorized_client(&mut table, 1000, "alice-token").unwrap());
-        assert_eq!(table.clients.len(), 1);
-        assert_eq!(table.clients[0].user, "bob");
-        assert!(!revoke_authorized_client(&mut table, 1000, "wrong-token").unwrap());
-        assert_eq!(table.clients.len(), 1);
-    }
-
-    #[test]
-    fn revoke_authorized_client_rejects_duplicate_uid_token_entries() {
-        let mut table = AuthorizedClients {
-            clients: vec![
-                AuthorizedClient {
-                    user: "alice".into(),
-                    uid: 1000,
-                    token: "same-token".into(),
-                },
-                AuthorizedClient {
-                    user: "alias".into(),
-                    uid: 1000,
-                    token: "same-token".into(),
-                },
-            ],
-        };
-        assert!(revoke_authorized_client(&mut table, 1000, "same-token").is_err());
-        assert_eq!(table.clients.len(), 2);
-    }
-
-    #[test]
-    fn revoke_authorized_client_rejects_empty_token() {
-        let mut table = AuthorizedClients::default();
-        assert!(revoke_authorized_client(&mut table, 1000, "").is_err());
-    }
-
-    #[test]
-    fn validate_client_token_checks_token_and_peer_uid() {
+    fn validate_client_token_for_peer_all_branches() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("authorized-clients.json");
-        write_authorized_clients_to(
-            &path,
-            &AuthorizedClients {
-                clients: vec![AuthorizedClient {
-                    user: "alice".into(),
-                    uid: 1000,
-                    token: "tok".into(),
-                }],
-            },
-        )
-        .unwrap();
+        let path = dir.path().join("owner");
+        let token = "my-secret-token";
+        let record = OwnerRecord {
+            uid: 1000,
+            token_sha256: crate::tun_transaction::sha256_revision(token.as_bytes()),
+        };
         let _guard = crate::utils::env_test_lock().lock().unwrap();
-        let old = std::env::var_os("MIHOMO_CLI_AUTHORIZED_CLIENTS_PATH");
+        let old = std::env::var_os("MIHOMO_CLI_OWNER_PATH");
         unsafe {
-            std::env::set_var("MIHOMO_CLI_AUTHORIZED_CLIENTS_PATH", &path);
+            std::env::set_var("MIHOMO_CLI_OWNER_PATH", &path);
         }
-        assert!(validate_client_token_for_peer(Some("tok"), Some(1000)).is_ok());
-        assert!(validate_client_token_for_peer(Some("tok"), Some(1001)).is_err());
-        assert!(validate_client_token_for_peer(Some("bad"), Some(1000)).is_err());
+
+        // Branch 1: root peer UID 0 passes without token
+        assert!(validate_client_token_for_peer(None, Some(0)).is_ok());
+        assert!(validate_client_token_for_peer(Some("irrelevant"), Some(0)).is_ok());
+
+        // Branch 2: missing or empty token fails
+        assert_eq!(
+            validate_client_token_for_peer(None, Some(1000)),
+            Err("invalid or missing auth token".to_string())
+        );
+        assert_eq!(
+            validate_client_token_for_peer(Some(""), Some(1000)),
+            Err("invalid or missing auth token".to_string())
+        );
+
+        // Branch 3: cannot determine peer UID
+        assert_eq!(
+            validate_client_token_for_peer(Some(token), None),
+            Err("cannot determine IPC peer uid".to_string())
+        );
+
+        // Branch 4: owner record missing / unreadable
+        let err = validate_client_token_for_peer(Some(token), Some(1000)).unwrap_err();
+        assert!(err.contains("cannot read owner record"), "{err}");
+
+        // Now write the owner record
+        write_owner_record_to(&path, &record).unwrap();
+
+        // Branch 5: peer UID mismatch
+        assert_eq!(
+            validate_client_token_for_peer(Some(token), Some(1001)),
+            Err("auth token does not belong to IPC peer uid".to_string())
+        );
+
+        // Branch 6: token hash mismatch
+        assert_eq!(
+            validate_client_token_for_peer(Some("wrong-token"), Some(1000)),
+            Err("invalid or missing auth token".to_string())
+        );
+
+        // Branch 7: valid token and matching peer UID
+        assert!(validate_client_token_for_peer(Some(token), Some(1000)).is_ok());
+
         if let Some(v) = old {
             unsafe {
-                std::env::set_var("MIHOMO_CLI_AUTHORIZED_CLIENTS_PATH", v);
+                std::env::set_var("MIHOMO_CLI_OWNER_PATH", v);
             }
         } else {
             unsafe {
-                std::env::remove_var("MIHOMO_CLI_AUTHORIZED_CLIENTS_PATH");
+                std::env::remove_var("MIHOMO_CLI_OWNER_PATH");
             }
         }
+    }
+
+    #[test]
+    fn validate_client_token_for_peer_rejects_whitespace_only_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner");
+        let token = "real-token";
+        let record = OwnerRecord {
+            uid: 1000,
+            token_sha256: crate::tun_transaction::sha256_revision(token.as_bytes()),
+        };
+        write_owner_record_to(&path, &record).unwrap();
+        let _guard = crate::utils::env_test_lock().lock().unwrap();
+        let old = std::env::var_os("MIHOMO_CLI_OWNER_PATH");
+        unsafe {
+            std::env::set_var("MIHOMO_CLI_OWNER_PATH", &path);
+        }
+
+        assert_eq!(
+            validate_client_token_for_peer(Some("   "), Some(1000)),
+            Err("invalid or missing auth token".to_string())
+        );
+        assert_eq!(
+            validate_client_token_for_peer(Some("\t\n"), Some(1000)),
+            Err("invalid or missing auth token".to_string())
+        );
+
+        if let Some(v) = old {
+            unsafe {
+                std::env::set_var("MIHOMO_CLI_OWNER_PATH", v);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("MIHOMO_CLI_OWNER_PATH");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_authorized_clients_migration_warning_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_file = dir.path().join("authorized-clients.json");
+        let _guard = crate::utils::env_test_lock().lock().unwrap();
+        let old = std::env::var_os("MIHOMO_CLI_LEGACY_AUTHORIZED_CLIENTS_PATH");
+        unsafe {
+            std::env::set_var("MIHOMO_CLI_LEGACY_AUTHORIZED_CLIENTS_PATH", &legacy_file);
+        }
+
+        // File does not exist -> no notice
+        assert_eq!(check_legacy_authorized_clients_migration_notice(), None);
+
+        // File exists -> triggers notice mentioning legacy file path and owner migration
+        std::fs::write(&legacy_file, b"{}").unwrap();
+        let notice = check_legacy_authorized_clients_migration_notice();
+        assert!(notice.is_some());
+        let notice_text = notice.unwrap();
+        assert!(notice_text.contains("authorized-clients.json"));
+        assert!(notice_text.contains("单所有者") || notice_text.contains("不再生效"));
+
+        if let Some(v) = old {
+            unsafe {
+                std::env::set_var("MIHOMO_CLI_LEGACY_AUTHORIZED_CLIENTS_PATH", v);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("MIHOMO_CLI_LEGACY_AUTHORIZED_CLIENTS_PATH");
+            }
+        }
+    }
+
+    #[test]
+    fn constant_time_token_eq_handles_different_lengths() {
+        assert!(constant_time_token_eq("abc", "abc"));
+        assert!(!constant_time_token_eq("abc", "abcd"));
+        assert!(!constant_time_token_eq("abcd", "abc"));
+        assert!(!constant_time_token_eq("", "a"));
+        assert!(!constant_time_token_eq("a", ""));
+        assert!(constant_time_token_eq("", ""));
+        // Ensure the function doesn't panic on very different lengths
+        assert!(!constant_time_token_eq(
+            "x",
+            "a]very_long_token_string_1234567890"
+        ));
+        assert!(!constant_time_token_eq(
+            "a_very_long_token_string_1234567890",
+            "x"
+        ));
+    }
+
+    #[test]
+    fn read_owner_record_from_rejects_corrupted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // Empty file
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(read_owner_record_from(&empty).is_err());
+        // Invalid JSON
+        let garbage = dir.path().join("garbage");
+        std::fs::write(&garbage, b"not json at all").unwrap();
+        assert!(read_owner_record_from(&garbage).is_err());
+        // Valid JSON but wrong shape
+        let wrong_shape = dir.path().join("wrong");
+        std::fs::write(&wrong_shape, br#"{"foo": "bar"}"#).unwrap();
+        assert!(read_owner_record_from(&wrong_shape).is_err());
+        // Non-existent file
+        assert!(read_owner_record_from(&dir.path().join("nonexistent")).is_err());
     }
 
     #[tokio::test]
     async fn process_command_rejects_unauthorized_client_token() {
         let state = Arc::new(Mutex::new(DaemonState::default()));
-        let response =
-            process_command(DaemonCommand::GetStatus { token: None }, state, Some(1000)).await;
+        let response = process_command(
+            DaemonCommand::GetStatus { token: None },
+            state,
+            peer_with_uid(Some(1000)),
+        )
+        .await;
         assert!(matches!(response, DaemonResponse::Error { .. }));
     }
 
@@ -5299,7 +5846,7 @@ mod tests {
                 token: None,
             },
             state,
-            Some(1000),
+            peer_with_uid(Some(1000)),
         )
         .await;
 
@@ -5310,8 +5857,12 @@ mod tests {
     #[tokio::test]
     async fn process_command_rejects_disable_tun_from_non_root_peer() {
         let state = Arc::new(Mutex::new(DaemonState::default()));
-        let response =
-            process_command(DaemonCommand::DisableTun { token: None }, state, Some(1000)).await;
+        let response = process_command(
+            DaemonCommand::DisableTun { token: None },
+            state,
+            peer_with_uid(Some(1000)),
+        )
+        .await;
 
         assert!(matches!(response, DaemonResponse::Error { .. }));
     }
@@ -5657,6 +6208,7 @@ mod tests {
 
     #[tokio::test]
     async fn restart_core_preflights_new_config_before_stopping_current_core() {
+        isolate_daemon_runtime_for_tests();
         let tmp = tempfile::TempDir::new().unwrap();
         #[cfg(target_os = "macos")]
         let config_path = PathBuf::from("/Users/alice/.config/mihomo/config.yaml");
@@ -5677,12 +6229,11 @@ mod tests {
             DaemonCommand::RestartCore {
                 config_content: "invalid: [yaml".to_string(),
                 config_revision: "invalid-revision".to_string(),
-                selection_intent_dir: None,
                 subscription_id: None,
                 token: None,
             },
             Arc::clone(&state),
-            Some(0),
+            peer_with_uid(Some(0)),
         )
         .await;
 
@@ -5961,30 +6512,65 @@ second
 
         // 持锁时，GetStatus 仍应立即执行（不取生命周期锁）
         let cmd = DaemonCommand::GetStatus { token: None };
-        let is_lifecycle = !matches!(cmd, DaemonCommand::GetStatus { .. });
-        assert!(!is_lifecycle, "GetStatus must not be a lifecycle command");
+        assert!(
+            !is_lifecycle_command(&cmd),
+            "GetStatus must not be a lifecycle command"
+        );
 
         let cmd = DaemonCommand::GetStatus {
             token: Some("authorized-token".to_string()),
         };
-        let is_lifecycle = !matches!(cmd, DaemonCommand::GetStatus { .. });
         assert!(
-            !is_lifecycle,
+            !is_lifecycle_command(&cmd),
             "authenticated GetStatus must not take the lifecycle lock"
+        );
+
+        // CoreApiRequest 与 SelectSystemProxy 也无需获取生命周期排他锁
+        let cmd_api = DaemonCommand::CoreApiRequest {
+            method: crate::ipc::CoreApiMethod::Get,
+            path: "/proxies".to_string(),
+            body: None,
+            token: None,
+        };
+        assert!(
+            !is_lifecycle_command(&cmd_api),
+            "CoreApiRequest must not take lifecycle lock"
+        );
+
+        let cmd_select = DaemonCommand::SelectSystemProxy {
+            group: "Proxy".to_string(),
+            node: "NodeA".to_string(),
+            token: None,
+        };
+        assert!(
+            !is_lifecycle_command(&cmd_select),
+            "SelectSystemProxy must not take lifecycle lock"
         );
 
         drop(guard);
 
-        // 生命周期命令（StartCore）应标记为需要锁
+        // 生命周期命令（StartCore / RestartCore）应标记为需要排他锁
         let cmd = DaemonCommand::StartCore {
             config_content: "mode: rule\n".to_string(),
             config_revision: "revision".to_string(),
-            selection_intent_dir: None,
             subscription_id: None,
             token: None,
         };
-        let is_lifecycle = !matches!(cmd, DaemonCommand::GetStatus { .. });
-        assert!(is_lifecycle, "StartCore must be a lifecycle command");
+        assert!(
+            is_lifecycle_command(&cmd),
+            "StartCore must be a lifecycle command"
+        );
+
+        let cmd_restart = DaemonCommand::RestartCore {
+            config_content: "mode: rule\n".to_string(),
+            config_revision: "revision".to_string(),
+            subscription_id: None,
+            token: None,
+        };
+        assert!(
+            is_lifecycle_command(&cmd_restart),
+            "RestartCore must be a lifecycle command"
+        );
     }
 
     #[test]
@@ -6059,6 +6645,7 @@ second
 
     #[tokio::test]
     async fn apply_tun_requires_explicit_core_restart_when_stopped() {
+        isolate_daemon_runtime_for_tests();
         let state = Arc::new(Mutex::new(DaemonState {
             core_running: false,
             core_binary: None,
@@ -6074,7 +6661,7 @@ second
                 token: None,
             },
             state,
-            Some(0),
+            peer_with_uid(Some(0)),
         )
         .await;
 
@@ -6118,6 +6705,7 @@ second
 
     #[tokio::test]
     async fn disable_tun_requires_explicit_core_restart_when_stopped() {
+        isolate_daemon_runtime_for_tests();
         let state = Arc::new(Mutex::new(DaemonState {
             core_running: false,
             core_binary: None,
@@ -6125,8 +6713,12 @@ second
             ..DaemonState::default()
         }));
 
-        let response =
-            process_command(DaemonCommand::DisableTun { token: None }, state, Some(0)).await;
+        let response = process_command(
+            DaemonCommand::DisableTun { token: None },
+            state,
+            peer_with_uid(Some(0)),
+        )
+        .await;
 
         match response {
             DaemonResponse::Error { ref message } => {
@@ -6186,7 +6778,7 @@ second
                 token: None,
             },
             state,
-            Some(0),
+            peer_with_uid(Some(0)),
         )
         .await;
 
@@ -6424,9 +7016,12 @@ mod windows_auth_model_tests {
         };
 
         // If journal is not found, it returns Stale/Unavailable
-        let _response =
-            handle_quiesce_candidate_runtime(std::sync::Arc::clone(&state), fence.clone(), Some(0))
-                .await;
+        let _response = handle_quiesce_candidate_runtime(
+            std::sync::Arc::clone(&state),
+            fence.clone(),
+            peer_with_uid(Some(0)),
+        )
+        .await;
 
         // Core must still be running after rejection
         let state_guard = state.lock().await;
@@ -6458,7 +7053,7 @@ mod windows_auth_model_tests {
             std::sync::Arc::clone(&state),
             fence.clone(),
             true,
-            Some(0),
+            peer_with_uid(Some(0)),
         )
         .await;
 

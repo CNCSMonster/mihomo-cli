@@ -181,7 +181,7 @@ mihomo-cli config --import /path/to/config.yaml --activate --yes  # 可选：运
 ### Related roadmap
 
 - `ROADMAP.md` → 基础安装与配置旅程
-
+- `SPEC.md` §2.1–2.3 → clean reinstall 基础合同与安装收敛
 ## J003b system runtime recovery/reset（Planned）
 
 #### Situation

@@ -11,6 +11,8 @@ pub struct InstanceLock {
     lock_file: PathBuf,
     #[cfg(unix)]
     fd: Option<std::os::unix::io::RawFd>,
+    #[cfg(not(unix))]
+    _file: Option<std::fs::File>,
 }
 
 impl InstanceLock {
@@ -20,6 +22,8 @@ impl InstanceLock {
             lock_file,
             #[cfg(unix)]
             fd: None,
+            #[cfg(not(unix))]
+            _file: None,
         }
     }
 
@@ -61,27 +65,49 @@ impl InstanceLock {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     pub fn try_acquire(&mut self) -> bool {
-        // Windows: use lock file existence as a simple check
-        if self.lock_file.exists() {
-            // Check if the lock is stale (older than 30 seconds)
-            if let Ok(metadata) = std::fs::metadata(&self.lock_file) {
-                if let Ok(modified) = metadata.modified() {
-                    if let Ok(age) = modified.elapsed() {
-                        if age.as_secs() > 30 {
-                            // Stale lock, remove it
-                            let _ = std::fs::remove_file(&self.lock_file);
-                        } else {
-                            return false;
-                        }
-                    }
-                }
-            } else {
-                return false;
-            }
+        use std::fs::OpenOptions;
+        use std::os::windows::fs::OpenOptionsExt;
+
+        // Ensure parent directory exists
+        if let Some(parent) = self.lock_file.parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
-        std::fs::write(&self.lock_file, std::process::id().to_string()).is_ok()
+
+        match OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            // share_mode(0) denies read/write/delete sharing while this
+            // handle is alive, providing atomic exclusion without TOCTOU races.
+            .share_mode(0)
+            .open(&self.lock_file)
+        {
+            Ok(file) => {
+                self._file = Some(file);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    #[cfg(all(not(unix), not(windows)))]
+    pub fn try_acquire(&mut self) -> bool {
+        if let Some(parent) = self.lock_file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&self.lock_file)
+        {
+            Ok(file) => {
+                self._file = Some(file);
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Release the lock.
@@ -98,7 +124,9 @@ impl InstanceLock {
 
     #[cfg(not(unix))]
     pub fn release(&mut self) {
-        let _ = std::fs::remove_file(&self.lock_file);
+        if self._file.take().is_some() {
+            let _ = std::fs::remove_file(&self.lock_file);
+        }
     }
 
     /// Get the lock file path.
@@ -1499,6 +1527,12 @@ pub enum ServiceAction {
     Stop,
     Restart,
     Uninstall,
+    /// Autostart enable (R1.2): planned form of the per-platform
+    /// enable/disable primitives previously inlined in `set_autostart`.
+    Enable,
+    /// Autostart disable (R1.2): planned form of the per-platform
+    /// enable/disable primitives previously inlined in `set_autostart`.
+    Disable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1589,6 +1623,100 @@ pub fn planned_service_plan(ctx: &InstanceContext, action: ServiceAction) -> Ins
         (TargetOs::Windows, InstanceMode::User, ServiceAction::Uninstall) => {
             windows_uninstall_plan(ctx, false)
         }
+
+        // ── R1.2 autostart Enable/Disable ────────────────────────────────
+        // Parameter-for-parameter mirrors of the direct primitives that
+        // used to live in `set_autostart` (behavior diff = 0). Linux System
+        // is intentionally empty: ADR-19 routes system autostart through
+        // the daemon SetAutostart IPC, never through systemctl, and
+        // `set_autostart` returns via IPC before consulting this plan.
+        (TargetOs::Macos, _, ServiceAction::Enable) => launchctl_autostart_plan(ctx, true),
+        (TargetOs::Macos, _, ServiceAction::Disable) => launchctl_autostart_plan(ctx, false),
+        (TargetOs::Linux, InstanceMode::System, ServiceAction::Enable) => empty_service_plan(),
+        (TargetOs::Linux, InstanceMode::System, ServiceAction::Disable) => empty_service_plan(),
+        (TargetOs::Linux, InstanceMode::User, ServiceAction::Enable) => {
+            systemctl_plan(ctx, ["--user", "enable", "mihomo"], false)
+        }
+        (TargetOs::Linux, InstanceMode::User, ServiceAction::Disable) => {
+            systemctl_plan(ctx, ["--user", "disable", "mihomo"], false)
+        }
+        (TargetOs::Windows, InstanceMode::System, ServiceAction::Enable) => {
+            windows_sc_plan(["config", "mihomo", "start=", "auto"], true)
+        }
+        (TargetOs::Windows, InstanceMode::System, ServiceAction::Disable) => {
+            windows_sc_plan(["config", "mihomo", "start=", "demand"], true)
+        }
+        (TargetOs::Windows, InstanceMode::User, ServiceAction::Enable) => {
+            windows_user_autostart_plan(ctx, true)
+        }
+        (TargetOs::Windows, InstanceMode::User, ServiceAction::Disable) => {
+            windows_user_autostart_plan(ctx, false)
+        }
+    }
+}
+
+fn empty_service_plan() -> InstanceServicePlan {
+    InstanceServicePlan {
+        commands: Vec::new(),
+        remove_paths: Vec::new(),
+    }
+}
+
+/// macOS autostart override: `launchctl enable|disable <domain>/io.mihomo`.
+/// Mirrors the direct call formerly inlined in `set_autostart` (the
+/// override survives reboots; the plist RunAtLoad rewrite stays in
+/// `set_autostart` as a plain `std::fs` write).
+fn launchctl_autostart_plan(ctx: &InstanceContext, enable: bool) -> InstanceServicePlan {
+    let privileged = ctx.permissions == PermissionModel::PrivilegedSystem;
+    InstanceServicePlan {
+        commands: vec![PlannedCommand {
+            program: "launchctl".to_string(),
+            args: vec![
+                if enable { "enable" } else { "disable" }.to_string(),
+                service_domain_label(ctx),
+            ],
+            privileged,
+        }],
+        remove_paths: Vec::new(),
+    }
+}
+
+/// Windows user-mode autostart: `reg.exe ADD|DELETE` the HKCU Run value
+/// pointing at the hidden `.vbs` launcher (ADR-17). The `.vbs` file itself
+/// is written/removed by `set_autostart` via `std::fs`; only the reg.exe
+/// call is planned here. Path derives from `ctx.paths.config_dir`
+/// (`%APPDATA%\mihomo\autostart.vbs`), matching the vbs write site.
+fn windows_user_autostart_plan(ctx: &InstanceContext, enable: bool) -> InstanceServicePlan {
+    let vbs_path = ctx.paths.config_dir.join("autostart.vbs");
+    let run_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+    let args = if enable {
+        vec![
+            "ADD".to_string(),
+            run_key.to_string(),
+            "/v".to_string(),
+            "mihomo-cli".to_string(),
+            "/t".to_string(),
+            "REG_SZ".to_string(),
+            "/d".to_string(),
+            format!("wscript.exe //B //NoLogo \"{}\"", vbs_path.display()),
+            "/f".to_string(),
+        ]
+    } else {
+        vec![
+            "DELETE".to_string(),
+            run_key.to_string(),
+            "/v".to_string(),
+            "mihomo-cli".to_string(),
+            "/f".to_string(),
+        ]
+    };
+    InstanceServicePlan {
+        commands: vec![PlannedCommand {
+            program: "reg.exe".to_string(),
+            args,
+            privileged: false,
+        }],
+        remove_paths: Vec::new(),
     }
 }
 

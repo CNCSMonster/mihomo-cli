@@ -85,6 +85,7 @@ docs/
 - 遵循 `cargo fmt` 和 `cargo clippy` 默认规则
 - 函数/模块注释用中文
 - 日志用 `crate::log!()` 宏（可通过 `-v` / `--verbose` 启用）
+- API 端点路径变更时，核实 `3rdparty/clash-verge-rev/` 和 `3rdparty/mihomo-cli/` 的参考实现
 
 ## 提交流程
 

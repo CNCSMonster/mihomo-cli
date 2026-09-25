@@ -1655,14 +1655,187 @@ fn apply_override_to_config_text_at_endpoint(
     Ok(serde_yaml::to_string(&config)?)
 }
 
+/// Rewrite rules whose target policy is absent from the merged config (groups + proxies +
+/// built-ins) to target `DIRECT`, emitting a warning for each rewritten rule.
+///
+/// This operates purely on the **in-memory** `config_content` string; it never touches
+/// `rules.yaml` on disk.
+fn apply_dangling_rule_fallback_to_config_text(config_content: &str) -> anyhow::Result<String> {
+    use crate::groups::BUILTIN_POLICIES;
+    use crate::rules::rule_policy;
+
+    let mut config: serde_yaml::Value = serde_yaml::from_str(config_content).map_err(|e| {
+        anyhow::anyhow!(
+            "Generated config is invalid YAML before dangling rule fallback: {}",
+            e
+        )
+    })?;
+
+    // Collect the full set of valid policy names from the merged config.
+    let mut valid_policies: std::collections::HashSet<String> =
+        BUILTIN_POLICIES.iter().map(|s| s.to_string()).collect();
+
+    // Proxy groups
+    if let Some(groups) = config
+        .get("proxy-groups")
+        .and_then(serde_yaml::Value::as_sequence)
+    {
+        for g in groups {
+            if let Some(name) = g.get("name").and_then(serde_yaml::Value::as_str) {
+                valid_policies.insert(name.to_string());
+            }
+        }
+    }
+
+    // Proxy nodes
+    if let Some(proxies) = config
+        .get("proxies")
+        .and_then(serde_yaml::Value::as_sequence)
+    {
+        for proxy in proxies {
+            if let Some(name) = proxy.get("name").and_then(serde_yaml::Value::as_str) {
+                valid_policies.insert(name.to_string());
+            }
+        }
+    }
+
+    // Proxy providers
+    if let Some(providers) = config
+        .get("proxy-providers")
+        .and_then(serde_yaml::Value::as_mapping)
+    {
+        for key in providers.keys() {
+            if let Some(name) = key.as_str() {
+                valid_policies.insert(name.to_string());
+            }
+        }
+    }
+
+    // Rewrite dangling rules
+    let Some(rules_val) = config.get_mut("rules") else {
+        return Ok(serde_yaml::to_string(&config)?);
+    };
+    let Some(rules_seq) = rules_val.as_sequence_mut() else {
+        return Ok(serde_yaml::to_string(&config)?);
+    };
+
+    for rule_val in rules_seq.iter_mut() {
+        let Some(rule) = rule_val.as_str() else {
+            continue;
+        };
+        let Some(policy) = rule_policy(rule) else {
+            continue;
+        };
+        if valid_policies.contains(policy) {
+            continue;
+        }
+        // Policy is dangling – rewrite to DIRECT
+        let rewritten = rewrite_rule_policy(rule, "DIRECT");
+        eprintln!(
+            "  ⚠ [WARN] Rule [{rule}] target group `{policy}` missing in the effective config; temporarily downgraded to DIRECT"
+        );
+        *rule_val = serde_yaml::Value::String(rewritten);
+    }
+
+    Ok(serde_yaml::to_string(&config)?)
+}
+
+/// Issue #011: carry the user's TUN intent across config regeneration.
+///
+/// `tun on` commits a `tun` block into the intent `config.yaml`
+/// (`compare_and_commit_user_intent`). The regeneration pipeline rebuilds
+/// config.yaml from the subscription and would silently drop that block,
+/// making `configured_tun` unobservable and breaking runtime attestation
+/// (`launched == active == intent`). Preserve the previous `tun` block when the
+/// freshly generated content does not define one. The block is appended last,
+/// matching the daemon's `merge_tun_block_into_config_yaml` insertion point, so
+/// the promoted runtime snapshot and the intent file stay byte-identical.
+fn carry_over_tun_block_from_previous_config(
+    previous_content: Option<&str>,
+    new_content: &str,
+) -> anyhow::Result<String> {
+    let Some(previous) = previous_content else {
+        return Ok(new_content.to_string());
+    };
+    let Ok(previous_yaml) = serde_yaml::from_str::<serde_yaml::Value>(previous) else {
+        return Ok(new_content.to_string());
+    };
+    let Some(tun_block) = previous_yaml
+        .as_mapping()
+        .and_then(|map| map.get(serde_yaml::Value::String("tun".to_string())))
+    else {
+        return Ok(new_content.to_string());
+    };
+
+    let mut config: serde_yaml::Value = serde_yaml::from_str(new_content).map_err(|e| {
+        anyhow::anyhow!(
+            "Generated config is invalid YAML before TUN carry-over: {}",
+            e
+        )
+    })?;
+    let Some(map) = config.as_mapping_mut() else {
+        return Ok(new_content.to_string());
+    };
+    if map
+        .get(serde_yaml::Value::String("tun".to_string()))
+        .is_some()
+    {
+        return Ok(new_content.to_string());
+    }
+    let tun_block = tun_block.clone();
+    map.insert(serde_yaml::Value::String("tun".to_string()), tun_block);
+    Ok(serde_yaml::to_string(&config)?)
+}
+
+/// Replace the last significant comma-separated token in a rule string with `new_policy`.
+/// For `MATCH,<policy>` (2 tokens) the second token is replaced; for all other types
+/// (3-4 tokens) the third token is replaced, preserving any trailing option (e.g. `no-resolve`).
+fn rewrite_rule_policy(rule: &str, new_policy: &str) -> String {
+    let parts: Vec<&str> = rule.splitn(4, ',').collect();
+    match parts.as_slice() {
+        // MATCH,<policy>
+        [rule_type, _policy] if rule_type.trim().eq_ignore_ascii_case("MATCH") => {
+            format!("{},{}", rule_type, new_policy)
+        }
+        // TYPE,PARAM,<policy>
+        [rule_type, param, _policy] => {
+            format!("{},{},{}", rule_type, param, new_policy)
+        }
+        // TYPE,PARAM,<policy>,option  (e.g. no-resolve)
+        [rule_type, param, _policy, option] => {
+            format!("{},{},{},{}", rule_type, param, new_policy, option)
+        }
+        _ => rule.to_string(),
+    }
+}
+
+#[allow(dead_code)]
 fn apply_groups_override_to_config_text(
     paths: &AppPaths,
     subscription_id: &str,
     config_content: &str,
 ) -> anyhow::Result<String> {
+    apply_groups_override_to_config_text_with_mode(
+        paths,
+        subscription_id,
+        config_content,
+        crate::groups::MergeMode::ActiveStrict,
+    )
+}
+
+fn apply_groups_override_to_config_text_with_mode(
+    paths: &AppPaths,
+    subscription_id: &str,
+    config_content: &str,
+    mode: crate::groups::MergeMode,
+) -> anyhow::Result<String> {
     let overlay_path = paths.groups_override_path_for_subscription(subscription_id);
     let overlay = crate::groups::GroupsOverlay::load(&overlay_path)?;
-    if overlay.prepend.is_empty() && overlay.append.is_empty() && overlay.delete.is_empty() {
+    if overlay.prepend.is_empty()
+        && overlay.append.is_empty()
+        && overlay.delete.is_empty()
+        && overlay.patches.is_empty()
+    {
         return Ok(config_content.to_string());
     }
 
@@ -1730,7 +1903,17 @@ fn apply_groups_override_to_config_text(
         .flatten()
         .filter_map(|(name, _)| name.as_str().map(str::to_owned))
         .collect();
-    let merged = overlay.merged_groups(&original_groups, &known_proxies, &known_providers)?;
+    let (merged, report) = overlay.merged_groups_with_mode(
+        &original_groups,
+        &known_proxies,
+        &known_providers,
+        mode,
+    )?;
+    if mode == crate::groups::MergeMode::PassiveTolerant {
+        for warning in &report.warnings {
+            eprintln!("  ⚠ [WARN] {warning}");
+        }
+    }
     config_map.insert(
         serde_yaml::Value::String("proxy-groups".into()),
         serde_yaml::Value::Sequence(merged),
@@ -1814,9 +1997,30 @@ pub fn merge_user_config_at_endpoint(
             position,
             endpoint,
         )?;
-        let config_content = apply_groups_override_to_config_text(paths, &id, &config_content)?;
+        let config_content = apply_groups_override_to_config_text_with_mode(
+            paths,
+            &id,
+            &config_content,
+            crate::groups::MergeMode::PassiveTolerant,
+        )?;
+        // Issue #010: the dangling-rule fallback must see the FINAL merged view,
+        // so groups defined only in override.yaml count as valid targets.
         let config_content =
             apply_override_to_config_text_at_endpoint(paths, &config_content, endpoint)?;
+        let config_content = apply_dangling_rule_fallback_to_config_text(&config_content)?;
+        // Issue #011: regeneration must not drop the TUN intent committed by `tun on`.
+        let previous_config = match std::fs::read_to_string(paths.config_path()) {
+            Ok(content) => Some(content),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                crate::log!(
+                    "  ⚠ [WARN] Failed to read previous config.yaml for TUN intent carry-over: {err}"
+                );
+                None
+            }
+        };
+        let config_content =
+            carry_over_tun_block_from_previous_config(previous_config.as_deref(), &config_content)?;
 
         // Validate the generated YAML
         serde_yaml::from_str::<serde_yaml::Value>(&config_content)
@@ -1969,6 +2173,125 @@ pub fn merge_user_config_checked_at_endpoint(
 pub fn merge_user_config_checked() -> anyhow::Result<()> {
     let mihomo = std::path::PathBuf::from(crate::utils::mihomo_path());
     merge_user_config_checked_at(&AppPaths::from_system(), Some(&mihomo))
+}
+
+// ── Change classification & fail-open orchestration (R2 / ADR-02) ──────────
+
+/// Change classification for configuration updates (R2 / ADR-02).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChangeKind {
+    /// Effective config changes (proxies, rules, DNS, mode, mixed-port, etc.)
+    /// that do not alter listener endpoints or TUN device, and can be hot-reloaded
+    /// via Core API PUT /configs without restarting Core.
+    HotReload,
+    /// Changes affecting TUN device (enable/stack/device) or controller listen
+    /// endpoints/secret that necessitate a process restart / promotion.
+    Promote,
+}
+
+fn norm_yaml_field<'a>(val: &'a serde_yaml::Value, key: &str) -> Option<&'a serde_yaml::Value> {
+    match val.get(key) {
+        None | Some(serde_yaml::Value::Null) => None,
+        Some(v) => Some(v),
+    }
+}
+
+impl ChangeKind {
+    /// Classifies the difference between `before` YAML and `after` YAML content.
+    /// Falls back to `ChangeKind::Promote` if either cannot be parsed.
+    pub fn classify_diff(before: &str, after: &str) -> Self {
+        let b = serde_yaml::from_str::<serde_yaml::Value>(before).ok();
+        let a = serde_yaml::from_str::<serde_yaml::Value>(after).ok();
+        match (b, a) {
+            (Some(b), Some(a)) => Self::classify_values(&b, &a),
+            _ => ChangeKind::Promote,
+        }
+    }
+
+    /// Classifies differences between two parsed YAML root values.
+    pub fn classify_values(before: &serde_yaml::Value, after: &serde_yaml::Value) -> Self {
+        // 1. Controller endpoint and authentication fields
+        if norm_yaml_field(before, "external-controller")
+            != norm_yaml_field(after, "external-controller")
+            || norm_yaml_field(before, "external-controller-unix")
+                != norm_yaml_field(after, "external-controller-unix")
+            || norm_yaml_field(before, "secret") != norm_yaml_field(after, "secret")
+        {
+            return ChangeKind::Promote;
+        }
+
+        // 2. TUN configuration:
+        let tun_enabled = |val: &serde_yaml::Value| -> bool {
+            val.get("tun")
+                .and_then(|t| t.get("enable"))
+                .and_then(|e| e.as_bool())
+                .unwrap_or(false)
+        };
+        let before_tun_enabled = tun_enabled(before);
+        let after_tun_enabled = tun_enabled(after);
+        if before_tun_enabled != after_tun_enabled {
+            return ChangeKind::Promote;
+        }
+        // If TUN is active in either, or if TUN block changes while enabled:
+        if (before_tun_enabled || after_tun_enabled) && before.get("tun") != after.get("tun") {
+            return ChangeKind::Promote;
+        }
+
+        // All other fields (rules, proxies, proxy-groups, dns, mode, mixed-port, etc.)
+        // can be reloaded safely via Core API.
+        ChangeKind::HotReload
+    }
+
+    #[allow(dead_code)]
+    pub fn requires_promotion(self) -> bool {
+        matches!(self, ChangeKind::Promote)
+    }
+}
+
+/// Indicates which path actually succeeded in applying the configuration change.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppliedVia {
+    HotReload,
+    Promotion,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyOutcome {
+    pub applied_via: AppliedVia,
+}
+
+/// Orchestration that attempts hot-reload first when ChangeKind is HotReload,
+/// and fails open to promotion if hot-reload returns an error (R2.3).
+#[allow(dead_code)]
+pub async fn apply_with_fail_open<R, P, FutR, FutP>(
+    change_kind: ChangeKind,
+    do_reload: R,
+    do_promote: P,
+) -> anyhow::Result<ApplyOutcome>
+where
+    R: FnOnce() -> FutR,
+    FutR: std::future::Future<Output = anyhow::Result<()>>,
+    P: FnOnce() -> FutP,
+    FutP: std::future::Future<Output = anyhow::Result<()>>,
+{
+    match change_kind {
+        ChangeKind::HotReload => match do_reload().await {
+            Ok(()) => Ok(ApplyOutcome {
+                applied_via: AppliedVia::HotReload,
+            }),
+            Err(reload_err) => {
+                crate::log!("hot-reload failed ({reload_err:#}); failing open to promotion");
+                do_promote().await.map(|()| ApplyOutcome {
+                    applied_via: AppliedVia::Promotion,
+                })
+            }
+        },
+        ChangeKind::Promote => do_promote().await.map(|()| ApplyOutcome {
+            applied_via: AppliedVia::Promotion,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -2913,7 +3236,9 @@ rules:
         // Verify config.yaml was generated
         let config = std::fs::read_to_string(paths.config_path()).unwrap();
         assert!(config.contains("external-controller-unix"));
-        assert!(config.contains("DOMAIN-SUFFIX,google.com,Proxy"));
+        // "Proxy" is not a valid proxy-group or proxy name in this subscription,
+        // so the dangling rule fallback rewrites it to DIRECT.
+        assert!(config.contains("DOMAIN-SUFFIX,google.com,DIRECT"));
     }
 
     #[test]
@@ -3158,6 +3483,425 @@ rules:
         let result = switch_subscription_at(&paths, "sub-nonexist");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    // ── Phase 2: Groups overlay PassiveTolerant + Dangling Rule Fallback tests ──
+
+    /// Test that PassiveTolerant mode gracefully prunes stale member nodes from a group overlay
+    /// and synthesises the config successfully (no error), producing a valid YAML output.
+    #[test]
+    fn groups_overlay_passive_tolerant_prunes_stale_nodes_and_synthesises_ok() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.subscriptions_dir()).unwrap();
+
+        let sub_id = "sub-aa110011";
+        // Subscription has two nodes; the overlay group references both plus a stale one.
+        let sub_content = r#"
+proxies:
+  - name: NodeA
+    type: http
+    server: a.example.com
+    port: 443
+  - name: NodeB
+    type: http
+    server: b.example.com
+    port: 443
+proxy-groups:
+  - name: Auto
+    type: url-test
+    proxies:
+      - NodeA
+      - NodeB
+rules:
+  - MATCH,DIRECT
+"#;
+        std::fs::write(paths.subscription_file_path(sub_id), sub_content).unwrap();
+        set_active_id_at(&paths, sub_id).unwrap();
+
+        // Write a groups overlay that patches "Auto" to add a stale node that no longer exists.
+        let overlay_path = paths.groups_override_path_for_subscription(sub_id);
+        std::fs::create_dir_all(overlay_path.parent().unwrap()).unwrap();
+        let overlay_content = r#"
+patches:
+  Auto:
+    add_proxies:
+      - StaleNode
+    remove_proxies: []
+"#;
+        std::fs::write(&overlay_path, overlay_content).unwrap();
+
+        // Apply with_mode PassiveTolerant – should succeed without error.
+        let sub_yaml: serde_yaml::Value = serde_yaml::from_str(sub_content).unwrap();
+        let config_text = generate_config_yaml_with_fake_ip_filters_for_endpoint(
+            &sub_yaml,
+            &[],
+            &[],
+            &[],
+            crate::rules::RulePosition::Front,
+            &current_api_endpoint(),
+        )
+        .unwrap();
+
+        let result = apply_groups_override_to_config_text_with_mode(
+            &paths,
+            sub_id,
+            &config_text,
+            crate::groups::MergeMode::PassiveTolerant,
+        );
+
+        assert!(
+            result.is_ok(),
+            "PassiveTolerant should succeed even with stale overlay node, got: {:?}",
+            result.err()
+        );
+
+        let merged: serde_yaml::Value = serde_yaml::from_str(&result.unwrap()).unwrap();
+        let groups = merged["proxy-groups"].as_sequence().unwrap();
+        let auto_group = groups
+            .iter()
+            .find(|g| g["name"].as_str() == Some("Auto"))
+            .unwrap();
+        let members: Vec<&str> = auto_group["proxies"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        // StaleNode was pruned; NodeA and NodeB remain
+        assert!(members.contains(&"NodeA"), "NodeA should still be present");
+        assert!(members.contains(&"NodeB"), "NodeB should still be present");
+        assert!(
+            !members.contains(&"StaleNode"),
+            "StaleNode should have been pruned"
+        );
+    }
+
+    /// Test that a global rule pointing to a non-existent proxy-group is automatically
+    /// downgraded to DIRECT in the generated config.yaml, while the on-disk rules.yaml
+    /// is not modified.
+    #[test]
+    fn dangling_rule_target_is_downgraded_to_direct_without_touching_rules_yaml() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.subscriptions_dir()).unwrap();
+
+        let sub_id = "sub-bb220022";
+        let sub_content = r#"
+proxies:
+  - name: HK01
+    type: http
+    server: hk.example.com
+    port: 443
+proxy-groups:
+  - name: HK Select
+    type: select
+    proxies:
+      - HK01
+rules:
+  - MATCH,DIRECT
+"#;
+        std::fs::write(paths.subscription_file_path(sub_id), sub_content).unwrap();
+        set_active_id_at(&paths, sub_id).unwrap();
+
+        // User rule referencing a proxy-group that does NOT exist in the subscription.
+        let user_rules = vec![
+            "DOMAIN-SUFFIX,google.com,NonExistentGroup".to_string(),
+            "DOMAIN-SUFFIX,github.com,HK Select".to_string(),
+            "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve".to_string(),
+            "MATCH,DIRECT".to_string(),
+        ];
+        rules::save_rules_at(&paths, &user_rules).unwrap();
+
+        // Run merge
+        merge_user_config_at(&paths).unwrap();
+
+        // Verify the generated config.yaml
+        let config_text = std::fs::read_to_string(paths.config_path()).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&config_text).unwrap();
+        let rules_in_config: Vec<&str> = config["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+
+        // The dangling rule must be rewritten to DIRECT
+        assert!(
+            rules_in_config.contains(&"DOMAIN-SUFFIX,google.com,DIRECT"),
+            "Dangling rule should have been downgraded to DIRECT, found rules: {:?}",
+            rules_in_config
+        );
+        // The valid rule must be unchanged
+        assert!(
+            rules_in_config.contains(&"DOMAIN-SUFFIX,github.com,HK Select"),
+            "Valid rule targeting 'HK Select' must remain unchanged"
+        );
+        // Rule with no-resolve option must be preserved
+        assert!(
+            rules_in_config.contains(&"IP-CIDR,192.168.0.0/16,DIRECT,no-resolve"),
+            "CIDR rule with no-resolve option must be preserved"
+        );
+
+        // Verify that rules.yaml on disk is NOT modified
+        let disk_rules = rules::load_rules_at(&paths).unwrap();
+        assert_eq!(
+            disk_rules, user_rules,
+            "rules.yaml must not be modified by dangling rule fallback"
+        );
+    }
+
+    /// Issue #010 regression: a rule targeting a group that only exists in
+    /// override.yaml must survive config regeneration without being downgraded
+    /// to DIRECT.
+    #[test]
+    fn rule_targeting_override_only_group_is_not_downgraded() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.subscriptions_dir()).unwrap();
+
+        let sub_id = "sub-override-group";
+        let sub_content = r#"
+proxies:
+  - name: HK01
+    type: http
+    server: hk.example.com
+    port: 443
+proxy-groups:
+  - name: 节点选择
+    type: select
+    proxies:
+      - HK01
+rules:
+  - MATCH,DIRECT
+"#;
+        std::fs::write(paths.subscription_file_path(sub_id), sub_content).unwrap();
+        set_active_id_at(&paths, sub_id).unwrap();
+
+        // override.yaml defines a group that does not exist in the subscription.
+        std::fs::write(
+            paths.override_path(),
+            r#"
+proxy-groups:
+  - name: 节点选择
+    type: select
+    proxies:
+      - HK01
+  - name: 苹果香港
+    type: select
+    proxies:
+      - HK01
+"#,
+        )
+        .unwrap();
+
+        let user_rules = vec![
+            "DOMAIN-SUFFIX,store.apple.com,苹果香港".to_string(),
+            "DOMAIN-SUFFIX,github.com,节点选择".to_string(),
+        ];
+        rules::save_rules_at(&paths, &user_rules).unwrap();
+
+        merge_user_config_at(&paths).unwrap();
+
+        let config_text = std::fs::read_to_string(paths.config_path()).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&config_text).unwrap();
+        let rules_in_config: Vec<&str> = config["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+
+        assert!(
+            rules_in_config.contains(&"DOMAIN-SUFFIX,store.apple.com,苹果香港"),
+            "rule targeting an override-only group must not be downgraded, found: {:?}",
+            rules_in_config
+        );
+        assert_eq!(
+            rules::load_rules_at(&paths).unwrap(),
+            user_rules,
+            "rules.yaml must not be modified"
+        );
+    }
+
+    /// Issue #011 regression: a `tun` block committed into the intent config.yaml
+    /// by `tun on` must survive config regeneration (e.g. triggered by `rule add`).
+    #[test]
+    fn tun_intent_block_survives_config_regeneration() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.subscriptions_dir()).unwrap();
+
+        let sub_id = "sub-tun-carry";
+        let sub_content = r#"
+proxies:
+  - name: HK01
+    type: http
+    server: hk.example.com
+    port: 443
+proxy-groups:
+  - name: 节点选择
+    type: select
+    proxies:
+      - HK01
+rules:
+  - MATCH,DIRECT
+"#;
+        std::fs::write(paths.subscription_file_path(sub_id), sub_content).unwrap();
+        set_active_id_at(&paths, sub_id).unwrap();
+        rules::save_rules_at(&paths, &["DOMAIN-SUFFIX,github.com,节点选择".to_string()]).unwrap();
+        merge_user_config_at(&paths).unwrap();
+
+        // Simulate the `tun on` intent commit: the candidate (== promoted snapshot)
+        // appended the tun block last, mirroring the daemon merge position.
+        let promoted = {
+            let mut doc: serde_yaml::Value =
+                serde_yaml::from_str(&std::fs::read_to_string(paths.config_path()).unwrap())
+                    .unwrap();
+            doc.as_mapping_mut().unwrap().insert(
+                serde_yaml::Value::String("tun".to_string()),
+                serde_yaml::from_str(
+                    r#"
+enable: true
+stack: mixed
+"dns-hijack":
+  - any:53
+"#,
+                )
+                .unwrap(),
+            );
+            serde_yaml::to_string(&doc).unwrap()
+        };
+        std::fs::write(paths.config_path(), &promoted).unwrap();
+
+        // Trigger regeneration as `rule add` would.
+        rules::save_rules_at(
+            &paths,
+            &[
+                "DOMAIN-SUFFIX,github.com,节点选择".to_string(),
+                "DOMAIN-SUFFIX,zz.invalid,DIRECT".to_string(),
+            ],
+        )
+        .unwrap();
+        merge_user_config_at(&paths).unwrap();
+
+        let config_text = std::fs::read_to_string(paths.config_path()).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&config_text).unwrap();
+        assert_eq!(
+            config["tun"]["enable"].as_bool(),
+            Some(true),
+            "TUN intent must survive regeneration; config was:\n{config_text}"
+        );
+
+        // Byte-identity: the daemon re-serializes the promoted content by inserting
+        // the snapshot tun block (same position/value); the result must be a fixed
+        // point so intent, snapshot and launched revisions hash equal.
+        let reparsed: serde_yaml::Value = serde_yaml::from_str(&config_text).unwrap();
+        let round_tripped = serde_yaml::to_string(&reparsed).unwrap();
+        assert_eq!(
+            round_tripped, config_text,
+            "intent config.yaml must be stable under the daemon promotion round-trip"
+        );
+    }
+
+    #[test]
+    fn rule_targeting_proxy_provider_is_not_downgraded() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.subscriptions_dir()).unwrap();
+
+        let sub_id = "sub-provider-test";
+        let sub_content = r#"
+proxy-providers:
+  my-provider:
+    type: http
+    url: http://example.com
+    path: ./my-provider.yaml
+rules:
+  - MATCH,DIRECT
+"#;
+        std::fs::write(paths.subscription_file_path(sub_id), sub_content).unwrap();
+        set_active_id_at(&paths, sub_id).unwrap();
+
+        let user_rules = vec!["DOMAIN-SUFFIX,provider.com,my-provider".to_string()];
+        rules::save_rules_at(&paths, &user_rules).unwrap();
+
+        merge_user_config_at(&paths).unwrap();
+
+        let config_text = std::fs::read_to_string(paths.config_path()).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&config_text).unwrap();
+        let rules_in_config: Vec<&str> = config["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+
+        assert!(
+            rules_in_config.contains(&"DOMAIN-SUFFIX,provider.com,my-provider"),
+            "Rule targeting proxy-provider must remain unchanged, found rules: {:?}",
+            rules_in_config
+        );
+    }
+
+    #[test]
+    fn merge_user_config_at_end_to_end_uses_passive_tolerant() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.subscriptions_dir()).unwrap();
+
+        let sub_id = "sub-e2e-passive";
+        let sub_content = r#"
+proxies:
+  - name: LiveNode
+    type: http
+    server: live.example.com
+    port: 443
+proxy-groups:
+  - name: Main
+    type: select
+    proxies:
+      - LiveNode
+rules:
+  - MATCH,DIRECT
+"#;
+        std::fs::write(paths.subscription_file_path(sub_id), sub_content).unwrap();
+        set_active_id_at(&paths, sub_id).unwrap();
+
+        // Overlay has a patch adding a stale node
+        let overlay_path = paths.groups_override_path_for_subscription(sub_id);
+        std::fs::create_dir_all(overlay_path.parent().unwrap()).unwrap();
+        let overlay_content = r#"
+patches:
+  Main:
+    add_proxies:
+      - ExpiredNode
+    remove_proxies: []
+"#;
+        std::fs::write(&overlay_path, overlay_content).unwrap();
+
+        // merge_user_config_at calls merge_user_config_at_endpoint - must succeed via PassiveTolerant
+        let res = merge_user_config_at(&paths);
+        assert!(
+            res.is_ok(),
+            "merge_user_config_at should succeed via PassiveTolerant: {:?}",
+            res.err()
+        );
+
+        let config_text = std::fs::read_to_string(paths.config_path()).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&config_text).unwrap();
+        let groups = config["proxy-groups"].as_sequence().unwrap();
+        let main_group = groups
+            .iter()
+            .find(|g| g["name"].as_str() == Some("Main"))
+            .unwrap();
+        let members: Vec<&str> = main_group["proxies"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(members, vec!["LiveNode"]);
     }
 }
 

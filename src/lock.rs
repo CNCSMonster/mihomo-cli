@@ -42,6 +42,29 @@ impl Drop for ConfigLockGuard {
 
 pub struct ConfigLock;
 
+/// Rolls back the outermost acquire's re-entrancy increment when the
+/// acquisition fails before a guard exists to release it (Bug #13). On
+/// success `disarm()` hands ownership of the increment to
+/// `ConfigLockGuard::drop`, keeping the depth balanced exactly once.
+struct DepthRollback(std::cell::Cell<bool>);
+
+impl DepthRollback {
+    fn new() -> Self {
+        Self(std::cell::Cell::new(true))
+    }
+    fn disarm(&self) {
+        self.0.set(false);
+    }
+}
+
+impl Drop for DepthRollback {
+    fn drop(&mut self) {
+        if self.0.get() {
+            LOCK_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
+}
+
 impl ConfigLock {
     pub fn acquire(config_dir: &Path) -> anyhow::Result<ConfigLockGuard> {
         // Reentrant: if this thread already holds the lock, return a no-op guard.
@@ -57,6 +80,11 @@ impl ConfigLock {
             });
         }
 
+        // Outermost acquisition: any error below must undo the increment,
+        // otherwise a later acquire on this thread would take the reentrant
+        // branch and return a guard that holds no OS lock.
+        let rollback = DepthRollback::new();
+
         let lock_path = config_dir.join(".mihomo-cli.lock");
         crate::utils::ensure_dir_all_no_follow(config_dir)?;
         crate::utils::restore_original_user_config_ownership(config_dir)?;
@@ -69,7 +97,6 @@ impl ConfigLock {
                     Ok(file) => break file,
                     Err(error) if crate::utils::is_not_found_error(&error) => {
                         if Instant::now() >= deadline {
-                            LOCK_DEPTH.with(|depth| depth.set(0));
                             return Err(anyhow::anyhow!(
                                 "Cannot open lock file {}: {}",
                                 lock_path.display(),
@@ -79,7 +106,6 @@ impl ConfigLock {
                         std::thread::sleep(POLL_INTERVAL);
                     }
                     Err(error) => {
-                        LOCK_DEPTH.with(|depth| depth.set(0));
                         return Err(anyhow::anyhow!(
                             "Cannot open lock file {}: {}",
                             lock_path.display(),
@@ -91,6 +117,7 @@ impl ConfigLock {
 
             crate::utils::restore_original_user_config_ownership(&lock_path)?;
             Self::lock_file(&file, &lock_path)?;
+            rollback.disarm();
             Ok(ConfigLockGuard {
                 _file: Some(file),
                 _path: lock_path,
@@ -99,6 +126,7 @@ impl ConfigLock {
         #[cfg(windows)]
         {
             let file = Self::open_windows_exclusive_lock_file(&lock_path)?;
+            rollback.disarm();
             Ok(ConfigLockGuard {
                 _file: Some(file),
                 _path: lock_path,
@@ -107,6 +135,7 @@ impl ConfigLock {
         #[cfg(all(not(unix), not(windows)))]
         {
             let file = Self::create_exclusive_lock_file(&lock_path)?;
+            rollback.disarm();
             Ok(ConfigLockGuard {
                 _file: Some(file),
                 _path: lock_path,
@@ -126,11 +155,9 @@ impl ConfigLock {
             }
             let err = io::Error::last_os_error();
             if err.kind() != ErrorKind::WouldBlock {
-                LOCK_DEPTH.with(|depth| depth.set(0));
                 anyhow::bail!("flock failed on {}: {}", lock_path.display(), err);
             }
             if Instant::now() >= deadline {
-                LOCK_DEPTH.with(|depth| depth.set(0));
                 anyhow::bail!(
                     "Another mihomo-cli instance is modifying config (timed out after {}s).\n  \
                      Please retry in a moment.",
@@ -160,7 +187,6 @@ impl ConfigLock {
                 Ok(file) => return Ok(file),
                 Err(err) if Self::is_lock_contention(&err) => {
                     if Instant::now() >= deadline {
-                        LOCK_DEPTH.with(|depth| depth.set(0));
                         anyhow::bail!(
                             "Another mihomo-cli instance is modifying config (timed out after {}s).\n  \
                              Please retry in a moment.",
@@ -170,7 +196,6 @@ impl ConfigLock {
                     std::thread::sleep(POLL_INTERVAL);
                 }
                 Err(err) => {
-                    LOCK_DEPTH.with(|depth| depth.set(0));
                     anyhow::bail!("Cannot open lock file {}: {}", lock_path.display(), err);
                 }
             }
@@ -197,7 +222,6 @@ impl ConfigLock {
                 Ok(file) => return Ok(file),
                 Err(err) if err.kind() == ErrorKind::AlreadyExists => {
                     if Instant::now() >= deadline {
-                        LOCK_DEPTH.with(|depth| depth.set(0));
                         anyhow::bail!(
                             "Another mihomo-cli instance is modifying config (timed out after {}s).\n  \
                              Please retry in a moment.",
@@ -207,7 +231,6 @@ impl ConfigLock {
                     std::thread::sleep(POLL_INTERVAL);
                 }
                 Err(err) => {
-                    LOCK_DEPTH.with(|depth| depth.set(0));
                     anyhow::bail!("Cannot create lock file {}: {}", lock_path.display(), err);
                 }
             }
@@ -260,5 +283,54 @@ mod tests {
         let _first = ConfigLock::acquire(tmp.path()).unwrap();
         let _second = ConfigLock::acquire(tmp.path()).unwrap();
         assert!(tmp.path().join(".mihomo-cli.lock").exists());
+    }
+
+    #[test]
+    fn failed_acquire_does_not_grant_a_fake_lock_on_retry() {
+        // Bug #13 regression: when the outermost acquire fails before taking
+        // the OS lock (here ensure_dir_all_no_follow hits ENOTDIR because a
+        // path component is a regular file), the re-entrancy depth must be
+        // rolled back. Otherwise the next acquire on the same thread sees
+        // already_held > 0 and returns a no-op guard with no OS lock —
+        // silently bypassing config serialization.
+        let tmp = TempDir::new().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let bad_dir = blocker.join("nested");
+
+        let first = ConfigLock::acquire(&bad_dir);
+        assert!(first.is_err(), "first acquire must fail");
+
+        let second = ConfigLock::acquire(&bad_dir);
+        assert!(
+            second.is_err(),
+            "retry after a failed acquire must not return a guard without an OS lock"
+        );
+    }
+
+    #[test]
+    fn failed_acquire_does_not_poison_subsequent_real_lock() {
+        // After an outermost acquire fails (depth must have been rolled back),
+        // the next acquire on the same thread must take a REAL OS lock —
+        // observable as blocking a second thread, which a leaked reentrant
+        // state would skip (fake guard) or the second thread would never see.
+        let tmp = TempDir::new().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        assert!(ConfigLock::acquire(&blocker.join("nested")).is_err());
+
+        let valid = TempDir::new().unwrap();
+        let guard = ConfigLock::acquire(valid.path()).unwrap();
+
+        let valid_path = valid.path().to_path_buf();
+        let handle = std::thread::spawn(move || ConfigLock::acquire(&valid_path));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !handle.is_finished(),
+            "acquire after a failed one must hold a real OS lock that blocks others"
+        );
+
+        drop(guard);
+        assert!(handle.join().unwrap().is_ok());
     }
 }

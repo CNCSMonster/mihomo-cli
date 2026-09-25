@@ -781,6 +781,8 @@ pub fn prepare_and_publish_active_transaction(
 
     let tx_dir = transactions_dir(ctx);
     ensure_system_dir(&tx_dir, 0o750)?;
+    #[cfg(unix)]
+    utils::set_directory_mode_no_follow(&tx_dir, 0o2750)?;
 
     let act_dir = active_dir(ctx);
     if act_dir.exists() {
@@ -1568,6 +1570,8 @@ pub fn check_and_migrate_legacy_journal(
     let transaction_id = format!("tun-migrated-{:016x}", rand::random::<u64>());
     let tx_dir = transactions_dir(ctx);
     ensure_system_dir(&tx_dir, 0o750)?;
+    #[cfg(unix)]
+    utils::set_directory_mode_no_follow(&tx_dir, 0o2750)?;
     let staging_dir = tx_dir.join(format!(".prepare-migrated-{}", rand::random::<u32>()));
     ensure_system_dir(&staging_dir, 0o750)?;
 

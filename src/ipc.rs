@@ -7,6 +7,7 @@
 //! on behalf of the unprivileged CLI.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -25,10 +26,6 @@ pub enum DaemonCommand {
     StartCore {
         config_content: String,
         config_revision: String,
-        /// Per-user config dir holding selection-state.yaml (SPEC-select-persistence).
-        /// The daemon replays pinned selections against the freshly started Core.
-        #[serde(default)]
-        selection_intent_dir: Option<String>,
         /// Active subscription identity for selection replay.
         #[serde(default)]
         subscription_id: Option<String>,
@@ -46,9 +43,6 @@ pub enum DaemonCommand {
     RestartCore {
         config_content: String,
         config_revision: String,
-        /// Per-user config dir holding selection-state.yaml (SPEC-select-persistence).
-        #[serde(default)]
-        selection_intent_dir: Option<String>,
         /// Active subscription identity for selection replay.
         #[serde(default)]
         subscription_id: Option<String>,
@@ -69,12 +63,29 @@ pub enum DaemonCommand {
     PromoteSystemConfig {
         config_content: String,
         config_revision: String,
-        /// Per-user config dir holding selection-state.yaml (SPEC-select-persistence).
-        #[serde(default)]
-        selection_intent_dir: Option<String>,
         /// Active subscription identity for selection replay.
         #[serde(default)]
         subscription_id: Option<String>,
+        /// Optional explicit change kind (R2); when None, daemon computes it from content diff.
+        #[serde(default)]
+        change_kind: Option<crate::config::ChangeKind>,
+        /// Windows-only auth token (None on unix — peer uid validation).
+        #[serde(default)]
+        token: Option<String>,
+    },
+    /// Record a selection-intent mirror copy in the fixed system runtime so the
+    /// daemon can replay selections after restart without reading the user tree
+    /// (SPEC §3.8.1 mirror contract; daemon is the only runtime writer).
+    RecordSelectionIntent {
+        subscription_id: String,
+        content_yaml: String,
+        /// Windows-only auth token (None on unix — peer uid validation).
+        #[serde(default)]
+        token: Option<String>,
+    },
+    /// Record the active subscription identity mirror in the fixed system runtime.
+    RecordActiveSubscription {
+        subscription_id: String,
         /// Windows-only auth token (None on unix — peer uid validation).
         #[serde(default)]
         token: Option<String>,
@@ -160,6 +171,16 @@ pub enum DaemonCommand {
         #[serde(default)]
         token: Option<String>,
     },
+    /// Query content revisions of the daemon-owned selection-intent mirrors
+    /// for external reconciliation (R3.2 mirror contract). The daemon
+    /// rejects any subscription id it would not accept for recording;
+    /// a `None` revision in the response means the mirror file is absent.
+    GetSelectionMirrorRevisions {
+        subscription_ids: Vec<String>,
+        /// Windows-only auth token (None on unix — peer uid validation).
+        #[serde(default)]
+        token: Option<String>,
+    },
 }
 
 /// Responses sent from Daemon → CLI.
@@ -200,6 +221,11 @@ pub enum DaemonResponse {
     /// Transaction structured response.
     Transaction {
         response: crate::tun_transaction::TransactionResponse,
+    },
+    /// Selection mirror revisions keyed by subscription id;
+    /// `None` value means the mirror file is absent.
+    SelectionMirrorRevisions {
+        revisions: BTreeMap<String, Option<String>>,
     },
 }
 
@@ -377,13 +403,11 @@ fn with_ipc_token(cmd: DaemonCommand, token: Option<String>) -> DaemonCommand {
         StartCore {
             config_content,
             config_revision,
-            selection_intent_dir,
             subscription_id,
             ..
         } => StartCore {
             config_content,
             config_revision,
-            selection_intent_dir,
             subscription_id,
             token,
         },
@@ -391,13 +415,11 @@ fn with_ipc_token(cmd: DaemonCommand, token: Option<String>) -> DaemonCommand {
         RestartCore {
             config_content,
             config_revision,
-            selection_intent_dir,
             subscription_id,
             ..
         } => RestartCore {
             config_content,
             config_revision,
-            selection_intent_dir,
             subscription_id,
             token,
         },
@@ -415,13 +437,28 @@ fn with_ipc_token(cmd: DaemonCommand, token: Option<String>) -> DaemonCommand {
         PromoteSystemConfig {
             config_content,
             config_revision,
-            selection_intent_dir,
             subscription_id,
+            change_kind,
             ..
         } => PromoteSystemConfig {
             config_content,
             config_revision,
-            selection_intent_dir,
+            subscription_id,
+            change_kind,
+            token,
+        },
+        RecordSelectionIntent {
+            subscription_id,
+            content_yaml,
+            ..
+        } => RecordSelectionIntent {
+            subscription_id,
+            content_yaml,
+            token,
+        },
+        RecordActiveSubscription {
+            subscription_id, ..
+        } => RecordActiveSubscription {
             subscription_id,
             token,
         },
@@ -490,6 +527,12 @@ fn with_ipc_token(cmd: DaemonCommand, token: Option<String>) -> DaemonCommand {
             token,
         },
         GetTransactionStatus { .. } => GetTransactionStatus { token },
+        GetSelectionMirrorRevisions {
+            subscription_ids, ..
+        } => GetSelectionMirrorRevisions {
+            subscription_ids,
+            token,
+        },
     }
 }
 
@@ -569,13 +612,14 @@ mod tests {
         let promote = DaemonCommand::PromoteSystemConfig {
             config_content: "mode: rule\n".to_string(),
             config_revision: "0123456789abcdef".to_string(),
-            selection_intent_dir: None,
             subscription_id: None,
+            change_kind: None,
             token: None,
         };
         let promote_json = serde_json::to_string(&promote).unwrap();
         assert!(promote_json.contains("PromoteSystemConfig"));
         assert!(!promote_json.contains("config_path"));
+        assert!(!promote_json.contains("selection_intent_dir"));
         assert!(matches!(
             serde_json::from_str::<DaemonCommand>(&promote_json).unwrap(),
             DaemonCommand::PromoteSystemConfig { config_revision, .. }
@@ -596,60 +640,126 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_commands_carry_selection_intent_dir() {
-        // SPEC-select-persistence: lifecycle commands tell the daemon where
-        // the per-user selection-state.yaml lives so it can replay after
-        // Core (re)starts. Older daemons tolerate the field being absent.
+    fn selection_mirror_commands_roundtrip_with_subscription_identity() {
+        // SPEC §3.8.1 mirror contract: the CLI pushes selection content and
+        // the active identity; the daemon resolves replay scopes from the
+        // fixed-runtime mirror and never receives user-tree paths.
+        for cmd in [
+            DaemonCommand::RecordSelectionIntent {
+                subscription_id: "sub-abcdef12".to_string(),
+                content_yaml: "selections:\n  G: N\n".to_string(),
+                token: None,
+            },
+            DaemonCommand::RecordActiveSubscription {
+                subscription_id: "sub-abcdef12".to_string(),
+                token: None,
+            },
+        ] {
+            let json = serde_json::to_string(&cmd).unwrap();
+            assert!(!json.contains("selection_intent_dir"));
+            let parsed = serde_json::from_str::<DaemonCommand>(&json).unwrap();
+            let id = match &parsed {
+                DaemonCommand::RecordSelectionIntent {
+                    subscription_id, ..
+                }
+                | DaemonCommand::RecordActiveSubscription {
+                    subscription_id, ..
+                } => subscription_id.as_str(),
+                other => panic!("unexpected command variant: {other:?}"),
+            };
+            assert_eq!(id, "sub-abcdef12");
+        }
+    }
+
+    #[test]
+    fn selection_mirror_revision_query_roundtrips() {
+        let cmd = DaemonCommand::GetSelectionMirrorRevisions {
+            subscription_ids: vec!["sub-abcdef12".to_string(), "sub-0000ff00".to_string()],
+            token: None,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"GetSelectionMirrorRevisions\""));
+        // Client must never transmit paths, only subscription identities.
+        assert!(!json.contains("selection_intent_dir"));
+        assert!(!json.contains("/var/run"));
+        let parsed = serde_json::from_str::<DaemonCommand>(&json).unwrap();
+        match parsed {
+            DaemonCommand::GetSelectionMirrorRevisions {
+                subscription_ids,
+                token: None,
+            } => assert_eq!(
+                subscription_ids,
+                vec!["sub-abcdef12".to_string(), "sub-0000ff00".to_string()]
+            ),
+            other => panic!("unexpected command variant: {other:?}"),
+        }
+
+        let mut revisions = BTreeMap::new();
+        revisions.insert("sub-abcdef12".to_string(), Some("aa".repeat(32)));
+        revisions.insert("sub-0000ff00".to_string(), None);
+        let resp = DaemonResponse::SelectionMirrorRevisions {
+            revisions: revisions.clone(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        match serde_json::from_str::<DaemonResponse>(&json).unwrap() {
+            DaemonResponse::SelectionMirrorRevisions { revisions: got } => {
+                assert_eq!(got, revisions)
+            }
+            other => panic!("unexpected response variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lifecycle_commands_carry_subscription_identity() {
+        // SPEC §3.8.1: lifecycle commands carry the active subscription
+        // identity so the daemon can replay the fixed-runtime mirror after
+        // Core (re)starts. User-tree paths are never transmitted.
         for cmd in [
             DaemonCommand::StartCore {
                 config_content: "mode: rule\n".to_string(),
                 config_revision: "rev".to_string(),
-                selection_intent_dir: Some("/home/alice/.config/mihomo".to_string()),
                 subscription_id: Some("sub-abcdef12".to_string()),
                 token: None,
             },
             DaemonCommand::RestartCore {
                 config_content: "mode: rule\n".to_string(),
                 config_revision: "rev".to_string(),
-                selection_intent_dir: Some("/home/alice/.config/mihomo".to_string()),
                 subscription_id: Some("sub-abcdef12".to_string()),
                 token: None,
             },
             DaemonCommand::PromoteSystemConfig {
                 config_content: "mode: rule\n".to_string(),
                 config_revision: "rev".to_string(),
-                selection_intent_dir: Some("/home/alice/.config/mihomo".to_string()),
                 subscription_id: Some("sub-abcdef12".to_string()),
+                change_kind: None,
                 token: None,
             },
         ] {
             let json = serde_json::to_string(&cmd).unwrap();
             let parsed = serde_json::from_str::<DaemonCommand>(&json).unwrap();
-            let intent_dir = match &parsed {
+            let subscription_id = match &parsed {
                 DaemonCommand::StartCore {
-                    selection_intent_dir,
-                    ..
+                    subscription_id, ..
                 }
                 | DaemonCommand::RestartCore {
-                    selection_intent_dir,
-                    ..
+                    subscription_id, ..
                 }
                 | DaemonCommand::PromoteSystemConfig {
-                    selection_intent_dir,
-                    ..
-                } => selection_intent_dir.as_deref(),
+                    subscription_id, ..
+                } => subscription_id.as_deref(),
                 other => panic!("unexpected command variant: {other:?}"),
             };
-            assert_eq!(intent_dir, Some("/home/alice/.config/mihomo"));
+            assert_eq!(subscription_id, Some("sub-abcdef12"));
         }
 
-        // Missing field (legacy CLI) must still deserialize via serde default.
+        // Missing optional identity (legacy CLI) must still deserialize via
+        // serde default.
         let legacy =
             r#"{"type":"StartCore","config_content":"mode: rule\n","config_revision":"rev"}"#;
         assert!(matches!(
             serde_json::from_str::<DaemonCommand>(legacy).unwrap(),
             DaemonCommand::StartCore {
-                selection_intent_dir: None,
+                subscription_id: None,
                 ..
             }
         ));

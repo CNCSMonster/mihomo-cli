@@ -2,7 +2,7 @@
 
 > Mihomo CLI — cross-platform setup & control tool for Mihomo (Clash.Meta) proxy
 
-> **权威性与状态：** 本文件是项目唯一的产品与架构权威 SPEC。本文档区分 `Implemented`、`Contract-tested`、`Real-Core-tested` 和 `Planned`，不得把局部代码存在描述为完整用户旅程已完成。
+> **权威性与状态：** 本文件是项目唯一的产品与架构权威 SPEC。其他实施文档只能补充实施细节、风险和验收，不得定义与本文件冲突的用户可观察行为；发现冲突时以本文件为准。本文档区分 `Implemented`、`Contract-tested`、`Real-Core-tested` 和 `Planned`，不得把局部代码存在描述为完整用户旅程已完成。
 
 ## 0. Unified Product Contract
 
@@ -83,7 +83,7 @@ uninstall --all --yes
 
 | 层级 | 命令/动作 | 合同 |
 |---|---|---|
-| 普通用户主面 | `install`, `uninstall`, `restart`, `config`, `rule`, `dns`, `exit-ip` | 目标导向、错误可修复；不要求用户理解 instance/daemon/Core |
+| 普通用户主面 | `install`, `uninstall`, `restart`, `config`, `rule`, `dns`, `select`, `group`, `exit-ip` | 目标导向、错误可修复；不要求用户理解 instance/daemon/Core |
 | 高级/脚本面 | `--system`, `--user`, `--yes`, `--dry-run`, `--json`、兼容旧 `ip` 以及现有非-config 兼容子命令 | 保留既有兼容行为，不作为普通用户教程主路径；`config` 的 action flat flags 不属于当前兼容表面，旧写法只保留在迁移映射中 |
 | 内部实现 | daemon IPC、Core API、systemd/launchd/SCM、sudo re-exec、socket/path | 不作为产品入口，不在错误中要求用户手工执行底层操作 |
 
@@ -269,16 +269,16 @@ enum DaemonResponse {
 
 **当前证据状态**：本节定义跨平台 IPC 认证合同；具体平台实现和旅程证据必须按 §0.4 单独标注，不能由 token 文件或 SDDL 设计本身推导为 `Implemented`。
 - Windows：要求 token 双副本（`service-token` + `service-client-token`）与 named pipe ACL/SDDL，并分别验证 SCM、IPC 授权和 Core/TUN 旅程。
-- Unix：要求 peer UID、per-user client token 和授权表三者共同校验；Linux 非 root daemon 与 macOS 特权服务按平台边界分别验证。
-- Unix 不使用独立 server token；认证材料是 peer UID、per-user client token 和授权表三者。
+- Unix：要求 peer UID、per-user client token 和 daemon 侧 owner record 共同校验；Linux 非 root daemon 与 macOS 特权服务按平台边界分别验证。
+- Unix 不使用独立 server token；认证材料是 peer UID、per-user client token 和 owner record（sha256 hash + owner uid）。
 - **Per-user client token**：`~/.config/mihomo/service-token`，权限 `0o600 <user>:<user>`，CLI 连接时携带。
-- **授权表**：`/var/lib/mihomo-cli/authorized-clients.json`，记录被授权的 (uid, client token) 对。Linux 为 `0o640 root:mihomo`，供非 root daemon 只读；macOS 为 `0o600 root:wheel`。
+- **Owner record**：`/var/lib/mihomo-cli/owner`（JSON: `{uid, token_sha256}`），安装时生成。Linux 为 `0o640 root:mihomo`，供非 root daemon 只读；macOS 为 `0o600 root:wheel`。
 - **Socket 权限**：保持 `0o666`，允许所有本机用户连接；授权边界在 daemon 应用层完成。
 - **Daemon 校验**：
   - 若 peer UID == 0（root），直接放行 token 校验（保留 root 排障/管理路径）。
-  - 非 root 用户：client token 必须存在于授权表，且 Unix socket peer UID 与授权表中该 token 归属 UID 一致。
+  - 非 root 用户：client token 的 sha256 必须与 owner record 一致，且 Unix socket peer UID 与 owner record 中 uid 一致。
 - **TUN 操作额外限制**：`ApplySystemTunSnapshot` / `DisableTun` 仍要求 peer UID == 0（root）。`ApplySystemTunSnapshot` 是 `tun on` 的内部 apply/update 请求；`DisableTun` 是 `tun off` 的内部请求。
-- **管理命令**：`mihomo-cli access grant --user <name>` / `access revoke --user <name>` / `access list` / `access status` 由 root 维护授权表。
+- 诊断：`mihomo-cli doctor --system` 输出认证状态。
 
 **计划改进（后续）**：
 - 长期考虑将 token 文件保护扩展到 macOS Keychain / Linux keyring（超出当前阶段）
@@ -351,6 +351,15 @@ CLI restart --system
 - 无法读取或校验用户 intent 时，CLI 必须在 IPC 前失败并返回可执行的 `mihomo-cli` 修复/重试指引；不得让 daemon 回退读取用户 home。
 
 成功条件是：CLI 能证明 payload 来源和 revision，daemon 能证明固定 runtime 写入，Core 能以固定 `-d` 和显式 `-f` 启动并完成 API readiness；这不要求也不允许 system daemon 直接访问用户配置树。
+
+### 1.7.2 Core launch contract（config source 与 runtime data dir 分离）
+
+System 模式下 Core 启动必须区分两个独立概念：`config_source`（本次加载的受管配置来源）与 `runtime_data_dir`（Core 的固定数据/工作目录）。`runtime_data_dir` 始终由 daemon 的固定 system instance context 派生（Linux `/var/lib/mihomo-cli`），禁止从 `config_source.parent()` 推导，也禁止由调用方路径影响。
+
+- 受管配置来源实现为枚举化 `ManagedConfigSource`（active config / TUN snapshot / 内部 recovery artifact），不得通过 IPC 暴露任意 `PathBuf`；recovery artifact 只允许作为 daemon 内部恢复输入，最终运行配置必须收敛到固定 runtime 文件。
+- Core 参数映射固定为 `-d <system runtime dir>` + 显式 `-f <受管配置路径>`，三个平台一致；API readiness 检查的 endpoint 必须来自实际传给 Core 的同一文件。
+- 唯一写者：用户 intent、订阅 metadata/cache 与 overlay 由普通用户 CLI 写入；`active-config.yaml`、`tun-config.yaml` 由 `mihomo` daemon 在认证 IPC 后写入；`transactions/`、generations 由 root coordinator（一次性命令生命周期内的协调角色，非常驻 daemon）写入；Core 只读取 daemon 选择的 `-d/-f`。跨写者一致性只能经 durable journal 与 revision/fence 连接，不依赖“两个进程都能写”形成隐式一致性。
+- daemon/Core 不得读取或回写用户 home；用户 home 的目录穿越权限不是 system 运行模式的依赖。
 
 ---
 
@@ -528,7 +537,7 @@ restart:
 | Windows | `%USERPROFILE%\.config\mihomo\config.yaml` |
 
 - daemon 通过受权 system context 使用固定 system runtime：普通 system Core 使用 `active-config.yaml`，system TUN Core 使用 `tun-config.yaml`；两者都不是用户配置的第二事实来源，也不直接接受调用方提供的任意 config path
-- 配置变更（订阅添加/导入、订阅切换/删除、规则编辑、DNS 策略、override）当前先按用户配置事务提交为 intent；system 模式会将已提交、已校验的内容通过受管 promotion 写入固定运行时并重新启动 Core。system TUN active 下对所有入口统一完成 candidate → snapshot → `CoreApplied` → compare-and-commit → `IntentCommitted` 仍是目标合同，尚未由统一代码路径完整实现和验收
+- 配置变更（订阅添加/导入、订阅切换/删除、规则编辑、DNS 策略、override）当前先按用户配置事务提交为 intent；system 模式会将已提交、已校验的内容通过受管 promotion 写入固定运行时并重新启动 Core。system TUN active 下，config/rule/DNS/override/group/select 等影响 active effective config 的入口统一经 candidate → snapshot → `CoreApplied` → compare-and-commit → `IntentCommitted` dispatcher 完成（Issue #004/#005/#008/#009）；真实 TUN 数据面证据仍按 §0.4 等级单独报告
 - 旧 `config.yaml` system store 路径（`/var/lib/mihomo-cli/config.yaml`、`/Library/Application Support/mihomo-cli/config.yaml`、`%ProgramData%\mihomo-cli\config.yaml`）已废弃；`active-config.yaml`、`tun-config.yaml`、事务和 Geo 等固定运行时资产仍位于这些平台的 system runtime 目录，并按正式 SPEC 的 writer/reader contract 管理
 
 ### 3.4 Subscription Processing and weak-network contract
@@ -591,6 +600,20 @@ TUN 收敛必须使用 immutable candidate/revision、固定 snapshot 路径、r
 - `proxy on/off` 只是当前 CLI 进程输出 shell 环境变量设置/清理语句；输出成功不改变父 shell，`proxy off` 不改变 TUN、system proxy 或 Core/service。
 - `stop` 只负责停止声明范围内的受管 Core/service；它不清理 system proxy，也不能修改父 shell 环境变量。
 
+### 3.7.2 TUN preflight contract（无副作用前置检查）
+
+`tun on` 在所有副作用（sudo、写 intent/snapshot、启动 Core、变更路由）之前，按固定顺序完成无副作用 preflight：
+
+1. system service 已安装且实例归属正确；
+2. daemon IPC transport、业务握手、token 与授权通过（socket 文件存在不等于授权通过）；
+3. 目标 Core 可执行、API endpoint 可识别，无 user Core、其他 system instance 或受管端口冲突；
+4. intent config 按原始用户身份经 no-follow 安全读取，为 regular/single-link 受管普通文件，并通过 YAML 与真实 Core 语义校验；
+5. 受管 runtime/Geo 资产权限可观察，仅允许对可证明受管资产做最小修复并立即复检；
+6. `/dev/net/tun` 与当前环境 TUN 能力前置条件可观察（设备存在本身不证明 capabilities）；
+7. 无未收敛的 active transaction journal、cleanup manifest、受管 snapshot 或网络残留。
+
+preflight 输出固定为 `Passed` / `Blocked` / `Next` 三段：`Passed` 只记录实际验证通过的检查，不能把“未检查”或“socket 存在”当成通过；`Blocked` 给出用户可理解的根因，未验证条件只能为 `unknown` 或进入 `Blocked`；`Next` 是用户可执行的 `mihomo-cli` 命令或明确的宿主环境动作，不要求用户手工拼接 `sudo`、`systemctl` 或内部路径。任一 blocker 都非零退出且 config、snapshot、Core 进程和系统路由保持原状；自动修复只允许作用于受管 runtime/Geo 资产，修复后复检失败仍必须阻断。
+
 ### 3.8 Proxy-group selection contract
 
 `select` 的目标是改变一个已存在代理组的当前成员选择，不修改规则目标、代理组定义或订阅内容。具体节点和子代理组都属于合法成员，但目标必须存在于当前 Core/配置所观察到的该组成员集合中。
@@ -601,6 +624,41 @@ TUN 收敛必须使用 immutable candidate/revision、固定 snapshot 路径、r
 - 普通运行实例可使用已登记的代理组选择 Core API forwarding，但只有 forwarding 成功并由当前 Core 观察到目标成员后，才返回 `runtime_applied`；API 不可达、成员观察缺失或运行时结果无法关联到当前 instance 时返回 `unknown`。
 - system TUN 为 `TunRunning` 时，选择改变 active effective config，必须经统一 promotion dispatcher；不得先写选择文件再直接 PUT Core API。promotion、runtime selection 或持久提交任一步失败时保留 last-known-good；无法证明恢复时返回 `RecoveryRequired`。
 - 选择成功不证明节点可连、目标服务可达、出口 IP 稳定或所有流量使用该选择；这些只能由显式 `exit-ip` 或真实业务数据面证据证明。
+
+### 3.8.1 Per-subscription selection persistence
+
+节点选择持久化以 active subscription ID 为作用域，与订阅 cache、groups overlay 共用同一 identity：
+
+- 选择 intent 按槽存储为 `selections/<active-id>.yaml`（单订阅内简单 `group → node` 映射）；文件不存在等价于该订阅没有固定选择。legacy 全局 `selection-state.yaml` 只是一次性迁移来源：在 active ID 可解析时把其内容复制进当前订阅槽（目标已有同名记录优先保留），随后移入受保护 legacy 备份名；任何正常 load/replay/unpin 不得再读旧路径，不得把旧状态复制到多个订阅，也不得因组名相同跨订阅合并。
+- `select`、`select --unpin` 与 `group` 编辑必须先解析并经校验 `subscriptions/active`；无 active subscription、active pointer 缺失/非法或指向不存在 cache 时 fail-fast，不调用 Core、不写选择文件，并给出 `config add/import/switch` 下一步。direct-only 配置可正常使用非选择功能，但不产生新的持久化 selection intent。
+- `select` 在同一选择锁（`<config_dir>/.selection-state.lock`）内完成：确认 active ID → Core PUT/daemon IPC（daemon 校验 IPC 携带的 `subscription_id` 与 active pointer 一致，缺失或不一致直接拒绝，不 fallback 到旧全局文件）→ 写 `selections/<id>.yaml`。锁顺序固定为 `config transaction lock → selection lock`，不得反向获取；daemon 不在本地文件锁内等待 sudo、Core readiness 或 TUN 事务。
+- replay 只在 Core API ready 后进行，总预算不超过 5 秒、逐组短超时、单组失败不阻塞其他组；结果区分 `applied`/`node_missing`/`group_missing`/`failed`/`budget_exceeded` 并携带 subscription ID，不改变 start/restart 主退出码。`config --switch` 在 active pointer 提交后才以新 ID replay；replay 失败不回滚已提交的 pointer，保留两边各自的 selection 文件并报告 pending/failed。refresh/import 只更新 cache 与配置生成，不删除 selection 文件，完成后只 replay 当前 active ID。
+- `list`/`status` 只读取当前 active subscription 的 intent；`status` 不触网，只做本地派生，JSON `selections` 必须携带 `subscription_id` 与 `source: local-derive`，不伪造 runtime attestation。`select --unpin [--group G | --all]` 只移除当前订阅的 intent，不切换运行态。
+- 权限合同：selection 目录与文件沿用现有 no-follow、原子写入与原用户 ownership 收敛原语；Linux setgid tree 下 0640 + service group，其它情况 0600，不放宽。backup/restore、`uninstall --remove-config/--all` 按订阅 selection 文件逐项纳管；锁文件永不备份。
+
+### 3.8.2 Proxy-group create/edit contract（声明式 overlay）
+
+代理组创建与成员编辑不修改订阅 cache，也不持久化全量生成的配置快照；所有组配置以声明式 overlay 绑定当前 active subscription 存储为 `overrides/<active-id>/groups.yaml`，格式为 `prepend`（自建前置组完整定义）/ `append`（自建后置组）/ `delete`（隐藏组名列表）/ `patches`（原生组增量微调：`add_proxies` / `remove_proxies`）。
+
+- 前置条件与 §3.8.1 相同：必须经 `subscriptions/active` 解析当前订阅 ID，缺失/非法时 fail-fast；overlay 不存在视为空配置；订阅刷新/重导入与单订阅卸载保留 overlay，仅 `uninstall --all` 清理。
+- 合成算法：按 `prepend` → 原生组就地处理（`delete` 列表过滤；`patches` 目标就地增删成员，保留原生类型、高级参数并严格保持原生拓扑位置）→ `append` 的顺序生成 `proxy-groups` 序列，最后执行全局 DAG 成环检测与成员有效性校验。patch 目标组被上游删除时跳过该 patch 并警告，不生成幽灵组；同一成员同时出现在 add/remove 时主动修改 fail-fast。
+- 组类型为 `select | url-test | fallback | load-balance | relay`。组名 1–128 Unicode 字符、字符集白名单（字母、数字、`-`、`_`、`.`、空格），禁止 YAML 特殊字符与控制字符，禁止以 `.` 或 `-` 开头；`DIRECT`、`REJECT`、`REJECT-DROP`、`REJECT-NO-DROP`、`PASS`、`GLOBAL`、`COMPATIBLE`、`MATCH`、`PROXY` 为保留字（大小写不敏感拦截）。字段集对齐 CVR `IProxyGroupConfig` 白名单。CLI 为强制字段注入安全默认值并回显：url-test/fallback/load-balance 默认 url `http://www.gstatic.com/generate_204`、interval `300`；load-balance 默认 strategy `consistent-hashing`；relay 严禁内置策略成员且组引用必须无环。
+- 双轨校验：主动交互（create/edit/add/remove）严格校验成员存在、无保留字冲突、无环引用，异常立即 fail-fast；被动路径（订阅刷新/切换）对已在订阅中消失的成员优雅剪枝并警告。普通组（select/url-test/fallback/load-balance）成员全部失效时注入 `DIRECT` 兜底保活并警告；`relay` 组全部失效时严禁注入 `DIRECT`，安全降级为 `REJECT`，防止多跳代理意外直连泄露真实 IP，同时保证 Core 语法合规。
+- 全局 `rules.yaml` 引用当前合并视图中不存在的组时（如切换订阅后），合成管线临时将该规则出口降级为 `DIRECT` 并醒目警告；磁盘规则文件不被物理修改，切回原订阅自动复原。
+- `group delete` 必须执行三维级联依赖扫描：本地规则出口、其它组（自建与原生）静态成员、`patches[*].add_proxies` 引用；存在任一引用即阻断删除并输出解绑指引。自建组 delete 从 prepend/append 彻底移除并同步清理本订阅 selection 中该组条目；原生组 delete 进入 `delete` 隐藏列表并清理对应 patch；`group reset` 同时从 `delete` 与 `patches` 移除目标，一键恢复上游原生状态（自建组不支持 reset）。
+- 修改命令持有 `ConfigLock`（5s 超时，防死锁），overlay 与生成配置经同目录原子写入与 Core 等价校验；校验失败回滚 overlay 与 `config.yaml`。权限遵循 Security #4：setgid 树内新建目录显式继承 `0o2755`，写入走 `atomic_write_file_for_original_user`，严禁跟随符号链接。
+- 结果遵守 §12.2.1 三层合同：overlay 与生成配置提交成功后，Core stopped 或 reload/promotion 失败时返回 `pending=true`、退出码 0 并提示显式 `mihomo-cli restart`；不得回滚已提交且校验通过的合法 intent，也不得把 pending 误报为已应用。
+
+### 3.8.3 Selection intent 固定 runtime 镜像
+
+System 模式下 daemon 不访问用户 home 目录树中的任何 selection 文件（ADR-25 边界在 selection 路径的完整收敛）；selection intent 以镜像形式存于固定 runtime，daemon 是唯一写者：
+
+- 镜像布局：`/var/lib/mihomo-cli/selections/active`（active subscription ID 副本）与 `selections/<sub-id>.yaml`（该订阅的选择映射副本，与用户树 `selections/<id>.yaml` 语义等价）。写入经 runtime 内同目录原子写（tmp+rename+fsync），权限 `mihomo:mihomo` 0640、目录 0750；daemon 不接受 IPC 传入的任何路径字段。
+- IPC 合同：CLI 经 `RecordSelectionIntent { subscription_id, content_yaml }` 与 `RecordActiveSubscription { subscription_id }` 推送；daemon 校验 id 格式（`sub-`+8hex）与 YAML schema（单映射 `group → node`、键值非空、总量上限），拒绝非法 payload 落盘。lifecycle/promote 请求只携带 `subscription_id`，replay 作用域由镜像 active 与请求 id 比对解析，身份不一致直接拒绝 replay（不改变 promotion 结果）。
+- 推送点：`select`/`select --unpin` 提交后、`config --switch`/`--import --activate` 提交后推送；`restart`/`start`（system 模式）在 daemon 重启前全量幂等推送 active ID + 全部订阅映射，作为镜像（重）建自愈点（老安装升级后第一次 restart 即完成初始化）。推送失败不改变命令主结果（intent 层已成功），输出 warning 如实反映；daemon 不可达/Core stopped 时静默跳过。
+- daemon replay：启动/自启钩子与 promote 成功路径只读镜像；镜像缺失或损坏 → 跳过 + 单行 warning，**不回退读用户树**（禁止隐式降级）。replay 预算、逐组降级与报告行格式与 §3.8.1 一致。
+- user 模式不启用镜像（daemon 以用户身份运行，无跨域问题）；Windows 维持编译边界。
+- 收益与后续：`selections/` 用户树目录的 setgid 组共享对 system 模式不再必要；收紧为用户私有（0700/0600）作为独立后续小步，需同步更新本权限条款与 #009 相关测试。
 
 ### 3.9 Restore-direct layered contract
 
@@ -932,7 +990,7 @@ YAML 编辑失败显式报错，不静默降级。
 
 **状态**: ✅ 已决策 (2026-08-02)
 
-调研同类项目（clash-cli.rs）时发现其内置了"AI 修改规则"功能，判断为错误方向，不借鉴。
+参考 `3rdparty/clash-cli.rs` 时发现其内置了"AI 修改规则"功能，判断为错误方向，不借鉴。
 
 mihomo-cli 的 AI 原生正确方向是作为**工具提供给上层 AI 使用**：
 - 合适的 CLI 接口设计（机器可解析、确定性输出，未来可补 `--json` 结构化输出）
@@ -946,7 +1004,7 @@ mihomo-cli 的 AI 原生正确方向是作为**工具提供给上层 AI 使用**
 
 **状态**: ✅ 已决策 (2026-08-02)
 
-调研同类项目（Proxy-RS，sing-box + mihomo 双内核管理器，Ratatui TUI）后确认：**当前目标只做好 mihomo 内核**，多内核管理方向不做。
+参考 `3rdparty/Proxy-RS`（sing-box + mihomo 双内核管理器，Ratatui TUI）后确认：**当前目标只做好 mihomo 内核**，多内核管理方向不做。
 
 **Why**: 双内核增加管理复杂度（两套路径/服务/配置模型）、测试矩阵翻倍、维护成本高；当前用户场景（mihomo 单内核）没有多内核需求。
 
@@ -1005,6 +1063,8 @@ Windows user 用注册表 Run 键 + `.vbs`（Proxy-RS 同款）——隐蔽、�
 ### ADR-18: 多用户 TUN 架构 —— per-user core 独立 + system daemon 独占 TUN 原子开关
 
 **状态**: ✅ 已决策 (2026-08-03，codex GPT-5.5 分析 + 用户确认)
+
+**状态澄清（R0 口径注记，不改下方 How-to-apply 条款正文语义）**: 当前实现为**单用户/单实例落地**；多 core / per-user 多实例并存属**远期演进，非当前目标**。文档不得将 ②per-user 并存或 ③多 core 标为已支持。
 
 **背景**: TUN 网卡是系统级单例——只能一个进程创建/管理（utun/wintun + 系统路由）。
 当前单用户部署，长期支持多用户：同一台 Linux/macOS 多用户，每用户独立代理配置
@@ -1118,7 +1178,7 @@ Windows user 用注册表 Run 键 + `.vbs`（Proxy-RS 同款）——隐蔽、�
 
 **实施位置**:
 - Linux systemd unit 与安装计划由 `instance.rs` 唯一生成，包含 `User=mihomo`、capabilities、目录权限和沙箱选项。
-- daemon 从 `MIHOMO_CLI_CONFIG_DIR` 读取原用户配置，并以 peer UID + token + 授权表认证。
+- daemon 从 `MIHOMO_CLI_CONFIG_DIR` 读取原用户配置，并以 peer UID + token hash + owner record 认证。
 - macOS 保持 root LaunchDaemon，Windows 保持 SCM/SYSTEM；两者不声明已实现 Linux 的非 root 模型。
 - 迁移：已有安装按用户明确的删除范围执行卸载；需要完整清理旧 system store 时使用 `mihomo-cli uninstall --all --yes`，随后重新 `mihomo-cli install --system --yes`。`--yes` 只跳过确认，不绕过 recovery、权限或归属校验
 
@@ -1362,7 +1422,7 @@ TUN 是系统级功能，一旦开启会影响所有用户流量。system TUN �
 - `config add/import/switch/refresh/remove`、rule、DNS、override 和节点选择：先报告 intent transaction 结果，再报告 `runtime_applied`、`pending`、`failed` 或 `unknown`。仅 intent 提交成功不得输出 `runtime_applied`。
 - Core stopped 时，合法 intent 可提交并返回 `pending`，同时给出显式 `mihomo-cli restart [--system]`；不得为了制造 `runtime_applied` 隐式启动 Core。
 - 普通运行实例只有在受管 reload/restart 已完成且当前 Core/API 观察确认目标 revision 后才返回 `runtime_applied`；Core/API 不可达或 revision 无法证明时返回 `unknown`。
-- system TUN 为 `TunRunning` 时，所有 active effective-config 变更统一经 promotion dispatcher 并完成 snapshot promotion、`CoreApplied`、当前 Core/API runtime attestation 和 `IntentCommitted`，是目标合同；当前实现已阻止通用 `/configs` 旁路，但尚未由统一代码路径完整覆盖和验收所有 config/rule/DNS/override/TUI 入口。未具备该完整证明时不得报告 `runtime_applied`，只能返回 `pending`、`failed`、`unknown` 或 `RecoveryRequired`。
+- system TUN 为 `TunRunning` 时，所有 active effective-config 变更统一经 promotion dispatcher 并完成 snapshot promotion、`CoreApplied`、当前 Core/API runtime attestation 和 `IntentCommitted`；dispatcher 已统一覆盖 config/rule/DNS/override/group/select 入口并阻止通用 `/configs` 旁路（Issue #004/#005/#008/#009）。未具备该完整证明的变更不得报告 `runtime_applied`，只能返回 `pending`、`failed`、`unknown` 或 `RecoveryRequired`。
 - `restart`/`start` 的 `Ready` 只证明声明的 daemon/Core/API control-plane readiness；无合法配置、residual/recovery blocker、API 不可达或目标 runtime 无法证明时返回 `Incomplete`、`Failed`、`Unknown` 或 `RecoveryRequired`。不得把 `Ready` 解释为公网、代理组出口、DNS/DIRECT 或 TUN 数据面成功。
 - `tun on/off` 只有在受管 transaction 完成、root peer gate 通过、目标 snapshot/revision 与 instance 关联可证明，并由当前 Core API 观察得到目标 TUN 状态时才返回 `Ready`；raw API 字段、daemon success、YAML intent 或 snapshot promotion 单独不足以返回成功。运行态不可观察时返回 `Unknown`/`RecoveryRequired`。
 - `ip`/`exit-ip` 和真实业务 fixture 是独立数据面证据；其成功或失败不得回填 `restart`、配置写入或 TUN 命令的 control-plane 结果。
@@ -1386,6 +1446,16 @@ CLI 不新增任何独立的恢复子命令（如 `recover`、`reset`、`repair`
 6. **结果语义**：安全恢复或受管 reset 完成后，原命令继续执行并只报告“运行状态已修复/已重新启动”；若 reset 未完成，报告配置未修改、运行状态仍需处理，并给出唯一下一步。不得把删除文件、daemon 可达或 Core 进程存在单独当作 Ready。
 
 因此，“无论历史状态如何”不是无条件删除所有状态，而是：用户配置永远优先保留；mihomo 自己管理且可重建的运行状态由既有目标命令自动收敛；外部归属无法证明时宁可停止，也不把风险转嫁给用户。
+
+### 12.3.1 受控自愈边界与权限诚实幂等
+
+自动修复只适用于在当前原始用户安全边界内可证明归属、无业务语义变化的权限/owner/路径问题；root-owned、身份不明或非受管配置不得自动 chown 后继续执行，sudo 修复不得成为绕过归属证明的默认路径。
+
+- 底层权限原语必须诚实幂等：目标 mode 已匹配时短路返回，不匹配时如实调用并抛出真实内核错误；禁止以调用者身份伪造成功或静默吞错，掩盖真实的权限漂移。
+- system 受管状态目录（如 `/var/lib/mihomo-cli` 及其 transactions 子树）在进入生命周期命令前只读探测 UID/GID 与 mode；状态正常时零额外系统调用、免 sudo 通行。探测到漂移时：当前进程为 root 直接就地收敛并复检；普通用户则明确告知“检测到系统状态权限问题，即将通过 sudo 修复并继续原命令”，经受控 `sudo_reexec_command` 提权收敛后无缝续跑。收敛后仍不达约定模式即 fail-closed。
+- 用户配置 owner 修复只在可证明为当前原始用户 passwd home 内受管普通文件（no-follow、拒绝 symlink/hardlink/路径逃逸）时执行；root 侧重新解析 `SUDO_UID` + `getpwuid`，不信任调用者传入的 home/UID。修复成功才续跑原命令，修复后失败不继续。
+- 交互契约：有 TTY 未给 `--yes` 时说明影响后询问确认；`--yes` 直接申请最小必要权限修复；无 TTY 未给 `--yes` 时不修复，报告 `repair_required` 与可执行的 `--yes` 下一步。自愈不得由 `status`/`doctor`/`tun status` 等只读命令隐式触发。
+
 ### 12.4 Verification obligations
 
 ADR-23/ADR-24 的早期“daemon 自动拉起 Core”文字仅保留为历史背景；任何专项 draft、PLAN 或实现说明若与本 SPEC 冲突，必须按本 SPEC 的当前合同修正，并在证据矩阵中如实标注状态。

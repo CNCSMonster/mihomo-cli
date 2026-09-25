@@ -1,10 +1,7 @@
 use serde_json::Value;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-#[cfg(unix)]
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-#[cfg(windows)]
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::ClientOptions;
 #[cfg(unix)]
@@ -58,8 +55,15 @@ fn parse_socket_http_response(response: &[u8]) -> anyhow::Result<Value> {
     let response_str = String::from_utf8_lossy(response);
     let status_line = response_str.lines().next().unwrap_or("");
     crate::log!("  HTTP status: {}", status_line);
-    if !status_line.contains("200") && !status_line.contains("204") {
-        anyhow::bail!("mihomo API returned: {}", status_line);
+    let status_code: Option<u16> = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok());
+    match status_code {
+        Some(code) if (200..=299).contains(&code) => {}
+        _ => {
+            anyhow::bail!("mihomo API returned: {}", status_line);
+        }
     }
     let body_start = response_str.find("\r\n\r\n").unwrap_or(0) + 4;
     let json_str = response_str[body_start..].trim();
@@ -87,6 +91,67 @@ fn reload_config_payload(path: &str) -> Value {
     serde_json::json!({"path": path})
 }
 
+/// Reads HTTP response bytes from stream, parsing Content-Length so that
+/// client does not hang waiting for EOF when the server keeps connection alive.
+async fn read_http_socket_response<R: AsyncReadExt + Unpin>(
+    stream: &mut R,
+) -> anyhow::Result<Vec<u8>> {
+    let mut data = Vec::new();
+    let mut buf = [0u8; 8192];
+    let mut expected_total_bytes: Option<usize> = None;
+
+    loop {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&buf[..n]);
+
+        if expected_total_bytes.is_none() {
+            if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                let header_bytes = &data[..pos];
+                let body_start = pos + 4;
+                let header_str = String::from_utf8_lossy(header_bytes);
+
+                let mut content_length = None;
+                for line in header_str.lines() {
+                    if let Some(colon_pos) = line.find(':') {
+                        let key = line[..colon_pos].trim();
+                        if key.eq_ignore_ascii_case("content-length") {
+                            if let Ok(cl) = line[colon_pos + 1..].trim().parse::<usize>() {
+                                content_length = Some(cl);
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                // If 204 No Content, body is 0 bytes
+                let status_code: Option<u16> = header_str
+                    .lines()
+                    .next()
+                    .and_then(|fl| fl.split_whitespace().nth(1))
+                    .and_then(|s| s.parse().ok());
+                if status_code == Some(204) {
+                    content_length = Some(0);
+                }
+
+                if let Some(cl) = content_length {
+                    expected_total_bytes = Some(body_start + cl);
+                }
+            }
+        }
+
+        if let Some(total) = expected_total_bytes {
+            if data.len() >= total {
+                data.truncate(total);
+                break;
+            }
+        }
+    }
+    Ok(data)
+}
+
 #[allow(async_fn_in_trait)]
 trait SocketTransport {
     async fn roundtrip(&self, socket: &str, request: &[u8]) -> anyhow::Result<Vec<u8>>;
@@ -105,32 +170,14 @@ impl SocketTransport for PlatformSocketTransport {
             )
             .await??;
             stream.write_all(request).await?;
-            let mut data = Vec::new();
-            let mut buf = vec![0u8; 8192];
-            loop {
-                let n = stream.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                data.extend_from_slice(&buf[..n]);
-            }
-            Ok(data)
+            read_http_socket_response(&mut stream).await
         }
 
         #[cfg(windows)]
         {
             let mut stream = ClientOptions::new().open(socket)?;
             stream.write_all(request).await?;
-            let mut data = Vec::new();
-            let mut buf = vec![0u8; 8192];
-            loop {
-                let n = stream.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                data.extend_from_slice(&buf[..n]);
-            }
-            Ok(data)
+            read_http_socket_response(&mut stream).await
         }
     }
 }
@@ -1219,6 +1266,12 @@ mod tests {
 
         let empty = parse_socket_http_response(b"HTTP/1.0 204 No Content\r\n\r\n").unwrap();
         assert!(empty.is_null());
+
+        let created = parse_socket_http_response(
+            b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n\r\n{\"status\":\"created\"}",
+        )
+        .unwrap();
+        assert_eq!(created["status"].as_str(), Some("created"));
     }
 
     #[test]
@@ -1228,10 +1281,29 @@ mod tests {
             .to_string();
         assert!(err.contains("404 Not Found"));
 
+        // Reject 500 error even if the message contains "200"
+        let err500 =
+            parse_socket_http_response(b"HTTP/1.0 500 Internal Error (code 2001)\r\n\r\n{}")
+                .unwrap_err()
+                .to_string();
+        assert!(err500.contains("500 Internal Error"));
+
         let err = parse_socket_http_response(b"HTTP/1.0 200 OK\r\n\r\nnot-json")
             .unwrap_err()
             .to_string();
         assert!(err.contains("expected") || err.contains("JSON"));
+    }
+
+    #[tokio::test]
+    async fn read_http_socket_response_terminates_on_content_length() {
+        use std::io::Cursor;
+        let response_bytes = b"HTTP/1.0 200 OK\r\nContent-Length: 17\r\n\r\n{\"hello\":\"world\"}extra_trailing_bytes_not_read";
+        let mut cursor = Cursor::new(response_bytes);
+        let result = read_http_socket_response(&mut cursor).await.unwrap();
+        assert_eq!(
+            result,
+            b"HTTP/1.0 200 OK\r\nContent-Length: 17\r\n\r\n{\"hello\":\"world\"}"
+        );
     }
 
     #[test]
