@@ -229,7 +229,7 @@ jobs:
         run: |
           # Verify that running unit tests with active system service directories/files
           # does not leak into live service or fail with EACCES (Issue #012)
-          cargo test --lib daemon
+          cargo test --bin mihomo-cli daemon
 
       - name: System mode lifecycle (stop/start/status)
         shell: bash
