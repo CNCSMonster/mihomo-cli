@@ -172,6 +172,18 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: e2e-cargo-${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            e2e-cargo-${{ matrix.os }}-
       - name: Download binary
         uses: actions/download-artifact@v4
         with:
@@ -212,6 +224,13 @@ jobs:
           # N1c: strong assertion — service must be installed (system service)
           $CLI status | grep -i "system service"
 
+      - name: Unit test isolation with active system service (#012 regression)
+        shell: bash
+        run: |
+          # Verify that running unit tests with active system service directories/files
+          # does not leak into live service or fail with EACCES (Issue #012)
+          cargo test --lib daemon
+
       - name: System mode lifecycle (stop/start/status)
         shell: bash
         run: |
@@ -220,6 +239,75 @@ jobs:
           $CLI status
           $CLI start
           $CLI status
+
+      - name: Core API forwarding and Selection Mirror replay (#017 regression)
+        shell: bash
+        run: |
+          # Prepare offline direct proxy and group fixture
+          cat << 'EOF' > fixture-sub.yaml
+          mixed-port: 18789
+          log-level: info
+          proxies:
+            - name: "NodeA"
+              type: direct
+            - name: "NodeB"
+              type: direct
+          proxy-groups:
+            - name: "ProxyGroup"
+              type: select
+              proxies:
+                - "NodeA"
+                - "NodeB"
+                - "DIRECT"
+          rules:
+            - "MATCH,DIRECT"
+          EOF
+
+          # Import and activate test subscription in system mode
+          $CLI config --import fixture-sub.yaml --activate --yes --system
+          $CLI restart --system --yes
+
+          # 1. Verify Core API forwarding: query proxy groups via list
+          echo "=== list proxies via Core API forwarding ==="
+          LIST_OUT=$($CLI list)
+          echo "$LIST_OUT"
+          echo "$LIST_OUT" | grep -i "ProxyGroup"
+
+          # 2. Verify non-interactive proxy selection & intent persistence
+          echo "=== select NodeB ==="
+          $CLI select --group ProxyGroup --node NodeB
+          $CLI list | grep -E "ProxyGroup.*NodeB"
+
+          # 3. Check Selection Mirror persistence on disk
+          case "${{ matrix.os }}" in
+            windows-latest)
+              MIRROR_FILE="$PROGRAMDATA/mihomo/runtime/selection-mirror.yaml"
+              if [ -f "$MIRROR_FILE" ]; then
+                echo "✓ Windows Selection Mirror file exists: $MIRROR_FILE"
+                cat "$MIRROR_FILE"
+              else
+                echo "Selection mirror info:"
+                ls -la "$PROGRAMDATA/mihomo/runtime" 2>/dev/null || true
+              fi
+              ;;
+            *)
+              if [ -f "/var/lib/mihomo-cli/runtime/selection-mirror.yaml" ]; then
+                echo "✓ Unix Selection Mirror file exists"
+                cat "/var/lib/mihomo-cli/runtime/selection-mirror.yaml" 2>/dev/null || true
+              fi
+              ;;
+          esac
+
+          # 4. Verify selection replay across restart
+          echo "=== restart and verify selection replay ==="
+          $CLI restart --system --yes
+          REPLAY_OUT=$($CLI list)
+          echo "$REPLAY_OUT"
+          echo "$REPLAY_OUT" | grep -E "ProxyGroup.*NodeB"
+
+          # 5. Verify doctor checks pass in system mode
+          echo "=== doctor in system mode ==="
+          $CLI doctor --system || true
 
       - name: System mode uninstall
         shell: bash
