@@ -1418,6 +1418,10 @@ fn install_staged_file_privileged_non_root(
     bytes: &[u8],
     mode: u16,
 ) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        let mkdir_args = ["mkdir", "-p", &parent.display().to_string()];
+        run_privileged(&mkdir_args)?;
+    }
     let temp_dir = tempfile::Builder::new()
         .prefix("mihomo-cli-privileged-write-")
         .tempdir()?;

@@ -999,6 +999,15 @@ pub fn planned_macos_install_plan(ctx: &InstanceContext) -> Option<InstanceInsta
                     privileged: true,
                 });
             }
+            if let Some(tun_dir) = ctx.paths.tun_config_file.parent() {
+                if tun_dir != std::path::Path::new("/Library/Application Support/mihomo") {
+                    directories.push(PlannedDirectory {
+                        path: tun_dir.to_path_buf(),
+                        mode: 0o755,
+                        privileged: true,
+                    });
+                }
+            }
         }
         InstanceMode::User => {
             directories.push(PlannedDirectory {
@@ -3287,6 +3296,7 @@ mod tests {
         for required_privileged_dir in [
             PathBuf::from("/Library/Application Support/mihomo"),
             PathBuf::from("/Library/Application Support/mihomo/bin"),
+            PathBuf::from("/Library/Application Support/mihomo-cli"),
             PathBuf::from("/var/log/mihomo"),
             PathBuf::from("/var/run/mihomo"),
         ] {
@@ -3309,6 +3319,7 @@ mod tests {
         let rendered = format!("{plan:#?}");
         for required in [
             "/Library/Application Support/mihomo/bin",
+            "/Library/Application Support/mihomo-cli",
             "/Users/alice/.config/mihomo",
             "/var/log/mihomo",
             "/var/run/mihomo",
