@@ -3547,6 +3547,9 @@ mod tests {
         }
         assert!(!rendered.contains("/etc/systemd/system"));
         assert!(!rendered.contains("/run/mihomo"));
+        assert!(plan.directories.iter().any(|d| {
+            d.path == std::path::Path::new("/Users/alice/.local/bin") && !d.privileged
+        }));
     }
 
     #[test]

@@ -5908,4 +5908,50 @@ mod r3_runtime_writer_gate_tests {
             violations.join("\n")
         );
     }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_user_mode_install_ensures_cli_binary_matches_service_post_hook() {
+        use crate::instance;
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let mut inputs = instance::PathInputs::for_tests();
+        inputs.home = home.clone();
+        inputs.uid = Some(1001);
+        inputs.xdg_runtime_dir = Some(temp.path().join("run/user/1001"));
+        let ctx = instance::InstanceContext::planned(
+            instance::TargetOs::Linux,
+            instance::InstanceMode::User,
+            &inputs,
+        );
+
+        // 验证用户模式下 cli_binary 与 core_binary 分立且正确配置
+        assert_ne!(ctx.paths.cli_binary, ctx.paths.core_binary);
+        assert_eq!(ctx.paths.cli_binary, home.join(".local/bin/mihomo-cli"));
+        assert_eq!(ctx.paths.core_binary, home.join(".local/bin/mihomo"));
+
+        let plan = instance::planned_install_plan(&ctx).unwrap();
+        // 验证 service 文件中的 ExecStartPost 严格引用 ctx.paths.cli_binary
+        let service_file = plan
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("mihomo.service"))
+            .expect("user service file must exist in plan");
+        let expected_hook = format!(
+            "ExecStartPost={} select --replay --user",
+            ctx.paths.cli_binary.display()
+        );
+        assert!(
+            service_file.content.contains(&expected_hook),
+            "service unit must contain ExecStartPost referencing cli_binary"
+        );
+
+        // 验证 cli_binary 父目录已在 planned_directories 中
+        assert!(
+            plan.directories
+                .iter()
+                .any(|d| d.path == home.join(".local/bin")),
+            "cli_binary parent directory must be planned for creation"
+        );
+    }
 }

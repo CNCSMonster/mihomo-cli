@@ -7618,6 +7618,7 @@ enum LinkLocalRouteDiagnosis {
     },
 }
 
+#[allow(dead_code)]
 #[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LinkLocalMatch {
@@ -7661,6 +7662,7 @@ fn classify_link_local_destination(dest: &str) -> LinkLocalMatch {
     LinkLocalMatch::None
 }
 
+#[allow(dead_code)]
 #[cfg(any(target_os = "linux", test))]
 fn inspect_config_tun_settings(
     config_path: &std::path::Path,
@@ -7698,6 +7700,7 @@ fn inspect_config_tun_settings(
     (excludes, device)
 }
 
+#[allow(dead_code)]
 #[cfg(any(target_os = "linux", test))]
 fn check_route_exclude_coverage(excludes: &[String]) -> LinkLocalMatch {
     let mut has_partial = false;
@@ -7743,6 +7746,7 @@ fn is_physical_interface(dev: &str, configured_tun_dev: Option<&str>) -> bool {
         || lower.starts_with("zt"))
 }
 
+#[allow(dead_code)]
 #[cfg(any(target_os = "linux", test))]
 fn find_safe_ip_binary() -> Option<&'static str> {
     const SAFE_PATHS: &[&str] = &["/sbin/ip", "/usr/sbin/ip", "/bin/ip", "/usr/bin/ip"];
@@ -7986,6 +7990,7 @@ fn parse_proc_net_route_content(
     }
 }
 
+#[allow(dead_code)]
 #[cfg(any(target_os = "linux", test))]
 fn check_linux_link_local_routing(
     config_path: Option<&std::path::Path>,
@@ -8494,6 +8499,10 @@ async fn cmd_install_instance(
     let cli_binary_valid = if ctx.permissions == instance::PermissionModel::PrivilegedSystem {
         std::env::current_exe()
             .is_ok_and(|current| utils::file_contents_equal(&current, &ctx.paths.cli_binary))
+    } else if mode == instance::InstanceMode::User && ctx.paths.cli_binary != ctx.paths.core_binary
+    {
+        std::env::current_exe()
+            .is_ok_and(|current| utils::file_contents_equal(&current, &ctx.paths.cli_binary))
     } else {
         true
     };
@@ -8689,6 +8698,16 @@ async fn cmd_install_instance(
             );
         } else {
             println!("  ✅ CLI daemon up to date, skipped");
+        }
+    } else if mode == instance::InstanceMode::User && ctx.paths.cli_binary != ctx.paths.core_binary
+    {
+        if force || !cli_binary_valid {
+            let current_cli = std::env::current_exe()?;
+            let cli_bytes = std::fs::read(&current_cli)?;
+            utils::atomic_write_bytes_no_follow(&ctx.paths.cli_binary, &cli_bytes, 0o755)?;
+            println!("  Installed CLI to {}", ctx.paths.cli_binary.display());
+        } else {
+            println!("  ✅ CLI up to date, skipped");
         }
     }
 

@@ -161,11 +161,11 @@ for target in $INSTALLED_TARGETS; do
             env RUSTC_WRAPPER="" \
                 "CC_x86_64_unknown_linux_musl=$SCRIPT_DIR/zig-musl-cc.sh" \
                 "AR_x86_64_unknown_linux_musl=$SCRIPT_DIR/zig-musl-ar.sh" \
-                cargo clippy --target "$target" -- -D warnings
+                cargo clippy --target "$target" --all-targets -- -D warnings
         continue
     fi
     
-    run_check "clippy ($target)" cargo clippy --target "$target" -- -D warnings
+    run_check "clippy ($target)" cargo clippy --target "$target" --all-targets -- -D warnings
 done
 
 # 3. 测试（只在 default/full/native 模式下运行）

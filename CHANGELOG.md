@@ -17,10 +17,12 @@
 - **TUN 意图深合并保护** — 修复配置重新生成与 override 合并时 TUN 意图（`enable/stack/auto-route` 等）被模板或不完整块意外覆盖的问题，确保持久意图优先。
 - **开机自启加载 TUN 快照** — 守护进程冷启动时优先研判是否存在启用了 TUN 的快照配置，确保开机自启时保留 TUN 运行态。
 - **Selection Mirror 缺失容错** — 明确区分未持久化选择与运行时镜像丢失，不再输出误导性的未持久化警告。
+- **用户模式服务与跨平台编译修复** — 修复用户模式 `install` 漏装 CLI 二进制导致 systemd user 启动失败的问题；修复 Windows 平台单元测试的 `unix` 条件编译宏缺失。
 
 ### 🛠️ Infrastructure & Build
 
 - **跨平台构建与兼容性** — 增强测试产物 ABI 兼容性检测与 Linux musl 静态构建支持，完善交叉编译覆盖。
+- **跨平台 CI 诊断增强** — 完善 GitHub Actions E2E 诊断日志输出。
 
 ## 2026-09-25
 

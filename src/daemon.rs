@@ -1047,6 +1047,7 @@ fn daemon_config_dir() -> std::path::PathBuf {
 pub(crate) static TEST_RUNTIME_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn isolate_daemon_runtime_for_tests() {
     TEST_RUNTIME_DIR.get_or_init(|| {
         let dir =
@@ -7019,6 +7020,7 @@ fn active_config_matches_requested(active: Option<&PathBuf>, requested: &std::pa
 #[cfg(test)]
 mod windows_auth_model_tests {
     use super::validate_windows_client_token_value;
+    #[cfg_attr(not(unix), allow(unused_imports))]
     use crate::ipc::DaemonResponse;
 
     #[test]

@@ -150,8 +150,14 @@ jobs:
           case "${{ matrix.os }}" in
             ubuntu-latest)
               echo "--- systemd user session ---"
-                  systemctl --user is-system-running 2>&1 || true
-                  loginctl show-user "$USER" -p Linger 2>&1 || true
+              systemctl --user is-system-running 2>&1 || true
+              loginctl show-user "$USER" -p Linger 2>&1 || true
+              echo "--- systemd user unit status ---"
+              systemctl --user status mihomo --no-pager 2>&1 || true
+              echo "--- systemd user unit journal ---"
+              journalctl --user -u mihomo --no-pager -n 50 2>&1 || true
+              echo "--- mihomo log ---"
+              cat "$HOME/.local/state/mihomo/mihomo.log" 2>&1 || true
               ;;
             macos-latest)
               echo "--- launchctl gui domain ---"
