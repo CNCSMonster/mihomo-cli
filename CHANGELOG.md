@@ -4,6 +4,24 @@
 
 ---
 
+## 2026-10-04
+
+### ✨ Features
+
+- **TUN 系统 DNS 路径探测** — `doctor` 新增本地解析器（loopback resolver）探测，快速诊断 TUN 下系统 DNS 是否绕过 Core 域名规则；支持 `--no-probe-dns` 开关。
+- **云服务器链路本地路由诊断** — `doctor` 新增 Linux 平台下的链路本地（`169.254.0.0/16`）路由诊断，自动识别并警告云服务器元数据服务（IMDS）与内网镜像源可能遭遇的黑洞超时问题。
+
+### 🐛 Bug Fixes
+
+- **DNS 劫持范围补齐** — `tun on --dns-hijack` 默认劫持目标从 `any:53` 扩展为 `any:53,tcp://any:53`，避免系统 TCP DNS 绕过 TUN。
+- **TUN 意图深合并保护** — 修复配置重新生成与 override 合并时 TUN 意图（`enable/stack/auto-route` 等）被模板或不完整块意外覆盖的问题，确保持久意图优先。
+- **开机自启加载 TUN 快照** — 守护进程冷启动时优先研判是否存在启用了 TUN 的快照配置，确保开机自启时保留 TUN 运行态。
+- **Selection Mirror 缺失容错** — 明确区分未持久化选择与运行时镜像丢失，不再输出误导性的未持久化警告。
+
+### 🛠️ Infrastructure & Build
+
+- **跨平台构建与兼容性** — 增强测试产物 ABI 兼容性检测与 Linux musl 静态构建支持，完善交叉编译覆盖。
+
 ## 2026-09-25
 
 ### ✨ Features

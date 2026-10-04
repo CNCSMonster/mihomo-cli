@@ -588,7 +588,10 @@ pub(crate) async fn tun_toggle_with_client(
                 println!("  stack: {}", stack);
             }
             if let Some(dns_hijack) = dns_hijack {
-                println!("  dns-hijack: {}", dns_hijack);
+                let values = crate::config::dns_hijack_entries(&dns_hijack);
+                if !values.is_empty() {
+                    println!("  dns-hijack: {}", values.join(", "));
+                }
             }
         }
         Some(crate::TunAction::Off) => {
@@ -633,10 +636,14 @@ pub(crate) fn tun_patch_payload(
         );
     }
     if let Some(dns_hijack) = dns_hijack {
-        tun.insert(
-            "dns-hijack".to_string(),
-            serde_json::Value::Array(vec![serde_json::Value::String(dns_hijack.to_string())]),
-        );
+        // Issue #022: `--dns-hijack` 支持逗号分隔的多个目标（如 any:53,tcp://any:53）。
+        let entries: Vec<serde_json::Value> = crate::config::dns_hijack_entries(dns_hijack)
+            .into_iter()
+            .map(serde_json::Value::String)
+            .collect();
+        if !entries.is_empty() {
+            tun.insert("dns-hijack".to_string(), serde_json::Value::Array(entries));
+        }
     }
     serde_json::json!({"tun": tun})
 }

@@ -12,6 +12,146 @@ mod cli_parse_tests {
         Cli::try_parse_from(argv).expect("CLI arguments should parse")
     }
 
+    /// review MAJOR-9 + 回归-3：`override import` 只对**控制键**告警（它们会被拒绝），
+    /// 非控制键（mtu/device/route-exclude-address 等）照常生效、不得误报。
+    fn temp_paths_for(tag: &str) -> utils::AppPaths {
+        let dir = std::env::temp_dir().join(format!("mihomo-replay-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        utils::AppPaths::new(dir)
+    }
+
+    /// review MAJOR-5：mirror 缺失信号必须由 CLI 结合**用户树**判定：
+    /// 无持久化选点 → 删除该行（不得误导）；有持久化选点 → 明确要求重建。
+    #[test]
+    fn translate_selection_replay_signal_uses_user_tree_not_mirror() {
+        let msg = "[selection-mirror-missing] selection mirror unavailable";
+        let paths = temp_paths_for("replay");
+
+        // 1) 没有 active 订阅 → 只陈述事实
+        let out = translate_selection_replay_signal(msg, &paths);
+        assert!(
+            out.contains("Selections not replayed: selection mirror unavailable"),
+            "{out}"
+        );
+        assert!(!out.contains("run any selection command"), "{out}");
+
+        // 2) 有 active 订阅但没有持久化选点 → 整行删除（场景 B 的契约）
+        config::set_active_id_at(&paths, "sub1").unwrap();
+        let out = translate_selection_replay_signal(msg, &paths);
+        assert!(out.trim().is_empty(), "必须删除该行: {out:?}");
+
+        // 3) 有持久化选点 + mirror 缺失 → 必须给出重建动作（真实的 mirror 丢失）
+        let sel_dir = paths.selections_dir();
+        std::fs::create_dir_all(&sel_dir).unwrap();
+        std::fs::write(
+            paths.selection_state_path_for_subscription("sub1"),
+            "Test: DIRECT\n",
+        )
+        .unwrap();
+        let out = translate_selection_replay_signal(msg, &paths);
+        assert!(
+            out.contains("run any selection command to rebuild it"),
+            "有持久化选点时必须要求重建: {out}"
+        );
+
+        // 4) 非信号消息原样返回
+        let plain = "system configuration promoted and runtime applied";
+        assert_eq!(translate_selection_replay_signal(plain, &paths), plain);
+
+        let _ = std::fs::remove_dir_all(paths.config_dir());
+    }
+
+    /// review 回归-1：非 root doctor 读不到 `/var/lib` 下的运行配置时，
+    /// attested 必须回退到 intent（字节一致且可读），否则探测永远退化成 ❓。
+    #[cfg(unix)]
+    #[test]
+    fn probe_config_source_prefers_intent_when_attested() {
+        let dir = std::env::temp_dir().join(format!("mihomo-probesrc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let intent = dir.join("config.yaml");
+        let missing = dir.join("var-lib-config.yaml"); // 不存在 → 模拟 EACCES/无权读
+        std::fs::write(&intent, "dns:\n  enhanced-mode: fake-ip\n").unwrap();
+
+        // attested + intent 可读 → 用 intent（即使运行配置读不到）
+        match probe_config_source(true, Some(&missing), &intent) {
+            ProbeConfigSource::Text { label, text } => {
+                assert!(label.contains("intent"), "{label}");
+                assert!(text.contains("fake-ip"), "{text}");
+            }
+            ProbeConfigSource::Unavailable(reason) => panic!("必须回退到 intent: {reason}"),
+        }
+
+        // 非 attested + 运行配置可读 → 用运行配置
+        std::fs::write(&missing, "dns:\n  enhanced-mode: normal\n").unwrap();
+        match probe_config_source(false, Some(&missing), &intent) {
+            ProbeConfigSource::Text { label, text } => {
+                assert!(label.contains("运行配置"), "{label}");
+                assert!(text.contains("normal"), "{text}");
+            }
+            ProbeConfigSource::Unavailable(reason) => panic!("必须读到运行配置: {reason}"),
+        }
+
+        // 非 attested + 无运行配置 → 明确原因（呈现为 ❓，不静默）
+        match probe_config_source(false, None, &intent) {
+            ProbeConfigSource::Unavailable(reason) => {
+                assert!(reason.contains("未观察到 Core 的运行配置"), "{reason}")
+            }
+            ProbeConfigSource::Text { .. } => panic!("没有运行配置时不得给出判据"),
+        }
+
+        // 非 attested + 运行配置不可读 → 带原因的 ❓
+        let gone = dir.join("gone.yaml");
+        match probe_config_source(false, Some(&gone), &intent) {
+            ProbeConfigSource::Unavailable(reason) => {
+                assert!(reason.contains("运行配置"), "{reason}")
+            }
+            ProbeConfigSource::Text { .. } => panic!("读不到就不该给出判据"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn override_tun_control_keys_are_warned_as_rejected() {
+        let control: serde_yaml::Value = serde_yaml::from_str(
+            "sniffer:\n  enable: true\ntun:\n  enable: false\n  stack: system\n",
+        )
+        .expect("yaml");
+        let warn = tun_owned_override_keys_warning(&control).expect("control keys must warn");
+        assert!(warn.contains("TUN 事务管辖"), "{warn}");
+        assert!(warn.contains("拒绝"), "{warn}");
+        assert!(warn.contains("tun.enable"), "{warn}");
+        assert!(warn.contains("tun.stack"), "{warn}");
+        assert!(warn.contains("非控制键不受影响"), "{warn}");
+
+        let non_control: serde_yaml::Value = serde_yaml::from_str(
+            "tun:\n  mtu: 9000\n  route-exclude-address:\n  - 169.254.0.0/16\n",
+        )
+        .expect("yaml");
+        assert!(
+            tun_owned_override_keys_warning(&non_control).is_none(),
+            "非控制键会被采用，不得告警"
+        );
+
+        let mixed: serde_yaml::Value =
+            serde_yaml::from_str("tun:\n  strict-route: false\n  mtu: 9000\n").expect("yaml");
+        let warn = tun_owned_override_keys_warning(&mixed).expect("mixed must warn for control");
+        assert!(warn.contains("tun.strict-route"), "{warn}");
+        assert!(
+            !warn.contains("tun.mtu"),
+            "非控制键不得出现在拒绝告警里: {warn}"
+        );
+
+        let no_tun: serde_yaml::Value =
+            serde_yaml::from_str("sniffer:\n  enable: true\n").expect("yaml");
+        assert!(
+            tun_owned_override_keys_warning(&no_tun).is_none(),
+            "override 不含 tun 键时不得告警"
+        );
+    }
+
     #[test]
     fn system_config_always_uses_managed_promotion() {
         assert!(system_config_requires_promotion(
@@ -47,6 +187,283 @@ mod cli_parse_tests {
         assert_eq!(
             DoctorCheck::fail("服务", "未安装", "运行: mihomo-cli install").format(),
             "  ❌ 服务: 未安装\n     💡 运行: mihomo-cli install"
+        );
+    }
+
+    #[test]
+    fn doctor_check_warn_formats_warning_icon() {
+        assert_eq!(
+            DoctorCheck::warn("云链路本地路由", "测试警告", None::<String>).format(),
+            "  ⚠ 云链路本地路由: 测试警告"
+        );
+    }
+
+    #[test]
+    fn link_local_route_ip_route_detects_configured_169_254_cidr() {
+        let output = "\
+default via 172.19.0.1 dev eth0 proto kernel onlink\n\
+169.254.0.0/16 dev eth0 scope link\n\
+172.19.0.0/20 dev eth0 proto kernel scope link src 172.19.2.140\n";
+        let diag = parse_ip_route_main_output(output, None);
+        assert_eq!(
+            diag,
+            LinkLocalRouteDiagnosis::DegradedMainTableOnly {
+                interface: "eth0".to_string(),
+                suggested_interface: "eth0".to_string(),
+            }
+        );
+        let check = format_link_local_route_check(&diag);
+        assert!(check.format().contains("⚠ 云链路本地路由:"));
+        assert!(check
+            .format()
+            .contains("降级模式下未评估策略路由（ip rule）"));
+    }
+
+    #[test]
+    fn link_local_route_classify_exit_devices_matrix() {
+        // 1. 两者皆为物理网卡 -> 真正直连通过
+        let diag = classify_link_local_exit_devices(
+            Some("eth0".to_string()),
+            Some("eth0".to_string()),
+            Some("Meta"),
+            Some("eth0".to_string()),
+            None,
+        );
+        assert_eq!(
+            diag,
+            Some(LinkLocalRouteDiagnosis::CoveredByRoute {
+                interface: "eth0".to_string()
+            })
+        );
+
+        // 2. 自定义 tun.device 为 clash0 时，clash0 正确被识别为 TUN 网卡
+        let diag_clash = classify_link_local_exit_devices(
+            Some("clash0".to_string()),
+            Some("eth0".to_string()),
+            Some("clash0"),
+            Some("eth0".to_string()),
+            None,
+        );
+        assert_eq!(
+            diag_clash,
+            Some(LinkLocalRouteDiagnosis::Partial {
+                interface: "eth0".to_string(),
+                host_or_subnet: "169.254.169.254".to_string(),
+                suggested_interface: "eth0".to_string(),
+                config_partial: None,
+            })
+        );
+
+        // 3. 镜像走物理网卡，IMDS 走 TUN -> 对称 Partial（169.254.0.3 直连，IMDS 被 TUN 捕获）
+        let diag_mirror_phys = classify_link_local_exit_devices(
+            Some("eth0".to_string()),
+            Some("Meta".to_string()),
+            Some("Meta"),
+            Some("eth0".to_string()),
+            None,
+        );
+        assert_eq!(
+            diag_mirror_phys,
+            Some(LinkLocalRouteDiagnosis::Partial {
+                interface: "eth0".to_string(),
+                host_or_subnet: "169.254.0.3".to_string(),
+                suggested_interface: "eth0".to_string(),
+                config_partial: None,
+            })
+        );
+
+        // 4. 两者皆被 TUN 接管 -> Missing
+        let diag_missing = classify_link_local_exit_devices(
+            Some("Meta".to_string()),
+            Some("Meta".to_string()),
+            Some("Meta"),
+            Some("eth0".to_string()),
+            None,
+        );
+        assert_eq!(
+            diag_missing,
+            Some(LinkLocalRouteDiagnosis::Missing {
+                suggested_interface: "eth0".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn link_local_route_detects_covered_by_config() {
+        let diag = LinkLocalRouteDiagnosis::CoveredByConfig {
+            details: "169.254.0.0/16".to_string(),
+        };
+        let check = format_link_local_route_check(&diag);
+        assert_eq!(
+            check.format(),
+            "  ✅ 云链路本地路由: 已在配置 tun.route-exclude-address 中排除（169.254.0.0/16），未受 TUN 接管影响"
+        );
+    }
+
+    #[test]
+    fn link_local_route_supernet_covers_block() {
+        assert!(subnet_covers_link_local_block(
+            "169.254.0.0".parse().unwrap(),
+            16
+        ));
+        assert!(subnet_covers_link_local_block(
+            "169.0.0.0".parse().unwrap(),
+            8
+        ));
+        assert!(!subnet_covers_link_local_block(
+            "10.0.0.0".parse().unwrap(),
+            8
+        ));
+        assert!(!subnet_covers_link_local_block(
+            "169.254.169.254".parse().unwrap(),
+            32
+        ));
+    }
+
+    #[test]
+    fn link_local_route_parse_ip_route_get_output() {
+        let sample = "169.254.0.3 via 172.31.48.1 dev eth0 src 172.31.61.162 uid 1000\n    cache\n";
+        assert_eq!(parse_ip_route_get_output(sample), Some("eth0".to_string()));
+
+        let sample_meta = "169.254.0.3 dev Meta src 198.18.0.1 uid 1000\n    cache\n";
+        assert_eq!(
+            parse_ip_route_get_output(sample_meta),
+            Some("Meta".to_string())
+        );
+    }
+
+    #[test]
+    fn link_local_route_ip_route_detects_partial_single_host_imds() {
+        let output = "\
+default via 10.0.0.1 dev ens3\n\
+169.254.169.254 dev ens3 proto kernel scope link\n\
+10.0.0.0/24 dev ens3 proto kernel scope link src 10.0.0.5\n";
+        let diag = parse_ip_route_main_output(output, None);
+        assert_eq!(
+            diag,
+            LinkLocalRouteDiagnosis::Partial {
+                interface: "ens3".to_string(),
+                host_or_subnet: "169.254.169.254".to_string(),
+                suggested_interface: "ens3".to_string(),
+                config_partial: None,
+            }
+        );
+        let check = format_link_local_route_check(&diag);
+        let formatted = check.format();
+        assert!(formatted.contains("⚠ 云链路本地路由:"), "{formatted}");
+        assert!(
+            formatted.contains("仅发现部分链路本地直连路由（169.254.169.254 dev ens3）"),
+            "{formatted}"
+        );
+        assert!(
+            formatted.contains(
+                "首选：在用户配置 intent.yaml 中添加 tun.route-exclude-address: [\"169.254.0.0/16\"]"
+            ),
+            "{formatted}"
+        );
+    }
+
+    #[test]
+    fn link_local_route_ip_route_ignores_blackhole_route() {
+        let output = "\
+default via 172.19.0.1 dev eth0 proto kernel onlink\n\
+blackhole 169.254.0.0/16\n\
+172.19.0.0/20 dev eth0 proto kernel scope link src 172.19.2.140\n";
+        let diag = parse_ip_route_main_output(output, None);
+        // blackhole 路由不可用于直连，应当判定为 Missing 并建议物理网卡
+        assert_eq!(
+            diag,
+            LinkLocalRouteDiagnosis::Missing {
+                suggested_interface: "eth0".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn link_local_route_ip_route_flags_missing_with_default_gateway() {
+        let output = "\
+default via 172.19.0.1 dev eth0 proto kernel onlink\n\
+172.19.0.0/20 dev eth0 proto kernel scope link src 172.19.2.140\n";
+        let diag = parse_ip_route_main_output(output, None);
+        assert_eq!(
+            diag,
+            LinkLocalRouteDiagnosis::Missing {
+                suggested_interface: "eth0".to_string()
+            }
+        );
+        let check = format_link_local_route_check(&diag);
+        let formatted = check.format();
+        assert!(formatted.contains("⚠ 云链路本地路由:"), "{formatted}");
+        assert!(
+            formatted.contains(
+                "TUN 已启用且流量被接管，但未配置链路本地网段（169.254.0.0/16）排除或直连"
+            ),
+            "{formatted}"
+        );
+        assert!(
+            formatted.contains(
+                "首选：在用户配置 intent.yaml 中添加 tun.route-exclude-address: [\"169.254.0.0/16\"]"
+            ),
+            "{formatted}"
+        );
+    }
+
+    #[test]
+    fn link_local_route_ip_route_flags_missing_without_default_gateway() {
+        let output = "172.19.0.0/20 dev eth0 proto kernel scope link src 172.19.2.140\n";
+        let diag = parse_ip_route_main_output(output, None);
+        assert_eq!(
+            diag,
+            LinkLocalRouteDiagnosis::Missing {
+                suggested_interface: "<物理网卡>".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn link_local_route_proc_net_route_detects_covered() {
+        // eth0 0000FEA9 (169.254.0.0) mask 0000FFFF (255.255.0.0)
+        let content = "\
+Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+eth0\t00000000\t01301FAC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n\
+eth0\t0000FEA9\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n";
+        let diag = parse_proc_net_route_content(content, None);
+        assert_eq!(
+            diag,
+            LinkLocalRouteDiagnosis::DegradedMainTableOnly {
+                interface: "eth0".to_string(),
+                suggested_interface: "eth0".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn link_local_route_proc_net_route_detects_missing() {
+        let content = "\
+Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+eth0\t00000000\t01301FAC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n";
+        let diag = parse_proc_net_route_content(content, None);
+        assert_eq!(
+            diag,
+            LinkLocalRouteDiagnosis::Missing {
+                suggested_interface: "eth0".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn link_local_route_degrades_gracefully_on_empty_or_invalid() {
+        assert_eq!(
+            parse_ip_route_main_output("", None),
+            LinkLocalRouteDiagnosis::Unknown {
+                reason: "主路由表为空或无法解析".to_string()
+            }
+        );
+        assert_eq!(
+            parse_proc_net_route_content("broken table header\n", None),
+            LinkLocalRouteDiagnosis::Unknown {
+                reason: "/proc/net/route 格式不符合预期".to_string()
+            }
         );
     }
 
@@ -2200,16 +2617,35 @@ vmess://example"
     #[test]
     fn rule_action_messages_are_planned() {
         assert_eq!(
-            format_rule_add_success("DOMAIN,example.com,DIRECT", true, true),
+            format_rule_add_success(
+                "DOMAIN,example.com,DIRECT",
+                true,
+                RuntimeApplyOutcome::SystemPromoted
+            ),
             vec![
                 "  ✓ Rule added: DOMAIN,example.com,DIRECT".to_string(),
                 "  ✓ Rule intent committed".to_string(),
-                "  ⚠ Runtime status: unknown (revision attestation unavailable)".to_string(),
-                "  Run: mihomo-cli restart  to establish runtime readiness".to_string(),
+                "  ✅ system configuration promoted and runtime applied".to_string(),
             ]
         );
         assert_eq!(
-            format_rule_add_success("DOMAIN,example.com,DIRECT", true, false),
+            format_rule_add_success(
+                "DOMAIN,example.com,DIRECT",
+                true,
+                RuntimeApplyOutcome::HotReloadAccepted
+            ),
+            vec![
+                "  ✓ Rule added: DOMAIN,example.com,DIRECT".to_string(),
+                "  ✓ Rule intent committed".to_string(),
+                "  ℹ Runtime status: unknown (revision attestation unavailable)".to_string(),
+            ]
+        );
+        assert_eq!(
+            format_rule_add_success(
+                "DOMAIN,example.com,DIRECT",
+                true,
+                RuntimeApplyOutcome::Pending
+            ),
             vec![
                 "  ✓ Rule added: DOMAIN,example.com,DIRECT".to_string(),
                 "  ✓ Rule intent committed".to_string(),
@@ -2218,7 +2654,7 @@ vmess://example"
             ]
         );
         assert_eq!(
-            format_rule_remove_success(2, false, false),
+            format_rule_remove_success(2, false, RuntimeApplyOutcome::Pending),
             vec![
                 "  ✓ Rule 2 removed".to_string(),
                 "  ℹ Config pending — rule saved".to_string(),
@@ -2226,16 +2662,15 @@ vmess://example"
             ]
         );
         assert_eq!(
-            format_rule_clear_success(true, true),
+            format_rule_clear_success(true, RuntimeApplyOutcome::SystemPromoted),
             vec![
                 "  ✓ All rules cleared".to_string(),
                 "  ✓ Rule intent committed".to_string(),
-                "  ⚠ Runtime status: unknown (revision attestation unavailable)".to_string(),
-                "  Run: mihomo-cli restart  to establish runtime readiness".to_string(),
+                "  ✅ system configuration promoted and runtime applied".to_string(),
             ]
         );
         assert_eq!(
-            format_rule_move_success(1, 3, true, false),
+            format_rule_move_success(1, 3, true, RuntimeApplyOutcome::Pending),
             vec![
                 "  ✓ Rule moved: 1 → 3".to_string(),
                 "  ✓ Rule intent committed".to_string(),
@@ -2244,7 +2679,7 @@ vmess://example"
             ]
         );
         assert_eq!(
-            format_rule_import_success(4, "rules.txt", false, false),
+            format_rule_import_success(4, "rules.txt", false, RuntimeApplyOutcome::Pending),
             vec![
                 "  ✓ Imported 4 rules from rules.txt".to_string(),
                 "  ℹ Config pending — rule saved".to_string(),
@@ -2457,8 +2892,7 @@ vmess://example"
             vec![
                 "  Added and activated subscription sub-a".to_string(),
                 "  ✓ Config reload request accepted by Core API".to_string(),
-                "  ⚠ Runtime status: unknown (revision attestation unavailable)".to_string(),
-                "  Run: mihomo-cli restart  to establish runtime readiness".to_string(),
+                "  ℹ Runtime status: unknown (revision attestation unavailable)".to_string(),
             ]
         );
         assert_eq!(
@@ -2486,8 +2920,6 @@ vmess://example"
                 "  ⚠ Restart required for controller changes to take effect.".to_string(),
                 "  Run: mihomo-cli restart".to_string(),
                 "  ✓ Config reload request accepted by Core API".to_string(),
-                "  ⚠ Runtime status: unknown (revision attestation unavailable)".to_string(),
-                "  Run: mihomo-cli restart  to establish runtime readiness".to_string(),
             ]
         );
         assert_eq!(

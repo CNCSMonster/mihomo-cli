@@ -109,13 +109,14 @@ can_compile_target() {
         fi
     fi
     
-    # musl targets 需要 musl-gcc（cargo-zigbuild 不能直接用于 clippy）
+    # musl targets：x86_64 需要 musl-gcc，或回退到 zig（wrapper 见 scripts/zig-musl-cc.sh，
+    # 免 root 即可交叉编译 ring 的 C 代码）；aarch64 musl 暂无工具链。
     if [[ "$target" == *"musl"* ]]; then
-        if [[ "$target" == "x86_64-unknown-linux-musl" ]] && command -v musl-gcc &>/dev/null; then
+        if [[ "$target" == "x86_64-unknown-linux-musl" ]] \
+            && { command -v musl-gcc &>/dev/null || command -v zig &>/dev/null; }; then
             return 0
-        else
-            return 1
         fi
+        return 1
     fi
     
     # 其他 targets 应该可以编译
@@ -150,6 +151,17 @@ for target in $INSTALLED_TARGETS; do
         else
             skip_check "clippy ($target)" "缺少工具链"
         fi
+        continue
+    fi
+    
+    # musl 无 musl-gcc 时走 zig wrapper：cc-rs 会把 RUSTC_WRAPPER(sccache) 前缀到 C 编译器，
+    # sccache 不识别 zig，故此处清空 RUSTC_WRAPPER（只影响本次 clippy 调用）。
+    if [[ "$target" == "x86_64-unknown-linux-musl" ]] && ! command -v musl-gcc &>/dev/null; then
+        run_check "clippy ($target) [zig]" \
+            env RUSTC_WRAPPER="" \
+                "CC_x86_64_unknown_linux_musl=$SCRIPT_DIR/zig-musl-cc.sh" \
+                "AR_x86_64_unknown_linux_musl=$SCRIPT_DIR/zig-musl-ar.sh" \
+                cargo clippy --target "$target" -- -D warnings
         continue
     fi
     

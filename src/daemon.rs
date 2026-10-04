@@ -529,9 +529,12 @@ pub async fn run_daemon(pipe_path: PathBuf, cancel: CancellationToken) -> anyhow
     // authoritative config dir — NOT the CLI's possibly-elevated home.
     let autostart_marker = daemon_config_dir().join("autostart");
     if autostart_marker.exists() {
-        let config_path = system_runtime_data_dir().join("active-config.yaml");
-        if config_path.exists() {
-            eprintln!("[mihomo-daemon] autostart marker present; starting core");
+        let runtime_dir = system_runtime_data_dir();
+        if let Some(config_path) = resolve_autostart_target_config_path(&runtime_dir) {
+            eprintln!(
+                "[mihomo-daemon] autostart marker present; starting core with {}",
+                config_path.display()
+            );
             let core_binary =
                 crate::instance::planned_current_context(crate::instance::InstanceMode::System)
                     .map(|ctx| ctx.paths.core_binary.clone())
@@ -542,7 +545,7 @@ pub async fn run_daemon(pipe_path: PathBuf, cancel: CancellationToken) -> anyhow
             }
         } else {
             eprintln!(
-                "[mihomo-daemon] autostart marker present but no config.yaml; skipping core start"
+                "[mihomo-daemon] autostart marker present but no valid config snapshot; skipping core start"
             );
         }
     }
@@ -553,7 +556,7 @@ pub async fn run_daemon(pipe_path: PathBuf, cancel: CancellationToken) -> anyhow
     if core_running_at_startup {
         if let Some(subscription_id) = read_mirror_active_id() {
             for line in replay_mirror_selection_intent(&state, &subscription_id).await {
-                eprintln!("[mihomo-daemon] {line}");
+                eprintln!("[mihomo-daemon] {}", render_replay_line_for_log(&line));
             }
         } else {
             eprintln!("[mihomo-daemon] selection mirror unavailable; startup replay skipped");
@@ -1155,6 +1158,24 @@ fn read_mirror_selection_map(
     read_mirror_selection_map_in(&daemon_config_dir(), subscription_id)
 }
 
+/// 结构化信号：selection mirror 缺失。
+///
+/// review MAJOR-5：daemon 按 SPEC（§3.8.1）**从不读用户 home**，因此无法判断用户是否
+/// 真有持久化选点——把它当 mirror 自己去判断会恒等于 mirror 是否存在（判断退化）。
+/// daemon 只回传这个信号，最终措辞（“无事可回放” vs “需要重建 mirror”）由 CLI 用
+/// **用户自己的 selections 树**决定，避免把真实 mirror 丢失掩盖成 `✓`（Issue #022 §4.8）。
+pub(crate) const SELECTION_MIRROR_MISSING_SIGNAL: &[u8] = b"[selection-mirror-missing]";
+
+/// daemon 日志侧渲染：信号只写事实，不下“有没有东西可回放”的结论。
+fn render_replay_line_for_log(line: &str) -> String {
+    if line.starts_with("[selection-mirror-missing]") {
+        "⚠ selection mirror unavailable; replay skipped (daemon does not consult the user tree)"
+            .to_string()
+    } else {
+        line.to_string()
+    }
+}
+
 /// Content revisions of selection mirror files for reconciliation (R3.2).
 /// `None` per id means the mirror file is absent. Ids that would not be
 /// accepted for recording are rejected wholesale (fail-closed, no path
@@ -1277,10 +1298,13 @@ async fn replay_mirror_selection_intent(
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
     let Some(selections) = read_mirror_selection_map(subscription_id) else {
-        return vec![
-            "⚠ Selections not replayed: selection mirror unavailable; run any selection command to rebuild it"
-                .to_string(),
-        ];
+        // Issue #022 C + review MAJOR-5：mirror 缺失只回传结构化信号。
+        // 两种情形（从未持久化 vs mirror 真丢）由 CLI 侧用用户树判定，见
+        // `main.rs::translate_selection_replay_signal`。
+        return vec![format!(
+            "{} selection mirror unavailable",
+            String::from_utf8_lossy(SELECTION_MIRROR_MISSING_SIGNAL)
+        )];
     };
     let replay_client = DaemonSelectionApiClient {
         state: Arc::clone(state),
@@ -1389,9 +1413,12 @@ pub async fn run_daemon(socket_path: PathBuf, cancel: CancellationToken) -> anyh
     // authoritative config dir — NOT the CLI's possibly-root-resolved home.
     let autostart_marker = daemon_config_dir().join("autostart");
     if autostart_marker.exists() {
-        let config_path = system_runtime_data_dir().join("active-config.yaml");
-        if config_path.exists() {
-            eprintln!("[mihomo-daemon] autostart marker present; starting core");
+        let runtime_dir = system_runtime_data_dir();
+        if let Some(config_path) = resolve_autostart_target_config_path(&runtime_dir) {
+            eprintln!(
+                "[mihomo-daemon] autostart marker present; starting core with {}",
+                config_path.display()
+            );
             let core_binary =
                 crate::instance::planned_current_context(crate::instance::InstanceMode::System)
                     .map(|ctx| ctx.paths.core_binary.clone())
@@ -1402,7 +1429,7 @@ pub async fn run_daemon(socket_path: PathBuf, cancel: CancellationToken) -> anyh
             }
         } else {
             eprintln!(
-                "[mihomo-daemon] autostart marker present but no config.yaml; skipping core start"
+                "[mihomo-daemon] autostart marker present but no valid config snapshot; skipping core start"
             );
         }
     }
@@ -1415,7 +1442,7 @@ pub async fn run_daemon(socket_path: PathBuf, cancel: CancellationToken) -> anyh
     if core_running_at_startup {
         if let Some(subscription_id) = read_mirror_active_id() {
             for line in replay_mirror_selection_intent(&state, &subscription_id).await {
-                eprintln!("[mihomo-daemon] {line}");
+                eprintln!("[mihomo-daemon] {}", render_replay_line_for_log(&line));
             }
         } else {
             eprintln!("[mihomo-daemon] selection mirror unavailable; startup replay skipped");
@@ -2604,6 +2631,49 @@ fn system_runtime_config_path(config_path: &std::path::Path) -> anyhow::Result<P
     Ok(active_path)
 }
 
+/// Inspect a YAML configuration snapshot and return true if `tun.enable == true`.
+#[cfg(any(unix, windows))]
+pub(crate) fn snapshot_tun_enabled(path: &std::path::Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    crate::utils::read_file_no_follow_limited(
+        path,
+        crate::tun_transaction::MAX_TRANSACTION_ARTIFACT_BYTES,
+    )
+    .ok()
+    .and_then(|bytes| serde_yaml::from_slice::<serde_yaml::Value>(&bytes).ok())
+    .and_then(|val| {
+        val.get("tun")
+            .and_then(|t| t.get("enable"))
+            .and_then(|e| e.as_bool())
+    })
+    .unwrap_or(false)
+}
+
+/// Resolve the target configuration file to start on daemon autostart.
+///
+/// If `tun-config.yaml` exists and contains a valid YAML document with
+/// `tun.enable == true`, TUN mode is preferred so that TUN survives daemon/system restarts.
+/// Otherwise, fallback to `active-config.yaml` if it exists.
+/// Returns `None` if neither valid candidate exists.
+#[cfg(any(unix, windows))]
+pub(crate) fn resolve_autostart_target_config_path(
+    runtime_dir: &std::path::Path,
+) -> Option<PathBuf> {
+    let tun_path = runtime_dir.join("tun-config.yaml");
+    if snapshot_tun_enabled(&tun_path) {
+        return Some(tun_path);
+    }
+
+    let active_path = runtime_dir.join("active-config.yaml");
+    if active_path.exists() {
+        return Some(active_path);
+    }
+
+    None
+}
+
 #[cfg(any(unix, windows))]
 fn runtime_data_dir_for_config(config_path: &std::path::Path) -> PathBuf {
     let system_dir = system_runtime_data_dir();
@@ -2803,17 +2873,17 @@ async fn promote_system_config(
     let is_tun_snapshot = {
         let mut s = state.lock().await;
         reap_exited_core(&mut s);
-        if s.config_path.as_ref() == Some(&transaction_ctx.paths.tun_config_file) {
-            transaction_ctx.paths.tun_config_file.exists()
-                && std::fs::read(&transaction_ctx.paths.tun_config_file)
-                    .ok()
-                    .and_then(|bytes| serde_yaml::from_slice::<serde_yaml::Value>(&bytes).ok())
-                    .and_then(|val| {
-                        val.get("tun")
-                            .and_then(|t| t.get("enable"))
-                            .and_then(|e| e.as_bool())
-                    })
-                    .unwrap_or(false)
+        // Issue #022 C：`is_tun_snapshot` 不能只依赖易失的运行态证据。daemon 刚重启、
+        // Core 未运行或 pid 元数据不可恢复时 `config_path` 为空，若此时判定为非 TUN 快照，
+        // restart 会 promote 到 `active-config.yaml`，把受管 TUN 快照永久晾在旧内容上，
+        // 三方 revision（launched / active snapshot / intent）从此对不上 →
+        // `TUN: unknown`、`Configuration: unknown`、`Health: degraded` 永不闭环。
+        // 运行态缺失时以持久证据（受管 TUN 快照 + tun.enable）为准。
+        let runtime_evidence_matches =
+            s.config_path.as_ref() == Some(&transaction_ctx.paths.tun_config_file);
+        let runtime_evidence_missing = s.config_path.is_none();
+        if runtime_evidence_matches || runtime_evidence_missing {
+            snapshot_tun_enabled(&transaction_ctx.paths.tun_config_file)
         } else {
             false
         }
@@ -5006,10 +5076,16 @@ fn set_tun_in_config_file(
         );
     }
     if let Some(dns_hijack) = dns_hijack {
-        tun.insert(
-            serde_yaml::Value::String("dns-hijack".to_string()),
-            serde_yaml::Value::Sequence(vec![serde_yaml::Value::String(dns_hijack.to_string())]),
-        );
+        // Issue #022: `--dns-hijack` 支持逗号分隔的多个目标（如 any:53,tcp://any:53）。
+        let entries = crate::config::dns_hijack_entries(dns_hijack);
+        if !entries.is_empty() {
+            tun.insert(
+                serde_yaml::Value::String("dns-hijack".to_string()),
+                serde_yaml::Value::Sequence(
+                    entries.into_iter().map(serde_yaml::Value::String).collect(),
+                ),
+            );
+        }
     }
     std::fs::write(config_path, serde_yaml::to_string(&doc)?)?;
     Ok(())
@@ -5046,10 +5122,14 @@ async fn toggle_tun_via_core_api(
         );
     }
     if let Some(dns_hijack) = dns_hijack {
-        tun.insert(
-            "dns-hijack".to_string(),
-            serde_json::Value::Array(vec![serde_json::Value::String(dns_hijack.to_string())]),
-        );
+        // Issue #022: `--dns-hijack` 支持逗号分隔的多个目标（如 any:53,tcp://any:53）。
+        let entries: Vec<serde_json::Value> = crate::config::dns_hijack_entries(dns_hijack)
+            .into_iter()
+            .map(serde_json::Value::String)
+            .collect();
+        if !entries.is_empty() {
+            tun.insert("dns-hijack".to_string(), serde_json::Value::Array(entries));
+        }
     }
     let tun_config = serde_json::json!({ "tun": tun });
 
@@ -7062,5 +7142,107 @@ mod windows_auth_model_tests {
             state_guard.core_running,
             "running unknown core must not be stopped by apply_promoted_snapshot"
         );
+    }
+}
+
+#[cfg(test)]
+mod autostart_tests {
+    use super::*;
+
+    #[test]
+    fn test_snapshot_tun_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.yaml");
+        assert!(!super::snapshot_tun_enabled(&path));
+
+        std::fs::write(&path, "tun:\n  enable: false\n").unwrap();
+        assert!(!super::snapshot_tun_enabled(&path));
+
+        std::fs::write(&path, "tun:\n  enable: true\n").unwrap();
+        assert!(super::snapshot_tun_enabled(&path));
+
+        std::fs::write(&path, "not yaml [").unwrap();
+        assert!(!super::snapshot_tun_enabled(&path));
+    }
+
+    #[test]
+    fn test_resolve_autostart_target_config_path_prefers_tun_when_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_dir = temp.path();
+        let tun_path = runtime_dir.join("tun-config.yaml");
+        let active_path = runtime_dir.join("active-config.yaml");
+
+        std::fs::write(&active_path, "mixed-port: 7890\n").unwrap();
+        std::fs::write(&tun_path, "mixed-port: 7890\ntun:\n  enable: true\n").unwrap();
+
+        let resolved = resolve_autostart_target_config_path(runtime_dir);
+        assert_eq!(resolved, Some(tun_path));
+    }
+
+    #[test]
+    fn test_resolve_autostart_target_config_path_falls_back_when_tun_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_dir = temp.path();
+        let tun_path = runtime_dir.join("tun-config.yaml");
+        let active_path = runtime_dir.join("active-config.yaml");
+
+        std::fs::write(&active_path, "mixed-port: 7890\n").unwrap();
+        std::fs::write(&tun_path, "mixed-port: 7890\ntun:\n  enable: false\n").unwrap();
+
+        let resolved = resolve_autostart_target_config_path(runtime_dir);
+        assert_eq!(resolved, Some(active_path));
+    }
+
+    #[test]
+    fn test_resolve_autostart_target_config_path_returns_active_when_tun_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_dir = temp.path();
+        let active_path = runtime_dir.join("active-config.yaml");
+
+        std::fs::write(&active_path, "mixed-port: 7890\n").unwrap();
+
+        let resolved = resolve_autostart_target_config_path(runtime_dir);
+        assert_eq!(resolved, Some(active_path));
+    }
+
+    #[test]
+    fn test_resolve_autostart_target_config_path_returns_none_when_both_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_dir = temp.path();
+
+        let resolved = resolve_autostart_target_config_path(runtime_dir);
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn test_resolve_autostart_target_config_path_handles_invalid_yaml_gracefully() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_dir = temp.path();
+        let tun_path = runtime_dir.join("tun-config.yaml");
+        let active_path = runtime_dir.join("active-config.yaml");
+
+        std::fs::write(&active_path, "mixed-port: 7890\n").unwrap();
+        std::fs::write(&tun_path, "invalid yaml: [[[:::").unwrap();
+
+        let resolved = resolve_autostart_target_config_path(runtime_dir);
+        assert_eq!(resolved, Some(active_path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_autostart_target_config_path_rejects_symlink_tun_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_dir = temp.path();
+        let active_path = runtime_dir.join("active-config.yaml");
+        let real_tun_file = temp.path().join("real-tun.yaml");
+        let tun_symlink = runtime_dir.join("tun-config.yaml");
+
+        std::fs::write(&active_path, "mixed-port: 7890\n").unwrap();
+        std::fs::write(&real_tun_file, "mixed-port: 7890\ntun:\n  enable: true\n").unwrap();
+        std::os::unix::fs::symlink(&real_tun_file, &tun_symlink).unwrap();
+
+        // 遇到符号链接 tun-config.yaml，snapshot_tun_enabled 安全拒绝，回退到 active-config.yaml
+        let resolved = resolve_autostart_target_config_path(runtime_dir);
+        assert_eq!(resolved, Some(active_path));
     }
 }

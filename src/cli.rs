@@ -280,8 +280,13 @@ pub(crate) enum Command {
         /// TUN stack: system, gvisor, or mixed
         #[arg(long)]
         stack: Option<TunStack>,
-        /// Enable DNS hijack, optionally with a target such as any:53
-        #[arg(long = "dns-hijack", num_args = 0..=1, default_missing_value = "any:53")]
+        /// Enable DNS hijack, optionally with one or more comma-separated targets
+        /// (default: any:53,tcp://any:53 — aligned with the reference configs)
+        #[arg(
+            long = "dns-hijack",
+            num_args = 0..=1,
+            default_missing_value = "any:53,tcp://any:53"
+        )]
         dns_hijack: Option<String>,
         /// Assume yes for TUN mode setup prompts
         #[arg(short, long)]
@@ -427,6 +432,9 @@ Limitations:
         /// Force the user service instance (advanced/debugging)
         #[arg(long = "user", conflicts_with = "system")]
         user: bool,
+        /// Skip the bounded local DNS resolver probe (Issue #022)
+        #[arg(long = "no-probe-dns")]
+        no_probe_dns: bool,
     },
 
     /// Backup mihomo-cli configuration files

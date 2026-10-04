@@ -104,6 +104,10 @@ rustup target add x86_64-unknown-linux-gnu x86_64-apple-darwin aarch64-unknown-l
 bash build.sh  # 一键构建全部平台
 ```
 
+musl 目标的静态产物（`x86_64-unknown-linux-musl`）不依赖宿主 glibc，可直接运行于
+`ubuntu:22.04` / `debian:12` 等旧发行版。`just lint` 会一并对该目标跑 clippy：宿主机有
+`musl-gcc` 时直接用，否则回退 `zig`（`scripts/zig-musl-cc.sh`，免 root）。
+
 ## 项目结构
 
 ```

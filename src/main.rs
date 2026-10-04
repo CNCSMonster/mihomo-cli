@@ -29,6 +29,9 @@ mod backup;
 mod config;
 mod daemon;
 mod dns;
+// Issue #022 A：本地解析器探测依赖 /etc/resolv.conf，仅在 unix 上提供。
+#[cfg(unix)]
+mod dns_probe;
 mod generation;
 mod groups;
 mod installer;
@@ -260,7 +263,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Override { system, action } => cmd_override(system, false, action).await,
         Command::Backup { system, output } => cmd_backup(system, false, output),
         Command::Restore { system, path, yes } => cmd_restore(system, false, &path, yes),
-        Command::Doctor { system, user } => cmd_doctor(system, user).await,
+        Command::Doctor {
+            system,
+            user,
+            no_probe_dns,
+        } => cmd_doctor(system, user, !no_probe_dns).await,
         Command::Daemon => {
             let sock_path = ipc::system_service_socket_path();
             // unix: launchd/systemd 管理生命周期，token 永不取消（保持现有行为）
@@ -1473,7 +1480,7 @@ async fn cmd_use(mode: Option<UseMode>) -> anyhow::Result<()> {
     }
 }
 
-async fn cmd_doctor(system: bool, user: bool) -> anyhow::Result<()> {
+async fn cmd_doctor(system: bool, user: bool, probe_dns: bool) -> anyhow::Result<()> {
     let ctx = match mode_request_from_flags(system, user) {
         instance::ModeRequest::ExplicitSystem => {
             instance::planned_current_context(instance::InstanceMode::System)
@@ -1631,9 +1638,10 @@ async fn cmd_doctor(system: bool, user: bool) -> anyhow::Result<()> {
             match ipc::send_command(&ipc::DaemonCommand::GetStatus { token: None }).await {
                 Ok(ipc::DaemonResponse::Status {
                     running,
-                    config_path: Some(_active_config),
+                    config_path: Some(active_config),
                     ..
                 }) => {
+                    let _ = &active_config;
                     #[cfg(unix)]
                     checks.push(format_doctor_owner_auth_check(
                         ctx.os,
@@ -1674,15 +1682,44 @@ async fn cmd_doctor(system: bool, user: bool) -> anyhow::Result<()> {
                             ));
                         }
                         None => {
+                            // Issue #022 C：unknown 的修法取决于缺哪一侧，不能一律建议
+                            // `restart`——Core 正在运行时那是一个无解的循环提示。
+                            let hint = match (
+                                snapshot.runtime_tun.as_bool(),
+                                snapshot.configured_tun.as_bool(),
+                            ) {
+                                (Some(_), None) => {
+                                    "配置意图缺少 tun.enable：运行 mihomo-cli tun on 重建 TUN 意图"
+                                        .to_string()
+                                }
+                                (None, Some(_)) => {
+                                    "Core 未报告 TUN 运行态；先运行 mihomo-cli status --json 观察 runtime_tun，再决定是否 restart --system"
+                                        .to_string()
+                                }
+                                _ => "启动或重启核心后重试: mihomo-cli restart --system"
+                                    .to_string(),
+                            };
                             checks.push(DoctorCheck::fail(
                                 "TUN 配置一致性",
                                 format!(
                                     "无法观察运行态（{}）或配置意图（{}）",
                                     snapshot.runtime_tun, snapshot.configured_tun
                                 ),
-                                "启动或重启核心后重试: mihomo-cli restart --system".to_string(),
+                                hint,
                             ));
                         }
+                    }
+
+                    // Issue #022: 快照构造完成后才执行 P2 探测，且不回填快照。
+                    if let Some(check) = doctor_dns_probe_check(&ctx, &snapshot, probe_dns).await {
+                        checks.push(check);
+                    }
+
+                    #[cfg(target_os = "linux")]
+                    if snapshot.runtime_tun == status::TriState::True {
+                        let diagnosis =
+                            check_linux_link_local_routing(Some(active_config.as_path()));
+                        checks.push(format_link_local_route_check(&diagnosis));
                     }
                 }
                 Ok(ipc::DaemonResponse::Status {
@@ -1716,6 +1753,11 @@ async fn cmd_doctor(system: bool, user: bool) -> anyhow::Result<()> {
                         format!("daemon 未报告活动配置（运行态: {}）", snapshot.runtime_tun),
                         "启动或重启核心后重试: mihomo-cli restart --system",
                     ));
+                    // MINOR-2（review）：D1 规定 doctor 默认探测；本分支（daemon 刚重启、
+                    // 尚未报告活动配置）正是最需要判定的场景之一，不能静默跳过。
+                    if let Some(check) = doctor_dns_probe_check(&ctx, &snapshot, probe_dns).await {
+                        checks.push(check);
+                    }
                 }
                 Ok(ipc::DaemonResponse::Error { message }) => {
                     #[cfg(unix)]
@@ -1793,6 +1835,12 @@ async fn cmd_doctor(system: bool, user: bool) -> anyhow::Result<()> {
         .is_ok()
     {
         checks.push(DoctorCheck::pass("Mihomo Core API", "可连接"));
+        if probe_dns {
+            let snapshot = status::StatusSnapshot::collect(&ctx).await;
+            if let Some(check) = doctor_dns_probe_check(&ctx, &snapshot, probe_dns).await {
+                checks.push(check);
+            }
+        }
     } else {
         checks.push(DoctorCheck::fail(
             "Mihomo Core API",
@@ -2966,11 +3014,13 @@ fn build_tun_candidate(
             serde_yaml::Value::String(stack.to_string()),
         );
     }
-    if let Some(dns_hijack) = dns_hijack {
-        tun.insert(
-            serde_yaml::Value::String("dns-hijack".to_string()),
-            serde_yaml::Value::Sequence(vec![serde_yaml::Value::String(dns_hijack.to_string())]),
-        );
+    // Issue #022: 开启 TUN 时归一化 TUN 块（dns-hijack 对齐参考实现、缺省补
+    // strict-route）以及旧版模板遗留的 DNS 默认值，关闭时只翻转 enable，不动其它字段。
+    // 归一化结果落在 intent config.yaml 里，仍受 candidate/revision 与 attestation 管辖，
+    // 因此存量安装无需额外跑一次 `config -u`。
+    if enable {
+        config::normalize_tun_block_for_enable(tun, dns_hijack);
+        config::normalize_dns_legacy_defaults(root);
     }
     Ok(serde_yaml::to_string(&doc)?.into_bytes())
 }
@@ -5734,16 +5784,15 @@ fn lifecycle_system_config_path(ctx: &instance::InstanceContext) -> std::path::P
 fn lifecycle_system_config_payload(
     ctx: &instance::InstanceContext,
 ) -> anyhow::Result<(String, String)> {
-    use anyhow::Context;
-
-    let content = std::fs::read_to_string(&ctx.paths.intent_config_file).with_context(|| {
-        format!(
-            "failed to read system intent config {}",
-            ctx.paths.intent_config_file.display()
-        )
-    })?;
-    let revision = tun_transaction::sha256_revision(content.as_bytes());
-    Ok((content, revision))
+    let paths = utils::AppPaths::new(ctx.paths.config_dir.clone());
+    // Issue #022 B：restart/start 的 payload 直接取 intent；必须先保证 override 参与合并，
+    // 否则任何漏掉合并的写入路径都会被 restart 静默放大成运行态丢配置。
+    // review MAJOR-3：直接使用锁内 reconcile 返回的内容与 revision，锁外重读会漏检并发写入。
+    let reconciled = config::reconcile_override_into_intent_checked(&paths, None)?;
+    if reconciled.changed {
+        crate::log!("  ⚠ override.yaml 派生键已重新合并进 intent config.yaml");
+    }
+    Ok((reconciled.content, reconciled.revision))
 }
 
 #[cfg(unix)]
@@ -6474,7 +6523,13 @@ async fn cmd_lifecycle_instance_mode(
         let resp = ipc::send_command(&cmd).await?;
         match resp {
             ipc::DaemonResponse::Success { message } => {
-                println!("  ✅ {message}");
+                // review MAJOR-5：daemon 不读用户 home，mirror 缺失只回传结构化信号；
+                // 由 CLI 结合用户 selections树决定最终措辞（§4.8 不得静默降级）。
+                let paths = utils::AppPaths::new(ctx.paths.config_dir.clone());
+                println!(
+                    "  ✅ {}",
+                    translate_selection_replay_signal(&message, &paths)
+                );
                 // Readiness is confirmed by the daemon (it waits for the core
                 // API before replying Success). The CLI must not re-poll —
                 // aligned with clash-verge-service: client trusts the
@@ -7170,6 +7225,9 @@ fn status_endpoint_label(endpoint: &instance::ApiEndpoint) -> String {
 
 struct DoctorCheck {
     passed: bool,
+    warning: bool,
+    /// `neutral` 表示「已观察但无法判定」：显示 ❓，且不计入问题数（ISS #022 P2 探测）。
+    neutral: bool,
     label: String,
     detail: String,
     hint: Option<String>,
@@ -7322,6 +7380,143 @@ fn doctor_checks_config_owner(mode: instance::InstanceMode) -> bool {
     mode == instance::InstanceMode::User
 }
 
+/// P2 判据来源选择的结果。
+#[cfg(unix)]
+enum ProbeConfigSource {
+    /// 可用于判定的配置文本与其出处标签。
+    Text { label: String, text: String },
+    /// 取不到可用配置时的原因（呈现为 ❓，绝不静默跳过）。
+    Unavailable(String),
+}
+
+/// 有界、不跟随 symlink 的配置读取（review MINOR-e：doctor 也用 #024 的加固读法）。
+#[cfg(unix)]
+fn read_probe_config_text(path: &std::path::Path) -> anyhow::Result<String> {
+    let bytes = crate::utils::read_file_no_follow_limited(
+        path,
+        crate::tun_transaction::MAX_TRANSACTION_ARTIFACT_BYTES,
+    )?;
+    Ok(String::from_utf8(bytes)?)
+}
+
+/// 选择 P2 判据来源（review 回归-1）。
+///
+/// 1. `runtime_attested`（launched == active == intent 三份 revision 一致）时**优先用 intent**：
+///    字节上等同于运行配置，而且普通用户可读——`/var/lib/mihomo-cli` 是 `root:mihomo 0770`，
+///    非 root 的 `doctor` 读运行配置必然 EACCES，否则探测会永远退化成 ❓；
+/// 2. 否则读 daemon 报告的运行配置（root 场景）；
+/// 3. 都不可用时返回具体原因，由调用方呈现为 ❓（不得静默跳过探测）。
+#[cfg(unix)]
+fn probe_config_source(
+    runtime_attested: bool,
+    active_config_path: Option<&std::path::Path>,
+    intent_path: &std::path::Path,
+) -> ProbeConfigSource {
+    let mut failures: Vec<String> = Vec::new();
+    if runtime_attested {
+        match read_probe_config_text(intent_path) {
+            Ok(text) => {
+                return ProbeConfigSource::Text {
+                    label: "intent 配置（runtime attested：launched == active == intent）"
+                        .to_string(),
+                    text,
+                }
+            }
+            Err(err) => failures.push(format!("intent 配置: {err}")),
+        }
+    }
+    match active_config_path {
+        Some(path) => match read_probe_config_text(path) {
+            Ok(text) => {
+                return ProbeConfigSource::Text {
+                    label: format!("运行配置 {}", path.display()),
+                    text,
+                }
+            }
+            Err(err) => failures.push(format!("运行配置 {}: {err}", path.display())),
+        },
+        None => failures.push("未观察到 Core 的运行配置".to_string()),
+    }
+    ProbeConfigSource::Unavailable(failures.join("；"))
+}
+
+/// Issue #022 P2 本地解析器探测（SPEC 草案 D1–D4）。
+///
+/// 仅在 `doctor` 默认启用（`--no-probe-dns` 关闭）、**运行态** TUN 生效且判据配置为 fake-ip
+/// 模式时执行一次 ≤2s 的有界查询；结果只生成独立的 `DoctorCheck`，不回填 `StatusSnapshot`，
+/// 也不参与 Health / attestation（D4）。
+#[cfg(unix)]
+async fn doctor_dns_probe_check(
+    _ctx: &instance::InstanceContext,
+    snapshot: &status::StatusSnapshot,
+    probe_dns: bool,
+) -> Option<DoctorCheck> {
+    if !probe_dns {
+        return None;
+    }
+    // D2（review MAJOR-7 修订）：只有**运行态确认 TUN 生效**才探测。
+    // 仅 configured_tun 为真而 Core 未运行时，系统解析本来就不该经过 mihomo，
+    // 报 ❌ 会与“Mihomo Core 未运行”重复计数，并把根因指向 DNS 路径。
+    if snapshot.runtime_tun.as_bool() != Some(true) {
+        return None;
+    }
+    // 判据来源（review MAJOR-7 + 回归-1）：attested 时优先 intent（与运行配置字节一致
+    // 且非 root 可读），否则读运行配置；取不到就给 ❓ 并说明原因，绝不静默跳过。
+    let (config_text, source_label) = match probe_config_source(
+        snapshot.runtime_attested,
+        snapshot.active_config_path.as_deref(),
+        &_ctx.paths.intent_config_file,
+    ) {
+        ProbeConfigSource::Text { text, label } => (text, label),
+        ProbeConfigSource::Unavailable(reason) => {
+            return Some(DoctorCheck::neutral(
+                "系统 DNS 路径",
+                format!("无法判定：{reason}"),
+            ))
+        }
+    };
+    // D2：非 fake-ip 模式下不存在「返回 fake-ip」这一判据，跳过。
+    let range = dns_probe::probe_precondition(&config_text)?;
+    match dns_probe::probe_system_resolver(&range).await {
+        dns_probe::ProbeVerdict::RoutedThroughMihomo => Some(DoctorCheck::pass(
+            "系统 DNS 路径",
+            format!(
+                "{} → fake-ip（{range}），系统解析经过 mihomo（判据：{source_label}）",
+                dns_probe::PROBE_DOMAIN
+            ),
+        )),
+        dns_probe::ProbeVerdict::BypassesMihomo => Some(DoctorCheck::fail(
+            "系统 DNS 路径",
+            format!(
+                "{} → 真实地址（不在 {range} 内），系统解析未经过 mihomo（判据：{source_label}）",
+                dns_probe::PROBE_DOMAIN
+            ),
+            // review MAJOR-8：提示必须落在真正会改变状态的动作上。
+            // `restart` 不执行 TUN/DNS 归一化（只有 `tun on` 会），
+            // 而 Issue #022 场景里 resolv.conf 本来就指向 127.0.0.53，
+            // 旧提示会让用户“按提示做完但状态不变”（违反 §4.8 不得循环）。
+            "TUN 下域名规则会对真实流量失效。运行: mihomo-cli tun on --yes（重建并归一化 TUN/DNS 意图，\
+             含 dns-hijack 与 strict-route；事务会直接应用到 Core，无需再 restart）；\
+             若 Core 未运行则 mihomo-cli start --system。仍绕过说明系统解析器未被 TUN 劫持\
+             （Issue #022 A2 待真机验证的 strict-route 假说）。\
+             刚修复过时系统解析缓存可能仍返回旧地址，稍后重跑 doctor 复核",
+        )),
+        dns_probe::ProbeVerdict::Unknown(detail) => Some(DoctorCheck::neutral(
+            "系统 DNS 路径",
+            format!("无法判定：{detail}"),
+        )),
+    }
+}
+
+#[cfg(not(unix))]
+async fn doctor_dns_probe_check(
+    _ctx: &instance::InstanceContext,
+    _snapshot: &status::StatusSnapshot,
+    _probe_dns: bool,
+) -> Option<DoctorCheck> {
+    None
+}
+
 fn doctor_checks_service(service: &instance::ServiceTarget) -> bool {
     !matches!(service, instance::ServiceTarget::WindowsUserProcess)
 }
@@ -7330,15 +7525,48 @@ impl DoctorCheck {
     fn pass(label: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
             passed: true,
+            warning: false,
+            neutral: false,
             label: label.into(),
             detail: detail.into(),
             hint: None,
         }
     }
 
+    /// 无法判定的观察结果：不算问题，但要在输出里显式标出来（仅 unix 的 P2 探测使用）。
+    #[cfg(unix)]
+    fn neutral(label: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            passed: true,
+            warning: false,
+            neutral: true,
+            label: label.into(),
+            detail: detail.into(),
+            hint: None,
+        }
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn warn(
+        label: impl Into<String>,
+        detail: impl Into<String>,
+        hint: Option<impl Into<String>>,
+    ) -> Self {
+        Self {
+            passed: true,
+            warning: true,
+            neutral: false,
+            label: label.into(),
+            detail: detail.into(),
+            hint: hint.map(Into::into),
+        }
+    }
+
     fn fail(label: impl Into<String>, detail: impl Into<String>, hint: impl Into<String>) -> Self {
         Self {
             passed: false,
+            warning: false,
+            neutral: false,
             label: label.into(),
             detail: detail.into(),
             hint: Some(hint.into()),
@@ -7346,12 +7574,584 @@ impl DoctorCheck {
     }
 
     fn format(&self) -> String {
-        let icon = if self.passed { "✅" } else { "❌" };
+        let icon = if !self.passed {
+            "❌"
+        } else if self.warning {
+            "⚠"
+        } else if self.neutral {
+            "❓"
+        } else {
+            "✅"
+        };
         let mut line = format!("  {icon} {}: {}", self.label, self.detail);
         if let Some(hint) = &self.hint {
             line.push_str(&format!("\n     💡 {hint}"));
         }
         line
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LinkLocalRouteDiagnosis {
+    CoveredByConfig {
+        details: String,
+    },
+    CoveredByRoute {
+        interface: String,
+    },
+    DegradedMainTableOnly {
+        interface: String,
+        suggested_interface: String,
+    },
+    Partial {
+        interface: String,
+        host_or_subnet: String,
+        suggested_interface: String,
+        config_partial: Option<String>,
+    },
+    Missing {
+        suggested_interface: String,
+    },
+    Unknown {
+        reason: String,
+    },
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LinkLocalMatch {
+    FullCover(String),
+    Partial(String),
+    None,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn subnet_covers_link_local_block(ip: std::net::Ipv4Addr, prefix: u8) -> bool {
+    if prefix == 0 || prefix > 16 {
+        return false;
+    }
+    let mask = !((1u32 << (32 - prefix)) - 1);
+    let ip_u32 = u32::from(ip);
+    let target_u32 = u32::from(std::net::Ipv4Addr::new(169, 254, 0, 0));
+    (ip_u32 & mask) == (target_u32 & mask)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn classify_link_local_destination(dest: &str) -> LinkLocalMatch {
+    let (ip_str, prefix_len) = if let Some((ip_part, mask_part)) = dest.split_once('/') {
+        let prefix = match mask_part.parse::<u8>() {
+            Ok(p) => p,
+            Err(_) => return LinkLocalMatch::None,
+        };
+        (ip_part, prefix)
+    } else {
+        (dest, 32)
+    };
+
+    if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
+        let octets = ip.octets();
+        if subnet_covers_link_local_block(ip, prefix_len) {
+            return LinkLocalMatch::FullCover(dest.to_string());
+        }
+        if octets[0] == 169 && octets[1] == 254 {
+            return LinkLocalMatch::Partial(dest.to_string());
+        }
+    }
+    LinkLocalMatch::None
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn inspect_config_tun_settings(
+    config_path: &std::path::Path,
+) -> (Option<Vec<String>>, Option<String>) {
+    let content = match crate::utils::read_file_no_follow_limited(
+        config_path,
+        crate::tun_transaction::MAX_TRANSACTION_ARTIFACT_BYTES,
+    ) {
+        Ok(c) => c,
+        Err(_) => return (None, None),
+    };
+    let val: serde_yaml::Value = match serde_yaml::from_slice(&content) {
+        Ok(v) => v,
+        Err(_) => return (None, None),
+    };
+    let tun = match val.get("tun") {
+        Some(t) => t,
+        None => return (None, None),
+    };
+
+    let excludes = tun
+        .get("route-exclude-address")
+        .and_then(|e| e.as_sequence())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        });
+
+    let device = tun
+        .get("device")
+        .and_then(|d| d.as_str())
+        .map(|s| s.to_string());
+
+    (excludes, device)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn check_route_exclude_coverage(excludes: &[String]) -> LinkLocalMatch {
+    let mut has_partial = false;
+    let mut partial_item = String::new();
+    for item in excludes {
+        match classify_link_local_destination(item) {
+            LinkLocalMatch::FullCover(s) => return LinkLocalMatch::FullCover(s),
+            LinkLocalMatch::Partial(s) => {
+                has_partial = true;
+                partial_item = s;
+            }
+            LinkLocalMatch::None => {}
+        }
+    }
+    if has_partial {
+        LinkLocalMatch::Partial(partial_item)
+    } else {
+        LinkLocalMatch::None
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn is_physical_interface(dev: &str, configured_tun_dev: Option<&str>) -> bool {
+    if let Some(custom_dev) = configured_tun_dev {
+        if dev.eq_ignore_ascii_case(custom_dev) {
+            return false;
+        }
+    }
+    let lower = dev.to_ascii_lowercase();
+    !(lower == "lo"
+        || lower.starts_with("tun")
+        || lower.starts_with("utun")
+        || lower.starts_with("meta")
+        || lower.starts_with("clash")
+        || lower.starts_with("tap")
+        || lower.starts_with("wg")
+        || lower.starts_with("dummy")
+        || lower.starts_with("docker")
+        || lower.starts_with("br-")
+        || lower.starts_with("veth")
+        || lower.starts_with("virbr")
+        || lower.starts_with("tailscale")
+        || lower.starts_with("zt"))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn find_safe_ip_binary() -> Option<&'static str> {
+    const SAFE_PATHS: &[&str] = &["/sbin/ip", "/usr/sbin/ip", "/bin/ip", "/usr/bin/ip"];
+    SAFE_PATHS
+        .iter()
+        .copied()
+        .find(|&p| std::path::Path::new(p).exists())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_ip_route_get_output(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if let Some(pos) = tokens.iter().position(|&t| t == "dev") {
+            if let Some(dev) = tokens.get(pos + 1) {
+                return Some(dev.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn classify_link_local_exit_devices(
+    mirror_dev: Option<String>,
+    imds_dev: Option<String>,
+    configured_tun_dev: Option<&str>,
+    default_dev: Option<String>,
+    config_partial: Option<String>,
+) -> Option<LinkLocalRouteDiagnosis> {
+    let m_dev = mirror_dev?;
+    let i_dev = imds_dev?;
+    let m_phys = is_physical_interface(&m_dev, configured_tun_dev);
+    let i_phys = is_physical_interface(&i_dev, configured_tun_dev);
+
+    if m_phys && i_phys {
+        Some(LinkLocalRouteDiagnosis::CoveredByRoute { interface: m_dev })
+    } else if !m_phys && i_phys {
+        Some(LinkLocalRouteDiagnosis::Partial {
+            interface: i_dev.clone(),
+            host_or_subnet: "169.254.169.254".to_string(),
+            suggested_interface: i_dev,
+            config_partial,
+        })
+    } else if m_phys && !i_phys {
+        Some(LinkLocalRouteDiagnosis::Partial {
+            interface: m_dev.clone(),
+            host_or_subnet: "169.254.0.3".to_string(),
+            suggested_interface: m_dev,
+            config_partial,
+        })
+    } else {
+        Some(LinkLocalRouteDiagnosis::Missing {
+            suggested_interface: default_dev.unwrap_or_else(|| "<物理网卡>".to_string()),
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_ip_route_main_output(
+    output: &str,
+    configured_tun_dev: Option<&str>,
+) -> LinkLocalRouteDiagnosis {
+    let mut default_interface: Option<String> = None;
+    let mut full_interface: Option<String> = None;
+    let mut partial_interface: Option<(String, String)> = None;
+    let mut has_any_routes = false;
+
+    for line in output.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.is_empty() {
+            continue;
+        }
+        if matches!(
+            tokens[0],
+            "blackhole" | "unreachable" | "prohibit" | "throw"
+        ) {
+            continue;
+        }
+        has_any_routes = true;
+        let dest = tokens[0];
+
+        let dev = tokens
+            .windows(2)
+            .find(|w| w[0] == "dev")
+            .map(|w| w[1].to_string());
+
+        if dest == "default" {
+            if let Some(ref interface) = dev {
+                if is_physical_interface(interface, configured_tun_dev)
+                    && default_interface.is_none()
+                {
+                    default_interface = Some(interface.clone());
+                }
+            }
+        }
+
+        match classify_link_local_destination(dest) {
+            LinkLocalMatch::FullCover(_) => {
+                if let Some(ref interface) = dev {
+                    if is_physical_interface(interface, configured_tun_dev) {
+                        full_interface = Some(interface.clone());
+                        break;
+                    }
+                }
+            }
+            LinkLocalMatch::Partial(sub) => {
+                if let Some(ref interface) = dev {
+                    if is_physical_interface(interface, configured_tun_dev)
+                        && partial_interface.is_none()
+                    {
+                        partial_interface = Some((interface.clone(), sub));
+                    }
+                }
+            }
+            LinkLocalMatch::None => {}
+        }
+    }
+
+    if let Some(interface) = full_interface {
+        LinkLocalRouteDiagnosis::DegradedMainTableOnly {
+            suggested_interface: default_interface.unwrap_or_else(|| interface.clone()),
+            interface,
+        }
+    } else if let Some((interface, sub)) = partial_interface {
+        LinkLocalRouteDiagnosis::Partial {
+            interface,
+            host_or_subnet: sub,
+            suggested_interface: default_interface.unwrap_or_else(|| "<物理网卡>".to_string()),
+            config_partial: None,
+        }
+    } else if has_any_routes {
+        LinkLocalRouteDiagnosis::Missing {
+            suggested_interface: default_interface.unwrap_or_else(|| "<物理网卡>".to_string()),
+        }
+    } else {
+        LinkLocalRouteDiagnosis::Unknown {
+            reason: "主路由表为空或无法解析".to_string(),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_net_route_content(
+    content: &str,
+    configured_tun_dev: Option<&str>,
+) -> LinkLocalRouteDiagnosis {
+    let mut lines = content.lines();
+    let header = match lines.next() {
+        Some(h) => h,
+        None => {
+            return LinkLocalRouteDiagnosis::Unknown {
+                reason: "/proc/net/route 为空".to_string(),
+            }
+        }
+    };
+    if !header.contains("Iface") || !header.contains("Destination") {
+        return LinkLocalRouteDiagnosis::Unknown {
+            reason: "/proc/net/route 格式不符合预期".to_string(),
+        };
+    }
+
+    let mut default_interface: Option<String> = None;
+    let mut full_interface: Option<String> = None;
+    let mut partial_interface: Option<(String, String)> = None;
+    let mut has_routes = false;
+
+    for line in lines {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.len() < 8 {
+            continue;
+        }
+        let iface = tokens[0];
+        let dest_hex = tokens[1];
+        let flags_hex = tokens[3];
+        let mask_hex = tokens[7];
+
+        let flags = u32::from_str_radix(flags_hex, 16).unwrap_or(0);
+        if (flags & 0x0001) == 0 || (flags & 0x0200) != 0 {
+            continue;
+        }
+        has_routes = true;
+
+        let dest_val = match u32::from_str_radix(dest_hex, 16) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let mask_val = match u32::from_str_radix(mask_hex, 16) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let dest_bytes = dest_val.to_ne_bytes();
+        let prefix_len = mask_val.count_ones() as u8;
+
+        if dest_val == 0
+            && mask_val == 0
+            && is_physical_interface(iface, configured_tun_dev)
+            && default_interface.is_none()
+        {
+            default_interface = Some(iface.to_string());
+        }
+
+        if dest_bytes[0] == 169
+            && dest_bytes[1] == 254
+            && is_physical_interface(iface, configured_tun_dev)
+        {
+            if prefix_len <= 16 && dest_bytes[2] == 0 && dest_bytes[3] == 0 {
+                full_interface = Some(iface.to_string());
+                break;
+            } else if partial_interface.is_none() {
+                let sub_str = format!(
+                    "{}.{}.{}.{}/{}",
+                    dest_bytes[0], dest_bytes[1], dest_bytes[2], dest_bytes[3], prefix_len
+                );
+                partial_interface = Some((iface.to_string(), sub_str));
+            }
+        }
+    }
+
+    if let Some(interface) = full_interface {
+        LinkLocalRouteDiagnosis::DegradedMainTableOnly {
+            suggested_interface: default_interface.unwrap_or_else(|| interface.clone()),
+            interface,
+        }
+    } else if let Some((interface, sub)) = partial_interface {
+        LinkLocalRouteDiagnosis::Partial {
+            interface,
+            host_or_subnet: sub,
+            suggested_interface: default_interface.unwrap_or_else(|| "<物理网卡>".to_string()),
+            config_partial: None,
+        }
+    } else if has_routes {
+        LinkLocalRouteDiagnosis::Missing {
+            suggested_interface: default_interface.unwrap_or_else(|| "<物理网卡>".to_string()),
+        }
+    } else {
+        LinkLocalRouteDiagnosis::Unknown {
+            reason: "未在 /proc/net/route 中读取到有效路由".to_string(),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn check_linux_link_local_routing(
+    config_path: Option<&std::path::Path>,
+) -> LinkLocalRouteDiagnosis {
+    let mut config_partial: Option<String> = None;
+    let (tun_excludes, configured_tun_dev) = match config_path {
+        Some(cfg_file) => inspect_config_tun_settings(cfg_file),
+        None => (None, None),
+    };
+
+    // 1. 优先检查 mihomo 自身配置文件中的 tun.route-exclude-address
+    if let Some(excludes) = tun_excludes.as_deref() {
+        match check_route_exclude_coverage(excludes) {
+            LinkLocalMatch::FullCover(matched) => {
+                return LinkLocalRouteDiagnosis::CoveredByConfig { details: matched };
+            }
+            LinkLocalMatch::Partial(matched) => {
+                config_partial = Some(matched);
+            }
+            LinkLocalMatch::None => {}
+        }
+    }
+
+    let ip_bin = find_safe_ip_binary();
+
+    // 2. 通过绝对路径调用 ip route get 探测内核综合策略路由与出口设备
+    if let Some(ip_bin_path) = ip_bin {
+        let mirror_out = std::process::Command::new(ip_bin_path)
+            .args(["route", "get", "169.254.0.3"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok());
+
+        let imds_out = std::process::Command::new(ip_bin_path)
+            .args(["route", "get", "169.254.169.254"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok());
+
+        if let (Some(mirror_text), Some(imds_text)) = (mirror_out, imds_out) {
+            let mirror_dev = parse_ip_route_get_output(&mirror_text);
+            let imds_dev = parse_ip_route_get_output(&imds_text);
+
+            let default_dev = std::process::Command::new(ip_bin_path)
+                .args(["route", "show", "table", "main"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .and_then(|out| {
+                    for line in out.lines() {
+                        if line.starts_with("default") {
+                            let tokens: Vec<&str> = line.split_whitespace().collect();
+                            if let Some(pos) = tokens.iter().position(|&t| t == "dev") {
+                                if let Some(dev) = tokens.get(pos + 1) {
+                                    if is_physical_interface(dev, configured_tun_dev.as_deref()) {
+                                        return Some(dev.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None
+                });
+
+            if let Some(diag) = classify_link_local_exit_devices(
+                mirror_dev,
+                imds_dev,
+                configured_tun_dev.as_deref(),
+                default_dev,
+                config_partial.clone(),
+            ) {
+                return diag;
+            }
+        }
+    }
+
+    // 3. 降级通道：读取 /proc/net/route
+    if let Ok(content) = std::fs::read_to_string("/proc/net/route") {
+        let diag = parse_proc_net_route_content(&content, configured_tun_dev.as_deref());
+        if !matches!(diag, LinkLocalRouteDiagnosis::Unknown { .. }) {
+            return diag;
+        }
+    }
+
+    // 4. 降级通道：执行 ip route show table main
+    if let Some(ip_bin_path) = ip_bin {
+        if let Ok(output) = std::process::Command::new(ip_bin_path)
+            .args(["route", "show", "table", "main"])
+            .output()
+        {
+            if output.status.success() {
+                if let Ok(stdout) = std::str::from_utf8(&output.stdout) {
+                    let diag = parse_ip_route_main_output(stdout, configured_tun_dev.as_deref());
+                    if !matches!(diag, LinkLocalRouteDiagnosis::Unknown { .. }) {
+                        return diag;
+                    }
+                }
+            }
+        }
+    }
+
+    LinkLocalRouteDiagnosis::Unknown {
+        reason: "未能通过 ip route get、/proc/net/route 或 ip route main 研判路由".to_string(),
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn format_link_local_route_check(diagnosis: &LinkLocalRouteDiagnosis) -> DoctorCheck {
+    match diagnosis {
+        LinkLocalRouteDiagnosis::CoveredByConfig { details } => DoctorCheck::pass(
+            "云链路本地路由",
+            format!("已在配置 tun.route-exclude-address 中排除（{details}），未受 TUN 接管影响"),
+        ),
+        LinkLocalRouteDiagnosis::CoveredByRoute { interface } => DoctorCheck::pass(
+            "云链路本地路由",
+            format!("169.254.0.0/16 流量由 {interface} 直连路由直接接管，未受 TUN 接管影响"),
+        ),
+        LinkLocalRouteDiagnosis::DegradedMainTableOnly {
+            interface,
+            suggested_interface,
+        } => DoctorCheck::warn(
+            "云链路本地路由",
+            format!(
+                "主路由表中存在直连路由（dev {interface}），但降级模式下未评估策略路由（ip rule）；若存在 auto-route 规则，访问内网镜像（如腾讯云 169.254.0.3）仍可能被送入 TUN"
+            ),
+            Some(format!(
+                "首选：在用户配置 intent.yaml 中添加 tun.route-exclude-address: [\"169.254.0.0/16\"]，执行 mihomo-cli restart --system 生效；备选：sudo ip route add 169.254.0.0/16 dev {suggested_interface}（临时生效；持久化需写入 netplan 配置）"
+            )),
+        ),
+        LinkLocalRouteDiagnosis::Partial {
+            interface,
+            host_or_subnet,
+            suggested_interface,
+            config_partial,
+        } => {
+            let config_hint = config_partial
+                .as_ref()
+                .map(|c| format!("（配置中仅排除 {c}）"))
+                .unwrap_or_default();
+            DoctorCheck::warn(
+                "云链路本地路由",
+                format!(
+                    "仅发现部分链路本地直连路由（{host_or_subnet} dev {interface}）{config_hint}，未覆盖 169.254.0.0/16 全段；访问内网镜像（如腾讯云 169.254.0.3）可能超时挂死"
+                ),
+                Some(format!(
+                    "首选：在用户配置 intent.yaml 中添加 tun.route-exclude-address: [\"169.254.0.0/16\"]，执行 mihomo-cli restart --system 生效；备选：sudo ip route add 169.254.0.0/16 dev {suggested_interface}（临时生效；持久化需写入 netplan 配置）"
+                )),
+            )
+        }
+        LinkLocalRouteDiagnosis::Missing {
+            suggested_interface,
+        } => DoctorCheck::warn(
+            "云链路本地路由",
+            "TUN 已启用且流量被接管，但未配置链路本地网段（169.254.0.0/16）排除或直连；在云主机上访问内网镜像（如腾讯云 169.254.0.3）或元数据可能超时挂死",
+            Some(format!(
+                "首选：在用户配置 intent.yaml 中添加 tun.route-exclude-address: [\"169.254.0.0/16\"]，执行 mihomo-cli restart --system 生效；备选：sudo ip route add 169.254.0.0/16 dev {suggested_interface}（临时生效；持久化需写入 netplan 配置）"
+            )),
+        ),
+        LinkLocalRouteDiagnosis::Unknown { reason } => DoctorCheck::warn(
+            "云链路本地路由",
+            format!("未完成链路本地路由研判（{reason}）"),
+            Some("建议检查网络环境与 ip 命令权限".to_string()),
+        ),
     }
 }
 
@@ -8454,21 +9254,15 @@ async fn apply_config_reload_lines(
     paths: &utils::AppPaths,
     base_revision: Option<&str>,
 ) -> Vec<String> {
-    let resolved_mode =
-        resolve_current_instance_context(system, user, instance::CommandIntent::ReadOnly)
-            .ok()
-            .map(|resolved| resolved.ctx.mode);
     match reload_configs_for_resolved_instance(system, user, paths, base_revision).await {
-        Ok(()) if resolved_mode == Some(instance::InstanceMode::System) => {
-            system_config_applied_lines()
-        }
-        Ok(()) => {
-            vec![
-                "  ✓ Config reload request accepted by Core API".to_string(),
-                "  ⚠ Runtime status: unknown (revision attestation unavailable)".to_string(),
-                "  Run: mihomo-cli restart  to establish runtime readiness".to_string(),
-            ]
-        }
+        Ok(RuntimeApplyOutcome::SystemPromoted) => system_config_applied_lines(),
+        // Issue #022 C + review 回归-2：既不得凭空怂恿 restart（原问题），
+        // 也不得在没有 revision attestation 时声称"已生效"——SPEC §12.3 要求
+        // 无法证明时如实报 unknown，只去掉误导性的 restart 劝导。
+        Ok(_) => vec![
+            "  ✓ Config reload request accepted by Core API".to_string(),
+            "  ℹ Runtime status: unknown (revision attestation unavailable)".to_string(),
+        ],
         Err(e) => vec![
             format!("  ⚠ Config written but runtime application is unknown: {e}"),
             "  Run: mihomo-cli restart  to establish runtime readiness".to_string(),
@@ -8476,12 +9270,46 @@ async fn apply_config_reload_lines(
     }
 }
 
+/// Issue #022 C：配置应用结果的真实状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeApplyOutcome {
+    /// system 模式：daemon promotion 成功，运行时已应用。
+    SystemPromoted,
+    /// Core API 接受了热加载；**没有** revision attestation，
+    /// 按 SPEC §12.3 必须以 `unknown` 汇报（不得声称"已生效"，review 回归-2）。
+    HotReloadAccepted,
+    /// intent 已写入但运行时尚未应用（需要 restart）。
+    Pending,
+}
+
+impl RuntimeApplyOutcome {
+    fn from_mode(mode: instance::InstanceMode) -> Self {
+        match mode {
+            instance::InstanceMode::System => RuntimeApplyOutcome::SystemPromoted,
+            instance::InstanceMode::User => RuntimeApplyOutcome::HotReloadAccepted,
+        }
+    }
+}
+
+/// 规则变更后的应用流程：先合并，再按真实结果汇报（Issue #022 C）。
+async fn rule_apply_outcome(
+    system: bool,
+    user: bool,
+    paths: &utils::AppPaths,
+    merged: bool,
+) -> anyhow::Result<RuntimeApplyOutcome> {
+    if !merged {
+        return Ok(RuntimeApplyOutcome::Pending);
+    }
+    reload_config_for_mutation(system, user, paths, config_base_revision(paths).as_deref()).await
+}
+
 async fn reload_config_for_mutation(
     system: bool,
     user: bool,
     paths: &utils::AppPaths,
     base_revision: Option<&str>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<RuntimeApplyOutcome> {
     let resolved =
         resolve_current_instance_context(system, user, instance::CommandIntent::ReadOnly)?;
     let tun_active = resolved.ctx.mode == instance::InstanceMode::System
@@ -8491,12 +9319,12 @@ async fn reload_config_for_mutation(
             == status::TunVerdict::TunRunning;
     if tun_active {
         reload_configs_for_resolved_instance(system, user, paths, base_revision).await?;
-        Ok(true)
+        Ok(RuntimeApplyOutcome::SystemPromoted)
     } else {
         Ok(
             reload_configs_for_resolved_instance(system, user, paths, base_revision)
                 .await
-                .is_ok(),
+                .unwrap_or(RuntimeApplyOutcome::Pending),
         )
     }
 }
@@ -8508,7 +9336,7 @@ async fn try_reload_group_config(
     base_revision: Option<&str>,
 ) -> anyhow::Result<Option<anyhow::Error>> {
     match reload_configs_for_resolved_instance(system, user, paths, base_revision).await {
-        Ok(()) => Ok(None),
+        Ok(_) => Ok(None),
         Err(error) => Ok(Some(error)),
     }
 }
@@ -8592,10 +9420,10 @@ fn format_config_add_success(id: &str, apply_lines: Vec<String>) -> Vec<String> 
 fn format_legacy_url_add_success(id: &str, hot_reloaded: bool) -> Vec<String> {
     let mut lines = vec![format!("  Added and activated subscription {id}")];
     if hot_reloaded {
+        // Issue #022 C + review 回归-2：不要求无谓的 restart，但也不得越过 attestation 声称已生效。
         lines.extend([
             "  ✓ Config reload request accepted by Core API".to_string(),
-            "  ⚠ Runtime status: unknown (revision attestation unavailable)".to_string(),
-            "  Run: mihomo-cli restart  to establish runtime readiness".to_string(),
+            "  ℹ Runtime status: unknown (revision attestation unavailable)".to_string(),
         ]);
     } else {
         lines.push("  Run: mihomo-cli restart".to_string());
@@ -8626,11 +9454,8 @@ fn format_fix_result(fixed_controller: bool, hot_reloaded: bool) -> Vec<String> 
         vec!["  Config already has Unix socket — no fix needed.".to_string()]
     };
     if hot_reloaded {
-        lines.extend([
-            "  ✓ Config reload request accepted by Core API".to_string(),
-            "  ⚠ Runtime status: unknown (revision attestation unavailable)".to_string(),
-            "  Run: mihomo-cli restart  to establish runtime readiness".to_string(),
-        ]);
+        // Issue #022 C：重载已接受是事实；controller 变更仍需 restart 的提示保留。
+        lines.push("  ✓ Config reload request accepted by Core API".to_string());
     }
     lines
 }
@@ -9167,20 +9992,16 @@ async fn reload_configs_for_resolved_instance(
     user: bool,
     paths: &utils::AppPaths,
     base_revision: Option<&str>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<RuntimeApplyOutcome> {
     let resolved =
         resolve_current_instance_context(system, user, instance::CommandIntent::ReadOnly)?;
-    let content = std::fs::read_to_string(paths.config_path())?;
-    if let Some(expected_base) = base_revision {
-        let current_revision = tun_transaction::content_revision(content.as_bytes());
-        if current_revision != expected_base {
-            anyhow::bail!(
-                "config.yaml was modified concurrently (expected revision {}, found {})",
-                &expected_base[..expected_base.len().min(12)],
-                &current_revision[..current_revision.len().min(12)],
-            );
-        }
+    // Issue #022 B + review MAJOR-3：基线比对与 reconcile 在同一把锁内完成，
+    // 直接使用锁内返回的内容，不在锁外重读（reconcile 主动改写不再跳过并发检查）。
+    let reconciled = config::reconcile_override_into_intent_checked(paths, base_revision)?;
+    if reconciled.changed {
+        crate::log!("  ⚠ override.yaml 派生键已重新合并进 intent config.yaml");
     }
+    let content = reconciled.content;
     if system_config_requires_promotion(resolved.ctx.mode) {
         let revision = tun_transaction::content_revision(content.as_bytes());
         let subscription_id = config::get_active_id_at(paths)?;
@@ -9193,7 +10014,7 @@ async fn reload_configs_for_resolved_instance(
         })
         .await?
         {
-            ipc::DaemonResponse::Success { .. } => return Ok(()),
+            ipc::DaemonResponse::Success { .. } => return Ok(RuntimeApplyOutcome::SystemPromoted),
             ipc::DaemonResponse::Error { message } => anyhow::bail!(message),
             response => anyhow::bail!("unexpected daemon promotion response: {response:?}"),
         }
@@ -9205,7 +10026,7 @@ async fn reload_configs_for_resolved_instance(
     let config_path = paths.config_path().display().to_string();
     mihomo_api::reload_configs_with_client(&client, &config_path).await?;
     print_selection_replay_after_ready(paths, &client, std::time::Instant::now()).await;
-    Ok(())
+    Ok(RuntimeApplyOutcome::from_mode(resolved.ctx.mode))
 }
 
 /// Capture the current config.yaml revision right before a reload so the
@@ -10665,42 +11486,53 @@ fn format_rule_list(rules: &[String], pos: crate::rules::RulePosition) -> Vec<St
     lines
 }
 
-fn format_rule_apply_result(merged: bool, hot_reloaded: bool, _new_rule: bool) -> Vec<String> {
-    if merged && hot_reloaded {
-        vec![
+fn format_rule_apply_result(merged: bool, apply: RuntimeApplyOutcome) -> Vec<String> {
+    if !merged {
+        return vec![
+            "  ℹ Config pending — rule saved".to_string(),
+            "  Run: mihomo-cli restart  to apply".to_string(),
+        ];
+    }
+    // Issue #022 C：按真实应用结果汇报，不得在规则已生效时声称
+    // "Runtime status: unknown" 并要求 restart。
+    match apply {
+        RuntimeApplyOutcome::SystemPromoted => vec![
             "  ✓ Rule intent committed".to_string(),
-            "  ⚠ Runtime status: unknown (revision attestation unavailable)".to_string(),
-            "  Run: mihomo-cli restart  to establish runtime readiness".to_string(),
-        ]
-    } else if merged {
-        vec![
+            "  ✅ system configuration promoted and runtime applied".to_string(),
+        ],
+        RuntimeApplyOutcome::HotReloadAccepted => vec![
+            "  ✓ Rule intent committed".to_string(),
+            // review 回归-2：user 实例没有 revision attestation，如实报 unknown；
+            // Issue #022 C 要解决的是"误导性 restart 循环"，不是抬高判定结论。
+            "  ℹ Runtime status: unknown (revision attestation unavailable)".to_string(),
+        ],
+        RuntimeApplyOutcome::Pending => vec![
             "  ✓ Rule intent committed".to_string(),
             "  ℹ Runtime status: pending".to_string(),
             "  Run: mihomo-cli restart  to apply".to_string(),
-        ]
-    } else {
-        vec![
-            "  ℹ Config pending — rule saved".to_string(),
-            "  Run: mihomo-cli restart  to apply".to_string(),
-        ]
+        ],
     }
 }
 
-fn format_rule_add_success(rule: &str, merged: bool, hot_reloaded: bool) -> Vec<String> {
+fn format_rule_add_success(rule: &str, merged: bool, apply: RuntimeApplyOutcome) -> Vec<String> {
     let mut lines = vec![format!("  ✓ Rule added: {rule}")];
-    lines.extend(format_rule_apply_result(merged, hot_reloaded, true));
+    lines.extend(format_rule_apply_result(merged, apply));
     lines
 }
 
-fn format_rule_remove_success(index: usize, merged: bool, hot_reloaded: bool) -> Vec<String> {
+fn format_rule_remove_success(
+    index: usize,
+    merged: bool,
+    apply: RuntimeApplyOutcome,
+) -> Vec<String> {
     let mut lines = vec![format!("  ✓ Rule {index} removed")];
-    lines.extend(format_rule_apply_result(merged, hot_reloaded, false));
+    lines.extend(format_rule_apply_result(merged, apply));
     lines
 }
 
-fn format_rule_clear_success(merged: bool, hot_reloaded: bool) -> Vec<String> {
+fn format_rule_clear_success(merged: bool, apply: RuntimeApplyOutcome) -> Vec<String> {
     let mut lines = vec!["  ✓ All rules cleared".to_string()];
-    lines.extend(format_rule_apply_result(merged, hot_reloaded, false));
+    lines.extend(format_rule_apply_result(merged, apply));
     lines
 }
 
@@ -10708,10 +11540,10 @@ fn format_rule_move_success(
     from: usize,
     to: usize,
     merged: bool,
-    hot_reloaded: bool,
+    apply: RuntimeApplyOutcome,
 ) -> Vec<String> {
     let mut lines = vec![format!("  ✓ Rule moved: {from} → {to}")];
-    lines.extend(format_rule_apply_result(merged, hot_reloaded, false));
+    lines.extend(format_rule_apply_result(merged, apply));
     lines
 }
 
@@ -10719,10 +11551,10 @@ fn format_rule_import_success(
     count: usize,
     path: &str,
     merged: bool,
-    hot_reloaded: bool,
+    apply: RuntimeApplyOutcome,
 ) -> Vec<String> {
     let mut lines = vec![format!("  ✓ Imported {count} rules from {path}")];
-    lines.extend(format_rule_apply_result(merged, hot_reloaded, false));
+    lines.extend(format_rule_apply_result(merged, apply));
     lines
 }
 
@@ -11902,15 +12734,8 @@ async fn cmd_rule(system: bool, user: bool, action: RuleAction) -> anyhow::Resul
             let merged =
                 merge_rules_change_checked(&paths, &core_binary, &config_endpoint, rules_snapshot)?;
             drop(_lock);
-            let hot_reloaded = merged
-                && reload_config_for_mutation(
-                    system,
-                    user,
-                    &paths,
-                    config_base_revision(&paths).as_deref(),
-                )
-                .await?;
-            print_lines(format_rule_add_success(&rule, merged, hot_reloaded));
+            let apply = rule_apply_outcome(system, user, &paths, merged).await?;
+            print_lines(format_rule_add_success(&rule, merged, apply));
             Ok(())
         }
         RuleAction::List => {
@@ -11934,15 +12759,8 @@ async fn cmd_rule(system: bool, user: bool, action: RuleAction) -> anyhow::Resul
             let merged =
                 merge_rules_change_checked(&paths, &core_binary, &config_endpoint, rules_snapshot)?;
             drop(_lock);
-            let hot_reloaded = merged
-                && reload_config_for_mutation(
-                    system,
-                    user,
-                    &paths,
-                    config_base_revision(&paths).as_deref(),
-                )
-                .await?;
-            print_lines(format_rule_remove_success(index, merged, hot_reloaded));
+            let apply = rule_apply_outcome(system, user, &paths, merged).await?;
+            print_lines(format_rule_remove_success(index, merged, apply));
             Ok(())
         }
         RuleAction::Clear { yes } => {
@@ -11974,15 +12792,8 @@ async fn cmd_rule(system: bool, user: bool, action: RuleAction) -> anyhow::Resul
             let merged =
                 merge_rules_change_checked(&paths, &core_binary, &config_endpoint, rules_snapshot)?;
             drop(_lock);
-            let hot_reloaded = merged
-                && reload_config_for_mutation(
-                    system,
-                    user,
-                    &paths,
-                    config_base_revision(&paths).as_deref(),
-                )
-                .await?;
-            print_lines(format_rule_clear_success(merged, hot_reloaded));
+            let apply = rule_apply_outcome(system, user, &paths, merged).await?;
+            print_lines(format_rule_clear_success(merged, apply));
             Ok(())
         }
         RuleAction::Move { from, to } => {
@@ -11996,15 +12807,8 @@ async fn cmd_rule(system: bool, user: bool, action: RuleAction) -> anyhow::Resul
             let merged =
                 merge_rules_change_checked(&paths, &core_binary, &config_endpoint, rules_snapshot)?;
             drop(_lock);
-            let hot_reloaded = merged
-                && reload_config_for_mutation(
-                    system,
-                    user,
-                    &paths,
-                    config_base_revision(&paths).as_deref(),
-                )
-                .await?;
-            print_lines(format_rule_move_success(from, to, merged, hot_reloaded));
+            let apply = rule_apply_outcome(system, user, &paths, merged).await?;
+            print_lines(format_rule_move_success(from, to, merged, apply));
             Ok(())
         }
         RuleAction::Import { path } => {
@@ -12017,20 +12821,8 @@ async fn cmd_rule(system: bool, user: bool, action: RuleAction) -> anyhow::Resul
             let merged =
                 merge_rules_change_checked(&paths, &core_binary, &config_endpoint, rules_snapshot)?;
             drop(_lock);
-            let hot_reloaded = merged
-                && reload_config_for_mutation(
-                    system,
-                    user,
-                    &paths,
-                    config_base_revision(&paths).as_deref(),
-                )
-                .await?;
-            print_lines(format_rule_import_success(
-                count,
-                &path,
-                merged,
-                hot_reloaded,
-            ));
+            let apply = rule_apply_outcome(system, user, &paths, merged).await?;
+            print_lines(format_rule_import_success(count, &path, merged, apply));
             Ok(())
         }
         RuleAction::Export { path } => {
@@ -13178,6 +13970,10 @@ async fn cmd_override(system: bool, user: bool, action: OverrideAction) -> anyho
             if !parsed.is_mapping() {
                 anyhow::bail!("override.yaml must be a YAML mapping");
             }
+            // Issue #022 B：被 TUN 事务管辖的键必须显式警告，不得“看起来生效、实际被丢弃”。
+            if let Some(warning) = tun_owned_override_keys_warning(&parsed) {
+                println!("{warning}");
+            }
             apply_override_change(system, user, &paths, Some(content), "updated").await
         }
         OverrideAction::Clear { yes } => {
@@ -13200,6 +13996,72 @@ async fn cmd_override(system: bool, user: bool, action: OverrideAction) -> anyho
             apply_override_change(system, user, &paths, None, "removed").await
         }
     }
+}
+
+/// Issue #022 B：`override.yaml` 中被 TUN 事务管辖的键必须显式告警。
+///
+/// `tun on/off` 按 CLI 参数与参考实现默认重建 `tun` 块，promotion 阶段还会沿用当前
+/// 运行中的 `tun` 块（`prepare_promoted_system_config_content`），因此 override 里的
+/// `tun.*` 在运行快照中可能不生效。这种“看起来生效、实际被丢弃”的情况必须可观察。
+fn tun_owned_override_keys_warning(override_yaml: &serde_yaml::Value) -> Option<String> {
+    // 只告警**控制键**（会被拒绝的那些）；mtu/device/route-exclude-address 等
+    // 非控制键照常生效，不得误报（review 回归-3）。
+    let tun = override_yaml.get("tun")?.as_mapping()?;
+    let owned: Vec<&str> = config::TUN_TRANSACTION_CONTROLLED_KEYS
+        .iter()
+        .copied()
+        .filter(|key| tun.contains_key(*key))
+        .collect();
+    if owned.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "  ⚠ override 中的 tun.{} 由 TUN 事务管辖：合并时会被**拒绝**（不会写入 intent/启动配置），\
+         TUN 由 `tun on/off` 的 candidate/snapshot 事务独占管辖（Issue #022 §4.7）；\
+         如需修改请用 `mihomo-cli tun on --stack <stack> --dns-hijack <targets>`；\
+         mtu / device / route-exclude-address 等非控制键不受影响：会写入 intent；TUN 已开启时，\
+         运行中的 TUN 快照在下次 `mihomo-cli tun on --yes` 重建候选后才采纳它们",
+        owned.join("、tun.")
+    ))
+}
+
+/// 把 daemon 回传的 mirror 缺失信号翻译成面向用户的结论。
+///
+/// - 用户树**没有**持久化选点 → 整行删除（没有东西可回放，不是故障，也绝不能给
+///   “运行选点命令重建”的误导提示）；
+/// - 用户树**有**持久化选点却丢了 mirror → 明确要求重建（此时执行一次选点命令确实能重建）；
+/// - 无法确定 active 订阅 → 只陈述事实，不给动作。
+///
+/// review MAJOR-5：这个判断必须在 CLI（用户权限）完成，daemon 按 SPEC 不读用户 home。
+fn translate_selection_replay_signal(message: &str, paths: &utils::AppPaths) -> String {
+    if !message.contains("[selection-mirror-missing]") {
+        return message.to_string();
+    }
+    // `Err` / `None`（没有 active 订阅）都归入“无法确定”，只陈述事实、不给动作。
+    let active = config::get_active_id_at(paths).ok().flatten();
+    let persisted = active
+        .as_ref()
+        .map(|id| paths.selection_state_path_for_subscription(id).exists())
+        .unwrap_or(false);
+    message
+        .lines()
+        .filter_map(|line| {
+            if !line.contains("[selection-mirror-missing]") {
+                return Some(line.to_string());
+            }
+            match (&active, persisted) {
+                (Some(_), true) => Some(
+                    "⚠ Selections not replayed: selection mirror unavailable; run any selection command to rebuild it"
+                        .to_string(),
+                ),
+                (Some(_), false) => None,
+                (None, _) => Some(
+                    "⚠ Selections not replayed: selection mirror unavailable".to_string(),
+                ),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn override_action_intent(action: &OverrideAction) -> instance::CommandIntent {

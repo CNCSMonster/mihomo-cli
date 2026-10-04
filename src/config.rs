@@ -948,16 +948,17 @@ tun:
   stack: system
   auto-route: true
   auto-detect-interface: true
+  strict-route: true
   dns-hijack:
     - any:53
+    - tcp://any:53
 dns:
   enable: true
   listen: 127.0.0.1:1053
   default-nameserver:
-    - 198.51.100.53
     - 223.5.5.5
   enhanced-mode: fake-ip
-  fake-ip-range: 28.0.0.1/8
+  fake-ip-range: 198.18.0.1/16
   fake-ip-filter:
     - '+.lan'
     - '+.local'
@@ -1440,6 +1441,9 @@ pub fn generate_config_yaml_with_fake_ip_filters_for_endpoint(
         .as_mapping_mut()
         .ok_or_else(|| anyhow::anyhow!("Subscription is not a valid YAML mapping"))?;
 
+    // 0. 收敛旧版模板遗留的 DNS 默认值（Issue #022 A3/A4），只动我们自己写过的取值。
+    normalize_dns_legacy_defaults(config_map);
+
     // 1. Merge rules
     let sub_rules = config_map
         .get("rules")
@@ -1607,6 +1611,35 @@ fn deep_merge_yaml(base: &mut serde_yaml::Value, override_value: serde_yaml::Val
     }
 }
 
+/// 结构等价判断：映射按**键集合**比较（忽略键序），序列按顺序逐项比较。
+///
+/// 用于判断“override 派生键是否缺失”，避免因序列化键序变化误写用户配置。
+fn yaml_structurally_equal(a: &serde_yaml::Value, b: &serde_yaml::Value) -> bool {
+    use serde_yaml::Value;
+    match (a, b) {
+        (Value::Mapping(left), Value::Mapping(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, value)| {
+                    right
+                        .get(key)
+                        .is_some_and(|other| yaml_structurally_equal(value, other))
+                })
+        }
+        (Value::Sequence(left), Value::Sequence(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(l, r)| yaml_structurally_equal(l, r))
+        }
+        (Value::Mapping(_), _) | (_, Value::Mapping(_)) => {
+            // 一侧是映射另一侧不是 → 不等；但 Null vs 空映射等退化情形交给 `==`。
+            a == b
+        }
+        _ => a == b,
+    }
+}
+
 #[allow(dead_code)]
 fn apply_override_at(paths: &AppPaths, config: &mut serde_yaml::Value) -> anyhow::Result<()> {
     apply_override_at_endpoint(paths, config, &current_api_endpoint())
@@ -1622,13 +1655,15 @@ fn apply_override_at_endpoint(
         let override_content = std::fs::read_to_string(&override_path).with_context(|| {
             format!("Failed to read override.yaml: {}", override_path.display())
         })?;
-        let override_yaml: serde_yaml::Value = serde_yaml::from_str(&override_content)
+        let mut override_yaml: serde_yaml::Value = serde_yaml::from_str(&override_content)
             .with_context(|| {
                 format!("Failed to parse override.yaml: {}", override_path.display())
             })?;
-        if !override_yaml.is_mapping() {
-            anyhow::bail!("override.yaml must be a YAML mapping");
-        }
+        let override_map = override_yaml
+            .as_mapping_mut()
+            .ok_or_else(|| anyhow::anyhow!("override.yaml must be a YAML mapping"))?;
+        // Issue #022 §4.7：TUN 管辖字段与受管 runtime 端点不得静默从 override 透入配置。
+        warn_rejected_transaction_owned_override_keys(override_map);
         deep_merge_yaml(config, override_yaml);
     }
 
@@ -1637,6 +1672,85 @@ fn apply_override_at_endpoint(
         .ok_or_else(|| anyhow::anyhow!("Merged config is not a YAML mapping after override"))?;
     inject_runtime_controller_for_endpoint(config_map, endpoint);
     Ok(())
+}
+
+/// 有界、不跟随 symlink 的配置读取（对齐 Issue #024 的加固读法，review MINOR-e）。
+fn read_config_text_bounded(path: &std::path::Path) -> anyhow::Result<String> {
+    let bytes = crate::utils::read_file_no_follow_limited(
+        path,
+        crate::tun_transaction::MAX_TRANSACTION_ARTIFACT_BYTES,
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", path.display()))?;
+    String::from_utf8(bytes)
+        .map_err(|e| anyhow::anyhow!("{} is not valid UTF-8: {e}", path.display()))
+}
+
+/// Issue #022 §4.7：TUN **控制键**（由 `tun on/off` 事务写入或归一化的字段）。
+///
+/// 只有这些键从 override 中剔除；`mtu` / `device` / `route-exclude-address` 等
+/// 非控制键仍按 ADR-22 作为 override 的权威取值进入 intent（review 回归-3：
+/// 整块拒绝会让这些键彻底失去入口，`route-exclude-address` 更是 #023 的推荐手段）。
+pub(crate) const TUN_TRANSACTION_CONTROLLED_KEYS: &[&str] = &[
+    "enable",
+    "stack",
+    "dns-hijack",
+    "strict-route",
+    "auto-route",
+    "auto-detect-interface",
+];
+
+/// 从 override 中**剔除**事务/受管端点独占的键，返回被剔除的键名。
+///
+/// - `tun` 中的控制键（见 [`TUN_TRANSACTION_CONTROLLED_KEYS`]）：归 TUN 事务管辖，
+///   override 若能静默改变 `tun.enable`，会绕过事务把意图翻回去（review MAJOR-1）；
+///   非控制键原样保留（review 回归-3）；
+/// - `external-controller*` / `external-ui*`：由 `inject_runtime_controller_for_endpoint`
+///   独占，override 写入会把 API 端点改到任意地址（review BLOCK-1、MINOR-a）。
+fn reject_transaction_owned_override_keys(override_map: &mut serde_yaml::Mapping) -> Vec<String> {
+    let mut rejected = Vec::new();
+    if let Some(serde_yaml::Value::Mapping(tun)) =
+        override_map.get_mut(serde_yaml::Value::String("tun".to_string()))
+    {
+        for key in TUN_TRANSACTION_CONTROLLED_KEYS {
+            if tun
+                .remove(serde_yaml::Value::String((*key).to_string()))
+                .is_some()
+            {
+                rejected.push(format!("tun.{key}"));
+            }
+        }
+        if tun.is_empty() {
+            override_map.remove(serde_yaml::Value::String("tun".to_string()));
+        }
+    }
+    for key in [
+        "external-controller",
+        "external-controller-unix",
+        "external-controller-pipe",
+        "external-controller-tls",
+        "external-ui",
+        "external-ui-url",
+        "external-ui-name",
+    ] {
+        if override_map
+            .remove(serde_yaml::Value::String(key.to_string()))
+            .is_some()
+        {
+            rejected.push(key.to_string());
+        }
+    }
+    rejected
+}
+
+/// 生成路径专用：剔除并输出可观测告警（§4.6：不采用用户可见配置必须可观察）。
+fn warn_rejected_transaction_owned_override_keys(override_map: &mut serde_yaml::Mapping) {
+    let rejected = reject_transaction_owned_override_keys(override_map);
+    if !rejected.is_empty() {
+        crate::log!(
+            "  ⚠ override 中的 {} 由 TUN 事务/受管端点管辖，合并时拒绝（Issue #022 §4.7）；TUN 请用 tun on/off 调整",
+            rejected.join(", ")
+        );
+    }
 }
 
 #[allow(dead_code)]
@@ -1653,6 +1767,102 @@ fn apply_override_to_config_text_at_endpoint(
         .map_err(|e| anyhow::anyhow!("Generated config is invalid YAML before override: {}", e))?;
     apply_override_at_endpoint(paths, &mut config, endpoint)?;
     Ok(serde_yaml::to_string(&config)?)
+}
+
+/// reconcile 的锁内返回值（review MAJOR-3）。
+///
+/// 调用方必须使用这里返回的 `content` / `revision`，**不得在锁外重读 intent 文件**，
+/// 否则“基线比对 → 合并 → 写回”之间的并发写入仍会漏检。
+pub(crate) struct ReconciledIntent {
+    pub(crate) changed: bool,
+    pub(crate) content: String,
+    pub(crate) revision: String,
+}
+
+/// Issue #022 B：把 `override.yaml` **幂等地**合并回 intent `config.yaml`（锁内版本）。
+///
+/// `override import` 本身会合并，但配置的其它写入路径可能产出不含 override 派生键的
+/// intent；随后 `restart` 会把这个残缺的 intent 当作启动 payload，静默丢掉用户的 override。
+/// 这里在“以 intent 为源的启动/应用入口”先做一次收敛，保证 override 参与合并（ADR-22）。
+///
+/// - 语义等价时（override 已合并）什么都不写，不改变文件字节 → 不干扰基线 revision；
+/// - **不合并** TUN 控制键与受管 runtime 端点键（§4.7 / review BLOCK-1、MAJOR-1、回归-3）；
+/// - 基线比对与合并写回都在 `ConfigLock` 内完成（review MAJOR-3）；
+/// - 复用生成流程的悬空规则兜底，保证与生成路径幂等（review MAJOR-2）。
+pub(crate) fn reconcile_override_into_intent_checked(
+    paths: &AppPaths,
+    base_revision: Option<&str>,
+) -> anyhow::Result<ReconciledIntent> {
+    let config_path = paths.config_path();
+    if !config_path.exists() {
+        anyhow::bail!("intent config {} does not exist", config_path.display());
+    }
+    // 线程内可重入的配置锁：与 `tun on` 的 intent 提交互斥，
+    // 避免“读完 intent → 并发提交 → 用旧内容覆盖写回”丢掉 TUN 意图（review MAJOR-3）。
+    let _lock = crate::lock::ConfigLock::acquire(paths.config_dir())?;
+    let current = read_config_text_bounded(&config_path)?;
+
+    // 基线比对必须在**合并之前**、且在锁内完成：reconcile 主动改写 intent 不能成为
+    // 跳过并发检查的理由（原实现 `if !reconciled` 会整体跳过，见 review MAJOR-3）。
+    if let Some(expected_base) = base_revision {
+        let pre_revision = crate::tun_transaction::content_revision(current.as_bytes());
+        if pre_revision != expected_base {
+            anyhow::bail!(
+                "config.yaml was modified concurrently (expected revision {}, found {})",
+                &expected_base[..expected_base.len().min(12)],
+                &pre_revision[..pre_revision.len().min(12)],
+            );
+        }
+    }
+
+    if !paths.override_path().exists() {
+        return Ok(ReconciledIntent {
+            changed: false,
+            revision: crate::tun_transaction::content_revision(current.as_bytes()),
+            content: current,
+        });
+    }
+    let override_content = read_config_text_bounded(&paths.override_path())?;
+    let mut override_value: serde_yaml::Value = serde_yaml::from_str(&override_content)
+        .map_err(|e| anyhow::anyhow!("override.yaml is not valid YAML: {e}"))?;
+    let override_map = override_value
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("override.yaml must be a YAML mapping"))?;
+    // BLOCK-1：runtime 端点字段与 TUN 控制键必须在合并前剥离；
+    // 生成流程靠 `inject_runtime_controller_for_endpoint` 收尾，reconcile 不做端点注入，
+    // 不剥离就会把 override 里的 external-controller/external-ui 写进 intent（可开放 0.0.0.0 API）。
+    // 这里**静默**剔除（MINOR-c）：用户已在 `override import` 与生成路径收到过告警，
+    // 每次 reload/restart 重复打印会淹没正常输出。
+    let _rejected = reject_transaction_owned_override_keys(override_map);
+    let current_value: serde_yaml::Value = serde_yaml::from_str(&current)
+        .map_err(|e| anyhow::anyhow!("config.yaml is not valid YAML: {e}"))?;
+    let mut merged = current_value.clone();
+    deep_merge_yaml(&mut merged, override_value);
+    // 与生成流程同序（override → 悬空规则兜底），否则 override 中指向已删除组的旧规则
+    // 会把已兜底成 DIRECT 的取值改回去，reload 时配置校验失败且每次都不收敛（review MAJOR-2）。
+    // MINOR-b：override 可能残留旧 DNS 默认值（28.0.0.1/8、198.51.100.53），
+    // 与 `tun on` 的归一化来回拉锯；在同一条合并路径里收敛到同一取值，双方即刻收敛。
+    if let Some(root) = merged.as_mapping_mut() {
+        normalize_dns_legacy_defaults(root);
+    }
+    let merged_text = serde_yaml::to_string(&merged)?;
+    let merged_text = apply_dangling_rule_fallback_to_config_text(&merged_text)?;
+    let merged_value: serde_yaml::Value = serde_yaml::from_str(&merged_text)
+        .map_err(|e| anyhow::anyhow!("merged config is not valid YAML: {e}"))?;
+    // 忽略映射键序比较：键序变化不代表 override 派生键缺失。
+    if yaml_structurally_equal(&current_value, &merged_value) {
+        return Ok(ReconciledIntent {
+            changed: false,
+            revision: crate::tun_transaction::content_revision(current.as_bytes()),
+            content: current,
+        });
+    }
+    utils::atomic_write_file_for_original_user(&config_path.display().to_string(), &merged_text)?;
+    Ok(ReconciledIntent {
+        changed: true,
+        revision: crate::tun_transaction::content_revision(merged_text.as_bytes()),
+        content: merged_text,
+    })
 }
 
 /// Rewrite rules whose target policy is absent from the merged config (groups + proxies +
@@ -1778,13 +1988,179 @@ fn carry_over_tun_block_from_previous_config(
     };
     if map
         .get(serde_yaml::Value::String("tun".to_string()))
-        .is_some()
+        .is_none()
     {
-        return Ok(new_content.to_string());
+        map.insert(
+            serde_yaml::Value::String("tun".to_string()),
+            tun_block.clone(),
+        );
+        return Ok(serde_yaml::to_string(&config)?);
     }
-    let tun_block = tun_block.clone();
-    map.insert(serde_yaml::Value::String("tun".to_string()), tun_block);
+    // Issue #022 B：新配置里已经有一个 `tun` 块（订阅/模板自带 `enable: false`，
+    // 或 override 的非控制键）时，不能直接跳过——否则上一次 `tun on` 写下的
+    // 完整 TUN 意图（enable/stack/dns-hijack…）会被这个块静默顶掉，`tun.enable` 直接消失。
+    //
+    // 按**键分类**的优先级（review MAJOR-4 + 回归-3）：
+    //   - 控制键（TUN_TRANSACTION_CONTROLLED_KEYS）：历史 TUN 意图优先（归 `tun on/off` 事务），
+    //     因此模板的 `enable: false` 翻不掉 `tun on` 的 true；
+    //   - 非控制键（mtu / device / route-exclude-address…）：新块优先——override 是 ADR-22
+    //     最后合并的用户层，这些键必须能通过 override 更新；新块没有时才由历史意图补齐。
+    let new_tun = map
+        .get(serde_yaml::Value::String("tun".to_string()))
+        .cloned()
+        .unwrap_or(serde_yaml::Value::Null);
+    let mut merged_tun = new_tun.clone();
+    if let (serde_yaml::Value::Mapping(previous_tun), serde_yaml::Value::Mapping(merged_map)) =
+        (&tun_block, &mut merged_tun)
+    {
+        for (key, value) in previous_tun {
+            let key_str = key.as_str().unwrap_or_default();
+            let controlled = TUN_TRANSACTION_CONTROLLED_KEYS.contains(&key_str);
+            let present_in_new = new_tun
+                .as_mapping()
+                .is_some_and(|map| map.contains_key(key));
+            if controlled || !present_in_new {
+                merged_map.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    map.insert(serde_yaml::Value::String("tun".to_string()), merged_tun);
     Ok(serde_yaml::to_string(&config)?)
+}
+
+/// 参考实现（mihomo 官方 wiki `config/inbound/tun` 与 Clash Verge Rev 默认配置）
+/// 为 TUN 声明的 DNS 劫持目标。
+///
+/// Issue #022：只劫持 UDP 53 无法覆盖走 TCP 的 DNS 查询，对齐参考实现需要
+/// 同时包含 `any:53` 与 `tcp://any:53`。
+pub(crate) const DEFAULT_DNS_HIJACK_SPEC: &str = "any:53,tcp://any:53";
+
+/// 旧版 CLI 写入的单项默认值；升级时需收敛到 [`DEFAULT_DNS_HIJACK_SPEC`]。
+const LEGACY_DNS_HIJACK_ENTRIES: &[&str] = &["any:53", "0.0.0.0:53"];
+
+/// `--dns-hijack` 接受逗号分隔的多个目标，返回去空白后的条目列表。
+pub(crate) fn dns_hijack_entries(spec: &str) -> Vec<String> {
+    spec.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// 参考实现的默认 DNS 劫持条目。
+pub(crate) fn default_dns_hijack_entries() -> Vec<String> {
+    dns_hijack_entries(DEFAULT_DNS_HIJACK_SPEC)
+}
+
+fn dns_hijack_entries_of(value: &serde_yaml::Value) -> Vec<String> {
+    match value {
+        serde_yaml::Value::String(s) => dns_hijack_entries(s),
+        serde_yaml::Value::Sequence(seq) => seq
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn dns_hijack_needs_alignment(value: Option<&serde_yaml::Value>) -> bool {
+    match value {
+        None => true,
+        Some(value) => {
+            let entries = dns_hijack_entries_of(value);
+            entries.is_empty()
+                || (entries.len() == 1 && LEGACY_DNS_HIJACK_ENTRIES.contains(&entries[0].as_str()))
+        }
+    }
+}
+
+fn yaml_string_sequence(entries: Vec<String>) -> serde_yaml::Value {
+    serde_yaml::Value::Sequence(entries.into_iter().map(serde_yaml::Value::String).collect())
+}
+
+/// `tun on` 归一化 TUN 块，使其与参考实现一致（Issue #022 对齐清单）：
+///
+/// - `dns-hijack`：显式 `--dns-hijack` 优先；未指定时，仅当现有值缺失、为空，或仍是
+///   旧版单项默认（`any:53` / `0.0.0.0:53`）才收敛为 [`DEFAULT_DNS_HIJACK_SPEC`]，
+///   用户自定义目标一律保留；
+/// - `strict-route`：仅在缺失时补 `true`（参考实现用它强制所有连接进入 TUN、防止 DNS
+///   泄漏），用户显式写下的 `false` 不被覆盖。
+///
+/// 两个字段都写进 intent `tun` 块，因此仍由既有 candidate/revision 事务、snapshot
+/// promotion 与 `launched == active == intent` attestation 覆盖，不引入第二个配置来源。
+pub(crate) fn normalize_tun_block_for_enable(
+    tun: &mut serde_yaml::Mapping,
+    dns_hijack: Option<&str>,
+) {
+    if let Some(spec) = dns_hijack {
+        tun.insert(
+            serde_yaml::Value::String("dns-hijack".to_string()),
+            yaml_string_sequence(dns_hijack_entries(spec)),
+        );
+    } else if dns_hijack_needs_alignment(tun.get("dns-hijack")) {
+        tun.insert(
+            serde_yaml::Value::String("dns-hijack".to_string()),
+            yaml_string_sequence(default_dns_hijack_entries()),
+        );
+    }
+
+    if !tun.contains_key("strict-route") {
+        tun.insert(
+            serde_yaml::Value::String("strict-route".to_string()),
+            serde_yaml::Value::Bool(true),
+        );
+    }
+}
+
+/// Issue #022（A3/A4）：收敛旧版模板遗留的 DNS 默认值，使其与参考实现一致。
+///
+/// - `dns.fake-ip-range` 曾默认 `28.0.0.1/8`（真实公网地址段，且 TUN 接口地址由该段派生），
+///   收敛为参考实现的 `198.18.0.1/16`；
+/// - `dns.default-nameserver` 曾写入 `198.51.100.53`（文档保留段 TEST-NET-2，无可用主机），
+///   直接剔除；剔除后为空则补参考实现的 `223.5.5.5`。
+///
+/// **只在取值完全等于我们自己写过的旧默认值时才改写**，订阅方/用户自定义取值原样保留；
+/// 没有 `dns` 块时直接返回（旧的 direct-only 基础配置就是这种）。
+///
+/// 两个调用点：`config` 生成漏斗（`generate_config_yaml_with_fake_ip_filters_for_endpoint`）
+/// 与 `tun on`（`build_tun_candidate`），后者让存量安装不必额外跑一次 `config -u`。
+pub(crate) fn normalize_dns_legacy_defaults(config: &mut serde_yaml::Mapping) {
+    const LEGACY_FAKE_IP_RANGE: &str = "28.0.0.1/8";
+    const REFERENCE_FAKE_IP_RANGE: &str = "198.18.0.1/16";
+    const LEGACY_TEST_NET_NAMESERVER: &str = "198.51.100.53";
+    const REFERENCE_FALLBACK_NAMESERVER: &str = "223.5.5.5";
+
+    let Some(dns) = config.get_mut("dns").and_then(|v| v.as_mapping_mut()) else {
+        return;
+    };
+
+    if dns
+        .get("fake-ip-range")
+        .is_some_and(|v| v.as_str() == Some(LEGACY_FAKE_IP_RANGE))
+    {
+        dns.insert(
+            serde_yaml::Value::String("fake-ip-range".to_string()),
+            serde_yaml::Value::String(REFERENCE_FAKE_IP_RANGE.to_string()),
+        );
+    }
+
+    let needs_fallback_nameserver =
+        if let Some(serde_yaml::Value::Sequence(list)) = dns.get_mut("default-nameserver") {
+            let before = list.len();
+            list.retain(|v| v.as_str() != Some(LEGACY_TEST_NET_NAMESERVER));
+            list.len() != before && list.is_empty()
+        } else {
+            false
+        };
+    if needs_fallback_nameserver {
+        dns.insert(
+            serde_yaml::Value::String("default-nameserver".to_string()),
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::String(
+                REFERENCE_FALLBACK_NAMESERVER.to_string(),
+            )]),
+        );
+    }
 }
 
 /// Replace the last significant comma-separated token in a rule string with `new_policy`.
@@ -3804,6 +4180,170 @@ stack: mixed
         );
     }
 
+    /// Issue #022 对齐清单：`config` 转换产出的 TUN/DNS 默认段必须与参考实现
+    /// （mihomo 官方 wiki / Clash Verge Rev 默认配置）一致，且不得默认开启 sniffer 兜底。
+    #[test]
+    fn generated_template_aligns_with_reference_tun_and_dns_defaults() {
+        // `vmess://` 原始订阅经 `convert_vmess_to_clash` 生成含 tun/dns 段的完整配置。
+        let vmess = "vmess://eyJwcyI6Im4xIiwiYWRkIjoiYS5leGFtcGxlLmNvbSIsInBvcnQiOiI0NDMiLCJpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMCIsImFpZCI6IjAiLCJuZXQiOiJ0Y3AiLCJ0bHMiOiIifQ==";
+        let output = super::convert_vmess_to_clash(vmess).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&output).unwrap();
+
+        let hijack: Vec<String> = config["tun"]["dns-hijack"]
+            .as_sequence()
+            .expect("tun.dns-hijack must be a sequence")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert_eq!(hijack, vec!["any:53", "tcp://any:53"]);
+        assert_eq!(config["tun"]["strict-route"].as_bool(), Some(true));
+        assert_eq!(config["tun"]["auto-route"].as_bool(), Some(true));
+
+        assert_eq!(config["dns"]["enhanced-mode"].as_str(), Some("fake-ip"));
+        assert_eq!(
+            config["dns"]["fake-ip-range"].as_str(),
+            Some("198.18.0.1/16")
+        );
+        let nameservers: Vec<&str> = config["dns"]["default-nameserver"]
+            .as_sequence()
+            .expect("dns.default-nameserver must be a sequence")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        // 198.51.100.0/24 是文档保留段（TEST-NET-2），不是可用解析器。
+        assert!(!nameservers.contains(&"198.51.100.53"));
+
+        // sniffer 保持参考实现的默认（关闭），不得作为兜底默认开启。
+        assert!(config.get("sniffer").is_none());
+    }
+
+    #[test]
+    fn dns_hijack_entries_parse_comma_separated_targets() {
+        assert_eq!(
+            super::dns_hijack_entries("any:53,tcp://any:53"),
+            vec!["any:53", "tcp://any:53"]
+        );
+        assert_eq!(super::dns_hijack_entries(" any:53 "), vec!["any:53"]);
+        assert!(super::dns_hijack_entries(" , ").is_empty());
+    }
+
+    #[test]
+    fn normalize_tun_block_aligns_legacy_dns_hijack_and_defaults_strict_route() {
+        let mut tun: serde_yaml::Mapping =
+            serde_yaml::from_str("enable: true\nstack: system\ndns-hijack:\n  - any:53\n").unwrap();
+        super::normalize_tun_block_for_enable(&mut tun, None);
+
+        assert_eq!(
+            tun.get("dns-hijack"),
+            Some(&serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("any:53".to_string()),
+                serde_yaml::Value::String("tcp://any:53".to_string()),
+            ]))
+        );
+        assert_eq!(
+            tun.get("strict-route"),
+            Some(&serde_yaml::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn normalize_tun_block_preserves_custom_dns_hijack_and_explicit_strict_route() {
+        let mut tun: serde_yaml::Mapping = serde_yaml::from_str(
+            "enable: true\ndns-hijack:\n  - 10.0.0.1:53\n  - tcp://any:53\nstrict-route: false\n",
+        )
+        .unwrap();
+        super::normalize_tun_block_for_enable(&mut tun, None);
+
+        assert_eq!(
+            tun.get("dns-hijack"),
+            Some(&serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("10.0.0.1:53".to_string()),
+                serde_yaml::Value::String("tcp://any:53".to_string()),
+            ]))
+        );
+        assert_eq!(
+            tun.get("strict-route"),
+            Some(&serde_yaml::Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn normalize_tun_block_honors_explicit_dns_hijack_flag() {
+        let mut tun: serde_yaml::Mapping =
+            serde_yaml::from_str("enable: true\ndns-hijack:\n  - any:53\n").unwrap();
+        super::normalize_tun_block_for_enable(&mut tun, Some("custom:53,tcp://any:53"));
+
+        assert_eq!(
+            tun.get("dns-hijack"),
+            Some(&serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("custom:53".to_string()),
+                serde_yaml::Value::String("tcp://any:53".to_string()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn normalize_dns_legacy_defaults_only_rewrites_our_stale_values() {
+        // 旧版模板产出：两个字段都收敛到参考实现值
+        let mut config: serde_yaml::Mapping = serde_yaml::from_str(
+            "dns:\n  fake-ip-range: 28.0.0.1/8\n  default-nameserver:\n    - 198.51.100.53\n    - 223.5.5.5\n",
+        )
+        .unwrap();
+        super::normalize_dns_legacy_defaults(&mut config);
+        let dns = config.get("dns").unwrap().as_mapping().unwrap();
+        assert_eq!(
+            dns.get("fake-ip-range"),
+            Some(&serde_yaml::Value::String("198.18.0.1/16".to_string()))
+        );
+        assert_eq!(
+            dns.get("default-nameserver"),
+            Some(&serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("223.5.5.5".to_string())
+            ]))
+        );
+
+        // 订阅方/用户自定义取值原样保留
+        let mut custom: serde_yaml::Mapping = serde_yaml::from_str(
+            "dns:\n  fake-ip-range: 10.0.0.0/16\n  default-nameserver:\n    - 1.1.1.1\n",
+        )
+        .unwrap();
+        super::normalize_dns_legacy_defaults(&mut custom);
+        assert_eq!(
+            custom
+                .get("dns")
+                .unwrap()
+                .as_mapping()
+                .unwrap()
+                .get("fake-ip-range"),
+            Some(&serde_yaml::Value::String("10.0.0.0/16".to_string()))
+        );
+
+        // 只剩 TEST-NET 名称服务器时补参考实现的兜底值
+        let mut only_test_net: serde_yaml::Mapping =
+            serde_yaml::from_str("dns:\n  default-nameserver:\n    - 198.51.100.53\n").unwrap();
+        super::normalize_dns_legacy_defaults(&mut only_test_net);
+        assert_eq!(
+            only_test_net
+                .get("dns")
+                .unwrap()
+                .as_mapping()
+                .unwrap()
+                .get("default-nameserver"),
+            Some(&serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("223.5.5.5".to_string())
+            ]))
+        );
+
+        // 没有 dns 块（direct-only 基础配置）时直接返回
+        let mut no_dns: serde_yaml::Mapping =
+            serde_yaml::from_str("mixed-port: 7890\ntun:\n  enable: false\n").unwrap();
+        super::normalize_dns_legacy_defaults(&mut no_dns);
+        assert_eq!(
+            no_dns.get("mixed-port"),
+            Some(&serde_yaml::Value::Number(serde_yaml::Number::from(7890)))
+        );
+    }
+
     #[test]
     fn rule_targeting_proxy_provider_is_not_downgraded() {
         let tmp = TempDir::new().unwrap();
@@ -4369,5 +4909,372 @@ rules:
             let active_meta = std::fs::metadata(&active_path).unwrap();
             assert_eq!(active_meta.mode() & 0o777, 0o640);
         }
+    }
+}
+
+#[cfg(test)]
+mod tun_carry_over_tests {
+    use super::carry_over_tun_block_from_previous_config;
+    use serde_yaml::Value;
+
+    fn parse(yaml: &str) -> Value {
+        serde_yaml::from_str(yaml).expect("valid YAML")
+    }
+
+    fn seq(items: &[&str]) -> Value {
+        Value::Sequence(
+            items
+                .iter()
+                .map(|item| Value::String((*item).to_string()))
+                .collect(),
+        )
+    }
+
+    /// Issue #022 B：override 只定义 `tun.dns-hijack` 时，绝不能把上一次 `tun on`
+    /// 写下的完整 TUN 意图整块顶掉（`tun.enable` 必须存活）。
+    #[test]
+    fn partial_tun_block_must_not_drop_previous_tun_intent() {
+        let previous = "\
+tun:
+  enable: true
+  stack: gvisor
+  auto-route: true
+  strict-route: true
+  device-name: Meta
+  dns-hijack:
+  - any:53
+";
+        let new = "\
+rules:
+- MATCH,Proxy
+tun:
+  dns-hijack:
+  - 10.0.0.1:53
+";
+        let out =
+            carry_over_tun_block_from_previous_config(Some(previous), new).expect("carry over");
+        let tun = &parse(&out)["tun"];
+        assert_eq!(tun["enable"], Value::Bool(true), "tun.enable must survive");
+        assert_eq!(tun["stack"], Value::String("gvisor".to_string()));
+        assert_eq!(tun["auto-route"], Value::Bool(true));
+        assert_eq!(tun["strict-route"], Value::Bool(true));
+        assert_eq!(tun["device-name"], Value::String("Meta".to_string()));
+        assert_eq!(
+            tun["dns-hijack"],
+            seq(&["any:53"]),
+            "历史 TUN 意图优先于模板/订阅带来的新块（review MAJOR-4）"
+        );
+    }
+
+    /// review MAJOR-4：订阅/模板自带的 `enable: false`（vmess 模板默认值）绝不能
+    /// 把上一次 `tun on` 写下的意图翻回去；新块里历史意图没有的键仍要保留。
+    #[test]
+    fn carry_over_historical_intent_wins_over_template_defaults() {
+        let previous = "tun:\n  enable: true\n  stack: gvisor\n  auto-route: true\n";
+        let new = "tun:\n  enable: false\n  stack: system\n  strict-route: true\n";
+        let out =
+            carry_over_tun_block_from_previous_config(Some(previous), new).expect("carry over");
+        let tun = &parse(&out)["tun"];
+        assert_eq!(
+            tun["enable"],
+            Value::Bool(true),
+            "模板的 enable:false 不得胜出"
+        );
+        assert_eq!(tun["stack"], Value::String("gvisor".to_string()));
+        assert_eq!(tun["auto-route"], Value::Bool(true));
+        assert_eq!(
+            tun["strict-route"],
+            Value::Bool(true),
+            "历史意图没有的新键必须保留"
+        );
+    }
+
+    #[test]
+    fn carry_over_applies_when_new_config_has_no_tun_block() {
+        let previous = "tun:\n  enable: true\n  stack: system\n";
+        let new = "rules:\n- MATCH,Proxy\n";
+        let out =
+            carry_over_tun_block_from_previous_config(Some(previous), new).expect("carry over");
+        let tun = &parse(&out)["tun"];
+        assert_eq!(tun["enable"], Value::Bool(true));
+        assert_eq!(tun["stack"], Value::String("system".to_string()));
+    }
+
+    /// review 回归-3：非控制键（mtu 等）必须允许 override/新块更新，
+    /// 否则这些键一旦写入历史意图就再也改不动。
+    #[test]
+    fn carry_over_lets_non_controlled_tun_keys_be_updated() {
+        let previous = "tun:\n  mtu: 1400\n  device-name: Meta\n  enable: true\n";
+        let new = "tun:\n  mtu: 9000\n  enable: false\n";
+        let out =
+            carry_over_tun_block_from_previous_config(Some(previous), new).expect("carry over");
+        let tun = &parse(&out)["tun"];
+        assert_eq!(
+            tun["mtu"],
+            Value::Number(serde_yaml::Number::from(9000_i64)),
+            "非控制键以新块为准"
+        );
+        assert_eq!(
+            tun["device-name"],
+            Value::String("Meta".to_string()),
+            "新块没有的历史键必须保留"
+        );
+        assert_eq!(
+            tun["enable"],
+            Value::Bool(true),
+            "控制键以历史 TUN 意图为准"
+        );
+    }
+
+    #[test]
+    fn carry_over_is_noop_without_previous_tun_intent() {
+        let new = "tun:\n  enable: false\n";
+        let out = carry_over_tun_block_from_previous_config(None, new).expect("carry over");
+        assert_eq!(parse(&out)["tun"]["enable"], Value::Bool(false));
+    }
+
+    #[test]
+    fn carry_over_keeps_new_config_untouched_without_previous_tun() {
+        let previous = "mode: rule\n";
+        let new = "rules:\n- MATCH,Proxy\n";
+        let out =
+            carry_over_tun_block_from_previous_config(Some(previous), new).expect("carry over");
+        let parsed = parse(&out);
+        assert!(parsed.get("tun").is_none(), "no tun intent to carry over");
+        assert_eq!(parsed["rules"], parse("rules:\n- MATCH,Proxy\n")["rules"]);
+    }
+}
+
+#[cfg(test)]
+mod yaml_structural_equality_tests {
+    use super::yaml_structurally_equal;
+
+    fn parse(yaml: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(yaml).expect("valid YAML")
+    }
+
+    #[test]
+    fn mapping_key_order_does_not_break_equality() {
+        let left = parse("a: 1\nb: 2\n");
+        let right = parse("b: 2\na: 1\n");
+        assert!(yaml_structurally_equal(&left, &right));
+    }
+
+    #[test]
+    fn sequence_order_still_matters() {
+        let left = parse("- 1\n- 2\n");
+        let right = parse("- 2\n- 1\n");
+        assert!(!yaml_structurally_equal(&left, &right));
+    }
+
+    #[test]
+    fn missing_key_is_a_difference() {
+        let intent = parse("tun:\n  enable: true\nrules:\n- MATCH,DIRECT\n");
+        let merged =
+            parse("tun:\n  enable: true\n  dns-hijack:\n  - any:53\nrules:\n- MATCH,DIRECT\n");
+        assert!(!yaml_structurally_equal(&intent, &merged));
+        assert!(yaml_structurally_equal(&merged, &merged));
+    }
+}
+
+#[cfg(test)]
+mod override_reconcile_tests {
+    use super::*;
+
+    fn temp_paths(tag: &str) -> AppPaths {
+        let dir =
+            std::env::temp_dir().join(format!("mihomo-reconcile-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        AppPaths::new(dir)
+    }
+
+    /// Issue #022 B：reconcile 只在 override 派生键确实缺失时才写 intent。
+    /// 键序差异不得触发重写（会破坏“tun 为最后一个顶层键”的契约）。
+    #[test]
+    fn reconcile_does_not_rewrite_when_only_key_order_differs() {
+        let paths = temp_paths("order");
+        std::fs::write(
+            paths.config_path(),
+            "mixed-port: 7890\nrules:\n- MATCH,DIRECT\nsniffer:\n  enable: true\nexternal-controller-unix: /tmp/x.sock\ntun:\n  enable: true\n",
+        )
+        .unwrap();
+        std::fs::write(paths.override_path(), "sniffer:\n  enable: true\n").unwrap();
+
+        let changed = reconcile_override_into_intent_checked(&paths, None)
+            .expect("reconcile must not fail")
+            .changed;
+        assert!(
+            !changed,
+            "key-order-only difference must not rewrite intent"
+        );
+        let after = std::fs::read_to_string(paths.config_path()).unwrap();
+        assert!(
+            after.contains("external-controller-unix: /tmp/x.sock\ntun:"),
+            "file untouched (controller must stay before tun): {after}"
+        );
+        let _ = std::fs::remove_dir_all(paths.config_dir());
+    }
+
+    /// 真实缺失 override 派生键时必须写回，并返回 true。
+    #[test]
+    fn reconcile_writes_when_override_keys_are_missing() {
+        let paths = temp_paths("missing");
+        std::fs::write(
+            paths.config_path(),
+            "mixed-port: 7890\nrules:\n- MATCH,DIRECT\n",
+        )
+        .unwrap();
+        std::fs::write(paths.override_path(), "sniffer:\n  enable: true\n").unwrap();
+
+        let changed = reconcile_override_into_intent_checked(&paths, None)
+            .expect("reconcile must not fail")
+            .changed;
+        assert!(changed, "missing override key must be written back");
+        let after = std::fs::read_to_string(paths.config_path()).unwrap();
+        assert!(after.contains("sniffer"), "override key merged into intent");
+        let _ = std::fs::remove_dir_all(paths.config_dir());
+    }
+
+    /// review BLOCK-1：override 里的 runtime 端点字段绝不能被 reconcile 写进 intent，
+    /// 否则 restart 提交的 payload 会让 Core 在 0.0.0.0 上开放 API 并挂载任意 external-ui。
+    #[test]
+    fn reconcile_rejects_runtime_endpoint_keys_from_override() {
+        let paths = temp_paths("endpoint");
+        std::fs::write(
+            paths.config_path(),
+            "mixed-port: 7890\nrules:\n- MATCH,DIRECT\nexternal-controller-unix: /tmp/x.sock\n",
+        )
+        .unwrap();
+        std::fs::write(
+            paths.override_path(),
+            "external-controller: 0.0.0.0:9090\nexternal-ui: /tmp/ui\nsniffer:\n  enable: true\n",
+        )
+        .unwrap();
+
+        let changed = reconcile_override_into_intent_checked(&paths, None)
+            .expect("reconcile must not fail")
+            .changed;
+        assert!(changed, "sniffer key must still be merged");
+        let after = std::fs::read_to_string(paths.config_path()).unwrap();
+        assert!(
+            !after.contains("0.0.0.0:9090"),
+            "override 的 external-controller 必须被拒绝: {after}"
+        );
+        assert!(
+            !after.contains("/tmp/ui"),
+            "external-ui 必须被拒绝: {after}"
+        );
+        assert!(
+            after.contains("external-controller-unix: /tmp/x.sock"),
+            "受管 unix 端点必须保留: {after}"
+        );
+        assert!(after.contains("sniffer"), "非管辖键正常合并: {after}");
+        let _ = std::fs::remove_dir_all(paths.config_dir());
+    }
+
+    /// review MAJOR-1：override 的 `tun.enable` 不得绕过 TUN 事务翻转意图。
+    #[test]
+    fn reconcile_rejects_tun_block_from_override() {
+        let paths = temp_paths("tunblock");
+        std::fs::write(
+            paths.config_path(),
+            "rules:\n- MATCH,DIRECT\ntun:\n  enable: false\n",
+        )
+        .unwrap();
+        std::fs::write(
+            paths.override_path(),
+            "tun:\n  enable: true\n  stack: system\n  route-exclude-address:\n  - 169.254.0.0/16\nsniffer:\n  enable: true\n",
+        )
+        .unwrap();
+
+        let changed = reconcile_override_into_intent_checked(&paths, None)
+            .expect("reconcile must not fail")
+            .changed;
+        assert!(changed, "override keys must still be merged");
+        let after = std::fs::read_to_string(paths.config_path()).unwrap();
+        assert!(
+            after.contains("enable: false"),
+            "intent 的 tun.enable 必须保持事务提交的 false: {after}"
+        );
+        assert!(
+            !after.contains("stack: system"),
+            "override 的 tun.stack 是控制键，必须被拒绝: {after}"
+        );
+        assert!(
+            after.contains("route-exclude-address"),
+            "非控制键必须照常采纳（ADR-22，review 回归-3）: {after}"
+        );
+        assert!(after.contains("sniffer"), "非管辖键正常合并: {after}");
+        let _ = std::fs::remove_dir_all(paths.config_dir());
+    }
+
+    /// review MAJOR-2：reconcile 必须与生成流程同序应用悬空规则兜底，且第二次调用不重写。
+    #[test]
+    fn reconcile_applies_dangling_rule_fallback_and_stays_idempotent() {
+        let paths = temp_paths("dangling");
+        std::fs::write(
+            paths.config_path(),
+            "rules:\n- DOMAIN-SUFFIX,foo.example,RemovedGroup\n",
+        )
+        .unwrap();
+        std::fs::write(paths.override_path(), "sniffer:\n  enable: true\n").unwrap();
+
+        let first = reconcile_override_into_intent_checked(&paths, None)
+            .expect("reconcile must not fail")
+            .changed;
+        assert!(first, "override key must be merged on first pass");
+        let after = std::fs::read_to_string(paths.config_path()).unwrap();
+        assert!(
+            !after.contains("RemovedGroup"),
+            "悬空规则必须兜底成 DIRECT: {after}"
+        );
+        assert!(
+            after.contains("DOMAIN-SUFFIX,foo.example,DIRECT"),
+            "{after}"
+        );
+
+        let second = reconcile_override_into_intent_checked(&paths, None)
+            .expect("reconcile must not fail")
+            .changed;
+        assert!(!second, "second pass must be a no-op (idempotent)");
+        let _ = std::fs::remove_dir_all(paths.config_dir());
+    }
+
+    /// review Round 1 MAJOR-2 的**原场景**：悬空规则来自 override（旧组名），
+    /// 合并后必须兜底成 DIRECT，且第二次 reconcile 不得把 override 的旧组名再写回来。
+    #[test]
+    fn reconcile_falls_back_rules_that_dangle_from_override() {
+        let paths = temp_paths("dangling-override");
+        std::fs::write(paths.config_path(), "rules:\n- MATCH,DIRECT\n").unwrap();
+        std::fs::write(
+            paths.override_path(),
+            "rules:\n- DOMAIN-SUFFIX,foo.example,DeletedGroup\n",
+        )
+        .unwrap();
+
+        let first = reconcile_override_into_intent_checked(&paths, None)
+            .expect("reconcile must not fail")
+            .changed;
+        assert!(first, "override rules must be merged");
+        let after = std::fs::read_to_string(paths.config_path()).unwrap();
+        assert!(
+            !after.contains("DeletedGroup"),
+            "override 里的旧组名必须兜底: {after}"
+        );
+        assert!(
+            after.contains("DOMAIN-SUFFIX,foo.example,DIRECT"),
+            "{after}"
+        );
+
+        let second = reconcile_override_into_intent_checked(&paths, None)
+            .expect("reconcile must not fail")
+            .changed;
+        assert!(
+            !second,
+            "override 的悬空组名不得被再次写回（幂等）: {}",
+            std::fs::read_to_string(paths.config_path()).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(paths.config_dir());
     }
 }
