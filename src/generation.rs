@@ -646,7 +646,7 @@ fn is_lock_contention(err: &io::Error) -> bool {
     matches!(
         err.kind(),
         io::ErrorKind::PermissionDenied | io::ErrorKind::AlreadyExists | io::ErrorKind::WouldBlock
-    )
+    ) || matches!(err.raw_os_error(), Some(32 | 33))
 }
 
 /// Storage manager for upgrade generations and state tracking under a root directory.

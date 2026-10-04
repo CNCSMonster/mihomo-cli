@@ -207,7 +207,7 @@ impl ConfigLock {
         matches!(
             err.kind(),
             ErrorKind::PermissionDenied | ErrorKind::AlreadyExists | ErrorKind::WouldBlock
-        )
+        ) || matches!(err.raw_os_error(), Some(32 | 33))
     }
 
     #[cfg(all(not(unix), not(windows)))]

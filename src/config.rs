@@ -4661,7 +4661,10 @@ proxies: []
         assert_eq!(config["proxy-groups"].as_sequence().map(Vec::len), Some(0));
         assert_eq!(config["rules"][0].as_str(), Some("MATCH,DIRECT"));
         assert!(config["mixed-port"].as_u64().is_some());
+        #[cfg(unix)]
         assert!(config["external-controller-unix"].as_str().is_some());
+        #[cfg(windows)]
+        assert!(config["external-controller-pipe"].as_str().is_some());
     }
 
     #[test]
@@ -4678,7 +4681,10 @@ proxies: []
             serde_yaml::from_str(&std::fs::read_to_string(paths.config_path()).unwrap()).unwrap();
         assert_eq!(config["mixed-port"].as_u64(), Some(7890));
         assert_eq!(config["rules"][0].as_str(), Some("MATCH,DIRECT"));
+        #[cfg(unix)]
         assert!(config["external-controller-unix"].as_str().is_some());
+        #[cfg(windows)]
+        assert!(config["external-controller-pipe"].as_str().is_some());
     }
 
     #[test]

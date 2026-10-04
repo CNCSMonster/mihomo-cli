@@ -201,8 +201,8 @@ mod tests {
 
     #[test]
     fn test_check_config_exists_present() {
-        // Use a file that definitely exists
-        let result = check_config_exists(Path::new("/etc/passwd"));
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let result = check_config_exists(temp.path());
         assert!(result.passed);
     }
 
@@ -215,8 +215,8 @@ mod tests {
 
     #[test]
     fn test_check_config_readable_present() {
-        // /etc/passwd should be readable
-        let result = check_config_readable(Path::new("/etc/passwd"));
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let result = check_config_readable(temp.path());
         assert!(result.passed);
     }
 

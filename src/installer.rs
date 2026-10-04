@@ -1203,7 +1203,13 @@ async fn download_geo_with_fallback(
 
             let resumed = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
             if try_download_geo(client, url, &tmp, resumed, gh_token).await {
-                let _ = std::fs::rename(&tmp, dest);
+                if let Err(e) = crate::generation::replace_file_safely(
+                    std::path::Path::new(&tmp),
+                    std::path::Path::new(dest),
+                ) {
+                    eprintln!("    Failed to install {} to {}: {}", tmp, dest, e);
+                    continue;
+                }
                 let size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
                 println!("  Saved ({} bytes)", size);
                 return true;

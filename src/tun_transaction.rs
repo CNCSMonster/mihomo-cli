@@ -354,9 +354,10 @@ pub fn legacy_candidate_path(ctx: &InstanceContext) -> PathBuf {
 // ---------------- Coordinator Lock ----------------
 
 pub struct CoordinatorLock {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
+    #[allow(dead_code)]
     file: File,
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(windows)))]
     _path: PathBuf,
 }
 
@@ -383,7 +384,48 @@ impl CoordinatorLock {
             }
             Ok(Self { file })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let poll_interval = std::time::Duration::from_millis(50);
+            let file = loop {
+                match std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .share_mode(0)
+                    .open(&lock_path)
+                {
+                    Ok(file) => break file,
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::PermissionDenied
+                                | std::io::ErrorKind::AlreadyExists
+                                | std::io::ErrorKind::WouldBlock
+                        ) || matches!(err.raw_os_error(), Some(32 | 33)) =>
+                    {
+                        if std::time::Instant::now() >= deadline {
+                            anyhow::bail!(
+                                "Coordinator lock timeout after 30s on {}",
+                                lock_path.display()
+                            );
+                        }
+                        std::thread::sleep(poll_interval);
+                    }
+                    Err(err) => {
+                        anyhow::bail!(
+                            "Cannot open coordinator lock {}: {}",
+                            lock_path.display(),
+                            err
+                        );
+                    }
+                }
+            };
+            Ok(Self { file })
+        }
+        #[cfg(all(not(unix), not(windows)))]
         {
             Ok(Self { _path: lock_path })
         }

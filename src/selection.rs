@@ -77,7 +77,7 @@ fn migrate_legacy_selection_if_needed(paths: &AppPaths, id: &str) -> Result<()> 
     let serialized = serde_yaml::to_string(&state)?;
     crate::utils::atomic_write_file_for_original_user(&target.display().to_string(), &serialized)?;
     let migrated = paths.config_dir().join("selection-state.yaml.legacy");
-    std::fs::rename(&legacy, &migrated).with_context(|| {
+    crate::generation::replace_file_safely(&legacy, &migrated).with_context(|| {
         format!(
             "Failed to archive legacy selection state: {}",
             legacy.display()

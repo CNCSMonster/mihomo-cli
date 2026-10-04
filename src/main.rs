@@ -61,11 +61,14 @@ async fn main() {
     }
     // Windows daemon 子命令：同步进 SCM dispatcher（StartServiceCtrlDispatcher
     // 必须由主线程调用；#[tokio::main] 的 block_on 在 main 线程执行，满足约束）。
-    // service_main 回调内再自建 tokio runtime 跑核心循环。
+    // service_main 回调内再自建 tokio runtime 跑核心循环。若非 SCM 启动则回退到 console loop。
     #[cfg(target_os = "windows")]
     if matches!(cli.command, Some(Command::Daemon)) {
         match daemon::run_windows_service() {
-            Ok(()) => return,
+            Ok(true) => return,
+            Ok(false) => {
+                // 回退到非 SCM 控制台循环：进入下方 run(cli).await 在已有 runtime 中执行
+            }
             Err(e) => {
                 eprintln!("\n  Error: {e}");
                 std::process::exit(1);

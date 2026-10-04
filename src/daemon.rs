@@ -737,20 +737,18 @@ pub async fn run_daemon(_socket_path: PathBuf, _cancel: CancellationToken) -> an
 /// main thread (StartServiceCtrlDispatcher requirement); service_main builds
 /// its own tokio runtime to run the daemon loop.
 ///
-/// Falls back to a raw console loop when not launched by SCM (e.g. manual
-/// `mihomo-cli daemon` from a shell) — `service_dispatcher::start` returns an
-/// error immediately outside a service context.
-pub fn run_windows_service() -> anyhow::Result<()> {
+/// Returns `Ok(true)` if handled by the SCM dispatcher.
+/// Returns `Ok(false)` when not launched by SCM (e.g. manual `mihomo-cli daemon`
+/// from a console/shell) so the caller can fall back to the console loop in its
+/// existing async runtime without creating a nested tokio runtime.
+pub fn run_windows_service() -> anyhow::Result<bool> {
     match windows_service_entry::run_dispatcher() {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(true),
         Err(e) => {
             // Not running under SCM (manual `mihomo-cli daemon` from a shell):
-            // dispatcher fails immediately; fall back to the raw console loop.
+            // dispatcher fails immediately; report and let caller fall back.
             eprintln!("[mihomo-daemon] dispatcher unavailable ({e}), running raw console loop");
-            let pipe_path = crate::ipc::system_service_socket_path();
-            let runtime = tokio::runtime::Runtime::new()
-                .map_err(|e| anyhow::anyhow!("failed to build tokio runtime: {e}"))?;
-            runtime.block_on(run_daemon(pipe_path, CancellationToken::new()))
+            Ok(false)
         }
     }
 }

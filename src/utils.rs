@@ -315,24 +315,8 @@ fn atomic_write_bytes_impl(path: &Path, bytes: &[u8], mode: u16) -> anyhow::Resu
 
 #[cfg(not(unix))]
 fn atomic_write_bytes_impl(path: &Path, bytes: &[u8], _mode: u16) -> anyhow::Result<()> {
-    let mut temp_path = path.as_os_str().to_os_string();
-    temp_path.push(".tmp");
-    std::fs::write(&temp_path, bytes).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to write temp file {}: {}",
-            Path::new(&temp_path).display(),
-            e
-        )
-    })?;
-    std::fs::rename(&temp_path, path).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to rename {} -> {}: {}",
-            Path::new(&temp_path).display(),
-            path.display(),
-            e
-        )
-    })?;
-    Ok(())
+    crate::generation::atomic_write_file_safely(path, bytes)
+        .map_err(|e| anyhow::anyhow!("Failed to atomically write {}: {}", path.display(), e))
 }
 
 pub fn atomic_write_file_for_original_user(path: &str, content: &str) -> anyhow::Result<()> {
@@ -1532,8 +1516,25 @@ pub fn rename_no_follow(from: &Path, to: &Path) -> anyhow::Result<()> {
 
 #[cfg(not(unix))]
 pub fn rename_no_follow(from: &Path, to: &Path) -> anyhow::Result<()> {
-    std::fs::rename(from, to)?;
-    Ok(())
+    if from.is_dir() {
+        std::fs::rename(from, to).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to rename directory {} to {}: {}",
+                from.display(),
+                to.display(),
+                e
+            )
+        })
+    } else {
+        crate::generation::replace_file_safely(from, to).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to rename file {} to {}: {}",
+                from.display(),
+                to.display(),
+                e
+            )
+        })
+    }
 }
 
 /// Remove a file or directory recursively through an fd chain. All directory
