@@ -361,6 +361,26 @@ pub async fn send_command(cmd: &DaemonCommand) -> anyhow::Result<DaemonResponse>
         })?
 }
 
+/// Determine retry budget for Windows named pipe connect failures.
+/// Transient ERROR_FILE_NOT_FOUND (2) is budgeted at 1500ms to allow brief startup / restart windows
+/// while still failing fast for non-installed services.
+/// ERROR_PIPE_BUSY (231) and ERROR_BROKEN_PIPE (109) get up to 3000ms.
+/// Fatal errors (like ERROR_ACCESS_DENIED 5 or unknown errors) fail immediately (None).
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub(crate) fn windows_ipc_retry_budget(raw_code: Option<i32>) -> Option<std::time::Duration> {
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    const ERROR_BROKEN_PIPE: i32 = 109;
+    const ERROR_PIPE_BUSY: i32 = 231;
+
+    match raw_code {
+        Some(ERROR_FILE_NOT_FOUND) => Some(std::time::Duration::from_millis(1500)),
+        Some(ERROR_PIPE_BUSY) | Some(ERROR_BROKEN_PIPE) => {
+            Some(std::time::Duration::from_millis(3000))
+        }
+        _ => None,
+    }
+}
+
 /// Send a command to the daemon and wait for a response.
 #[cfg(windows)]
 pub async fn send_command(cmd: &DaemonCommand) -> anyhow::Result<DaemonResponse> {
@@ -371,15 +391,38 @@ pub async fn send_command(cmd: &DaemonCommand) -> anyhow::Result<DaemonResponse>
     let cmd = with_ipc_token(cmd.clone(), token);
 
     let pipe_path = system_service_socket_path();
-    let mut pipe = ClientOptions::new().open(&pipe_path).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to connect to system service at {}\n  \
-             Is the system service installed and running?\n  \
-             Install: mihomo-cli install --system\n  \
-             Error: {e}",
-            pipe_path.display()
-        )
-    })?;
+    let start_time = std::time::Instant::now();
+    let mut pipe = loop {
+        match ClientOptions::new().open(&pipe_path) {
+            Ok(p) => break p,
+            Err(e) => {
+                let raw = e.raw_os_error();
+                let elapsed = start_time.elapsed();
+                if let Some(budget) = windows_ipc_retry_budget(raw) {
+                    if elapsed < budget {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+                }
+                if raw == Some(231) || raw == Some(109) {
+                    anyhow::bail!(
+                        "failed to connect to system service at {} (service is busy or resetting after multiple retries)\n  \
+                         The service may be handling another request or restarting.\n  \
+                         Check status: mihomo-cli status\n  \
+                         Error: {e}",
+                        pipe_path.display()
+                    );
+                }
+                anyhow::bail!(
+                    "failed to connect to system service at {}\n  \
+                     Is the system service installed and running?\n  \
+                     Install: mihomo-cli install --system\n  \
+                     Error: {e}",
+                    pipe_path.display()
+                );
+            }
+        }
+    };
 
     write_json_message(&mut pipe, &cmd).await?;
     let mut reader = BufReader::new(pipe);
@@ -897,5 +940,40 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("daemon command too large"));
+    }
+
+    #[test]
+    fn test_windows_ipc_retry_budget_policy() {
+        use super::windows_ipc_retry_budget;
+        assert_eq!(
+            windows_ipc_retry_budget(Some(2)),
+            Some(std::time::Duration::from_millis(1500)),
+            "ERROR_FILE_NOT_FOUND should have 1500ms budget"
+        );
+        assert_eq!(
+            windows_ipc_retry_budget(Some(231)),
+            Some(std::time::Duration::from_millis(3000)),
+            "ERROR_PIPE_BUSY should have 3000ms budget"
+        );
+        assert_eq!(
+            windows_ipc_retry_budget(Some(109)),
+            Some(std::time::Duration::from_millis(3000)),
+            "ERROR_BROKEN_PIPE should have 3000ms budget"
+        );
+        assert_eq!(
+            windows_ipc_retry_budget(Some(5)),
+            None,
+            "ERROR_ACCESS_DENIED must fail immediately"
+        );
+        assert_eq!(
+            windows_ipc_retry_budget(Some(999)),
+            None,
+            "Unknown OS error must fail immediately"
+        );
+        assert_eq!(
+            windows_ipc_retry_budget(None),
+            None,
+            "Missing raw error must fail immediately"
+        );
     }
 }

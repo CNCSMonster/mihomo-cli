@@ -1098,29 +1098,6 @@ fn run_command_output(command: &PlannedCommand) -> std::io::Result<std::process:
     Command::new(&command.program).args(&command.args).output()
 }
 
-fn spawn_detached_command(command: &PlannedCommand) -> std::io::Result<std::process::Child> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x00000008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-        Command::new(&command.program)
-            .args(&command.args)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-            .spawn()
-    }
-    #[cfg(not(windows))]
-    {
-        Command::new(&command.program)
-            .args(&command.args)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-    }
-}
-
 fn run_planned_command(command: &PlannedCommand) -> anyhow::Result<()> {
     if command.privileged {
         let mut args: Vec<&str> = Vec::with_capacity(command.args.len() + 1);
@@ -1482,6 +1459,43 @@ pub fn remove_path_privileged(path: &str) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(windows)]
+fn spawn_detached_windows_process(
+    program: &str,
+    args: &[String],
+) -> std::io::Result<std::process::Child> {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x00000008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub(crate) fn is_windows_detached_start(program: &str, args: &[String]) -> bool {
+    let file_name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let is_cmd = file_name.eq_ignore_ascii_case("cmd.exe") || file_name.eq_ignore_ascii_case("cmd");
+    if !is_cmd {
+        return false;
+    }
+    if args.iter().any(|a| a.eq_ignore_ascii_case("/WAIT")) {
+        return false;
+    }
+    // Find the position of "/C" (allowing optional pre-switches like /S, /Q, /D)
+    if let Some(pos) = args.iter().position(|a| a.eq_ignore_ascii_case("/C")) {
+        // Next argument immediately following /C must be "start"
+        args.get(pos + 1)
+            .is_some_and(|a| a.eq_ignore_ascii_case("start"))
+    } else {
+        false
+    }
+}
+
 pub fn run_instance_command(command: &crate::instance::PlannedCommand) -> anyhow::Result<()> {
     if command.privileged {
         #[cfg(unix)]
@@ -1496,6 +1510,20 @@ pub fn run_instance_command(command: &crate::instance::PlannedCommand) -> anyhow
             let script = windows_elevated_native_command_script(&command.program, &command.args);
             return run_windows_elevated_powershell(&script);
         }
+    }
+    #[cfg(windows)]
+    if is_windows_detached_start(&command.program, &command.args) {
+        let child = spawn_detached_windows_process(&command.program, &command.args)
+            .map_err(|e| anyhow::anyhow!("failed to spawn {}: {e}", command.program))?;
+        if !wait_child(child, std::time::Duration::from_secs(10)) {
+            anyhow::bail!(
+                "detached process launcher failed or timed out (10s): {} {}\n  \
+                 The background daemon may still be starting. Check status with 'mihomo-cli status'.",
+                command.program,
+                command.args.join(" ")
+            );
+        }
+        return Ok(());
     }
     let status = std::process::Command::new(&command.program)
         .args(&command.args)
@@ -2762,5 +2790,69 @@ e"
             temp_path.exists(),
             "private temporary directory owns cleanup after privileged install"
         );
+    }
+
+    #[test]
+    fn test_is_windows_detached_start_detection() {
+        assert!(is_windows_detached_start(
+            "cmd.exe",
+            &["/C".into(), "start".into(), "mihomo".into(), "/B".into()]
+        ));
+        assert!(is_windows_detached_start(
+            "cmd",
+            &["/c".into(), "START".into(), "mihomo".into()]
+        ));
+        assert!(is_windows_detached_start(
+            r"C:\Windows\System32\cmd.exe",
+            &["/c".into(), "start".into(), "mihomo".into()]
+        ));
+        assert!(is_windows_detached_start(
+            "cmd.exe",
+            &["/s".into(), "/c".into(), "start".into(), "mihomo".into()]
+        ));
+        // Must reject if /WAIT is present
+        assert!(!is_windows_detached_start(
+            "cmd.exe",
+            &["/C".into(), "start".into(), "/WAIT".into(), "mihomo".into()]
+        ));
+        // Must reject if not /C
+        assert!(!is_windows_detached_start(
+            "cmd.exe",
+            &["/K".into(), "start".into()]
+        ));
+        // Must reject if not start
+        assert!(!is_windows_detached_start(
+            "cmd.exe",
+            &["/C".into(), "stop".into()]
+        ));
+        // Must reject non-cmd
+        assert!(!is_windows_detached_start(
+            "powershell.exe",
+            &["/C".into(), "start".into()]
+        ));
+    }
+
+    #[test]
+    fn test_windows_user_start_plan_matches_detached_start_predicate() {
+        use crate::instance::{
+            planned_service_plan, InstanceContext, InstanceMode, PathInputs, ServiceAction,
+            TargetOs,
+        };
+
+        let inputs = PathInputs::for_tests();
+        let user = InstanceContext::planned(TargetOs::Windows, InstanceMode::User, &inputs);
+        let start_plan = planned_service_plan(&user, ServiceAction::Start);
+        assert!(
+            !start_plan.commands.is_empty(),
+            "Windows user start plan must have commands"
+        );
+        for cmd in &start_plan.commands {
+            assert!(
+                is_windows_detached_start(&cmd.program, &cmd.args),
+                "Windows user start command must match detached start predicate: {} {:?}",
+                cmd.program,
+                cmd.args
+            );
+        }
     }
 }
