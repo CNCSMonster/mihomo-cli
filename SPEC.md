@@ -537,7 +537,7 @@ restart:
 | Windows | `%USERPROFILE%\.config\mihomo\config.yaml` |
 
 - daemon 通过受权 system context 使用固定 system runtime：普通 system Core 使用 `active-config.yaml`，system TUN Core 使用 `tun-config.yaml`；两者都不是用户配置的第二事实来源，也不直接接受调用方提供的任意 config path
-- 配置变更（订阅添加/导入、订阅切换/删除、规则编辑、DNS 策略、override）当前先按用户配置事务提交为 intent；system 模式会将已提交、已校验的内容通过受管 promotion 写入固定运行时并重新启动 Core。system TUN active 下，config/rule/DNS/override/group/select 等影响 active effective config 的入口统一经 candidate → snapshot → `CoreApplied` → compare-and-commit → `IntentCommitted` dispatcher 完成（Issue #004/#005/#008/#009）；真实 TUN 数据面证据仍按 §0.4 等级单独报告
+- 配置变更（订阅添加/导入、订阅切换/删除、规则编辑、DNS 策略、override）当前先按用户配置事务提交为 intent；system 模式会将已提交、已校验的内容通过受管 promotion 写入固定运行时并重新启动 Core。system TUN active 下，config/rule/DNS/override/group/select 等影响 active effective config 的入口统一经 candidate → snapshot → `CoreApplied` → compare-and-commit → `IntentCommitted` dispatcher 完成；真实 TUN 数据面证据仍按 §0.4 等级单独报告
 - 旧 `config.yaml` system store 路径（`/var/lib/mihomo-cli/config.yaml`、`/Library/Application Support/mihomo-cli/config.yaml`、`%ProgramData%\mihomo-cli\config.yaml`）已废弃；`active-config.yaml`、`tun-config.yaml`、事务和 Geo 等固定运行时资产仍位于这些平台的 system runtime 目录，并按正式 SPEC 的 writer/reader contract 管理
 
 ### 3.4 Subscription Processing and weak-network contract
@@ -1422,7 +1422,7 @@ TUN 是系统级功能，一旦开启会影响所有用户流量。system TUN �
 - `config add/import/switch/refresh/remove`、rule、DNS、override 和节点选择：先报告 intent transaction 结果，再报告 `runtime_applied`、`pending`、`failed` 或 `unknown`。仅 intent 提交成功不得输出 `runtime_applied`。
 - Core stopped 时，合法 intent 可提交并返回 `pending`，同时给出显式 `mihomo-cli restart [--system]`；不得为了制造 `runtime_applied` 隐式启动 Core。
 - 普通运行实例只有在受管 reload/restart 已完成且当前 Core/API 观察确认目标 revision 后才返回 `runtime_applied`；Core/API 不可达或 revision 无法证明时返回 `unknown`。
-- system TUN 为 `TunRunning` 时，所有 active effective-config 变更统一经 promotion dispatcher 并完成 snapshot promotion、`CoreApplied`、当前 Core/API runtime attestation 和 `IntentCommitted`；dispatcher 已统一覆盖 config/rule/DNS/override/group/select 入口并阻止通用 `/configs` 旁路（Issue #004/#005/#008/#009）。未具备该完整证明的变更不得报告 `runtime_applied`，只能返回 `pending`、`failed`、`unknown` 或 `RecoveryRequired`。
+- system TUN 为 `TunRunning` 时，所有 active effective-config 变更统一经 promotion dispatcher 并完成 snapshot promotion、`CoreApplied`、当前 Core/API runtime attestation 和 `IntentCommitted`；dispatcher 已统一覆盖 config/rule/DNS/override/group/select 入口并阻止通用 `/configs` 旁路。未具备该完整证明的变更不得报告 `runtime_applied`，只能返回 `pending`、`failed`、`unknown` 或 `RecoveryRequired`。
 - `restart`/`start` 的 `Ready` 只证明声明的 daemon/Core/API control-plane readiness；无合法配置、residual/recovery blocker、API 不可达或目标 runtime 无法证明时返回 `Incomplete`、`Failed`、`Unknown` 或 `RecoveryRequired`。不得把 `Ready` 解释为公网、代理组出口、DNS/DIRECT 或 TUN 数据面成功。
 - `tun on/off` 只有在受管 transaction 完成、root peer gate 通过、目标 snapshot/revision 与 instance 关联可证明，并由当前 Core API 观察得到目标 TUN 状态时才返回 `Ready`；raw API 字段、daemon success、YAML intent 或 snapshot promotion 单独不足以返回成功。运行态不可观察时返回 `Unknown`/`RecoveryRequired`。
 - `ip`/`exit-ip` 和真实业务 fixture 是独立数据面证据；其成功或失败不得回填 `restart`、配置写入或 TUN 命令的 control-plane 结果。

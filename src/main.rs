@@ -3500,10 +3500,14 @@ fn service_runtime_state(ctx: &instance::InstanceContext) -> service::ServiceRun
         }
         _ => true,
     };
-    let unit_installed = if cfg!(target_os = "windows") {
-        windows_mihomo_service_installed()
-    } else {
-        ctx.paths.service_file.as_ref().is_some_and(|p| p.exists())
+    let unit_installed = match (ctx.os, ctx.mode) {
+        (instance::TargetOs::Windows, instance::InstanceMode::System) => {
+            windows_mihomo_service_installed()
+        }
+        (instance::TargetOs::Windows, instance::InstanceMode::User) => {
+            instance::windows_user_install_marker(ctx).is_some_and(|marker| marker.exists())
+        }
+        _ => ctx.paths.service_file.as_ref().is_some_and(|p| p.exists()),
     };
     service::classify_service_runtime(
         service_manager_available,
