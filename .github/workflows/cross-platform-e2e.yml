@@ -166,6 +166,10 @@ jobs:
             windows-latest)
               echo "--- mihomo processes ---"
                   tasklist | grep -i mihomo || true
+              echo "--- mihomo log (user mode) ---"
+              cat "$LOCALAPPDATA/mihomo/mihomo.log" 2>&1 || true
+              echo "--- mihomo log (system mode) ---"
+              cat "$ProgramData/mihomo/mihomo.log" 2>&1 || true
               ;;
           esac
 
