@@ -1,0 +1,5 @@
+NAME=j005-company-intranet-direct
+DESC=验证 J005 公司内网直连所需 dns/rule CLI 合约
+SCRIPT=test-j005-company-intranet-direct.sh
+TAGS=smoke,dns,rule,direct,intranet
+REQUIRES=

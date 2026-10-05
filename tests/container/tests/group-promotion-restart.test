@@ -1,0 +1,5 @@
+NAME=group-promotion-restart
+DESC=验证 system 模式 TUN 开启时 group 变更即时 promotion、pending 变更经 restart 生效、选择重启后重放（fake core）
+SCRIPT=test-group-promotion-restart.sh
+TAGS=user-journey,group,restart,tun,selection
+REQUIRES=

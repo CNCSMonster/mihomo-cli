@@ -1,0 +1,26 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV MIHOMO_CLI_MIHOMO_PATH=/usr/local/lib/mihomo/mihomo
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 sudo systemd iproute2 curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY target/container-test/mihomo-cli /usr/local/bin/mihomo-cli
+COPY target/container-test/mihomo-cli /tests/mihomo-cli-source
+COPY target/container-test/mihomo-real /usr/local/lib/mihomo/mihomo
+COPY target/container-test/mihomo-real /tests/real-mihomo
+COPY tests/container/scripts/test-real-core-http-dataplane.sh /tests/test-real-core-http-dataplane.sh
+
+RUN chmod 755 /usr/local/bin/mihomo-cli /tests/mihomo-cli-source \
+    /tests/real-mihomo /usr/local/lib/mihomo/mihomo /tests/test-real-core-http-dataplane.sh && \
+    mkdir -p /var/lib/mihomo-cli /var/run/mihomo /var/log/mihomo \
+    /home/testuser/.config/mihomo && \
+    useradd -m -s /bin/bash testuser && \
+    useradd --system --no-create-home --shell /usr/sbin/nologin mihomo && \
+    printf 'testuser ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/testuser && \
+    chmod 440 /etc/sudoers.d/testuser && \
+    chown -R testuser:testuser /home/testuser/.config
+
+WORKDIR /tests

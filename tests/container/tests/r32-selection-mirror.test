@@ -1,0 +1,5 @@
+NAME=r32-selection-mirror
+DESC=验证 R3.2-1 selection mirror 对账、push自愈、写者门禁与 doctor 漂移检查（system 模式，fake core）
+SCRIPT=test-r32-selection-mirror.sh
+TAGS=r32,selection,mirror,doctor,reconcile,gate
+REQUIRES=

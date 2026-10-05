@@ -1,0 +1,30 @@
+# Runtime-only systemd contract image. The test entrypoint prepares Linux
+# artifacts in target/container-test before this image is built.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    sudo \
+    systemd \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY target/container-test/mihomo-cli /usr/local/bin/mihomo-cli
+COPY target/container-test/mihomo-cli /tests/mihomo-cli-source
+COPY target/container-test/mihomo /usr/local/lib/mihomo/mihomo
+COPY target/container-test/mihomo /tests/fake-mihomo
+COPY tests/container/mock/gsettings /usr/local/bin/gsettings
+COPY tests/container/scripts/ /tests/scripts/
+COPY tests/container/scripts/test-tun-config-contract.sh /tests/test-tun-config-contract.sh
+
+RUN chmod 755 /usr/local/bin/mihomo-cli /tests/mihomo-cli-source /usr/local/lib/mihomo/mihomo /usr/local/bin/gsettings /tests/test-tun-config-contract.sh /tests/scripts/*.sh && \
+    mkdir -p /var/lib/mihomo-cli /var/run/mihomo /var/log/mihomo /home/testuser/.config/mihomo && \
+    useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin mihomo && \
+    useradd -m -s /bin/bash testuser && \
+    useradd -m -s /bin/bash untrusted && \
+    printf 'testuser ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/testuser && \
+    chmod 440 /etc/sudoers.d/testuser && \
+    chown -R testuser:testuser /home/testuser/.config
+
+WORKDIR /tests

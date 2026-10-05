@@ -1,0 +1,5 @@
+NAME=j009-subscription-drift-warning
+DESC=验证 J009 订阅刷新漂移警告（config --refresh 命令行为及漂移警告输出）
+SCRIPT=test-j009-subscription-drift-warning.sh
+TAGS=user-journey,config,refresh,drift
+REQUIRES=

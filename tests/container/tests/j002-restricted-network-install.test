@@ -1,0 +1,5 @@
+NAME=j002-restricted-network-install
+DESC=验证 J002 受限网络安装 CLI 合约（install --github-mirror, --skip-config）
+SCRIPT=test-j002-restricted-network-install.sh
+TAGS=smoke,install,network,mirror
+REQUIRES=

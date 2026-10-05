@@ -1,0 +1,46 @@
+# 完整测试镜像
+# 包含 mihomo-cli + mock 服务 + 测试脚本
+FROM ubuntu:24.04
+
+# 安装基础工具
+RUN apt-get update && apt-get install -y \
+    sudo \
+    curl \
+    wget \
+    jq \
+    python3 \
+    python3-pip \
+    netcat-openbsd \
+    dnsutils \
+    iproute2 \
+    iptables \
+    systemd \
+    && rm -rf /var/lib/apt/lists/*
+
+# 拷贝 mihomo-cli 二进制
+COPY target/release/mihomo-cli /usr/local/bin/mihomo-cli
+RUN chmod +x /usr/local/bin/mihomo-cli
+
+# 创建测试用户
+RUN useradd -m -s /bin/bash testuser && \
+    echo "testuser:testpass" | chpasswd && \
+    echo "testuser ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+# 拷贝 mock 服务
+COPY tests/container/mock/ /tests/mock/
+RUN chmod +x /tests/mock/*.py
+
+# 拷贝测试运行器和脚本
+COPY tests/container/test-runner.sh /tests/
+COPY tests/container/scripts/ /tests/scripts/
+COPY tests/container/tests/ /tests/tests/
+RUN chmod +x /tests/test-runner.sh /tests/scripts/*.sh
+
+# 创建配置目录
+RUN mkdir -p /home/testuser/.config/mihomo && \
+    chown testuser:testuser /home/testuser/.config/mihomo
+
+WORKDIR /tests
+
+# 默认命令：运行所有测试
+CMD ["/tests/test-runner.sh"]

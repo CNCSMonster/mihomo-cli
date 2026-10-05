@@ -1,0 +1,27 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV MIHOMO_FAKE_VALIDATION_LOG=/tmp/mihomo-user-validation.log
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    sudo \
+    systemd \
+    dbus \
+    libpam-systemd \
+    gzip \
+    tar \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY target/container-test/mihomo-cli /usr/local/bin/mihomo-cli
+COPY target/container-test/mihomo /tests/fake-mihomo
+COPY tests/container/scripts/ /tests/scripts/
+
+RUN chmod 755 /usr/local/bin/mihomo-cli /tests/fake-mihomo /tests/scripts/*.sh && \
+    useradd -m -s /bin/bash testuser && \
+    printf 'testuser ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/testuser && \
+    chmod 440 /etc/sudoers.d/testuser && \
+    mkdir -p /home/testuser/.config/mihomo /home/testuser/.config/systemd/user /home/testuser/.local/bin /home/testuser/.local/state/mihomo && \
+    chown -R testuser:testuser /home/testuser
+
+WORKDIR /tests

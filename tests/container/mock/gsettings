@@ -1,0 +1,3 @@
+#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${MIHOMO_FAKE_GSETTINGS_LOG:-/tmp/mihomo-fake-gsettings.log}"

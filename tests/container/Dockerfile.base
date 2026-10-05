@@ -1,0 +1,39 @@
+# 基础测试镜像
+# 包含 mihomo-cli 和测试工具
+FROM ubuntu:24.04
+
+# 安装基础工具
+RUN apt-get update && apt-get install -y \
+    sudo \
+    curl \
+    wget \
+    jq \
+    python3 \
+    python3-pip \
+    netcat-openbsd \
+    dnsutils \
+    iproute2 \
+    iptables \
+    && rm -rf /var/lib/apt/lists/*
+
+# 拷贝 mihomo-cli 二进制
+COPY target/release/mihomo-cli /usr/local/bin/mihomo-cli
+RUN chmod +x /usr/local/bin/mihomo-cli
+
+# 创建测试用户
+RUN useradd -m -s /bin/bash testuser && \
+    echo "testuser:testpass" | chpasswd && \
+    echo "testuser ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+# 创建测试目录
+RUN mkdir -p /tests/scripts /tests/tests /tests/mock
+COPY tests/container/test-runner.sh /tests/
+COPY tests/container/scripts/ /tests/scripts/
+COPY tests/container/tests/ /tests/tests/
+RUN chmod +x /tests/test-runner.sh
+
+# 默认工作目录
+WORKDIR /tests
+
+# 默认命令
+CMD ["/tests/test-runner.sh"]

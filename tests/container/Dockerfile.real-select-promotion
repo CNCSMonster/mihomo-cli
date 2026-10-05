@@ -1,0 +1,28 @@
+# Real-Core select/promotion 终审镜像。target/container-test/mihomo-real 必须预先准备。
+# 覆盖 #007 按订阅选择持久化与 #004 TUN-active promotion dispatcher，
+# 分别以普通用户 testuser 与 root 两种身份运行。
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV MIHOMO_CLI_MIHOMO_PATH=/usr/local/lib/mihomo/mihomo
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-yaml sudo systemd iproute2 curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY target/container-test/mihomo-cli /usr/local/bin/mihomo-cli
+COPY target/container-test/mihomo-real /usr/local/lib/mihomo/mihomo
+COPY target/container-test/mihomo-real /tests/real-mihomo
+COPY tests/container/scripts/test-real-core-select-promotion-inner.sh /tests/test-inner.sh
+
+RUN chmod 755 /usr/local/bin/mihomo-cli /usr/local/lib/mihomo/mihomo /tests/real-mihomo /tests/test-inner.sh && \
+    mkdir -p /var/lib/mihomo-cli /var/run/mihomo /var/log/mihomo && \
+    useradd -m -s /bin/bash testuser && \
+    useradd --system --no-create-home --shell /usr/sbin/nologin mihomo && \
+    mkdir -p /home/testuser/.config/mihomo && \
+    printf 'testuser ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/testuser && \
+    chmod 440 /etc/sudoers.d/testuser && \
+    chown -R testuser:testuser /home/testuser && \
+    chmod 0750 /home/testuser
+
+WORKDIR /tests

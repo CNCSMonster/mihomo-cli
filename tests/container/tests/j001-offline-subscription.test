@@ -1,0 +1,5 @@
+NAME=j001-offline-subscription
+DESC=验证 J001 离线订阅获取流程（fetch → import → validate）
+SCRIPT=test-j001-offline-subscription.sh
+TAGS=user-journey,config,fetch,import
+REQUIRES=

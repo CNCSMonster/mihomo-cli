@@ -1,0 +1,29 @@
+# 容器测试配置
+
+# 默认镜像（本地快速测试用）
+default_image = "ubuntu:24.04"
+
+# 矩阵测试用的镜像列表
+matrix_images = [
+    "ubuntu:24.04",
+    "ubuntu:22.04",
+    "debian:12",
+]
+
+# 全局设置
+[global]
+# 默认并行度（auto = 自动检测）
+parallel = "auto"
+# 最大并行度上限
+max_jobs = 4
+# 单个测试超时（秒）
+timeout = 300
+# 是否自动清理容器
+cleanup = true
+
+# 资源限制
+[resources]
+# 每个容器的内存限制
+memory_limit = "512m"
+# 每个容器的 CPU 限制
+cpu_limit = "1.0"

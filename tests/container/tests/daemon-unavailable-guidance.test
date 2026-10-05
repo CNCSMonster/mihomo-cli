@@ -1,0 +1,6 @@
+NAME=daemon-unavailable-guidance
+DESC=验证 daemon 未安装/不可用时的恢复指引
+IMAGE=ubuntu:24.04
+SCRIPT=test-daemon-version-mismatch.sh
+TAGS=error-handling,daemon
+REQUIRES=

@@ -1,0 +1,54 @@
+# Runtime-only test image. The test entrypoint prepares a Linux binary in
+# target/container-test before this image is built.
+
+ARG RUNTIME_IMAGE=ubuntu:24.04
+FROM ${RUNTIME_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV MIHOMO_FAKE_VALIDATION_LOG=/tmp/mihomo-fake-validation.log
+ENV MIHOMO_CLI_MIHOMO_PATH=/usr/local/lib/mihomo/mihomo
+
+# 安装运行时依赖
+RUN apt-get update && apt-get install -y \
+    sudo \
+    curl \
+    wget \
+    jq \
+    python3 \
+    python3-pip \
+    iproute2 \
+    iptables \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# 创建普通用户与系统服务用户
+RUN useradd -m -s /bin/bash -G sudo testuser && \
+    echo "testuser:testpass" | chpasswd && \
+    echo "testuser ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers && \
+    useradd --system --no-create-home --shell /usr/sbin/nologin mihomo
+
+# 创建系统目录
+RUN mkdir -p /var/lib/mihomo-cli /var/run/mihomo /var/log/mihomo
+
+COPY target/container-test/mihomo-cli /usr/local/bin/mihomo-cli
+COPY target/container-test/mihomo /usr/local/lib/mihomo/mihomo
+RUN chmod +x /usr/local/bin/mihomo-cli /usr/local/lib/mihomo/mihomo
+
+# 复制测试运行器和配置
+COPY tests/container/test-runner.sh /tests/test-runner.sh
+COPY tests/container/config.toml /tests/config.toml
+
+# 复制测试定义和脚本
+COPY tests/container/tests/ /tests/tests/
+COPY tests/container/scripts/ /tests/scripts/
+COPY tests/container/mock/ /tests/mock/
+
+# 设置执行权限
+RUN chmod +x /tests/test-runner.sh && \
+    chmod +x /tests/scripts/*.sh 2>/dev/null || true
+
+# 切换到普通用户
+USER testuser
+WORKDIR /home/testuser
+
+CMD ["/tests/test-runner.sh"]

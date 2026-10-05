@@ -1,0 +1,5 @@
+NAME=config-regen-intent
+DESC=验证配置重生成保留 override 组规则与 TUN 意图（Bug #14/#15/#17，root 与 testuser 双身份）
+SCRIPT=test-config-regen-intent.sh
+TAGS=user-journey,config,refresh,tun,override
+REQUIRES=

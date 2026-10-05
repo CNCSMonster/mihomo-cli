@@ -1,0 +1,5 @@
+NAME=j006-pin-proxy-node
+DESC=验证 J006 固定节点所需 select/list CLI 与错误合约
+SCRIPT=test-j006-pin-proxy-node.sh
+TAGS=user-journey,select,list,proxy
+REQUIRES=

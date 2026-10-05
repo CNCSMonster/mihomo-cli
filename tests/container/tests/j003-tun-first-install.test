@@ -1,0 +1,5 @@
+NAME=j003-tun-first-install
+DESC=验证 J003 TUN 安装 CLI 合约（install --system, tun on）
+SCRIPT=test-j003-tun-first-install.sh
+TAGS=smoke,install,tun,system
+REQUIRES=

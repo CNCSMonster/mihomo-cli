@@ -1,0 +1,4 @@
+NAME=sudo-context
+DESC=验证 sudo 提权后上下文保留
+SCRIPT=test-sudo-context.sh
+TAGS=sudo,security,linux

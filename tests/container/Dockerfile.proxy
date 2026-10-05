@@ -1,0 +1,19 @@
+# 代理测试镜像
+# 包含 mock 代理服务器
+FROM mihomo-cli-test-base
+
+# 安装代理模拟工具
+RUN pip3 install --break-system-packages proxy.py
+
+# 拷贝 mock 代理脚本
+COPY tests/container/mock/mock-proxy.py /tests/mock/
+RUN chmod +x /tests/mock/mock-proxy.py
+
+# 暴露代理端口
+EXPOSE 8080 8443
+
+# 启动脚本
+COPY tests/container/scripts/start-mock-proxy.sh /tests/
+RUN chmod +x /tests/start-mock-proxy.sh
+
+CMD ["/tests/start-mock-proxy.sh"]

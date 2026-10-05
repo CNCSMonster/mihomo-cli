@@ -1,0 +1,5 @@
+NAME=config-ownership
+DESC=验证 sudo 写入配置后文件所有者是原始用户而非 root
+SCRIPT=test-config-ownership.sh
+TAGS=security,sudo,config
+REQUIRES=
