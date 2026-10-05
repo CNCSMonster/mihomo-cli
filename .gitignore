@@ -3,3 +3,5 @@
 /coverage/
 /tarpaulin-report.html
 /cobertura.xml
+# Temporary sync logs
+/.sync-commits.txt

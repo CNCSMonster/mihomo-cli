@@ -1063,6 +1063,22 @@ pub fn windows_uninstall_service() -> anyhow::Result<()> {
     let label: service_manager::ServiceLabel = "mihomo"
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid service label: {e}"))?;
+
+    // Stop the service first if it's running. On Windows, DeleteService marks
+    // the service for deletion but the service continues running until stopped.
+    // We must stop it explicitly before uninstalling.
+    let stop_result = std::process::Command::new("sc.exe")
+        .args(["stop", "mihomo"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if let Ok(status) = stop_result {
+        if status.success() {
+            // Wait briefly for the service to actually stop
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    }
+
     let _ = manager.uninstall(ServiceUninstallCtx { label });
     Ok(())
 }
@@ -1513,16 +1529,13 @@ pub fn run_instance_command(command: &crate::instance::PlannedCommand) -> anyhow
     }
     #[cfg(windows)]
     if is_windows_detached_start(&command.program, &command.args) {
-        let child = spawn_detached_windows_process(&command.program, &command.args)
+        // Fire-and-forget: spawn cmd.exe and return immediately.
+        // cmd.exe /C start /B creates a background process, but cmd.exe itself
+        // may wait for the child to complete. We don't want to block on that.
+        let _child = spawn_detached_windows_process(&command.program, &command.args)
             .map_err(|e| anyhow::anyhow!("failed to spawn {}: {e}", command.program))?;
-        if !wait_child(child, std::time::Duration::from_secs(10)) {
-            anyhow::bail!(
-                "detached process launcher failed or timed out (10s): {} {}\n  \
-                 The background daemon may still be starting. Check status with 'mihomo-cli status'.",
-                command.program,
-                command.args.join(" ")
-            );
-        }
+        // Give cmd.exe a brief moment to launch the background process
+        std::thread::sleep(std::time::Duration::from_millis(500));
         return Ok(());
     }
     let status = std::process::Command::new(&command.program)
