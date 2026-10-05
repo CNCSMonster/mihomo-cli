@@ -1439,19 +1439,11 @@ pub fn planned_linux_install_plan(ctx: &InstanceContext) -> Option<InstanceInsta
 fn planned_windows_user_process_start(ctx: &InstanceContext) -> InstanceServicePlan {
     InstanceServicePlan {
         commands: vec![PlannedCommand {
-            program: "cmd.exe".to_string(),
-            args: vec![
-                "/C".to_string(),
-                "start".to_string(),
-                // `start` treats an UNQUOTED first arg as the program, not the
-                // window title — a title containing ':' (mihomo:C:\...) would be
-                // executed as a command and fail (os error 2). Quote it.
-                format!("\"mihomo:{}\"", ctx.paths.config_dir.display()),
-                "/B".to_string(),
-                ctx.paths.core_binary.display().to_string(),
-                "-d".to_string(),
-                ctx.paths.config_dir.display().to_string(),
-            ],
+            // Direct launch of mihomo core binary, without cmd.exe wrapper.
+            // This is more reliable in CI environments where cmd.exe /C start /B
+            // may not work correctly with detached processes.
+            program: ctx.paths.core_binary.display().to_string(),
+            args: vec!["-d".to_string(), ctx.paths.config_dir.display().to_string()],
             privileged: false,
         }],
         remove_paths: Vec::new(),
@@ -1614,8 +1606,8 @@ pub fn planned_service_plan(ctx: &InstanceContext, action: ServiceAction) -> Ins
                 program: "taskkill".to_string(),
                 args: vec![
                     "/F".to_string(),
-                    "/FI".to_string(),
-                    format!("WINDOWTITLE eq mihomo:{}", ctx.paths.config_dir.display()),
+                    "/IM".to_string(),
+                    "mihomo.exe".to_string(),
                 ],
                 privileged: false,
             }],
@@ -3605,9 +3597,16 @@ mod tests {
             ctx.paths.api_endpoint,
             ApiEndpoint::WindowsNamedPipe(r"\\.\pipe\mihomo-alice".to_string())
         );
+        // Windows user mode now directly launches mihomo.exe (not via cmd.exe)
         assert!(rendered.contains("mihomo.exe"));
-        assert!(rendered.contains("cmd.exe"));
-        assert!(rendered.contains("start"));
+        assert!(plan
+            .commands
+            .iter()
+            .any(|c| c.program.contains("mihomo.exe")));
+        assert!(plan
+            .commands
+            .iter()
+            .any(|c| c.args.contains(&"-d".to_string())));
         assert!(!rendered.contains(r"C:\\ProgramData"));
         assert!(!rendered.contains("sc.exe"));
     }
@@ -3698,23 +3697,19 @@ mod tests {
         assert_eq!(system_restart.commands[1].args, vec!["start", "mihomo"]);
         assert!(system_restart.commands.iter().all(|c| c.privileged));
 
+        // Windows user mode now directly launches mihomo.exe (not via cmd.exe)
         let user_start = planned_service_plan(&user, ServiceAction::Start);
-        assert_eq!(user_start.commands[0].program, "cmd.exe");
-        assert_eq!(user_start.commands[0].args[0], "/C");
-        assert_eq!(user_start.commands[0].args[1], "start");
-        assert!(user_start.commands[0]
-            .args
-            .iter()
-            .any(|arg| arg.contains("mihomo.exe")));
+        assert!(user_start.commands[0].program.contains("mihomo.exe"));
+        assert!(user_start.commands[0].args.contains(&"-d".to_string()));
         assert!(!user_start.commands[0].privileged);
 
         let user_stop = planned_service_plan(&user, ServiceAction::Stop);
         assert_eq!(user_stop.commands[0].program, "taskkill");
         assert!(user_stop.commands[0].args.contains(&"/F".to_string()));
+        assert!(user_stop.commands[0].args.contains(&"/IM".to_string()));
         assert!(user_stop.commands[0]
             .args
-            .iter()
-            .any(|arg| arg.starts_with("WINDOWTITLE eq mihomo:")));
+            .contains(&"mihomo.exe".to_string()));
     }
 
     #[test]

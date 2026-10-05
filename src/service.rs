@@ -1495,21 +1495,33 @@ fn spawn_detached_windows_process(
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
 pub(crate) fn is_windows_detached_start(program: &str, args: &[String]) -> bool {
     let file_name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+
+    // Check for cmd.exe /C start pattern (legacy approach)
     let is_cmd = file_name.eq_ignore_ascii_case("cmd.exe") || file_name.eq_ignore_ascii_case("cmd");
-    if !is_cmd {
+    if is_cmd {
+        if args.iter().any(|a| a.eq_ignore_ascii_case("/WAIT")) {
+            return false;
+        }
+        // Find the position of "/C" (allowing optional pre-switches like /S, /Q, /D)
+        if let Some(pos) = args.iter().position(|a| a.eq_ignore_ascii_case("/C")) {
+            // Next argument immediately following /C must be "start"
+            return args
+                .get(pos + 1)
+                .is_some_and(|a| a.eq_ignore_ascii_case("start"));
+        }
         return false;
     }
-    if args.iter().any(|a| a.eq_ignore_ascii_case("/WAIT")) {
-        return false;
+
+    // Check for direct mihomo.exe launch with -d flag (new approach)
+    // mihomo.exe is a long-running daemon, so we spawn it detached
+    let is_mihomo =
+        file_name.eq_ignore_ascii_case("mihomo.exe") || file_name.eq_ignore_ascii_case("mihomo");
+    if is_mihomo {
+        // If it has -d flag (daemon mode), spawn detached
+        return args.iter().any(|a| a == "-d");
     }
-    // Find the position of "/C" (allowing optional pre-switches like /S, /Q, /D)
-    if let Some(pos) = args.iter().position(|a| a.eq_ignore_ascii_case("/C")) {
-        // Next argument immediately following /C must be "start"
-        args.get(pos + 1)
-            .is_some_and(|a| a.eq_ignore_ascii_case("start"))
-    } else {
-        false
-    }
+
+    false
 }
 
 pub fn run_instance_command(command: &crate::instance::PlannedCommand) -> anyhow::Result<()> {
@@ -2807,6 +2819,7 @@ e"
 
     #[test]
     fn test_is_windows_detached_start_detection() {
+        // cmd.exe /C start pattern (legacy approach)
         assert!(is_windows_detached_start(
             "cmd.exe",
             &["/C".into(), "start".into(), "mihomo".into(), "/B".into()]
@@ -2838,11 +2851,37 @@ e"
             "cmd.exe",
             &["/C".into(), "stop".into()]
         ));
-        // Must reject non-cmd
+        // Must reject non-cmd (unless it's mihomo with -d)
         assert!(!is_windows_detached_start(
             "powershell.exe",
             &["/C".into(), "start".into()]
         ));
+
+        // Direct mihomo.exe launch with -d flag (new approach)
+        assert!(is_windows_detached_start(
+            "mihomo.exe",
+            &[
+                "-d".into(),
+                "C:\\Users\\test\\AppData\\Roaming\\mihomo".into()
+            ]
+        ));
+        assert!(is_windows_detached_start(
+            r"C:\Users\test\AppData\Local\mihomo\bin\mihomo.exe",
+            &[
+                "-d".into(),
+                "C:\\Users\\test\\AppData\\Roaming\\mihomo".into()
+            ]
+        ));
+        assert!(is_windows_detached_start(
+            "mihomo",
+            &["-d".into(), "/home/user/.config/mihomo".into()]
+        ));
+        // Must reject mihomo without -d flag
+        assert!(!is_windows_detached_start(
+            "mihomo.exe",
+            &["-f".into(), "config.yaml".into()]
+        ));
+        assert!(!is_windows_detached_start("mihomo.exe", &[]));
     }
 
     #[test]

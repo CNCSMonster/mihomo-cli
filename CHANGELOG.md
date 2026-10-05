@@ -8,6 +8,7 @@
 
 ### 🐛 Bug Fixes
 
+- **Windows 用户模式启动可靠性** — 将 Windows 用户模式的后台启动方式从 `cmd.exe /C start /B` 改为直接启动 `mihomo.exe -d`，解决 CI 环境中进程无法正确启动的问题。
 - **Windows 命名管道与后台启动稳定性** — 为 Windows 命名管道客户端增加分级重试预算策略，解决服务重启与管道重置时的短时连接失败；Windows 用户模式后台启动使用 `DETACHED_PROCESS` 和独立进程组，避免管道句柄继承导致自动化流程挂起。
 - **Windows 系统服务卸载与用户模式启动** — 修复 `uninstall --system` 未先停止服务导致卸载后服务仍在运行的问题；修复用户模式 `install` 时 `cmd.exe /C start /B` 阻塞导致 CI 超时的问题。
 
