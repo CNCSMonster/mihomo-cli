@@ -9,6 +9,7 @@ TOKEN_FILE="$CONFIG_DIR/service-token"
 SYSTEM_UNIT=/etc/systemd/system/mihomo.service
 CORE_BINARY=/usr/local/lib/mihomo/mihomo
 INSTALLER_CLI=/tests/mihomo-cli-source
+GEN_ROOT=/var/lib/mihomo-cli-generations
 
 fail() {
     echo "FAIL: $*" >&2
@@ -67,8 +68,10 @@ truncate -s 8000001 "$CONFIG_DIR/geoip.metadb"
 truncate -s 2000001 "$CONFIG_DIR/GeoSite.dat"
 chown "$TEST_USER:$TEST_USER" "$CONFIG_DIR/geoip.metadb" "$CONFIG_DIR/GeoSite.dat"
 
-echo "--- install --system from a normal user's sudo context ---"
-as_user sudo -n "$INSTALLER_CLI" install --system --yes
+echo "--- install --system from a normal user (no outer sudo) ---"
+# 裁决 B 验收：标准安装态主旅程必须由普通用户直接驱动；CLI 自己按业务阶段请求
+# 管理员授权（不预先 sudo、不预先加组、不放宽 mode）。
+as_user "$INSTALLER_CLI" install --system --yes
 
 [ -f "$SYSTEM_UNIT" ] || fail "systemd unit was not installed without an initial config"
 grep -q '^User=mihomo$' "$SYSTEM_UNIT" || fail "unit does not run the daemon as mihomo"
@@ -178,7 +181,7 @@ PID_AFTER_MUTATION=$(status_json | json_value 'json.load(sys.stdin)["data"]["cor
     fail "R2 invariant: System non-TUN change restarted Core (old=$PID_BEFORE_MUTATION new=$PID_AFTER_MUTATION)"
 
 echo "--- install remains idempotent after the clean reinstall journey ---"
-as_user sudo -n "$INSTALLER_CLI" install --system --skip-config --yes
+as_user "$INSTALLER_CLI" install --system --skip-config --yes
 [ -S /var/run/mihomo/mihomo.sock ] || fail "idempotent install unexpectedly stopped Core"
 
 echo "--- resolved paths and running state ---"
@@ -347,20 +350,169 @@ PY
 chown -R root:root /var/lib/mihomo-cli/transactions
 chmod 0755 /var/lib/mihomo-cli/transactions
 chmod 0644 /var/lib/mihomo-cli/transactions/tun-candidate.yaml /var/lib/mihomo-cli/transactions/tun-journal.json
+# the legacy fixture must observe the current contract — early
+# refusal with the explicit controlled-reset next step, zero runtime side
+# effects. `tun on --yes` has no runtime-reset authority (SPEC §12.10);
+# the migrated RecoveryRequired journal with incomplete legacy evidence
+# refuses under Resume + Base intent (src/tun_transaction.rs plan_recovery).
+LEGACY_JOURNAL=/var/lib/mihomo-cli/transactions/tun-journal.json
+LEGACY_CANDIDATE=/var/lib/mihomo-cli/transactions/tun-candidate.yaml
+SNAPSHOT_FILE=/var/lib/mihomo-cli/tun-config.yaml
+# the daemon runs as user mihomo, and the root:root 0750 fixture
+# applied above blinds its state-dir reads — daemon-reported core.pid is None
+# for the whole window even though the Core process keeps running untouched.
+# The process table is the ground truth for the "refusal must not replace the
+# running Core" invariant.
+CORE_PID_BEFORE_LEGACY=$(pgrep -x mihomo | head -n1)
+[ -n "$CORE_PID_BEFORE_LEGACY" ] || fail "legacy fixture baseline: no running Core process"
+SNAPSHOT_SHA_BEFORE=$(sha256sum "$SNAPSHOT_FILE" | cut -d' ' -f1)
+INTENT_SHA_BEFORE=$(sha256sum "$CONFIG_FILE" | cut -d' ' -f1)
+LEGACY_JOURNAL_SHA_BEFORE=$(sha256sum "$LEGACY_JOURNAL" | cut -d' ' -f1)
+LEGACY_CANDIDATE_SHA_BEFORE=$(sha256sum "$LEGACY_CANDIDATE" | cut -d' ' -f1)
 if as_user mihomo-cli tun on --yes > /tmp/tun-legacy-recovery.out 2>&1; then
     cat /tmp/tun-legacy-recovery.out >&2
     fail "tun on accepted a legacy transaction without attested old runtime evidence"
 fi
-grep -q 'running core does not match attested old runtime' /tmp/tun-legacy-recovery.out || {
+cat /tmp/tun-legacy-recovery.out
+# plan the refusal before any runtime attestation, so the contract is
+# "refused at RecoveryRequired + actionable Fix", not the retired attestation text.
+# additionally requires the user-visible managed recovery message. Both texts
+# come from the same refusal (planner Fix line + managed_recovery_required_message),
+# so both are asserted.
+grep -q 'RecoveryRequired' /tmp/tun-legacy-recovery.out || {
     cat /tmp/tun-legacy-recovery.out >&2
-    fail "legacy recovery did not reject the unattested runtime"
+    fail "legacy recovery refusal did not report the RecoveryRequired phase"
 }
+grep -q '暂时无法自动恢复' /tmp/tun-legacy-recovery.out || {
+    cat /tmp/tun-legacy-recovery.out >&2
+    fail "legacy recovery did not refuse with the managed recovery message"
+}
+grep -q 'mihomo-cli restart --yes' /tmp/tun-legacy-recovery.out || {
+    cat /tmp/tun-legacy-recovery.out >&2
+    fail "legacy recovery refusal did not offer the restart --yes next step"
+}
+if grep -qE '已保留用户配置并重置|正在从用户配置重新建立运行状态|受控重置未执行' /tmp/tun-legacy-recovery.out; then
+    cat /tmp/tun-legacy-recovery.out >&2
+    fail "legacy recovery refusal performed or claimed a controlled runtime reset"
+fi
+# Ownership drift converges to the managed owners: the sudo re-exec'd `tun on`
+# calls ensure_mihomo_system_state_dir (src/main.rs tun entry + legacy-migration
+# admission) which repairs the state root to root:mihomo 770 and the migrated
+# active journal to mihomo:mihomo 640. This is permission convergence only,
+# not a runtime reset.
 [ "$(stat -c '%U:%G %a' /var/lib/mihomo-cli)" = "root:mihomo 770" ] || \
     fail "legacy recovery did not restore the group-writable system state root"
 [ "$(stat -c '%U:%G %a' /var/lib/mihomo-cli/transactions/active/journal.json)" = "mihomo:mihomo 640" ] || \
     fail "legacy recovery did not restore the active journal ownership"
+# State invariants: the refusal must not touch the user config, the managed
+# snapshot, the legacy evidence, or the running Core.
+[ "$(sha256sum "$SNAPSHOT_FILE" | cut -d' ' -f1)" = "$SNAPSHOT_SHA_BEFORE" ] || \
+    fail "legacy recovery modified the managed TUN snapshot content"
+[ "$(sha256sum "$CONFIG_FILE" | cut -d' ' -f1)" = "$INTENT_SHA_BEFORE" ] || \
+    fail "legacy recovery modified the user intent configuration"
+[ "$(sha256sum "$LEGACY_JOURNAL" | cut -d' ' -f1)" = "$LEGACY_JOURNAL_SHA_BEFORE" ] || \
+    fail "legacy recovery modified the legacy journal evidence"
+[ "$(sha256sum "$LEGACY_CANDIDATE" | cut -d' ' -f1)" = "$LEGACY_CANDIDATE_SHA_BEFORE" ] || \
+    fail "legacy recovery modified the legacy candidate evidence"
+CORE_PID_AFTER_LEGACY=$(pgrep -x mihomo | head -n1)
+[ "$CORE_PID_AFTER_LEGACY" = "$CORE_PID_BEFORE_LEGACY" ] || \
+    fail "legacy recovery replaced the running Core (old=$CORE_PID_BEFORE_LEGACY new=$CORE_PID_AFTER_LEGACY)"
+# The refusal's sudo re-exec already repaired the state-dir ownership, so the
+# daemon's own view is trustworthy again and must report the Core running.
+wait_for_json_value 'json.load(sys.stdin)["data"]["core"]["running"]' true || \
+    fail "legacy recovery stopped the running Core"
+python3 - <<'PY' || fail "legacy recovery did not leave a parseable RecoveryRequired journal"
+import json
+
+journal = json.load(open("/var/lib/mihomo-cli/transactions/active/journal.json"))
+assert journal["phase"] == "RecoveryRequired", journal["phase"]
+assert journal["legacy_source"] is True
+assert journal["rollback_evidence_complete"] is False
+# None-valued candidate identity fields are skipped by the serializer
+# (skip_serializing_if), so absence — not an explicit null — is the proof.
+assert journal.get("candidate_core_identity") is None
+assert journal.get("candidate_core_pid") is None
+assert journal["legacy_transaction_id"] == "stale-prepared"
+PY
+[ -d /var/lib/mihomo-cli/transactions/gc ] || \
+    fail "state repair did not create the managed gc directory"
+[ -z "$(ls -A /var/lib/mihomo-cli/transactions/gc)" ] || \
+    fail "legacy recovery quarantined artifacts into gc without an explicit reset"
+if find /var/lib/mihomo-cli -maxdepth 1 -name 'cache.db.corrupt-*' | grep -q .; then
+    fail "legacy recovery isolated cache.db without an explicit reset"
+fi
+# the controlled reset must now converge on exactly this fixture.
+# The migrated placeholder answers "which old runtime was this?" (it does not
+# claim the current Core is stopped); the running Core is independently proven
+# to be the current managed instance, stopped with an observed exit, and only
+# then are the artifacts reset. No pre-stop, no evidence deletion, no faked
+# fingerprint is involved — the fixture above is still the untouched v9 shape.
+CONFIG_SHA_BEFORE_LEGACY_RESET=$(sha256sum "$CONFIG_FILE" | cut -d' ' -f1)
+CORE_PID_BEFORE_LEGACY_RESET=$(pgrep -x mihomo | head -n1)
+[ -n "$CORE_PID_BEFORE_LEGACY_RESET" ] || fail "legacy reset fixture: no running Core"
+LEGACY_RESET_GENERATION=$(python3 -c 'import json; print(json.load(open("/var/lib/mihomo-cli/transactions/active/journal.json"))["generation"])')
+# Boundary negative controls: break one admission condition at a time and prove
+# the destructive cleanup count stays 0 while the unknown process keeps running.
+ACTIVE_BACKUP=/tmp/legacy-active-backup
+rm -rf "$ACTIVE_BACKUP"
+cp -a /var/lib/mihomo-cli/transactions/active "$ACTIVE_BACKUP"
+cp -a /var/run/mihomo/core.pid /tmp/legacy-core-pid-backup
+GC_RESET_COUNT_BEFORE=$(find /var/lib/mihomo-cli/transactions/gc -maxdepth 1 -name 'reset-*' | wc -l)
+
+# (a) placeholder evidence digest mismatch
+printf '\n' >> /var/lib/mihomo-cli/transactions/active/old-runtime.json
+if as_user mihomo-cli restart --system --yes >/tmp/legacy-reset-bad-evidence.out 2>&1; then
+    cat /tmp/legacy-reset-bad-evidence.out >&2
+    fail "controlled reset accepted a mismatched old-runtime digest"
+fi
+[ "$(pgrep -x mihomo | head -n1)" = "$CORE_PID_BEFORE_LEGACY_RESET" ] || \
+    fail "a refused reset replaced the unknown Core"
+[ -d /var/lib/mihomo-cli/transactions/active ] || \
+    fail "a refused reset deleted the transaction evidence"
 rm -rf /var/lib/mihomo-cli/transactions/active
-rm -f /var/lib/mihomo-cli/transactions/tun-journal.json /var/lib/mihomo-cli/transactions/tun-candidate.yaml
+cp -a "$ACTIVE_BACKUP" /var/lib/mihomo-cli/transactions/active
+
+# (b) current-instance ownership cannot be established (no launch record)
+rm -f /var/run/mihomo/core.pid
+if as_user mihomo-cli restart --system --yes >/tmp/legacy-reset-bad-owner.out 2>&1; then
+    cat /tmp/legacy-reset-bad-owner.out >&2
+    fail "controlled reset accepted an unprovable Core ownership"
+fi
+[ "$(pgrep -x mihomo | head -n1)" = "$CORE_PID_BEFORE_LEGACY_RESET" ] || \
+    fail "the ownership refusal terminated the unknown Core"
+[ -d /var/lib/mihomo-cli/transactions/active ] || \
+    fail "the ownership refusal deleted the transaction evidence"
+cp -a /tmp/legacy-core-pid-backup /var/run/mihomo/core.pid
+[ "$(find /var/lib/mihomo-cli/transactions/gc -maxdepth 1 -name 'reset-*' | wc -l)" = "$GC_RESET_COUNT_BEFORE" ] || \
+    fail "a refused admission quarantined the transaction"
+
+if ! as_user mihomo-cli restart --system --yes > /tmp/legacy-reset.out 2>&1; then
+    cat /tmp/legacy-reset.out >&2
+    echo "--- legacy reset diagnostics ---" >&2
+    find /var/lib/mihomo-cli/transactions -printf '%y %M %u:%g %p\n' >&2 || true
+    journalctl -u mihomo.service --no-pager -n 100 >&2 || true
+    fail "restart --yes did not converge the migrated legacy transaction while the Core ran"
+fi
+cat /tmp/legacy-reset.out
+grep -q '检测到旧版本运行状态' /tmp/legacy-reset.out || \
+    fail "controlled reset did not state its impact to the user"
+grep -q '已保留用户配置并重置' /tmp/legacy-reset.out || \
+    fail "controlled reset did not report the reset"
+[ ! -e /var/lib/mihomo-cli/transactions/active ] || \
+    fail "legacy reset left the active transaction"
+[ ! -e "$LEGACY_JOURNAL" ] || fail "legacy reset left the legacy journal"
+[ ! -e "$LEGACY_CANDIDATE" ] || fail "legacy reset left the legacy candidate"
+find /var/lib/mihomo-cli/transactions/gc -maxdepth 1 \
+    -name "reset-${LEGACY_RESET_GENERATION}-*" | grep -q . || \
+    fail "legacy reset did not quarantine the transaction evidence"
+[ "$(sha256sum "$CONFIG_FILE" | cut -d' ' -f1)" = "$CONFIG_SHA_BEFORE_LEGACY_RESET" ] || \
+    fail "legacy reset changed the user configuration"
+wait_for_json_value 'json.load(sys.stdin)["data"]["core"]["running"]' true || \
+    fail "legacy reset did not restore the Core"
+CORE_PID_AFTER_LEGACY_RESET=$(pgrep -x mihomo | head -n1)
+[ -n "$CORE_PID_AFTER_LEGACY_RESET" ] && \
+    [ "$CORE_PID_AFTER_LEGACY_RESET" != "$CORE_PID_BEFORE_LEGACY_RESET" ] || \
+    fail "legacy reset did not replace the Core process"
 if ! as_user mihomo-cli tun on --yes > /tmp/tun-on.out 2>&1; then
     cat /tmp/tun-on.out >&2
     echo "--- TUN transaction diagnostics ---" >&2
@@ -473,12 +625,12 @@ printf '%s\n' "$STATUS_VERBOSE" | grep -q '^Listening ports:' || fail "verbose s
 printf '%s\n' "$STATUS_VERBOSE" | grep -q 'mixed-port=7890' || fail "verbose status did not read live Core port"
 
 echo "--- staged upgrade while system daemon is running ---"
-# Older installations may already contain a root-owned generation directory.
-# A normal user must still be able to prepare a pending update through the CLI's
-# controlled privilege boundary.
-mkdir -p /var/lib/mihomo-cli/generations
-chown root:root /var/lib/mihomo-cli/generations
-chmod 0755 /var/lib/mihomo-cli/generations
+# A legacy install may leave the generation directories root-owned inside the
+# trust root. A normal user must still be able to prepare a pending update
+# through the CLI's controlled privilege boundary.
+mkdir -p "$GEN_ROOT/generations"
+chown root:root "$GEN_ROOT/generations"
+chmod 0755 "$GEN_ROOT/generations"
 
 cp /usr/local/bin/mihomo-cli /tmp/new-mihomo-cli
 chmod 0755 /tmp/new-mihomo-cli
@@ -489,18 +641,23 @@ printf '%s
 ' "$UPGRADE_OUT"
 printf '%s
 ' "$UPGRADE_OUT" | grep -q 'Upgrade prepared in pending generation' ||     fail "install --system did not prepare pending generation for running service"
+printf '%s
+' "$UPGRADE_OUT" | grep -q 'To apply this update, run: mihomo-cli restart' ||     fail "install --system did not tell the normal user how to apply the pending update"
 
 systemctl is-active --quiet mihomo || fail "daemon was interrupted during staged upgrade"
 
-DOCTOR_OUT=$(as_user mihomo-cli doctor)
+# moved generation state into the root:root 0750 trust root, which the normal
+# user cannot read, so pending detection is asserted from the privileged context.
+# 刻意以 root 身份读取代际状态：这是受保护的观测面，用于验证 pending 检测本身。
+DOCTOR_OUT=$(sudo -n /usr/local/bin/mihomo-cli doctor)
 printf '%s
 ' "$DOCTOR_OUT" | grep -q '待应用更新' || fail "doctor did not detect pending generation"
 
 chown root:mihomo /var/lib/mihomo-cli
 chmod 0755 /var/lib/mihomo-cli
-chown -R root:root /var/lib/mihomo-cli/generations
-chown root:root /var/lib/mihomo-cli/state.json
-rm -f /var/lib/mihomo-cli/.generation.lock
+chown -R root:root "$GEN_ROOT/generations"
+chown root:root "$GEN_ROOT/state.json"
+rm -f "$GEN_ROOT/.generation.lock"
 # A root rewrite can leave a valid terminal TUN journal inaccessible to the
 # daemon. Restart must converge this managed state before daemon StartCore.
 mkdir -p /var/lib/mihomo-cli/transactions/active
@@ -523,7 +680,7 @@ chmod 0640 /var/lib/mihomo-cli/transactions/active/journal.json
 sudo -u "$TEST_USER" test ! -w /var/lib/mihomo-cli || \
     fail "system state root unexpectedly became writable by the normal user"
 
-as_user mihomo-cli restart --system
+as_user /tmp/new-mihomo-cli restart --system
 wait_for_json_value 'json.load(sys.stdin)["data"]["core"]["running"]' true || fail "Core not running after staged upgrade apply"
 [ ! -e /var/lib/mihomo-cli/transactions/active ] || \
     fail "restart did not converge the terminal active TUN transaction"
@@ -531,7 +688,7 @@ wait_for_json_value 'json.load(sys.stdin)["data"]["core"]["running"]' true || fa
     fail "restart did not preserve the transaction directory ownership, was: $(stat -c '%U:%G %a' /var/lib/mihomo-cli/transactions)"
 [ "$(stat -c '%U:%G %a' /var/lib/mihomo-cli)" = "root:mihomo 770" ] || \
     fail "staged upgrade changed system state root ownership or mode"
-[ "$(stat -c '%U:%G %a' /var/lib/mihomo-cli/state.json)" = "root:root 644" ] || \
+[ "$(stat -c '%U:%G %a' "$GEN_ROOT/state.json")" = "root:root 644" ] || \
     fail "staged upgrade did not preserve root-owned generation state"
 
 cmp -s /tmp/new-mihomo-cli /usr/local/bin/mihomo-cli || fail "installed CLI binary was not upgraded to pending generation"
@@ -546,6 +703,12 @@ printf '%s\n' "$LEGACY_UPGRADE_OUT"
 printf '%s\n' "$LEGACY_UPGRADE_OUT" | grep -q 'Upgrade prepared in pending generation' || \
     fail "install --system did not prepare a pending generation for legacy recovery"
 
+# plant the fixture against a **running** Core — that is the real
+# v9 upgrade shape. No pre-stop and no journal deletion: the migrated
+# placeholder plus the independently proven instance ownership are the whole
+# admission.
+CORE_PID_BEFORE_MIGRATED=$(pgrep -x mihomo | head -n1)
+[ -n "$CORE_PID_BEFORE_MIGRATED" ] || fail "staged upgrade fixture: no running Core"
 rm -rf /var/lib/mihomo-cli/transactions/active
 python3 - <<'PY'
 import json
@@ -557,6 +720,13 @@ intent = Path("/home/testuser/.config/mihomo/config.yaml")
 candidate = transactions / "tun-candidate.yaml"
 candidate_bytes = intent.read_bytes() + b"# legacy candidate differs from current intent\n"
 candidate.write_bytes(candidate_bytes)
+# Deliberate fixture correspondence (issue -tail): the legacy journal
+# names this file as `snapshot_path`, and the legacy site being modelled is one
+# where the snapshot already carries the candidate while the journal stayed
+# Prepared. Keeping snapshot == candidate is what makes the migrated site
+# recoverable (classification Candidate -> converge); rewriting the snapshot to
+# the pre-candidate intent would instead be "no durable old-snapshot evidence"
+# and the controlled reset would refuse. Do not "fix" this to old intent bytes.
 (state_root / "tun-config.yaml").write_bytes(candidate_bytes)
 
 def revision(data):
@@ -583,13 +753,26 @@ chmod 0640 /var/lib/mihomo-cli/transactions/tun-journal.json \
     /var/lib/mihomo-cli/transactions/tun-candidate.yaml \
     /var/lib/mihomo-cli/tun-config.yaml
 
-as_user mihomo-cli restart --system --yes
+# The recovery runs before the pending generation is applied (main.rs recovery
+# entry precedes apply_pending_generation), so this exercises the same ordering
+# a real upgrade has.
+MIGRATED_RESET_OUT=$(as_user /tmp/legacy-recovery-mihomo-cli restart --system --yes 2>&1) || {
+    printf '%s\n' "$MIGRATED_RESET_OUT" >&2
+    fail "restart --yes did not converge the migrated transaction while the Core ran"
+}
+printf '%s\n' "$MIGRATED_RESET_OUT"
+printf '%s\n' "$MIGRATED_RESET_OUT" | grep -q '已保留用户配置并重置' || \
+    fail "migrated legacy reset did not report the reset"
 wait_for_json_value 'json.load(sys.stdin)["data"]["core"]["running"]' true || \
     fail "Core not running after migrated legacy transaction recovery"
 [ ! -e /var/lib/mihomo-cli/transactions/active ] || \
     fail "restart did not finalize the migrated legacy TUN transaction"
 [ ! -e /var/lib/mihomo-cli/transactions/tun-journal.json ] || \
     fail "restart did not remove the legacy TUN journal"
+CORE_PID_AFTER_MIGRATED=$(pgrep -x mihomo | head -n1)
+[ -n "$CORE_PID_AFTER_MIGRATED" ] && \
+    [ "$CORE_PID_AFTER_MIGRATED" != "$CORE_PID_BEFORE_MIGRATED" ] || \
+    fail "migrated legacy reset did not replace the Core process"
 cmp -s /tmp/legacy-recovery-mihomo-cli /usr/local/bin/mihomo-cli || \
     fail "installed CLI binary was not upgraded after migrated legacy recovery"
 
@@ -621,6 +804,12 @@ candidate = intent.read_bytes() + b"# migrated legacy candidate blocks install\n
     "runtime_tun": False,
     "api_endpoint": "",
 }))
+# Deliberate fixture correspondence (issue -tail): this fixture models a
+# migrated legacy transaction whose snapshot/old-snapshot already equal the
+# candidate and whose journal records that same revision. The controlled reset
+# only converges such a site (RecoveryRequired + snapshot == candidate); writing
+# the pre-candidate intent here would turn it into an unattestable "other"
+# snapshot and the fixture would stop exercising the migration path.
 (state_root / "tun-config.yaml").write_bytes(candidate)
 
 journal = {
@@ -646,7 +835,8 @@ chmod 0750 /var/lib/mihomo-cli/transactions \
 chmod 0640 /var/lib/mihomo-cli/transactions/active/* \
     /var/lib/mihomo-cli/tun-config.yaml
 
-as_user sudo -n /usr/local/bin/mihomo-cli install --system --yes
+# 普通用户重入：授权边界必须自行覆盖迁移事务的恢复与后续重启。
+as_user /usr/local/bin/mihomo-cli install --system --yes
 wait_for_json_value 'json.load(sys.stdin)["data"]["core"]["running"]' true || \
     fail "idempotent install did not recover and restart the Core"
 [ ! -e /var/lib/mihomo-cli/transactions/active ] || \
@@ -731,6 +921,145 @@ CONFIG_DIGEST_AFTER=$(sha256sum "$CONFIG_FILE" | cut -d' ' -f1)
     fail "managed reset did not rebuild the managed runtime snapshot"
 [ "$(cat "$EXTERNAL_FILE")" = "must survive managed reset" ] || \
     fail "managed reset touched an external runtime residue"
+
+# hard gate: the recovery entry runs BEFORE the pending generation is
+# applied, so a real upgrade always meets the daemon that was already running —
+# which cannot know the new admission. This section downgrades only the daemon
+# binary to the pre- baseline and proves the whole sequence still completes:
+# the privileged CLI performs the stop (identity + exit observation), the reset
+# is done, and only then is the daemon generation applied.
+if [ -x /tests/legacy/mihomo-cli ]; then
+    echo "--- real upgrade combination: pre- daemon + current CLI ---"
+    install -m 0755 /tests/mihomo-cli-source /tmp/new-cli-049
+    NEW_CLI_SHA=$(sha256sum /tmp/new-cli-049 | cut -d' ' -f1)
+    OLD_DAEMON_SHA=$(sha256sum /tests/legacy/mihomo-cli | cut -d' ' -f1)
+    [ "$NEW_CLI_SHA" != "$OLD_DAEMON_SHA" ] || fail "legacy daemon artifact is not a distinct build"
+
+    # Downgrade the whole installation through the pre- CLI itself: stage it
+    # as a pending generation and apply it. A hand-swapped binary would be a
+    # "mixed install" the generation guard (correctly) refuses, so the fixture
+    # must be a real old install state.
+    LEGACY_DOWNGRADE_OUT=$(as_user /tests/legacy/mihomo-cli install --system --yes 2>&1) || {
+        printf '%s\n' "$LEGACY_DOWNGRADE_OUT" >&2
+        fail "the pre- CLI could not stage its own install"
+    }
+    printf '%s\n' "$LEGACY_DOWNGRADE_OUT"
+    printf '%s\n' "$LEGACY_DOWNGRADE_OUT" | grep -q 'Upgrade prepared in pending generation' || \
+        fail "the pre- CLI did not prepare a pending generation"
+    as_user /tests/legacy/mihomo-cli restart --system
+    [ "$(sha256sum /usr/local/bin/mihomo-cli | cut -d' ' -f1)" = "$OLD_DAEMON_SHA" ] || \
+        fail "the pre- install did not take effect"
+    OLD_DAEMON_PID=$(systemctl show mihomo -p MainPID --value)
+    [ "$(sha256sum "/proc/$OLD_DAEMON_PID/exe" | cut -d' ' -f1)" = "$OLD_DAEMON_SHA" ] || \
+        fail "running daemon is not the pre- binary"
+    # The installed CLI is the old one, so this restart never stages an upgrade:
+    # it only starts the Core under the pre- daemon.
+    as_user mihomo-cli restart --system
+    wait_for_json_value 'json.load(sys.stdin)["data"]["core"]["running"]' true || \
+        fail "pre- daemon could not start the Core"
+    CORE_PID_BEFORE_OLD_DAEMON=$(pgrep -x mihomo | head -n1)
+    [ -n "$CORE_PID_BEFORE_OLD_DAEMON" ] || fail "old-daemon fixture: no running Core"
+    CONFIG_SHA_BEFORE_OLD_DAEMON=$(sha256sum "$CONFIG_FILE" | cut -d' ' -f1)
+    # The current CLI is newer than the installed daemon, so this is the upgrade
+    # direction the admission has to survive.
+    [ "$(sha256sum /usr/local/bin/mihomo-cli | cut -d' ' -f1)" != "$NEW_CLI_SHA" ] || \
+        fail "daemon downgrade did not take effect"
+
+    rm -rf /var/lib/mihomo-cli/transactions/active
+    python3 - <<'PY'
+import json
+from pathlib import Path
+
+state_root = Path("/var/lib/mihomo-cli")
+transactions = state_root / "transactions"
+intent = Path("/home/testuser/.config/mihomo/config.yaml")
+candidate = transactions / "tun-candidate.yaml"
+candidate_bytes = intent.read_bytes() + b"# legacy candidate for the old-daemon upgrade\n"
+candidate.write_bytes(candidate_bytes)
+(state_root / "tun-config.yaml").write_bytes(candidate_bytes)
+
+def revision(data):
+    value = 0xcbf29ce484222325
+    for byte in data:
+        value ^= byte
+        value = (value * 0x100000001b3) & 0xffffffffffffffff
+    return f"{value:016x}"
+
+journal = {
+    "transaction_id": "legacy-old-daemon-upgrade",
+    "base_revision": "0000000000000000",
+    "candidate_revision": revision(candidate.read_bytes()),
+    "state": "Prepared",
+    "candidate_path": str(candidate),
+    "snapshot_path": str(state_root / "tun-config.yaml"),
+}
+(transactions / "tun-journal.json").write_text(json.dumps(journal))
+PY
+    chown mihomo:mihomo /var/lib/mihomo-cli/transactions/tun-journal.json \
+        /var/lib/mihomo-cli/transactions/tun-candidate.yaml \
+        /var/lib/mihomo-cli/tun-config.yaml
+    chmod 0640 /var/lib/mihomo-cli/transactions/tun-journal.json \
+        /var/lib/mihomo-cli/transactions/tun-candidate.yaml \
+        /var/lib/mihomo-cli/tun-config.yaml
+
+    if ! as_user /tmp/new-cli-049 restart --system --yes > /tmp/old-daemon-upgrade.out 2>&1; then
+        cat /tmp/old-daemon-upgrade.out >&2
+        echo "--- old daemon upgrade diagnostics ---" >&2
+        find /var/lib/mihomo-cli/transactions -printf '%y %M %u:%g %p\n' >&2 || true
+        journalctl -u mihomo.service --no-pager -n 100 >&2 || true
+        fail "the pre- daemon + current CLI upgrade path did not execute the reset"
+    fi
+    cat /tmp/old-daemon-upgrade.out
+    # The pre- daemon rejected the new request; the privileged CLI had to be
+    # the stop executor, and it reports the observed exit before any cleanup.
+    grep -q "旧 daemon 不识别本次准入" /tmp/old-daemon-upgrade.out || \
+        fail "the compatibility stop executor was not used against the pre- daemon"
+    grep -q "pid=$CORE_PID_BEFORE_OLD_DAEMON，退出已确认" /tmp/old-daemon-upgrade.out || \
+        fail "the compatibility stop did not report the observed exit of the original Core"
+    COMPAT_LINE=$(grep -n '旧 daemon 不识别本次准入' /tmp/old-daemon-upgrade.out | cut -d: -f1)
+    RESET_LINE=$(grep -n '已保留用户配置并重置' /tmp/old-daemon-upgrade.out | cut -d: -f1)
+    [ -n "$COMPAT_LINE" ] && [ -n "$RESET_LINE" ] && [ "$COMPAT_LINE" -lt "$RESET_LINE" ] || \
+        fail "the reset was reported before the stop proof"
+    # Recovery must precede the generation apply (main.rs recovery entry runs
+    # before apply_pending_generation): the old daemon is still running the old
+    # binary while the compat stop happens.
+    SKEW_LINE=$(grep -n '检测到当前 CLI 与系统 Daemon 二进制不一致' /tmp/old-daemon-upgrade.out | cut -d: -f1)
+    [ -n "$SKEW_LINE" ] && [ "$RESET_LINE" -lt "$SKEW_LINE" ] || \
+        fail "the daemon generation was applied before the legacy reset"
+    # Dynamic proof: the original process is gone and a different Core serves now.
+    for _ in $(seq 1 50); do [ ! -e "/proc/$CORE_PID_BEFORE_OLD_DAEMON" ] && break; sleep 0.1; done
+    [ ! -e "/proc/$CORE_PID_BEFORE_OLD_DAEMON" ] || \
+        fail "the original Core process $CORE_PID_BEFORE_OLD_DAEMON is still alive"
+    CORE_PID_AFTER_OLD_DAEMON=$(pgrep -x mihomo | head -n1)
+    [ -n "$CORE_PID_AFTER_OLD_DAEMON" ] && \
+        [ "$CORE_PID_AFTER_OLD_DAEMON" != "$CORE_PID_BEFORE_OLD_DAEMON" ] || \
+        fail "the upgrade did not start a new Core process"
+    wait_for_json_value 'json.load(sys.stdin)["data"]["core"]["running"]' true || \
+        fail "Core not running after the old-daemon upgrade"
+    grep -q 'API ready at /var/run/mihomo/mihomo.sock' /tmp/old-daemon-upgrade.out || \
+        fail "the upgrade did not reach API readiness"
+    grep -q 'Successfully upgraded to generation' /tmp/old-daemon-upgrade.out || \
+        fail "the upgrade did not report a successful generation apply"
+    # Evidence: transaction quarantined, legacy artifacts gone, user config intact.
+    [ ! -e /var/lib/mihomo-cli/transactions/active ] || \
+        fail "old-daemon upgrade left the active transaction"
+    [ ! -e /var/lib/mihomo-cli/transactions/tun-journal.json ] || \
+        fail "old-daemon upgrade left the legacy journal"
+    [ ! -e /var/lib/mihomo-cli/transactions/tun-candidate.yaml ] || \
+        fail "old-daemon upgrade left the legacy candidate"
+    find /var/lib/mihomo-cli/transactions/gc -maxdepth 1 -name 'reset-*' | grep -q . || \
+        fail "old-daemon upgrade did not quarantine the transaction evidence"
+    [ "$(sha256sum "$CONFIG_FILE" | cut -d' ' -f1)" = "$CONFIG_SHA_BEFORE_OLD_DAEMON" ] || \
+        fail "old-daemon upgrade changed the user configuration"
+    # The daemon generation was applied only after the reset.
+    [ "$(sha256sum /usr/local/bin/mihomo-cli | cut -d' ' -f1)" = "$NEW_CLI_SHA" ] || \
+        fail "old-daemon upgrade did not apply the pending daemon generation"
+    NEW_DAEMON_PID=$(systemctl show mihomo -p MainPID --value)
+    [ "$(sha256sum "/proc/$NEW_DAEMON_PID/exe" | cut -d' ' -f1)" = "$NEW_CLI_SHA" ] || \
+        fail "the running daemon was not upgraded to the current binary"
+else
+    echo "SKIP: /tests/legacy/mihomo-cli is missing; the pre- daemon upgrade combination was not exercised"
+fi
 
  echo "--- all-uninstall is non-interactive and removes both modes ---"
 as_user mihomo-cli uninstall --all --yes

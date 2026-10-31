@@ -29,15 +29,18 @@ mod backup;
 mod config;
 mod daemon;
 mod dns;
-// Issue #022 A：本地解析器探测依赖 /etc/resolv.conf，仅在 unix 上提供。
+// A：本地解析器探测依赖 /etc/resolv.conf，仅在 unix 上提供。
+mod core_identity;
 #[cfg(unix)]
 mod dns_probe;
 mod generation;
+mod generation_adoption;
 mod groups;
 mod installer;
 mod instance;
 mod ipc;
 mod lock;
+mod manual;
 mod mihomo_api;
 mod preflight;
 mod rules;
@@ -75,9 +78,21 @@ async fn main() {
             }
         }
     }
+    let is_json = cli.json;
+    let cmd_name = cli.command.as_ref().map(|c| c.name()).unwrap_or("install");
     if let Err(e) = run(cli).await {
-        eprintln!("\n  Error: {e}");
-        eprintln!("  Run with -v for more details");
+        if is_json {
+            let error_envelope = json_error_envelope(cmd_name, &format!("{e:#}"));
+            if let Ok(json_str) = serde_json::to_string_pretty(&error_envelope) {
+                println!("{json_str}");
+            }
+        }
+        if VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("\n  Error: {e:#}");
+        } else {
+            eprintln!("\n  Error: {e}");
+            eprintln!("  Run with -v for more details");
+        }
         std::process::exit(1);
     }
 }
@@ -91,6 +106,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         github_mirror: None,
         skip_config: false,
         yes: false,
+        discard_pending: None,
+        adopt_current: false,
+        dry_run: false,
     }) {
         Command::Install {
             system,
@@ -100,7 +118,21 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             github_mirror,
             skip_config,
             yes,
+            discard_pending,
+            adopt_current,
+            dry_run,
         } => {
+            if adopt_current {
+                let ctx = instance::planned_current_context(instance::InstanceMode::System)
+                    .ok_or_else(|| anyhow::anyhow!("Unsupported OS for instance lifecycle"))?;
+                return generation_adoption::adopt(
+                    &ctx,
+                    discard_pending.as_deref(),
+                    yes,
+                    dry_run,
+                    cli.json,
+                );
+            }
             cmd_install_entry(
                 system,
                 user,
@@ -109,11 +141,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 github_mirror.as_deref(),
                 skip_config,
                 yes,
+                discard_pending.as_deref(),
             )
             .await
         }
         Command::Upgrade { system, yes } => cmd_upgrade(system, false, yes).await,
         Command::Version { system } => cmd_version(system, false, cli.json).await,
+        Command::Manual { list, topic } => manual::run(list, topic.as_deref(), cli.json),
         Command::Config {
             command,
             system,
@@ -207,7 +241,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             unpin,
             all,
             replay,
-        } => cmd_select_resolved(system, user, group, node, unpin, all, replay).await,
+        } => cmd_select_resolved(system, user, group, node, unpin, all, replay, cli.json).await,
         Command::List { system } => cmd_list_resolved(system, false).await,
         Command::Delay {
             system,
@@ -270,7 +304,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             system,
             user,
             no_probe_dns,
-        } => cmd_doctor(system, user, !no_probe_dns).await,
+            privileged,
+        } => {
+            if privileged {
+                return generation_adoption::inspect_privileged(cli.json);
+            }
+            cmd_doctor(system, user, !no_probe_dns).await
+        }
         Command::Daemon => {
             let sock_path = ipc::system_service_socket_path();
             // unix: launchd/systemd 管理生命周期，token 永不取消（保持现有行为）
@@ -1234,7 +1274,7 @@ async fn prompt_install_for_start() -> anyhow::Result<bool> {
     println!("No mihomo service is installed yet.");
     println!("Start needs an installed service/core first.");
     println!();
-    cmd_install_entry(false, false, false, None, None, false, false).await?;
+    cmd_install_entry(false, false, false, None, None, false, false, None).await?;
     Ok(true)
 }
 
@@ -1249,7 +1289,11 @@ async fn cmd_lifecycle_resolved(
             instance::CommandIntent::StartLike
         }
         instance::ServiceAction::Stop => instance::CommandIntent::StopLike,
-        instance::ServiceAction::Uninstall => instance::CommandIntent::UninstallLike,
+        // Uninstall is resolved by the installer path, never here — keep it loud
+        // instead of silently inheriting another intent.
+        instance::ServiceAction::Uninstall => {
+            unreachable!("uninstall is resolved by the installer path, not the lifecycle resolver")
+        }
         // Enable/Disable are autostart-only (R1.2) and never enter the
         // lifecycle path; Mutating is the conservative intent if they do.
         instance::ServiceAction::Enable | instance::ServiceAction::Disable => {
@@ -1483,6 +1527,40 @@ async fn cmd_use(mode: Option<UseMode>) -> anyhow::Result<()> {
     }
 }
 
+/// pending generation 三态消费——可读无 pending 静默、可读有 pending
+/// 沿用既有告警、读不动（EACCES）显示「无法判定」。不可读绝不代表「无 pending」，
+/// 只读面也绝不在这里提权。
+fn doctor_pending_generation_check(store: &generation::GenerationStore) -> Option<DoctorCheck> {
+    match store.observe_pending() {
+        generation::PendingObservation::Applied => None,
+        generation::PendingObservation::HasPending(pending_id) => Some(DoctorCheck::fail(
+            "待应用更新",
+            format!("发现 pending generation ({pending_id})"),
+            "应用更新: mihomo-cli restart".to_string(),
+        )),
+        generation::PendingObservation::Undeterminable(error) => Some(DoctorCheck::neutral(
+            "待应用更新",
+            pending_generation_unknown_notice(&error),
+        )),
+    }
+}
+
+pub(crate) fn doctor_intranet_guard_checks(config_path: &std::path::Path) -> Vec<DoctorCheck> {
+    let mut checks = Vec::new();
+    if let Ok(content) = std::fs::read_to_string(config_path) {
+        if let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+            for w in config::lint_intranet_guard(&yaml) {
+                checks.push(DoctorCheck::warn(
+                    "内网资产安全 (Intranet Guard)",
+                    w.message,
+                    Some(w.recommendation),
+                ));
+            }
+        }
+    }
+    checks
+}
+
 async fn cmd_doctor(system: bool, user: bool, probe_dns: bool) -> anyhow::Result<()> {
     let ctx = match mode_request_from_flags(system, user) {
         instance::ModeRequest::ExplicitSystem => {
@@ -1516,6 +1594,7 @@ async fn cmd_doctor(system: bool, user: bool, probe_dns: bool) -> anyhow::Result
             "配置文件",
             config_path.display().to_string(),
         ));
+        checks.extend(doctor_intranet_guard_checks(config_path));
     }
 
     #[cfg(unix)]
@@ -1591,14 +1670,8 @@ async fn cmd_doctor(system: bool, user: bool, probe_dns: bool) -> anyhow::Result
         daemon::check_and_warn_legacy_authorized_clients();
 
         let gen_store = system_generation_store(&ctx);
-        if let Ok(gen_state) = gen_store.read_state() {
-            if let Some(pending_id) = gen_state.pending {
-                checks.push(DoctorCheck::fail(
-                    "待应用更新",
-                    format!("发现 pending generation ({pending_id})"),
-                    "应用更新: mihomo-cli restart".to_string(),
-                ));
-            }
+        if let Some(check) = doctor_pending_generation_check(&gen_store) {
+            checks.push(check);
         }
         if let Ok(current_cli) = std::env::current_exe() {
             if ctx.paths.cli_binary.exists() {
@@ -1608,7 +1681,7 @@ async fn cmd_doctor(system: bool, user: bool, probe_dns: bool) -> anyhow::Result
                     checks.push(DoctorCheck::fail(
                         "Daemon 二进制",
                         format!("与当前 CLI 不一致 ({})", ctx.paths.cli_binary.display()),
-                        "应用更新: mihomo-cli restart".to_string(),
+                        doctor_daemon_binary_skew_hint().to_string(),
                     ));
                 }
             } else {
@@ -1685,7 +1758,7 @@ async fn cmd_doctor(system: bool, user: bool, probe_dns: bool) -> anyhow::Result
                             ));
                         }
                         None => {
-                            // Issue #022 C：unknown 的修法取决于缺哪一侧，不能一律建议
+                            // C：unknown 的修法取决于缺哪一侧，不能一律建议
                             // `restart`——Core 正在运行时那是一个无解的循环提示。
                             let hint = match (
                                 snapshot.runtime_tun.as_bool(),
@@ -1713,7 +1786,7 @@ async fn cmd_doctor(system: bool, user: bool, probe_dns: bool) -> anyhow::Result
                         }
                     }
 
-                    // Issue #022: 快照构造完成后才执行 P2 探测，且不回填快照。
+                    // 快照构造完成后才执行 P2 探测，且不回填快照。
                     if let Some(check) = doctor_dns_probe_check(&ctx, &snapshot, probe_dns).await {
                         checks.push(check);
                     }
@@ -1782,7 +1855,8 @@ async fn cmd_doctor(system: bool, user: bool, probe_dns: bool) -> anyhow::Result
                 Ok(
                     ipc::DaemonResponse::CoreApi { .. }
                     | ipc::DaemonResponse::Transaction { .. }
-                    | ipc::DaemonResponse::SelectionMirrorRevisions { .. },
+                    | ipc::DaemonResponse::SelectionMirrorRevisions { .. }
+                    | ipc::DaemonResponse::SelectionDrift { .. },
                 ) => checks.push(DoctorCheck::fail(
                     "Daemon 状态",
                     "收到意外的 Core API / Transaction / Mirror revisions 响应",
@@ -1832,6 +1906,17 @@ async fn cmd_doctor(system: bool, user: bool, probe_dns: bool) -> anyhow::Result
                     "确认 system daemon 可用: mihomo-cli status --system".to_string(),
                 )),
             }
+            // B3: immediate read-only drift comparison reusing the
+            // daemon's decision function (no write, no fix). Intent source is
+            // the user tree (the CLI never requires /var/lib readability).
+            match doctor_selection_drift_check(&ctx).await {
+                Ok(check) => checks.push(check),
+                Err(err) => checks.push(DoctorCheck::fail(
+                    "Selection drift",
+                    format!("即时比对失败: {err:#}"),
+                    "确认 Core API 可用: mihomo-cli status --system".to_string(),
+                )),
+            }
         }
     } else if mihomo_api::api_get_at_endpoint(&ctx.paths.api_endpoint, "/configs")
         .await
@@ -1853,6 +1938,19 @@ async fn cmd_doctor(system: bool, user: bool, probe_dns: bool) -> anyhow::Result
             ),
             "启动或重启服务: mihomo-cli restart",
         ));
+    }
+
+    if let Some(observation) = orphan_core_observation(&ctx).await {
+        checks.push(DoctorCheck {
+            passed: true,
+            warning: true,
+            neutral: false,
+            label: "孤儿 Core".to_string(),
+            detail: observation,
+            hint: Some(
+                "只读观察：未停止、未清理；显式 restart/install 会在接管时证明退出".to_string(),
+            ),
+        });
     }
 
     for check in &checks {
@@ -1913,9 +2011,31 @@ async fn cmd_status_json(system: bool, user: bool) -> anyhow::Result<()> {
             &ctx.paths.intent_config_file,
             &snapshot,
             service_runtime_state(&ctx),
+            &ctx,
         ),
         Vec::new(),
     )
+}
+
+/// `status --json` 的 pending generation 三态结构化表达。
+/// `unknown` 表示代际信任根以当前身份读不动（可能存在未应用更新），
+/// 不等于无 pending；user 实例无该概念，为 null。
+fn status_json_pending_generation(
+    mode: instance::InstanceMode,
+    ctx: &instance::InstanceContext,
+) -> serde_json::Value {
+    if mode != instance::InstanceMode::System {
+        return serde_json::Value::Null;
+    }
+    match system_generation_store(ctx).observe_pending() {
+        generation::PendingObservation::Applied => serde_json::json!({ "state": "none" }),
+        generation::PendingObservation::HasPending(id) => {
+            serde_json::json!({ "state": "pending", "id": id.as_str() })
+        }
+        generation::PendingObservation::Undeterminable(_) => {
+            serde_json::json!({ "state": "unknown" })
+        }
+    }
 }
 
 /// Render status JSON exclusively from the shared runtime snapshot.  This
@@ -1927,16 +2047,11 @@ fn status_json_data(
     intent_config_path: &std::path::Path,
     snapshot: &status::StatusSnapshot,
     runtime: service::ServiceRuntimeState,
+    ctx: &instance::InstanceContext,
 ) -> serde_json::Value {
-    let health = service_runtime_health_label(runtime, snapshot_instance_up(snapshot))
-        .unwrap_or_else(
-            || match (snapshot.core_running.as_bool(), snapshot.api_reachable) {
-                (Some(false), _) => "inactive",
-                (Some(true), true) if snapshot.runtime_tun.as_bool().is_some() => "healthy",
-                (Some(true), _) | (None, true) => "degraded",
-                _ => "unknown",
-            },
-        );
+    // Spec §0.6: the JSON top-level judgment is the machine-readable form of the
+    // text summary, so it must come from the same predicate.
+    let health = status_health_label(snapshot, runtime);
     let daemon = if plan.mode == instance::InstanceMode::System {
         serde_json::json!({
             "running": snapshot.daemon_reachable.as_bool(),
@@ -1945,6 +2060,11 @@ fn status_json_data(
     } else {
         serde_json::Value::Null
     };
+
+    // SPEC §3.8.1: status JSON carries `selections` with `subscription_id` and
+    // `source: local-derive`. Pure local derivation, no network, no runtime
+    // attestation.
+    let selections_value = status_json_selections(ctx);
 
     serde_json::json!({
         "health": health,
@@ -1956,10 +2076,12 @@ fn status_json_data(
             "pid": snapshot.core_pid,
             "active_config": snapshot.active_config_path,
             "api_reachable": snapshot.api_reachable,
+            // Raw Core `/configs` observation (unattested); the attested judgment
+            // lives in the top-level `tun` field (Spec §0.6).
             "tun": snapshot.runtime_tun.as_bool(),
         },
         "api": if snapshot.api_reachable { "reachable" } else { "unknown" },
-        "tun": runtime_tun_status_label(snapshot.runtime_tun),
+        "tun": status_tun_label(snapshot),
         "configured_tun": snapshot.configured_tun.to_string(),
         "system_proxy": system_proxy_status_label(snapshot.system_proxy),
         "shell_proxy": shell_proxy_status_label(snapshot.shell_proxy),
@@ -1975,7 +2097,36 @@ fn status_json_data(
         "binary": { "path": plan.binary, "exists": snapshot.core_binary_exists },
         "daemon": daemon,
         "logs": plan.log_file,
+        "selections": selections_value,
+        // durable 代际状态，非 runtime 快照；与文本路径共用
+        // `observe_pending` 单点观测，杜绝同一次调用内两处判定漂移。
+        "pending_generation": status_json_pending_generation(plan.mode, ctx),
     })
+}
+
+/// SPEC §3.8.1: derive `selections` for status JSON from the user config tree.
+/// `source` is always `local-derive`; no network, no runtime attestation.
+fn status_json_selections(ctx: &instance::InstanceContext) -> serde_json::Value {
+    let paths = utils::AppPaths::new(ctx.paths.config_dir.clone());
+    let active_id = config::get_active_id_at(&paths).ok().flatten();
+    match active_id {
+        Some(id) => {
+            let selection_path = paths.selection_state_path_for_subscription(&id);
+            let selections = selection::load_selection_state_path(&selection_path)
+                .ok()
+                .unwrap_or_default();
+            serde_json::json!({
+                "subscription_id": id,
+                "source": "local-derive",
+                "count": selections.len(),
+            })
+        }
+        None => serde_json::json!({
+            "subscription_id": serde_json::Value::Null,
+            "source": "local-derive",
+            "count": 0,
+        }),
+    }
 }
 
 async fn cmd_status_resolved(system: bool, user: bool) -> anyhow::Result<()> {
@@ -2568,13 +2719,11 @@ async fn cmd_dashboard() -> anyhow::Result<()> {
             let proxies = client.get("/proxies").await.ok();
 
             // Extract info
+            // Spec §0.6: the dashboard is also a user-visible TUN renderer, so
+            // it must use the attested verdict rather than the raw `/configs` bit.
+            let snapshot = status::StatusSnapshot::collect(&resolved.ctx).await;
             let mode = instance_mode_label(resolved.ctx.mode);
-            let tun = configs
-                .as_ref()
-                .and_then(|c| c.get("tun"))
-                .and_then(|t| t.get("enable"))
-                .and_then(|e| e.as_bool())
-                .unwrap_or(false);
+            let tun = dashboard_tun_label(&snapshot);
             let mixed_port = configs
                 .as_ref()
                 .and_then(|c| c.get("mixed-port"))
@@ -2622,11 +2771,7 @@ async fn cmd_dashboard() -> anyhow::Result<()> {
             writeln!(stdout, "║        mihomo-cli  Dashboard             ║")?;
             writeln!(stdout, "╠══════════════════════════════════════════╣")?;
             writeln!(stdout, "║  Mode:        {:<25} ║", mode)?;
-            writeln!(
-                stdout,
-                "║  TUN:         {:<25} ║",
-                if tun { "✅ enabled" } else { "❌ disabled" }
-            )?;
+            writeln!(stdout, "║  TUN:         {:<25} ║", tun)?;
             writeln!(stdout, "║  Mixed port:  {:<25} ║", mixed_port)?;
             writeln!(stdout, "║  Connections: {:<25} ║", conn_count)?;
             writeln!(
@@ -2708,10 +2853,13 @@ async fn apply_selected_proxy(
     client: &mihomo_api::EndpointMihomoApiClient,
     group_name: &str,
     node_name: &str,
+    json: bool,
 ) -> anyhow::Result<()> {
     // D8: hold the per-instance selection lock across kernel PUT/IPC + intent
     // persist so select and replay serialize (SPEC-select-persistence §3.2-6).
     // Acquired before the PUT, so a lock failure means the node was NOT switched.
+    // The lock is not reentrant, so persist goes through the `_locked` variant
+    // and this path keeps exactly one acquisition.
     let paths = utils::AppPaths::new(resolved.ctx.paths.config_dir.clone());
     let _selection_lock = selection::acquire_selection_lock_at(&paths).map_err(|err| {
         anyhow::anyhow!("Failed to acquire selection lock; node was NOT switched: {err:#}")
@@ -2740,7 +2888,8 @@ async fn apply_selected_proxy(
     } else {
         mihomo_api::select_proxy_with_client(client, group_name, node_name).await?;
     }
-    if let Err(persist_err) = selection::remember_selection_for_scope(&scope, group_name, node_name)
+    if let Err(persist_err) =
+        selection::remember_selection_for_scope_locked(&scope, group_name, node_name)
     {
         if let Ok(old_map) = selection::load_selection_state_for_scope(&scope) {
             if let Some(old_node) = old_map.get(group_name) {
@@ -2757,12 +2906,31 @@ async fn apply_selected_proxy(
                 }
             }
         }
+        if resolved.ctx.mode == instance::InstanceMode::System {
+            // Re-record the (unchanged) intent: this closes the select segment
+            // opened by the rollback PUT instead of wedging sampling on an
+            // unprovable segment, and honestly reflects the post-rollback state
+            // (if the rollback itself failed, the sampler will report the real
+            // drift instead of hiding it behind `unknown`).
+            push_selection_mirror_update(&paths, &scope.subscription_id, json).await;
+        }
         anyhow::bail!("Selection applied but persist failed; runtime rolled back: {persist_err:#}");
     }
     if resolved.ctx.mode == instance::InstanceMode::System {
-        push_selection_mirror_update(&paths, &scope.subscription_id).await;
+        push_selection_mirror_update(&paths, &scope.subscription_id, json).await;
     }
-    println!("Switched {group_name} → {node_name}");
+    if json {
+        print_json_envelope(
+            "select",
+            serde_json::json!({
+                "group": group_name,
+                "node": node_name,
+            }),
+            Vec::new(),
+        )?;
+    } else {
+        println!("Switched {group_name} → {node_name}");
+    }
     Ok(())
 }
 
@@ -2778,6 +2946,7 @@ async fn print_selection_replay_after_ready(
             for line in report.format_lines() {
                 println!("{line}");
             }
+            print_selection_replay_remedies(&report);
         }
         Err(err) => println!("⚠ Selections not replayed: {err:#}"),
     }
@@ -2815,7 +2984,7 @@ fn cmd_select_unpin(
 }
 
 /// System-mode mirror push after an unpin commit (best-effort).
-async fn push_mirror_after_unpin(system: bool, user: bool) {
+async fn push_mirror_after_unpin(system: bool, user: bool, json: bool) {
     let Ok(resolved) =
         resolve_current_instance_context(system, user, instance::CommandIntent::ReadOnly)
     else {
@@ -2828,7 +2997,7 @@ async fn push_mirror_after_unpin(system: bool, user: bool) {
     let Ok(Some(active)) = config::get_active_id_at(&paths) else {
         return;
     };
-    push_selection_mirror_update(&paths, &active).await;
+    push_selection_mirror_update(&paths, &active, json).await;
 }
 
 /// Hidden service-manager hook (`select --replay`). Hard contract: always
@@ -2868,6 +3037,7 @@ async fn select_replay_inner(system: bool, user: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_select_resolved(
     system: bool,
     user: bool,
@@ -2876,6 +3046,7 @@ async fn cmd_select_resolved(
     unpin: bool,
     all: bool,
     replay: bool,
+    json: bool,
 ) -> anyhow::Result<()> {
     if replay {
         return cmd_select_replay(system, user).await;
@@ -2883,7 +3054,7 @@ async fn cmd_select_resolved(
     if unpin {
         let result = cmd_select_unpin(system, user, group, all);
         if result.is_ok() {
-            push_mirror_after_unpin(system, user).await;
+            push_mirror_after_unpin(system, user, json).await;
         }
         return result;
     }
@@ -2901,17 +3072,19 @@ async fn cmd_select_resolved(
             let group_name = group.ok_or_else(|| {
                 anyhow::anyhow!("--node requires --group (the proxy group that contains the node)")
             })?;
-            apply_selected_proxy(&resolved, &client, &group_name, &node_name).await
+            apply_selected_proxy(&resolved, &client, &group_name, &node_name, json).await
         }
         // Interactive TUI (no --node): existing behavior.
         None => match group {
             Some(g) => match ui::select_node_with_client(&client, &g).await? {
-                Some(node_name) => apply_selected_proxy(&resolved, &client, &g, &node_name).await,
+                Some(node_name) => {
+                    apply_selected_proxy(&resolved, &client, &g, &node_name, json).await
+                }
                 None => Ok(()),
             },
             None => match ui::flat_select_with_client(&client).await? {
                 Some((group_name, node_name)) => {
-                    apply_selected_proxy(&resolved, &client, &group_name, &node_name).await
+                    apply_selected_proxy(&resolved, &client, &group_name, &node_name, json).await
                 }
                 None => Ok(()),
             },
@@ -2977,22 +3150,27 @@ fn ensure_instance_controller_endpoint(ctx: &instance::InstanceContext) -> anyho
     Ok(())
 }
 
+/// 从**调用方捕获的** intent 字节构建 TUN candidate（不自行读盘）。
+///
+/// P1-1：字节由 `prepare_and_publish_active_transaction_capturing_intent`
+/// 在其 CoordinatorLock → ConfigLock 临界区内提供，本函数只在锁内做内存构建。
 fn build_tun_candidate(
     ctx: &instance::InstanceContext,
+    intent_bytes: &[u8],
     enable: bool,
     stack: Option<&TunStack>,
     dns_hijack: Option<&str>,
 ) -> anyhow::Result<Vec<u8>> {
-    let content = std::fs::read_to_string(&ctx.paths.intent_config_file).map_err(|e| {
+    let content = std::str::from_utf8(intent_bytes).map_err(|e| {
         anyhow::anyhow!(
-            "cannot read config for TUN candidate: {} ({e})",
+            "config for TUN candidate is not valid UTF-8: {} ({e})",
             ctx.paths.intent_config_file.display()
         )
     })?;
     let content = if enable {
-        config::ensure_controller_for_endpoint(&content, &ctx.paths.api_endpoint)?
+        config::ensure_controller_for_endpoint(content, &ctx.paths.api_endpoint)?
     } else {
-        content
+        content.to_string()
     };
     let mut doc: serde_yaml::Value = serde_yaml::from_str(&content)?;
     if !matches!(doc, serde_yaml::Value::Mapping(_)) {
@@ -3017,7 +3195,7 @@ fn build_tun_candidate(
             serde_yaml::Value::String(stack.to_string()),
         );
     }
-    // Issue #022: 开启 TUN 时归一化 TUN 块（dns-hijack 对齐参考实现、缺省补
+    // 开启 TUN 时归一化 TUN 块（dns-hijack 对齐参考实现、缺省补
     // strict-route）以及旧版模板遗留的 DNS 默认值，关闭时只翻转 enable，不动其它字段。
     // 归一化结果落在 intent config.yaml 里，仍受 candidate/revision 与 attestation 管辖，
     // 因此存量安装无需额外跑一次 `config -u`。
@@ -3491,7 +3669,7 @@ fn system_daemon_unavailable_message(operation: &str, ctx: &instance::InstanceCo
     )
 }
 
-/// Classify the system service runtime state (Issue #015): probe results feed
+/// Classify the system service runtime state: probe results feed
 /// diagnosis and guidance only — ServiceTarget selection stays purely static.
 fn service_runtime_state(ctx: &instance::InstanceContext) -> service::ServiceRuntimeState {
     let service_manager_available = match (ctx.os, ctx.mode) {
@@ -3583,7 +3761,7 @@ fn system_tun_requires_daemon_message(
     }
 }
 
-/// Runtime variant of `system_tun_requires_daemon_message` (Issue #015):
+/// Runtime variant of `system_tun_requires_daemon_message`:
 /// diagnose the service runtime state first (no systemd / not installed /
 /// not running), falling back to the generic daemon-unavailable message.
 fn system_tun_block_message(
@@ -3628,7 +3806,21 @@ fn is_current_process_root() -> bool {
 }
 
 fn sudo_reexec_command(exe: &std::path::Path, args: &[String]) -> std::process::Command {
+    sudo_reexec_command_with(exe, args, false)
+}
+
+/// `non_interactive` 只影响 sudo 自身的认证方式，不改变被重入的命令参数：
+/// 无 TTY 时不等待交互输入，认证不成立即由 sudo 立即失败并返回非零
+/// （`--yes` 是 CLI 的业务确认，不构成操作系统授权）。
+fn sudo_reexec_command_with(
+    exe: &std::path::Path,
+    args: &[String],
+    non_interactive: bool,
+) -> std::process::Command {
     let mut command = std::process::Command::new("sudo");
+    if non_interactive {
+        command.arg("--non-interactive");
+    }
     // 传递原始用户上下文，避免 sudo 重置 $HOME 后路径解析错误
     // 仅在 Linux 上需要（macOS sudo 默认保留 HOME，Windows 无此问题）
     #[cfg(target_os = "linux")]
@@ -3714,23 +3906,44 @@ async fn prepare_system_transaction_recovery() -> anyhow::Result<bool> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
+/// SPEC §12.3.1 / issue: `read_state` preserves the filesystem error kind, so an
+/// unreadable state file is classified structurally. A message that merely mentions a
+/// permission problem is not an identity limitation and must not escalate.
+fn generation_read_is_identity_limited(error: &generation::GenerationError) -> bool {
+    matches!(
+        error,
+        generation::GenerationError::Io(io_error)
+            if io_error.kind() == std::io::ErrorKind::PermissionDenied
+    )
+}
+
+/// 「无法判定」的诚实文案——不宣称有 pending、不宣称无 pending、
+/// 不在这里提权。身份不足时指引 `restart --system`（它会为这次操作自行申请
+/// 管理员授权并检查、应用信任根）；非身份类读取失败只报事实，不给授权指引。
+fn pending_generation_unknown_notice(error: &generation::GenerationError) -> String {
+    if generation_read_is_identity_limited(error) {
+        "代际状态以当前身份不可读，无法判定是否存在待应用更新或是否需采纳；可能存在未应用更新，需管理员权限查看。显式只读检查：mihomo-cli doctor --system --privileged（不修复、不迁移、不应用更新）".to_string()
+    } else {
+        format!("代际状态读取失败，无法判定是否有待应用更新 ({error})")
+    }
+}
+
 fn maybe_sudo_reexec_for_system_generation(ctx: &instance::InstanceContext) -> anyhow::Result<()> {
     if is_current_process_root() {
         return Ok(());
     }
 
     let state = match system_generation_store(ctx).read_state() {
-        Ok(state) => state,
-        Err(error) if error.to_string().contains("Permission denied") => {
-            let exe = std::env::current_exe().unwrap_or_else(|_| {
-                std::env::args()
-                    .next()
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_default()
-            });
-            let args: Vec<String> = std::env::args().skip(1).collect();
-            let status = sudo_reexec_command(&exe, &args).status()?;
-            std::process::exit(status.code().unwrap_or(1));
+        Ok(state) => Some(state),
+        // The generation state lives under `0770 root:mihomo`, so a caller outside the
+        // group cannot read it at all. That is an identity limitation, not evidence of
+        // a pending generation, and it must not turn every lifecycle command into a
+        // sudo prompt.
+        Err(error) if generation_read_is_identity_limited(&error) => {
+            eprintln!(
+                "  ⚠ Cannot inspect the pending system generation with the current identity; skipping the generation check."
+            );
+            None
         }
         Err(error) => {
             return Err(anyhow::anyhow!(
@@ -3738,7 +3951,7 @@ fn maybe_sudo_reexec_for_system_generation(ctx: &instance::InstanceContext) -> a
             ));
         }
     };
-    let has_pending = state.pending.is_some();
+    let has_pending = state.is_some_and(|state| state.pending.is_some());
     if !has_pending && !is_system_cli_skewed(ctx) {
         return Ok(());
     }
@@ -3751,6 +3964,132 @@ fn maybe_sudo_reexec_for_system_generation(ctx: &instance::InstanceContext) -> a
     });
     let args: Vec<String> = std::env::args().skip(1).collect();
     let status = sudo_reexec_command(&exe, &args).status()?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// SPEC §12.3.1（裁决 B）：root 专属域。这两个域**只**影响「当前显式操作是否
+/// 必须由特权执行者完成」，与权限漂移判定无关。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtectedDomain {
+    /// runtime 事务域：`/var/lib/mihomo-cli`（`0770 root:mihomo`）内的 transaction 对象。
+    RuntimeTransactions,
+    /// 代际信任根：独立的 `/var/lib/mihomo-cli-generations`（`root:root 0750`）。
+    GenerationTrustRoot,
+}
+
+impl ProtectedDomain {
+    fn label(self) -> &'static str {
+        match self {
+            ProtectedDomain::RuntimeTransactions => "受保护的运行事务状态",
+            ProtectedDomain::GenerationTrustRoot => "受保护的代际信任根",
+        }
+    }
+}
+
+/// 结构化判据：错误链里出现 `EACCES`/`EPERM` 即「当前身份看不到」，而不是「它不对」。
+fn identity_limited_io(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    })
+}
+
+/// 纯判定：哪些 root 专属域当前身份观测不到（需要业务授权）。
+/// 观测得到、或对象根本不存在时返回空——健康状态下不产生任何授权请求。
+fn protected_domains_requiring_authorization(
+    ctx: &instance::InstanceContext,
+) -> Vec<ProtectedDomain> {
+    [
+        ProtectedDomain::RuntimeTransactions,
+        ProtectedDomain::GenerationTrustRoot,
+    ]
+    .into_iter()
+    .filter(|domain| match domain {
+        ProtectedDomain::RuntimeTransactions => {
+            matches!(
+                tun_transaction::read_active_journal(ctx),
+                Err(ref error) if identity_limited_io(error)
+            )
+        }
+        ProtectedDomain::GenerationTrustRoot => {
+            matches!(
+                system_generation_store(ctx).read_state(),
+                Err(generation::GenerationError::Io(ref error))
+                    if error.kind() == std::io::ErrorKind::PermissionDenied
+            )
+        }
+    })
+    .collect()
+}
+
+fn protected_domain_authorization_notice(operation: &str, impact: &str) -> String {
+    format!(
+        "  为执行你请求的 {operation}，需要管理员授权检查受保护的运行状态，并按原命令范围\
+         恢复事务或应用更新。当前尚未判定权限异常；{impact}可能暂时中断连接。"
+    )
+}
+
+/// 已取得管理员授权但仍观测不到：结构化失败，绝不递归 sudo。
+fn protected_domain_still_unobservable_message(domains: &[ProtectedDomain]) -> String {
+    let labels: Vec<&str> = domains.iter().map(|domain| domain.label()).collect();
+    format!(
+        "已取得管理员授权，但{}仍不可观测，拒绝在无法确认事务/代际状态的情况下继续。\n  \
+         未判定权限漂移；运行态未改动，证据保留。\n  \
+         Next: mihomo-cli doctor --system",
+        labels.join("与")
+    )
+}
+
+/// SPEC §12.3.1（裁决 B）：代际信任根的拒绝文案。
+/// 「授权不足」与「确证违约」必须分开报，且删除递归 `chown`/`chmod` 建议——
+/// 后者把「我看不到」误报成「它不对」，且对普通用户是不可执行的递归操作。
+fn generation_trust_root_refusal(action: &str, error: &anyhow::Error) -> anyhow::Error {
+    if identity_limited_io(error) {
+        anyhow::anyhow!(
+            "授权不足，无法{action}：未能以当前身份确认代际信任根的安全条件（未判定权限漂移）。\n  \
+             未使用任何代际，运行态未改动。\n  \
+             Next: 在可取得管理员授权的会话重试原 mihomo-cli 命令\n  \
+             原因: {error}"
+        )
+    } else {
+        anyhow::anyhow!(
+            "代际信任根安全条件不满足，已拒绝{action}；运行态未改动，证据保留。\n  \
+             Next: mihomo-cli doctor --system\n  \
+             原因: {error}"
+        )
+    }
+}
+
+/// SPEC §12.3.1（裁决 B）：业务操作授权边界。
+///
+/// 决策与权限漂移判定分离：这里只回答「当前显式操作是否需要特权执行者」，
+/// 不 chown/chmod、不产生修复计划、不宣称检测到权限异常。
+/// 每命令至多一次协调提权重入；权限面以原命令参数重入，业务范围不变
+/// （`--yes` 仍是业务确认，runtime reset 仍需原有确认）。
+fn authorize_protected_domain_operations(
+    ctx: &instance::InstanceContext,
+    operation: &str,
+    impact: &str,
+) -> anyhow::Result<()> {
+    if ctx.mode != instance::InstanceMode::System {
+        return Ok(());
+    }
+    let unobservable = protected_domains_requiring_authorization(ctx);
+    if unobservable.is_empty() {
+        return Ok(());
+    }
+    if is_current_process_root() {
+        anyhow::bail!(protected_domain_still_unobservable_message(&unobservable));
+    }
+
+    println!(
+        "{}",
+        protected_domain_authorization_notice(operation, impact)
+    );
+    let exe = std::env::current_exe()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let status = sudo_reexec_command_with(&exe, &args, !std::io::stdin().is_terminal()).status()?;
     std::process::exit(status.code().unwrap_or(1));
 }
 
@@ -3905,10 +4244,51 @@ fn successful_runtime_proof(
     Ok(proof)
 }
 
+/// a refused controlled reset must say whether a stop was even
+/// attempted. "Not attempted" and "attempted but the exit is unconfirmed" are
+/// different obligations for the operator and must not collapse into one text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopAttemptPhase {
+    NotAttempted,
+    AttemptedButUnconfirmed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedStopError {
+    phase: StopAttemptPhase,
+    detail: String,
+}
+
+impl ManagedStopError {
+    fn not_attempted(detail: impl Into<String>) -> Self {
+        Self {
+            phase: StopAttemptPhase::NotAttempted,
+            detail: detail.into(),
+        }
+    }
+
+    fn attempted_but_unconfirmed(detail: impl Into<String>) -> Self {
+        Self {
+            phase: StopAttemptPhase::AttemptedButUnconfirmed,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ManagedStopError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for ManagedStopError {}
+
+/// SPEC B3 / 去脂裁决②: the single quiesce proof consumed by both the
+/// rollback path and the controlled reset. There is no "attested but still
+/// running" state any more: a valid proof always means the Core is stopped.
 fn validate_quiesced_response(
     response: &ipc::DaemonResponse,
     fence: &tun_transaction::TransactionFence,
-    old_evidence: &tun_transaction::OldRuntimeEvidence,
 ) -> anyhow::Result<()> {
     let proof = match response {
         ipc::DaemonResponse::Transaction {
@@ -3916,34 +4296,366 @@ fn validate_quiesced_response(
                 tun_transaction::TransactionResponse::Completed(proof)
                 | tun_transaction::TransactionResponse::AlreadySatisfied(proof),
         } => proof,
-        other => anyhow::bail!("candidate runtime was not successfully quiesced: {other:?}"),
+        // A `NotSatisfied` response means the daemon did try to stop the Core and
+        // could not confirm it; every other refusal never reached a stop.
+        ipc::DaemonResponse::Transaction {
+            response: tun_transaction::TransactionResponse::NotSatisfied { error, .. },
+        } => {
+            return Err(anyhow::Error::new(
+                ManagedStopError::attempted_but_unconfirmed(error.message.clone()),
+            ))
+        }
+        other => {
+            return Err(anyhow::Error::new(ManagedStopError::not_attempted(
+                format!("daemon did not prove the managed runtime is stopped: {other:?}"),
+            )))
+        }
     };
+    // SPEC B3: fence validation must check against fence.expected_phase, not a hardcoded phase
     if proof.transaction_id != fence.transaction_id
         || proof.generation != fence.generation
-        || proof.observed_phase != tun_transaction::JournalPhase::RollbackPending
+        || proof.observed_phase != fence.expected_phase
         || proof.proof_kind != tun_transaction::RuntimeProofKind::CandidateQuiesced
     {
-        anyhow::bail!("daemon returned an invalid quiesce proof: {proof:?}");
+        return Err(anyhow::Error::new(ManagedStopError::not_attempted(
+            format!("daemon returned an invalid quiesce proof: {proof:?}"),
+        )));
     }
     let stopped = proof.core_pid == 0
         && proof.launched_revision.is_empty()
         && !proof.api_ready
         && !proof.runtime_tun;
-    let old_attested = tun_transaction::runtime_matches_old_evidence(
-        old_evidence,
-        &tun_transaction::RuntimeObservation {
-            core_running: true,
-            core_identity: Some(proof.core_identity.clone()),
-            core_pid: Some(proof.core_pid),
-            launched_revision: Some(proof.launched_revision.clone()),
-            runtime_tun: Some(proof.runtime_tun),
-            api_ready: proof.api_ready,
-        },
-    );
-    if !stopped && !old_attested {
-        anyhow::bail!("quiesce proof does not prove stopped or attested old runtime: {proof:?}");
+    if !stopped {
+        return Err(anyhow::Error::new(
+            ManagedStopError::attempted_but_unconfirmed(format!(
+                "daemon proof does not show a stopped managed runtime (pid={}, revision={:?}, api_ready={}, tun={}): {proof:?}",
+                proof.core_pid,
+                proof.launched_revision,
+                proof.api_ready,
+                proof.runtime_tun
+            )),
+        ));
     }
     Ok(())
+}
+
+/// the rollback copy path reads the same durable evidence the
+/// planner classified. Evidence can still vanish between planning and execution,
+/// so this wrapper keeps the Fix guidance instead of surfacing a bare ENOENT.
+fn read_old_runtime_for_rollback(
+    ctx: &instance::InstanceContext,
+    journal: &tun_transaction::TunJournal,
+) -> anyhow::Result<tun_transaction::OldRuntimeEvidence> {
+    tun_transaction::read_and_validate_old_runtime(ctx, journal).map_err(|error| {
+        anyhow::anyhow!(
+            "the rollback cannot prove the old runtime: old-runtime evidence is {} ({error}).\n  Every transaction artifact is kept.\n  Fix: mihomo-cli restart --system",
+            tun_transaction::classify_old_runtime_evidence(ctx, journal).describe()
+        )
+    })
+}
+
+#[cfg(test)]
+mod restored_old_compat_tests {
+    use super::*;
+
+    #[test]
+    fn fallback_requires_authorized_exact_response_stage_code_and_observation() {
+        let evidence = tun_transaction::OldRuntimeEvidence {
+            core_running: true,
+            core_identity: "core".into(),
+            core_pid: 1,
+            launched_revision: "old".into(),
+            launch_source: tun_transaction::LaunchSource::SystemTunSnapshot,
+            runtime_tun: true,
+            api_endpoint: "endpoint".into(),
+            recorded_at_secs: None,
+        };
+        let observation = tun_transaction::RuntimeObservation {
+            core_running: true,
+            core_identity: Some("core".into()),
+            core_pid: Some(2),
+            launched_revision: Some("old".into()),
+            runtime_tun: Some(true),
+            api_ready: true,
+        };
+        for (quiesce, stage, accepted) in [
+            (true, "quiesce_candidate", true),
+            (true, "quiesce_old_runtime", true),
+            (true, "attest_old_runtime_after_start", false),
+            (false, "attest_old_runtime_after_start", true),
+            (false, "quiesce_candidate", false),
+            (false, "start_old_core", false),
+        ] {
+            let make = |obs: tun_transaction::RuntimeObservation, code| {
+                let error = tun_transaction::StructuredError {
+                    code,
+                    stage: stage.into(),
+                    retryable: false,
+                    message: String::new(),
+                };
+                ipc::DaemonResponse::Transaction {
+                    response: if quiesce {
+                        tun_transaction::TransactionResponse::EvidenceMismatch {
+                            observation: obs,
+                            error,
+                        }
+                    } else {
+                        tun_transaction::TransactionResponse::NotSatisfied {
+                            observation: obs,
+                            error,
+                        }
+                    },
+                }
+            };
+            let response = make(
+                observation.clone(),
+                tun_transaction::TransactionErrorCode::RuntimeRevisionMismatch,
+            );
+            assert_eq!(
+                restored_old_compat_observation(&response, &evidence, true, quiesce).is_some(),
+                accepted
+            );
+            assert!(
+                restored_old_compat_observation(&response, &evidence, false, quiesce).is_none()
+            );
+            let wrong_code = make(
+                observation.clone(),
+                tun_transaction::TransactionErrorCode::CoreStartFailed,
+            );
+            assert!(
+                restored_old_compat_observation(&wrong_code, &evidence, true, quiesce).is_none()
+            );
+            let mut wrong_observation = observation.clone();
+            wrong_observation.runtime_tun = Some(false);
+            let wrong = make(
+                wrong_observation,
+                tun_transaction::TransactionErrorCode::RuntimeRevisionMismatch,
+            );
+            assert!(restored_old_compat_observation(&wrong, &evidence, true, quiesce).is_none());
+        }
+        let error = ipc::DaemonResponse::Error {
+            message: "error".into(),
+        };
+        assert!(restored_old_compat_observation(&error, &evidence, true, true).is_none());
+    }
+}
+
+fn restored_old_compat_observation<'a>(
+    response: &'a ipc::DaemonResponse,
+    evidence: &tun_transaction::OldRuntimeEvidence,
+    allow: bool,
+    quiesce: bool,
+) -> Option<&'a tun_transaction::RuntimeObservation> {
+    if !allow {
+        return None;
+    }
+    let (observation, error) = match response {
+        ipc::DaemonResponse::Transaction {
+            response: tun_transaction::TransactionResponse::EvidenceMismatch { observation, error },
+        } if quiesce => (observation, error),
+        ipc::DaemonResponse::Transaction {
+            response: tun_transaction::TransactionResponse::NotSatisfied { observation, error },
+        } if !quiesce => (observation, error),
+        _ => return None,
+    };
+    let stage_matches = if quiesce {
+        matches!(
+            error.stage.as_str(),
+            "quiesce_candidate" | "quiesce_old_runtime"
+        )
+    } else {
+        error.stage == "attest_old_runtime_after_start"
+    };
+    (error.code == tun_transaction::TransactionErrorCode::RuntimeRevisionMismatch
+        && stage_matches
+        && tun_transaction::runtime_matches_restored_old_state(evidence, observation))
+    .then_some(observation)
+}
+
+#[cfg(target_os = "linux")]
+async fn observe_managed_restored_old_runtime(
+    ctx: &instance::InstanceContext,
+    fence: &tun_transaction::TransactionFence,
+    expected: &tun_transaction::OldRuntimeEvidence,
+    verify_source_revision: bool,
+) -> anyhow::Result<tun_transaction::RuntimeObservation> {
+    use std::os::unix::fs::MetadataExt;
+    let journal = tun_transaction::read_active_journal(ctx)?
+        .ok_or_else(|| anyhow::anyhow!("active journal missing"))?;
+    if journal.transaction_id != fence.transaction_id
+        || journal.generation != fence.generation
+        || journal.phase != fence.expected_phase
+        || journal.candidate_revision != fence.expected_candidate_revision
+        || journal.phase != tun_transaction::JournalPhase::RollbackPending
+        || read_old_runtime_for_rollback(ctx, &journal)? != *expected
+    {
+        anyhow::bail!("rollback fence or old evidence changed");
+    }
+    let endpoint = managed_core_endpoint(ctx);
+    if expected.api_endpoint != status_endpoint_label(&ctx.paths.api_endpoint) {
+        anyhow::bail!("old evidence endpoint does not match the managed endpoint");
+    }
+    let socket = match &ctx.paths.api_endpoint {
+        instance::ApiEndpoint::UnixSocket(path) => path,
+        _ => anyhow::bail!("managed endpoint is not a Unix socket"),
+    };
+    let before = std::fs::symlink_metadata(socket)?;
+    if !std::os::unix::fs::FileTypeExt::is_socket(&before.file_type()) {
+        anyhow::bail!("managed endpoint is not a socket");
+    }
+    let state_dir = managed_state_dir(ctx)?;
+    let service_uid = managed_service_uid()
+        .ok_or_else(|| anyhow::anyhow!("managed service account is unavailable"))?;
+    let peer = || match core_identity::prove_core_api_peer(
+        &endpoint,
+        &ctx.paths.core_binary,
+        &state_dir,
+        Some(service_uid),
+    ) {
+        core_identity::CoreIdentityProof::Proven(identity) => Ok(identity),
+        other => Err(anyhow::anyhow!(
+            "managed Core identity unprovable: {other:?}"
+        )),
+    };
+    let identity = peer()?;
+    let source = match expected.launch_source {
+        tun_transaction::LaunchSource::SystemActiveConfig => {
+            tun_transaction::active_config_path(ctx)
+        }
+        tun_transaction::LaunchSource::SystemTunSnapshot => ctx.paths.tun_config_file.clone(),
+    };
+    if verify_source_revision {
+        let bytes = utils::read_file_no_follow_limited(
+            &source,
+            tun_transaction::MAX_TRANSACTION_ARTIFACT_BYTES,
+        )?;
+        if tun_transaction::sha256_revision(&bytes) != expected.launched_revision {
+            anyhow::bail!("restored launch source differs from old revision");
+        }
+    }
+    if !identity
+        .cmdline
+        .windows(2)
+        .any(|args| args[0] == "-f" && std::path::Path::new(&args[1]) == source)
+    {
+        anyhow::bail!("managed Core launch source differs from old evidence");
+    }
+    let (running, pid, revision, config_path) =
+        match ipc::send_command(&ipc::DaemonCommand::GetStatus { token: None }).await? {
+            ipc::DaemonResponse::Status {
+                running,
+                core_pid,
+                launched_config_revision,
+                config_path,
+                ..
+            } => (running, core_pid, launched_config_revision, config_path),
+            other => anyhow::bail!("unexpected daemon status: {other:?}"),
+        };
+    if pid != Some(identity.pid) || config_path.as_deref() != Some(source.as_path()) {
+        anyhow::bail!("daemon status conflicts with managed Core identity or source");
+    }
+    let configs = mihomo_api::api_get_at_endpoint(&ctx.paths.api_endpoint, "/configs").await?;
+    let tun = configs
+        .get("tun")
+        .and_then(|v| v.get("enable"))
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| anyhow::anyhow!("runtime TUN is unobservable"))?;
+    let second = peer()?;
+    let after = std::fs::symlink_metadata(socket)?;
+    if identity != second
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || !std::os::unix::fs::FileTypeExt::is_socket(&after.file_type())
+    {
+        anyhow::bail!("managed Core endpoint changed during observation");
+    }
+    let observation = tun_transaction::RuntimeObservation {
+        core_running: running,
+        core_identity: Some(ctx.paths.core_binary.to_string_lossy().to_string()),
+        core_pid: pid,
+        launched_revision: revision,
+        runtime_tun: Some(tun),
+        api_ready: true,
+    };
+    if !tun_transaction::runtime_matches_restored_old_state(expected, &observation) {
+        anyhow::bail!("current runtime differs from old evidence");
+    }
+    let current = tun_transaction::read_active_journal(ctx)?
+        .ok_or_else(|| anyhow::anyhow!("active journal disappeared"))?;
+    if current != journal || read_old_runtime_for_rollback(ctx, &current)? != *expected {
+        anyhow::bail!("rollback evidence changed during observation");
+    }
+    Ok(observation)
+}
+
+#[cfg(target_os = "linux")]
+async fn cli_quiesce_restored_old_core(
+    ctx: &instance::InstanceContext,
+    fence: &tun_transaction::TransactionFence,
+    evidence: &tun_transaction::OldRuntimeEvidence,
+    observed: &tun_transaction::RuntimeObservation,
+) -> anyhow::Result<()> {
+    if !is_current_process_root() {
+        return Err(anyhow::Error::new(ManagedStopError::not_attempted(
+            "managed Core stop requires root",
+        )));
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let pid = observed.core_pid.ok_or_else(|| {
+        anyhow::Error::new(ManagedStopError::not_attempted("missing observed PID"))
+    })?;
+    let bound = core_identity::BoundManagedCore::bind(pid, std::time::Duration::from_secs(5))
+        .map_err(|e| anyhow::Error::new(ManagedStopError::not_attempted(e)))?;
+    let fresh = tokio::time::timeout_at(
+        deadline,
+        observe_managed_restored_old_runtime(ctx, fence, evidence, false),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::Error::new(ManagedStopError::not_attempted(
+            "stop budget expired during identity verification",
+        ))
+    })?
+    .map_err(|e| anyhow::Error::new(ManagedStopError::not_attempted(e.to_string())))?;
+    if fresh.core_pid != Some(pid)
+        || !bound
+            .is_live()
+            .map_err(|e| anyhow::Error::new(ManagedStopError::not_attempted(e)))?
+    {
+        return Err(anyhow::Error::new(ManagedStopError::not_attempted(
+            "bound Core identity changed",
+        )));
+    }
+    match bound.terminate_and_wait() {
+        core_identity::ProcessExitProof::Exited => Ok(()),
+        other => Err(anyhow::Error::new(
+            ManagedStopError::attempted_but_unconfirmed(format!(
+                "managed Core exit unconfirmed: {other:?}"
+            )),
+        )),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn observe_managed_restored_old_runtime(
+    _ctx: &instance::InstanceContext,
+    _fence: &tun_transaction::TransactionFence,
+    _expected: &tun_transaction::OldRuntimeEvidence,
+    _verify_source_revision: bool,
+) -> anyhow::Result<tun_transaction::RuntimeObservation> {
+    anyhow::bail!("managed Core identity is unsupported on this platform")
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn cli_quiesce_restored_old_core(
+    _ctx: &instance::InstanceContext,
+    _fence: &tun_transaction::TransactionFence,
+    _evidence: &tun_transaction::OldRuntimeEvidence,
+    _observed: &tun_transaction::RuntimeObservation,
+) -> anyhow::Result<()> {
+    Err(anyhow::Error::new(ManagedStopError::not_attempted(
+        "stable process handles are unsupported on this platform",
+    )))
 }
 
 async fn execute_automatic_rollback(
@@ -3978,13 +4690,15 @@ async fn execute_automatic_rollback(
     }
     let quiesce_resp = ipc::send_command(&ipc::DaemonCommand::QuiesceCandidateRuntime {
         fence: fence.clone(),
+        allow_legacy_reset: false,
+        allow_restored_old_quiesce: false,
         token: None,
     })
     .await?;
 
     // Validate immutable evidence before changing the Snapshot.
-    let old_evidence = tun_transaction::read_and_validate_old_runtime(ctx, &journal)?;
-    validate_quiesced_response(&quiesce_resp, &fence, &old_evidence)?;
+    let old_evidence = read_old_runtime_for_rollback(ctx, &journal)?;
+    validate_quiesced_response(&quiesce_resp, &fence)?;
 
     // 3. Root restore snapshot
     tun_transaction::restore_snapshot(ctx, &journal)?;
@@ -4031,6 +4745,7 @@ async fn execute_recovery_action(
     action: tun_transaction::RecoveryAction,
     obs: &tun_transaction::RuntimeObservation,
     direction: tun_transaction::RecoveryDirection,
+    allow_runtime_reset: bool,
 ) -> anyhow::Result<()> {
     match action {
         tun_transaction::RecoveryAction::NoOpTerminal => Ok(()),
@@ -4070,14 +4785,21 @@ async fn execute_recovery_action(
             let snap_cls = tun_transaction::classify_snapshot(ctx, &updated);
             let intent_cls =
                 tun_transaction::classify_intent(&ctx.paths.intent_config_file, &updated);
-            let next_action =
-                tun_transaction::plan_recovery(&updated, snap_cls, intent_cls, obs, direction);
+            let next_action = tun_transaction::plan_recovery(
+                &updated,
+                snap_cls,
+                intent_cls,
+                tun_transaction::classify_old_runtime_evidence(ctx, &updated),
+                obs,
+                direction,
+            );
             Box::pin(execute_recovery_action(
                 ctx,
                 &updated,
                 next_action,
                 obs,
                 direction,
+                allow_runtime_reset,
             ))
             .await
         }
@@ -4174,7 +4896,12 @@ async fn execute_recovery_action(
                     let intent_cls =
                         tun_transaction::classify_intent(&ctx.paths.intent_config_file, &updated);
                     let next_action = tun_transaction::plan_recovery(
-                        &updated, snap_cls, intent_cls, obs, direction,
+                        &updated,
+                        snap_cls,
+                        intent_cls,
+                        tun_transaction::classify_old_runtime_evidence(ctx, &updated),
+                        obs,
+                        direction,
                     );
                     Box::pin(execute_recovery_action(
                         ctx,
@@ -4182,6 +4909,7 @@ async fn execute_recovery_action(
                         next_action,
                         obs,
                         direction,
+                        allow_runtime_reset,
                     ))
                     .await
                 }
@@ -4266,12 +4994,23 @@ async fn execute_recovery_action(
             };
             let quiesce_resp = ipc::send_command(&ipc::DaemonCommand::QuiesceCandidateRuntime {
                 fence: fence.clone(),
+                allow_legacy_reset: false,
+                allow_restored_old_quiesce: false,
                 token: None,
             })
             .await?;
 
-            let old_evidence = tun_transaction::read_and_validate_old_runtime(ctx, &journal)?;
-            validate_quiesced_response(&quiesce_resp, &fence, &old_evidence)?;
+            let old_evidence = read_old_runtime_for_rollback(ctx, &journal)?;
+            if let Some(observation) = restored_old_compat_observation(
+                &quiesce_resp,
+                &old_evidence,
+                allow_runtime_reset,
+                true,
+            ) {
+                cli_quiesce_restored_old_core(ctx, &fence, &old_evidence, observation).await?;
+            } else {
+                validate_quiesced_response(&quiesce_resp, &fence)?;
+            }
             tun_transaction::restore_snapshot(ctx, &journal)?;
 
             let restore_resp = ipc::send_command(&ipc::DaemonCommand::RestoreOldRuntime {
@@ -4281,14 +5020,25 @@ async fn execute_recovery_action(
                 token: None,
             })
             .await?;
-            let _ = successful_runtime_proof(
+            if restored_old_compat_observation(
                 &restore_resp,
-                &fence,
-                tun_transaction::JournalPhase::RollbackPending,
-                tun_transaction::RuntimeProofKind::OldRuntimeRestored,
-                &old_evidence.launched_revision,
-                old_evidence.runtime_tun,
-            )?;
+                &old_evidence,
+                allow_runtime_reset,
+                false,
+            )
+            .is_some()
+            {
+                observe_managed_restored_old_runtime(ctx, &fence, &old_evidence, true).await?;
+            } else {
+                let _ = successful_runtime_proof(
+                    &restore_resp,
+                    &fence,
+                    tun_transaction::JournalPhase::RollbackPending,
+                    tun_transaction::RuntimeProofKind::OldRuntimeRestored,
+                    &old_evidence.launched_revision,
+                    old_evidence.runtime_tun,
+                )?;
+            }
 
             let _ = tun_transaction::cas_update_phase(
                 ctx,
@@ -4308,15 +5058,19 @@ async fn execute_recovery_action(
                 expected_phase: journal.phase,
                 expected_candidate_revision: journal.candidate_revision.clone(),
             };
-            let old_evidence = tun_transaction::read_and_validate_old_runtime(ctx, journal)?;
-            let status_resp =
-                ipc::send_command(&ipc::DaemonCommand::GetTransactionStatus { token: None })
-                    .await?;
+            let old_evidence = read_old_runtime_for_rollback(ctx, journal)?;
+            let restore_resp = ipc::send_command(&ipc::DaemonCommand::RestoreOldRuntime {
+                fence: fence.clone(),
+                expected_old_runtime_revision: old_evidence.launched_revision.clone(),
+                expected_old_runtime_tun: old_evidence.runtime_tun,
+                token: None,
+            })
+            .await?;
             let proof = successful_runtime_proof(
-                &status_resp,
+                &restore_resp,
                 &fence,
                 journal.phase,
-                tun_transaction::RuntimeProofKind::CandidateAttested,
+                tun_transaction::RuntimeProofKind::OldRuntimeRestored,
                 &old_evidence.launched_revision,
                 old_evidence.runtime_tun,
             )?;
@@ -4328,7 +5082,7 @@ async fn execute_recovery_action(
                 runtime_tun: Some(proof.runtime_tun),
                 api_ready: proof.api_ready,
             };
-            if !tun_transaction::runtime_matches_old_evidence(&old_evidence, &observation) {
+            if !tun_transaction::runtime_matches_restored_old_state(&old_evidence, &observation) {
                 anyhow::bail!("current runtime does not match durable old-runtime evidence");
             }
             let _ = tun_transaction::cas_update_phase(
@@ -4408,30 +5162,16 @@ async fn execute_recovery_action(
 pub(crate) fn system_generation_store(
     ctx: &instance::InstanceContext,
 ) -> generation::GenerationStore {
-    let root = ctx
-        .paths
-        .tun_config_file
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| ctx.paths.config_dir.clone());
-    generation::GenerationStore::new(root)
-}
-
-pub(crate) fn commit_system_generation_active(
-    _ctx: &instance::InstanceContext,
-    store: &generation::GenerationStore,
-) -> anyhow::Result<generation::GenerationState> {
-    store
-        .commit_active()
-        .map_err(|error| anyhow::anyhow!("failed to commit active generation: {error}"))
+    generation::GenerationStore::new(ctx.paths.generation_store_root.clone())
 }
 
 pub(crate) fn cleanup_system_generation_old(
     ctx: &instance::InstanceContext,
     store: &generation::GenerationStore,
+    lock: &generation::GenerationLockGuard,
     keep_limit: usize,
 ) -> anyhow::Result<Vec<generation::GenerationId>> {
-    match store.cleanup_old_generations(keep_limit) {
+    match store.cleanup_old_generations_with_lock(lock, keep_limit) {
         Ok(removed) => Ok(removed),
         Err(generation::GenerationError::Io(err))
             if err.kind() == std::io::ErrorKind::PermissionDenied
@@ -4458,6 +5198,12 @@ pub(crate) fn cleanup_system_generation_old(
                 for entry in entries.flatten() {
                     if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                         let name = entry.file_name().to_string_lossy().to_string();
+                        // SPEC N3: tombstones are never collected by GC.
+                        if name.ends_with(generation::WITHDRAWN_SUFFIX)
+                            || entry.path().join(generation::UNTRUSTED_MARKER).exists()
+                        {
+                            continue;
+                        }
                         if let Ok(id) = generation::GenerationId::new(&name) {
                             if !protected.contains(&id) {
                                 unreferenced.push(id);
@@ -4487,12 +5233,203 @@ pub(crate) fn cleanup_system_generation_old(
     }
 }
 
+/// SPEC 裁决 A1: explicit, metadata-only revocation of ONE pending
+/// generation.
+///
+/// Contract: verify the trust root, the target identity, `P.baseline == previous`
+/// and the baseline's integrity — then persist the tombstone (no-replace) **before**
+/// consuming the slots. Zero service stops/starts, zero installed-file replacement:
+/// the poisoned bytes stay as evidence (`<P>.withdrawn`) and the authenticated
+/// baseline `B` stays bound as `previous` for the next candidate.
+const NATIVE_WITHDRAWAL_RECORD: &str = ".native-withdrawal-v1";
+
+fn is_migrated_generation_evidence(
+    store: &generation::GenerationStore,
+    id: &generation::GenerationId,
+) -> bool {
+    store.is_generation_untrusted(id)
+        || store
+            .withdrawn_path(id)
+            .join(generation::UNTRUSTED_MARKER)
+            .exists()
+}
+
+fn native_withdrawal_record(
+    store: &generation::GenerationStore,
+    pending: &generation::GenerationId,
+    baseline: &generation::GenerationId,
+    withdrawn: bool,
+) -> anyhow::Result<Vec<u8>> {
+    let directory = if withdrawn {
+        store.withdrawn_path(pending)
+    } else {
+        store.generation_dir(pending)
+    };
+    let bytes = utils::read_file_no_follow_limited(
+        &directory.join(generation::MANIFEST_FILE_NAME),
+        generation::MAX_MANIFEST_BYTES,
+    )?;
+    Ok(format!(
+        "native-withdrawal-v1\npending={pending}\nbaseline={baseline}\nmanifest_sha256={}\n",
+        generation::calculate_sha256_bytes(&bytes)
+    )
+    .into_bytes())
+}
+
+fn record_native_withdrawal(
+    store: &generation::GenerationStore,
+    pending: &generation::GenerationId,
+    baseline: &generation::GenerationId,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !is_migrated_generation_evidence(store, pending)
+            && !store.is_generation_untrusted(baseline),
+        "迁移证据不能生成原生撤销关联"
+    );
+    let withdrawn = store.has_withdrawn(pending);
+    let directory = if withdrawn {
+        store.withdrawn_path(pending)
+    } else {
+        store.generation_dir(pending)
+    };
+    utils::atomic_write_bytes_no_follow(
+        &directory.join(NATIVE_WITHDRAWAL_RECORD),
+        &native_withdrawal_record(store, pending, baseline, withdrawn)?,
+        0o644,
+    )
+}
+
+fn verify_native_withdrawal(
+    store: &generation::GenerationStore,
+    pending: &generation::GenerationId,
+    baseline: &generation::GenerationId,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !is_migrated_generation_evidence(store, pending)
+            && !store.is_generation_untrusted(baseline),
+        "迁移记录不是已认证的原生撤销"
+    );
+    let actual = utils::read_file_no_follow_limited(
+        &store.withdrawn_path(pending).join(NATIVE_WITHDRAWAL_RECORD),
+        4096,
+    )?;
+    anyhow::ensure!(
+        actual == native_withdrawal_record(store, pending, baseline, true)?,
+        "原生撤销关联与当前候选/基线不一致"
+    );
+    Ok(())
+}
+
+fn discard_pending_generation(
+    ctx: &instance::InstanceContext,
+    target: &generation::GenerationId,
+) -> anyhow::Result<()> {
+    authorize_protected_domain_operations(ctx, "install --discard-pending", "安装")?;
+    let store = system_generation_store(ctx);
+    utils::verify_generation_trust_root(store.root_dir())
+        .map_err(|error| generation_trust_root_refusal("撤销代际", &error))?;
+    migrate_generation_store_if_needed(ctx, &store)?;
+    store
+        .init()
+        .map_err(|error| anyhow::anyhow!("failed to init generation store: {error}"))?;
+    let lock = store
+        .acquire_lock()
+        .map_err(|error| anyhow::anyhow!("failed to acquire generation lock: {error}"))?;
+
+    let state = store
+        .read_state()
+        .map_err(|error| anyhow::anyhow!("代际状态损坏，拒绝撤销：{error}"))?;
+    let pending = state.pending.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "没有待应用代际可撤销。\n  \
+             Fix: mihomo-cli install --system（重新准备候选）"
+        )
+    })?;
+    if &pending != target {
+        anyhow::bail!(
+            "目标代际 {} 不是当前待应用代际 {}（撤销被拒绝，槽位未被改动）。\n  \
+             Fix: mihomo-cli install --system --discard-pending={}",
+            target,
+            pending,
+            pending
+        );
+    }
+
+    if is_migrated_generation_evidence(&store, target) {
+        anyhow::bail!(
+            "待应用代际 {target} 来自存量迁移、未经认证；单独撤销可能伪装首装，拒绝撤销。\n  \
+             管理员核对当前完整快照后，可显式采纳并同时撤销：mihomo-cli install --system --adopt-current --discard-pending={target}"
+        );
+    }
+    // Target identity + coverage: the pending generation's own bytes must verify.
+    let manifest = (if store.has_withdrawn(target) {
+        store.read_withdrawn_manifest(target)
+    } else {
+        store.validate_generation(target)
+    })
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "待应用代际 {} 不可验证（{error}）：证据不足，拒绝撤销",
+            target
+        )
+    })?;
+    let baseline_id = state.previous.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "待应用代际 {} 缺少绑定基线（state.previous 为空）：证据不足，拒绝撤销",
+            target
+        )
+    })?;
+    anyhow::ensure!(
+        !store.is_generation_untrusted(&baseline_id),
+        "绑定基线未经认证，拒绝撤销"
+    );
+    let bound = manifest
+        .metadata
+        .get("baseline")
+        .map(|value| value.as_str());
+    if bound != Some(baseline_id.as_str()) {
+        anyhow::bail!(
+            "待应用代际 {} 的绑定基线 {:?} 与 state.previous {} 不一致：证据不足，拒绝撤销",
+            target,
+            bound,
+            baseline_id
+        );
+    }
+    store.validate_generation(&baseline_id).map_err(|error| {
+        anyhow::anyhow!(
+            "绑定基线 {} 不可验证（{error}）：拒绝撤销（基线必须保持为下一次尝试的认证回退目标）",
+            baseline_id
+        )
+    })?;
+
+    // Tombstone first (no-replace), then consume the slots. A crash in between is
+    // re-entrant: the absence of the rollback-proof marker means "revoked, not
+    // rolled back".
+    record_native_withdrawal(&store, target, &baseline_id)?;
+    if !store.has_withdrawn(target) {
+        store
+            .withdraw_generation(target)
+            .map_err(|error| anyhow::anyhow!("撤销墓碑发布失败（槽位未改动）：{error}"))?;
+    }
+    store
+        .consume_revoked_with_lock(&lock, Some(&baseline_id))
+        .map_err(|error| anyhow::anyhow!("槽位消费失败：{error}"))?;
+
+    println!("  ✓ 已撤销待应用代际 {target}（仅元数据；未停启服务、未替换任何安装文件）");
+    println!("  · 候选字节保留为证据：{}.withdrawn", target);
+    println!("  · 绑定基线保持为 previous：{baseline_id}");
+    println!("  Next: mihomo-cli install --system（准备候选 C；不会捕获当前安装态为新基线）");
+    Ok(())
+}
+
 pub(crate) fn prepare_system_generation(
     ctx: &instance::InstanceContext,
     core_bytes: &[u8],
     cli_bytes: &[u8],
     extra_artifacts: Vec<(String, Vec<u8>, Option<u32>)>,
 ) -> anyhow::Result<generation::GenerationId> {
+    // SPEC §12.3.1（裁决 B）：暂存代际属业务阶段，可在首次特权写入之前请求一次授权。
+    authorize_protected_domain_operations(ctx, "install --system", "安装")?;
     let daemon_rel = ctx
         .paths
         .cli_binary
@@ -4566,12 +5503,73 @@ pub(crate) fn prepare_system_generation(
     }
 
     let store = system_generation_store(ctx);
+    // SPEC P1-1: migration must precede *every* staging write — `init` and the
+    // lock both create the new root, which would otherwise look like
+    // "new root exists without state" and silently skip the migration.
+    utils::verify_generation_trust_root(store.root_dir())
+        .map_err(|error| generation_trust_root_refusal("暂存代际", &error))?;
+    migrate_generation_store_if_needed(ctx, &store)?;
     store
         .init()
         .map_err(|e| anyhow::anyhow!("failed to init generation store: {e}"))?;
     let lock = store
         .acquire_lock()
         .map_err(|e| anyhow::anyhow!("failed to lock generation store: {e}"))?;
+
+    // SPEC N5: re-staging admission. A partially replaced install (or a
+    // store with slots but no verifiable install state) must never be certified
+    // as a new baseline by overwriting the scene.
+    enforce_restage_admission(ctx, &store, &lock)?;
+
+    // SPEC 裁决 A1: a pending generation is never silently overwritten.
+    // Discarding it is an explicit, separate authorization.
+    let staging_state = store
+        .read_state()
+        .map_err(|error| anyhow::anyhow!("failed to read generation state: {error}"))?;
+    if let Some(pending) = staging_state.pending.clone() {
+        anyhow::bail!(
+            "存在待应用代际 {pending}，本次暂存被拒绝（不隐式丢弃）。\n  \
+             Apply:   mihomo-cli restart --system\n  \
+             Discard: mihomo-cli install --system --discard-pending={pending}"
+        );
+    }
+
+    // SPEC 裁决 A1 recovery mode: after a discard the install tree still holds
+    // the failed candidate's bytes, so the scene must NOT be captured as a new
+    // baseline — the authenticated previous baseline stays the binding target.
+    let recovery_baseline = match (staging_state.active.clone(), staging_state.previous.clone()) {
+        (None, Some(baseline)) => Some(baseline),
+        _ => None,
+    };
+    let baseline_id = match recovery_baseline {
+        Some(baseline) => {
+            anyhow::ensure!(
+                !store.is_generation_untrusted(&baseline),
+                "恢复基线未经认证，拒绝准备候选"
+            );
+            store.validate_generation(&baseline).map_err(|error| {
+                anyhow::anyhow!(
+                    "恢复态的绑定基线 {} 不可验证（{error}）：拒绝准备候选（不捕获当前安装态为新基线）",
+                    baseline
+                )
+            })?;
+            println!(
+                "  恢复态：候选将绑定已认证基线 {}（不捕获当前安装态为新基线）",
+                baseline
+            );
+            baseline
+        }
+        None => {
+            // SPEC A/P2-1: every staging captures a baseline, including a wholly
+            // absent install — the all-missing baseline is how "本无此 artifact" is
+            // expressed, so a legitimate staging never becomes an unusable unbound pending.
+            let baseline_artifacts = build_baseline_artifacts(ctx, &manifest)?;
+            generation::capture_baseline(&store, &lock, &baseline_artifacts).map_err(|error| {
+                anyhow::anyhow!("基线捕获失败（fail-closed，尝试修复后重试）: {error}")
+            })?
+        }
+    };
+    manifest = manifest.with_metadata("baseline", baseline_id.as_str());
 
     let gen_dir = store.generation_dir(&gen_id);
     utils::ensure_dir_all_no_follow(&gen_dir)?;
@@ -4595,11 +5593,147 @@ pub(crate) fn prepare_system_generation(
     store
         .write_manifest(&manifest)
         .map_err(|e| anyhow::anyhow!("failed to write generation manifest: {e}"))?;
+    // SPEC A/P2-2: pending + `previous = baseline` land in ONE state write
+    // inside the staging critical section — no RMW window to crash into.
     store
-        .stage_pending_with_lock(&lock, gen_id.clone())
+        .stage_pending_with_baseline_with_lock(&lock, gen_id.clone(), Some(&baseline_id))
         .map_err(|e| anyhow::anyhow!("failed to stage pending generation: {e}"))?;
 
     Ok(gen_id)
+}
+
+/// SPEC A: builds the baseline artifact list from the current install — the
+/// full managed set (daemon/core/extra artifacts) the pending generation targets,
+/// so artifacts that do not exist yet are captured as explicitly missing.
+fn build_baseline_artifacts(
+    ctx: &instance::InstanceContext,
+    manifest: &generation::GenerationManifest,
+) -> anyhow::Result<Vec<generation::BaselineArtifact>> {
+    let state_dir = managed_state_dir(ctx)?;
+    let mut artifacts = vec![
+        generation::BaselineArtifact {
+            relative_path: manifest.daemon.relative_path.clone(),
+            kind: generation::ArtifactKind::Daemon,
+            source_path: ctx.paths.cli_binary.clone(),
+            unix_mode: manifest.daemon.unix_mode,
+        },
+        generation::BaselineArtifact {
+            relative_path: manifest.core.relative_path.clone(),
+            kind: generation::ArtifactKind::Core,
+            source_path: ctx.paths.core_binary.clone(),
+            unix_mode: manifest.core.unix_mode,
+        },
+    ];
+    for extra in &manifest.extra_artifacts {
+        artifacts.push(generation::BaselineArtifact {
+            relative_path: extra.relative_path.clone(),
+            kind: extra.kind.clone(),
+            source_path: state_dir.join(&extra.relative_path),
+            unix_mode: extra.unix_mode,
+        });
+    }
+    Ok(artifacts)
+}
+
+/// SPEC N5: re-staging admission. A partially replaced install (or a store
+/// with slots but no verifiable install state) must never be certified as a new
+/// baseline by overwriting the scene.
+fn enforce_restage_admission(
+    ctx: &instance::InstanceContext,
+    store: &generation::GenerationStore,
+    _lock: &generation::GenerationLockGuard,
+) -> anyhow::Result<()> {
+    let state = store
+        .read_state()
+        .map_err(|error| anyhow::anyhow!("failed to read generation state: {error}"))?;
+    let slots: Vec<generation::GenerationId> = [
+        state.active.clone(),
+        state.pending.clone(),
+        state.previous.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if slots.is_empty() {
+        // First install (or a pre-generation deployment): the current install is
+        // the only scene available, and capturing it is exactly the intent.
+        return Ok(());
+    }
+    for id in &slots {
+        // A migrated or unverifiable slot cannot certify the installed state.
+        if store.is_generation_untrusted(id) {
+            continue;
+        }
+        let Ok(manifest) = store.validate_generation(id) else {
+            continue;
+        };
+        if manifest.metadata.get("adoption_source").map(String::as_str)
+            == Some(generation_adoption::ADOPTION_SOURCE)
+        {
+            if generation_adoption::installed_matches_adopted(ctx, &manifest)? {
+                return Ok(());
+            }
+            continue;
+        }
+        if installed_matches_manifest(ctx, store, id, &manifest)? {
+            return Ok(());
+        }
+    }
+    // Explicit A1 recovery reuses its authenticated baseline. It never certifies
+    // the current (possibly mixed) install, and tombstones are not trust evidence.
+    if state.active.is_none() && state.pending.is_none() {
+        if let Some(baseline) = &state.previous {
+            if !store.is_generation_untrusted(baseline) {
+                let manifest = store.validate_generation(baseline)?;
+                anyhow::ensure!(manifest.is_baseline(), "恢复绑定不是已认证基线");
+                if manifest.metadata.get("adoption_source").map(String::as_str)
+                    != Some(generation_adoption::ADOPTION_SOURCE)
+                {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    if slots.iter().all(|id| store.is_generation_untrusted(id)) {
+        let command = state
+            .pending
+            .as_ref()
+            .map(|id| format!("mihomo-cli install --system --adopt-current --discard-pending={id}"))
+            .unwrap_or_else(|| "mihomo-cli install --system --adopt-current".into());
+        anyhow::bail!("已迁移但尚无可信基线，拒绝重新暂存（零覆盖）；需管理员采纳当前安装态。\n  先只读检查：mihomo-cli doctor --system --privileged\n  管理员核对完整路径与 SHA-256 后显式采纳：{command}\n  采纳是新的信任决策，不证明历史非混合或运行健康。");
+    }
+    anyhow::bail!(
+        "安装态与任何已知代际（active/pending/基线）都不一致：混合态，拒绝重新暂存（零覆盖）。\n  \
+         现场保持原样，本工具无法自动认证或恢复此状态。只读检查：mihomo-cli doctor --system --privileged\n  \
+         保留取证并核对安装文件（不要循环执行 install）：\n  \
+         sha256sum {}\n  sha256sum {}",
+        ctx.paths.cli_binary.display(),
+        ctx.paths.core_binary.display(),
+    )
+}
+
+/// SPEC N5: does the current install match this generation byte for byte?
+fn installed_matches_manifest(
+    ctx: &instance::InstanceContext,
+    store: &generation::GenerationStore,
+    id: &generation::GenerationId,
+    manifest: &generation::GenerationManifest,
+) -> anyhow::Result<bool> {
+    let missing = manifest_missing_set(manifest);
+    for target in build_artifact_targets(ctx, store, id, manifest)? {
+        if missing.contains(&target.relative_path) {
+            match utils::open_regular_file_no_follow(&target.dest) {
+                Err(error) if utils::is_not_found_error(&error) => {}
+                Err(error) => return Err(error),
+                Ok(_) => return Ok(false),
+            }
+            continue;
+        }
+        if !target_matches(&target)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub(crate) fn maybe_prepare_cli_skew_generation(
@@ -4617,6 +5751,27 @@ pub(crate) fn maybe_prepare_cli_skew_generation(
             return Ok(false);
         }
     }
+    // SPEC C: tombstone gate — if a withdrawn tombstone exists matching
+    // the current CLI sha, refuse automatic re-staging. User must explicitly
+    // run `mihomo-cli install --system` to retry.
+    if let Ok(withdrawn) = store.list_withdrawn() {
+        for wid in &withdrawn {
+            let Ok(wmanifest) = store.read_withdrawn_manifest(wid) else {
+                continue;
+            };
+            if daemon_identity_matches_current_exe(&wmanifest.daemon.sha256).unwrap_or(false) {
+                anyhow::bail!(
+                    "存在已撤销候选墓碑 {}（不单独证明回滚成功），重试请显式运行: mihomo-cli install --system",
+                    wid
+                );
+            }
+        }
+    }
+    if let Ok(state) = store.read_state() {
+        if state.active.is_none() && state.previous.is_some() {
+            anyhow::bail!("恢复基线已绑定；请显式运行 mihomo-cli install --system 准备候选，不自动采纳或重新捕获现场");
+        }
+    }
     if !ctx.paths.core_binary.exists() {
         anyhow::bail!(
             "检测到当前 CLI 与系统 Daemon 二进制不一致，但系统 Core 二进制不存在 ({})。\n  请先运行: mihomo-cli install --system",
@@ -4632,174 +5787,1408 @@ pub(crate) fn maybe_prepare_cli_skew_generation(
     Ok(true)
 }
 
+/// SPEC P1-2: configuration identity frozen at P1. The mirror push, the
+/// start/restart request and the (b′) report consumption must all use these
+/// same bytes, revision and subscription ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FrozenConfig {
+    pub content: String,
+    pub revision: String,
+    pub subscription_id: Option<String>,
+    /// False when the active-subscription pointer could not be read: ownership
+    /// is unprovable, so selection replay must be skipped instead of claimed.
+    pub ownership_proven: bool,
+}
+
+/// SPEC P3/P4: one artifact the pipeline may replace or restore.
+#[derive(Debug, Clone)]
+pub(crate) struct ArtifactTarget {
+    pub relative_path: String,
+    pub kind: generation::ArtifactKind,
+    pub sha256: String,
+    pub source: std::path::PathBuf,
+    pub dest: std::path::PathBuf,
+    pub mode: Option<u32>,
+}
+
+impl ArtifactTarget {
+    fn is_daemon(&self) -> bool {
+        self.kind == generation::ArtifactKind::Daemon
+    }
+}
+
+/// SPEC B: the immutable description of one apply attempt, derived from the
+/// verified pending manifest and its bound baseline.
+struct ApplyPlan {
+    pending_id: generation::GenerationId,
+    manifest: generation::GenerationManifest,
+    baseline_id: generation::GenerationId,
+    baseline_manifest: generation::GenerationManifest,
+    targets: Vec<ArtifactTarget>,
+}
+
+/// What P3/P4 must touch: minimal downtime scope and minimal inode churn.
+#[derive(Debug, Clone)]
+struct ChangeSet {
+    daemon: bool,
+    core: bool,
+    extras: Vec<usize>,
+}
+
+impl ChangeSet {
+    fn has_changes(&self) -> bool {
+        self.daemon || self.core || !self.extras.is_empty()
+    }
+}
+
+struct ApplyReport {
+    core_request_id: Option<String>,
+    degraded: Vec<String>,
+}
+
+struct Replacement {
+    relative_path: String,
+    had_pre_image: bool,
+}
+
+struct DaemonStatusView {
+    running: bool,
+    launched_config_revision: Option<String>,
+}
+
+fn short_revision(revision: &str) -> String {
+    revision.chars().take(16).collect()
+}
+
+fn managed_state_dir(ctx: &instance::InstanceContext) -> anyhow::Result<std::path::PathBuf> {
+    ctx.paths
+        .tun_config_file
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "managed state directory is undefined for {}",
+                ctx.paths.tun_config_file.display()
+            )
+        })
+}
+
+fn file_sha256(path: &std::path::Path) -> anyhow::Result<Option<String>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    generation::calculate_sha256(path)
+        .map(Some)
+        .map_err(|error| anyhow::anyhow!("failed to hash {}: {error}", path.display()))
+}
+
+fn target_matches(target: &ArtifactTarget) -> anyhow::Result<bool> {
+    Ok(file_sha256(&target.dest)?.as_deref() == Some(target.sha256.as_str()))
+}
+
+/// SPEC A: artifacts a baseline manifest declares as absent at capture time.
+fn manifest_missing_set(
+    manifest: &generation::GenerationManifest,
+) -> std::collections::HashSet<String> {
+    manifest
+        .metadata
+        .get("missing")
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// recovery candidates are built from the authenticated baseline (or a
+/// freshly downloaded/validated artifact), never from the current install just
+/// because it still passes `-v`. `None` means the baseline explicitly recorded
+/// the artifact as absent.
+fn recovery_baseline_artifact(
+    ctx: &instance::InstanceContext,
+    relative_path: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let store = system_generation_store(ctx);
+    let state = store.read_state()?;
+    let baseline = state
+        .previous
+        .ok_or_else(|| anyhow::anyhow!("恢复态缺少绑定基线，拒绝捕获当前安装态"))?;
+    anyhow::ensure!(
+        !store.is_generation_untrusted(&baseline),
+        "恢复基线未经认证，拒绝复用其字节"
+    );
+    let manifest = store.validate_generation(&baseline)?;
+    anyhow::ensure!(manifest.is_baseline(), "恢复绑定不是已认证的基线代际");
+    if manifest.missing_paths().contains(relative_path) {
+        return Ok(None);
+    }
+    let Some(entry) = manifest
+        .all_entries()
+        .into_iter()
+        .find(|entry| entry.relative_path == relative_path)
+    else {
+        return Ok(None);
+    };
+    let bytes = utils::read_file_no_follow_limited(
+        &store.generation_dir(&baseline).join(&entry.relative_path),
+        512 * 1024 * 1024,
+    )?;
+    anyhow::ensure!(
+        generation::calculate_sha256_bytes(&bytes) == entry.sha256,
+        "恢复基线 artifact 与 manifest 不一致"
+    );
+    Ok(Some(bytes))
+}
+
+fn build_artifact_targets(
+    ctx: &instance::InstanceContext,
+    store: &generation::GenerationStore,
+    id: &generation::GenerationId,
+    manifest: &generation::GenerationManifest,
+) -> anyhow::Result<Vec<ArtifactTarget>> {
+    let gen_dir = store.generation_dir(id);
+    let state_dir = managed_state_dir(ctx)?;
+    let mut targets = vec![
+        ArtifactTarget {
+            relative_path: manifest.daemon.relative_path.clone(),
+            kind: generation::ArtifactKind::Daemon,
+            sha256: manifest.daemon.sha256.clone(),
+            source: gen_dir.join(&manifest.daemon.relative_path),
+            dest: ctx.paths.cli_binary.clone(),
+            mode: manifest.daemon.unix_mode,
+        },
+        ArtifactTarget {
+            relative_path: manifest.core.relative_path.clone(),
+            kind: generation::ArtifactKind::Core,
+            sha256: manifest.core.sha256.clone(),
+            source: gen_dir.join(&manifest.core.relative_path),
+            dest: ctx.paths.core_binary.clone(),
+            mode: manifest.core.unix_mode,
+        },
+    ];
+    for extra in &manifest.extra_artifacts {
+        anyhow::ensure!(
+            matches!(
+                extra.relative_path.as_str(),
+                "geoip.metadb" | "GeoSite.dat" | "Country.mmdb"
+            ) && !matches!(
+                extra.kind,
+                generation::ArtifactKind::Daemon | generation::ArtifactKind::Core
+            ),
+            "拒绝未知或角色冒充的受管资源路径: {}",
+            extra.relative_path
+        );
+        targets.push(ArtifactTarget {
+            relative_path: extra.relative_path.clone(),
+            kind: extra.kind.clone(),
+            sha256: extra.sha256.clone(),
+            source: gen_dir.join(&extra.relative_path),
+            dest: state_dir.join(&extra.relative_path),
+            mode: extra.unix_mode,
+        });
+    }
+    Ok(targets)
+}
+
+/// SPEC P4: replacement is content addressed — equal bytes are skipped, so a
+/// daemon-only upgrade never touches the core inode.
+fn change_set(plan: &ApplyPlan) -> anyhow::Result<ChangeSet> {
+    let mut daemon = false;
+    let mut core = false;
+    let mut extras = Vec::new();
+    for (index, target) in plan.targets.iter().enumerate() {
+        if target_matches(target)? {
+            continue;
+        }
+        if target.is_daemon() {
+            daemon = true;
+        } else if target.kind == generation::ArtifactKind::Core {
+            core = true;
+        } else {
+            extras.push(index);
+        }
+    }
+    Ok(ChangeSet {
+        daemon,
+        core,
+        extras,
+    })
+}
+
+fn write_artifact(target: &ArtifactTarget, bytes: &[u8]) -> anyhow::Result<()> {
+    if let Some(parent) = target.dest.parent() {
+        utils::ensure_dir_all_no_follow(parent)?;
+    }
+    if target.kind == generation::ArtifactKind::Daemon
+        || target.kind == generation::ArtifactKind::Core
+    {
+        return utils::atomic_write_bytes_no_follow(&target.dest, bytes, 0o755);
+    }
+    // Extra artifacts live in the service-owned runtime directory: write directly
+    // when we already have access, escalate only when the filesystem refuses.
+    let mode = target.mode.unwrap_or(0o644) as u16;
+    match utils::atomic_write_bytes_no_follow(&target.dest, bytes, mode) {
+        Ok(()) => Ok(()),
+        Err(error) if is_permission_denied(&error) => {
+            service::PrivilegeExecutor::write_file(&target.dest, bytes, mode)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_permission_denied(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io_error| io_error.kind() == std::io::ErrorKind::PermissionDenied)
+}
+
+fn replace_artifacts(plan: &ApplyPlan, change: &ChangeSet) -> anyhow::Result<Vec<Replacement>> {
+    let mut replaced = Vec::new();
+    for (index, target) in plan.targets.iter().enumerate() {
+        let changed = if target.is_daemon() {
+            change.daemon
+        } else if target.kind == generation::ArtifactKind::Core {
+            change.core
+        } else {
+            change.extras.contains(&index)
+        };
+        if !changed {
+            continue;
+        }
+        let had_pre_image = target.dest.exists();
+        let bytes = std::fs::read(&target.source).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot read staged artifact {}: {error}",
+                target.source.display()
+            )
+        })?;
+        write_artifact(target, &bytes)?;
+        replaced.push(Replacement {
+            relative_path: target.relative_path.clone(),
+            had_pre_image,
+        });
+    }
+    Ok(replaced)
+}
+
+/// SPEC P0: copies the pre-upgrade `cache.db` aside before anything in the
+/// pipeline can start a Core that would delete a broken database.
+///
+/// the evidence face is the superset "corrupt content verdict +
+/// unjudged overlay". `PermissionDrift` short-circuits the content verdict, so a
+/// drifted file may also be corrupt and the Core would delete it once the repair
+/// lets it open the file. Using the same superset predicate here closes the
+/// post-recovery entry points (`tun off` / `uninstall` / `install` after a repair)
+/// that the CLI repair gate deliberately does not cover.
+fn preserve_upgrade_evidence(ctx: &instance::InstanceContext) -> anyhow::Result<()> {
+    let Some(state_dir) = ctx.paths.tun_config_file.parent() else {
+        return Ok(());
+    };
+    let cache_db_path = state_dir.join(utils::CACHE_DB_FILE_NAME);
+    let classification =
+        utils::classify_cache_db_detailed(&cache_db_path, Some(SERVICE_ACCOUNT_USER));
+    if !classification.needs_evidence_preservation() {
+        return Ok(());
+    }
+    let preserved = utils::preserve_cache_db_evidence(&cache_db_path).map_err(|error| {
+        anyhow::anyhow!(
+            "cache.db 证据保全失败（{}），本次操作已中止，运行态未改动。\n  \
+             原因: {error}\n  \
+             Fix: 检查 {} 的可读性与所在目录权限后重试",
+            classification.state.as_str(),
+            state_dir.display()
+        )
+    })?;
+    crate::log!("preserved cache.db evidence at {}", preserved.display());
+    println!(
+        "  ⚠ cache.db {} 已复制留证：{}",
+        classification.state.as_str(),
+        preserved.display()
+    );
+    Ok(())
+}
+
+/// SPEC P0: read-only transaction convergence. An in-flight TUN journal
+/// already owns the runtime mutation; the generation pipeline must not become a
+/// second side-effect owner (recovery runs before this pipeline, never here).
+fn refuse_inflight_transaction(ctx: &instance::InstanceContext) -> anyhow::Result<()> {
+    let Some(journal) = tun_transaction::read_active_journal(ctx)? else {
+        return Ok(());
+    };
+    if matches!(
+        journal.phase,
+        tun_transaction::JournalPhase::IntentCommitted | tun_transaction::JournalPhase::RolledBack
+    ) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "存在未收敛的 TUN 事务（{:?}），本次不应用代际升级，运行态未改动。\n  Fix: mihomo-cli restart --system",
+        journal.phase
+    );
+}
+
+fn migrate_generation_store_if_needed(
+    ctx: &instance::InstanceContext,
+    store: &generation::GenerationStore,
+) -> anyhow::Result<()> {
+    let legacy_root = ctx
+        .paths
+        .tun_config_file
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| ctx.paths.config_dir.clone());
+    if legacy_root == store.root_dir() {
+        return Ok(());
+    }
+    match generation::migrate_legacy_store(&legacy_root, store) {
+        Ok(generation::MigrationOutcome::FirstInstall)
+        | Ok(generation::MigrationOutcome::NewRootAuthoritative) => Ok(()),
+        Ok(generation::MigrationOutcome::Migrated) => {
+            println!("  ✅ 代际存储已从旧路径迁移到新信任根");
+            Ok(())
+        }
+        Err(error) => anyhow::bail!(
+            "代际存储迁移失败: {error}\n  旧数据保留，本工具未完成迁移；保留取证。显式只读检查：mihomo-cli doctor --system --privileged"
+        ),
+    }
+}
+
+/// SPEC P1 (frozen): the single daemon identity criterion — the candidate
+/// daemon bytes must equal **the running executable's** bytes. Shared by the P1
+/// verification, the skew detector and the tombstone retry gate so the three
+/// cannot drift apart.
+pub(crate) fn daemon_identity_matches_current_exe(candidate_sha256: &str) -> anyhow::Result<bool> {
+    let current_exe = std::env::current_exe()?;
+    let current_exe_sha = file_sha256(&current_exe)?
+        .ok_or_else(|| anyhow::anyhow!("cannot hash current executable"))?;
+    Ok(candidate_sha256 == current_exe_sha)
+}
+
+/// SPEC P1: the pending daemon bytes must be the identity we are running
+/// (sudo re-entry or repair) — the pipeline validates, it never stages.
+fn verify_pending_daemon_identity(
+    _ctx: &instance::InstanceContext,
+    manifest: &generation::GenerationManifest,
+    pending_id: &generation::GenerationId,
+) -> anyhow::Result<()> {
+    if daemon_identity_matches_current_exe(&manifest.daemon.sha256)? {
+        return Ok(());
+    }
+    let current_exe = std::env::current_exe()?;
+    let current_exe_sha = file_sha256(&current_exe)?.unwrap_or_default();
+    anyhow::bail!(
+        "代际 {} 的 daemon 哈希 {} 与当前运行的可执行文件 {} 不匹配。\n  \
+         零替换。请使用 mihomo-cli install --system 重新暂存。",
+        pending_id,
+        short_revision(&manifest.daemon.sha256),
+        short_revision(&current_exe_sha),
+    );
+}
+
+/// SPEC P2: strict binding verification. No binding, an inconsistent
+/// binding, or a baseline that came from the untrusted legacy migration all mean
+/// "fact unknown" → zero replacement plus recovery guidance.
+fn verify_baseline_binding(
+    store: &generation::GenerationStore,
+    manifest: &generation::GenerationManifest,
+    state: &generation::GenerationState,
+    pending_id: &generation::GenerationId,
+) -> anyhow::Result<generation::GenerationId> {
+    if store.is_generation_untrusted(pending_id) {
+        anyhow::bail!(
+            "代际 {} 来自存量迁移，未经认证（事实不明），零替换。\n  \
+             请使用 mihomo-cli install --system 重新暂存以建立基线绑定。",
+            pending_id
+        );
+    }
+    let binding = manifest.metadata.get("baseline").cloned();
+    let previous = state.previous.as_ref().map(|id| id.as_str().to_string());
+    let bound = match (binding, previous) {
+        (Some(binding), Some(previous)) if binding == previous => binding,
+        (None, _) => anyhow::bail!(
+            "代际 {} 无基线绑定（legacy pending），事实不明，零替换。\n  \
+             请使用 mihomo-cli install --system 重新暂存以建立基线绑定。",
+            pending_id
+        ),
+        (Some(_), None) => anyhow::bail!(
+            "代际 {} 有基线绑定但 state.previous 为空，事实不明，零替换。\n  \
+             请使用 mihomo-cli install --system 重新暂存。",
+            pending_id
+        ),
+        (Some(binding), Some(previous)) => anyhow::bail!(
+            "代际 {} 的基线绑定 {} 与 state.previous {} 不一致，事实不明，零替换。\n  \
+             请使用 mihomo-cli install --system 重新暂存。",
+            pending_id,
+            binding,
+            previous
+        ),
+    };
+    let baseline_id = generation::GenerationId::new(&bound)
+        .map_err(|error| anyhow::anyhow!("绑定基线 ID {bound} 非法：{error}"))?;
+    if store.is_generation_untrusted(&baseline_id) {
+        anyhow::bail!(
+            "代际 {} 的绑定基线 {} 来自存量迁移，未经认证（事实不明），零替换。\n  \
+             请使用 mihomo-cli install --system 重新暂存以捕获可信基线。",
+            pending_id,
+            baseline_id
+        );
+    }
+    Ok(baseline_id)
+}
+
+/// SPEC P1-2: freezes `(配置字节, revision, subscription_id)` before any
+/// downtime so the mirror push, the start request and the report share one
+/// identity. Lock order note: the generation lock is already held; the config
+/// lock is a different (bounded, leaf) lock — no coordinator lock is taken.
+fn freeze_config_triple(ctx: &instance::InstanceContext) -> anyhow::Result<Option<FrozenConfig>> {
+    let config_path = lifecycle_system_config_path(ctx);
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    let (content, revision) = lifecycle_system_config_payload(ctx)?;
+    let paths = utils::AppPaths::new(ctx.paths.config_dir.clone());
+    let (subscription_id, ownership_proven) = match config::get_active_id_at(&paths) {
+        Ok(id) => (id, true),
+        Err(error) => {
+            crate::log!("active subscription pointer unreadable: {error}");
+            (None, false)
+        }
+    };
+    Ok(Some(FrozenConfig {
+        content,
+        revision,
+        subscription_id,
+        ownership_proven,
+    }))
+}
+
+/// SPEC P5 mirror timing: push the mirror through the still-live old daemon
+/// and require a confirmed business response (`Error` = channel unavailable).
+async fn push_mirror_strict(
+    ctx: &instance::InstanceContext,
+    frozen: &FrozenConfig,
+) -> anyhow::Result<()> {
+    let Some(subscription_id) = frozen.subscription_id.clone() else {
+        return Ok(());
+    };
+    match ipc::send_command(&ipc::DaemonCommand::RecordActiveSubscription {
+        subscription_id: subscription_id.clone(),
+        config_revision: Some(frozen.revision.clone()),
+        token: None,
+    })
+    .await?
+    {
+        ipc::DaemonResponse::Success { .. } => {}
+        ipc::DaemonResponse::Error { message } => {
+            anyhow::bail!("RecordActiveSubscription 被拒绝：{message}")
+        }
+        other => anyhow::bail!("RecordActiveSubscription 返回非预期响应：{other:?}"),
+    }
+    let paths = utils::AppPaths::new(ctx.paths.config_dir.clone());
+    let selection_path = paths.selection_state_path_for_subscription(&subscription_id);
+    let Ok(content) = std::fs::read_to_string(&selection_path) else {
+        return Ok(());
+    };
+    if content.trim().is_empty() {
+        return Ok(());
+    }
+    match ipc::send_command(&ipc::DaemonCommand::RecordSelectionIntent {
+        subscription_id,
+        content_yaml: content,
+        config_revision: Some(frozen.revision.clone()),
+        token: None,
+    })
+    .await?
+    {
+        ipc::DaemonResponse::Success { .. } => Ok(()),
+        ipc::DaemonResponse::Error { message } => {
+            anyhow::bail!("RecordSelectionIntent 被拒绝：{message}")
+        }
+        other => anyhow::bail!("RecordSelectionIntent 返回非预期响应：{other:?}"),
+    }
+}
+
+async fn daemon_status() -> anyhow::Result<DaemonStatusView> {
+    match ipc::send_command(&ipc::DaemonCommand::GetStatus { token: None }).await? {
+        ipc::DaemonResponse::Status {
+            running,
+            launched_config_revision,
+            ..
+        } => Ok(DaemonStatusView {
+            running,
+            launched_config_revision,
+        }),
+        ipc::DaemonResponse::Error { message } => {
+            anyhow::bail!("daemon status query failed: {message}")
+        }
+        other => anyhow::bail!("daemon returned unexpected status response: {other:?}"),
+    }
+}
+
+/// SPEC P3: stopped proof for the managed Core while the daemon stays alive.
+async fn wait_for_core_stopped_proof(ctx: &instance::InstanceContext) -> anyhow::Result<()> {
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(10);
+    while start.elapsed() < timeout {
+        match daemon_status().await {
+            Ok(status) if !status.running => {
+                no_running_core_without_daemon(ctx)?;
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(error) => anyhow::bail!("无法获取 core 停止证明：{error}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    anyhow::bail!(
+        "无法证明受管 core 已停止（{}s 超时），拒绝继续",
+        timeout.as_secs()
+    )
+}
+
+async fn quiesce_daemon_service(ctx: &instance::InstanceContext) -> anyhow::Result<()> {
+    if ipc::is_daemon_running().await {
+        let _ = ipc::send_command(&ipc::DaemonCommand::StopCore { token: None }).await;
+    }
+    let stop_plan = instance::planned_generation_quiesce_plan(ctx);
+    for command in &stop_plan.commands {
+        service::run_instance_command(command)?;
+    }
+    wait_for_system_daemon_shutdown().await?;
+    // SPEC P3/P2-5: a stopped daemon is not a stopped Core. Replacing the
+    // Core binary under an orphaned process would swap the file behind a running
+    // runtime, so the same process-level proof the recovery path uses is required
+    // before any replacement (fail closed, never kill).
+    quiesce_managed_core_after_daemon_stop(ctx).await
+}
+
+/// SPEC P3: minimal downtime — the daemon service stops only when the
+/// daemon binary changes; core/extra changes only restart the managed Core.
+async fn quiesce_for_apply(
+    ctx: &instance::InstanceContext,
+    change: &ChangeSet,
+) -> anyhow::Result<()> {
+    if change.daemon {
+        println!("  P3 停机：daemon 变更 → 停止 system service（最小停机范围）");
+        return quiesce_daemon_service(ctx).await;
+    }
+    if change.core || !change.extras.is_empty() {
+        println!("  P3 停机：core/资源变更 → 只停受管 core，daemon service 不动");
+        if ipc::is_daemon_running().await {
+            match ipc::send_command(&ipc::DaemonCommand::StopCore { token: None }).await? {
+                ipc::DaemonResponse::Success { .. } => {}
+                ipc::DaemonResponse::Error { message } => {
+                    anyhow::bail!("core 停止请求被拒绝：{message}")
+                }
+                other => anyhow::bail!("core 停止返回非预期响应：{other:?}"),
+            }
+            return wait_for_core_stopped_proof(ctx).await;
+        }
+        return quiesce_managed_core_after_daemon_stop(ctx).await;
+    }
+    Ok(())
+}
+
+async fn start_daemon_service(ctx: &instance::InstanceContext) -> anyhow::Result<()> {
+    let start_plan = instance::planned_generation_resume_plan(ctx);
+    for command in &start_plan.commands {
+        service::run_instance_command(command)?;
+    }
+    wait_for_system_daemon_readiness().await
+}
+
+async fn core_payload(
+    ctx: &instance::InstanceContext,
+    frozen: Option<&FrozenConfig>,
+) -> anyhow::Result<(String, String, Option<String>)> {
+    if let Some(frozen) = frozen {
+        return Ok((
+            frozen.content.clone(),
+            frozen.revision.clone(),
+            frozen.subscription_id.clone(),
+        ));
+    }
+    let (content, revision) = lifecycle_system_config_payload(ctx)?;
+    let subscription_id =
+        config::get_active_id_at(&utils::AppPaths::new(ctx.paths.config_dir.clone()))
+            .ok()
+            .flatten();
+    Ok((content, revision, subscription_id))
+}
+
+fn print_replay_report(
+    ctx: &instance::InstanceContext,
+    request_id: &str,
+    revision: &str,
+    message: &str,
+    frozen: Option<&FrozenConfig>,
+) {
+    let paths = utils::AppPaths::new(ctx.paths.config_dir.clone());
+    println!(
+        "  ✓ core 启动/重启请求 {request_id} 已确认（revision {}）",
+        short_revision(revision)
+    );
+    let subscription_id_at_request = frozen.and_then(|frozen| frozen.subscription_id.as_deref());
+    for line in selection_replay_message_lines(message, subscription_id_at_request, &paths) {
+        println!("{line}");
+    }
+}
+
+/// SPEC P5: the start/restart request is bound to the request ID printed
+/// here and to the frozen revision (never to the mirror's current active slot).
+async fn request_core_start(
+    ctx: &instance::InstanceContext,
+    tag: &str,
+    frozen: Option<&FrozenConfig>,
+) -> anyhow::Result<(String, String)> {
+    let (content, revision, subscription_id) = core_payload(ctx, frozen).await?;
+    let request_id = format!("start:{tag}:{}", short_revision(&revision));
+    let response = ipc::send_command(&ipc::DaemonCommand::StartCore {
+        config_content: content,
+        config_revision: revision.clone(),
+        subscription_id,
+        token: None,
+    })
+    .await?;
+    match response {
+        ipc::DaemonResponse::Success { message } => {
+            print_replay_report(ctx, &request_id, &revision, &message, frozen);
+            Ok((request_id, message))
+        }
+        ipc::DaemonResponse::Error { message } => {
+            anyhow::bail!(daemon_command_error_message(ctx.os, &message))
+        }
+        other => anyhow::bail!("core 启动返回非预期响应：{other:?}"),
+    }
+}
+
+async fn request_core_restart(
+    ctx: &instance::InstanceContext,
+    tag: &str,
+    frozen: Option<&FrozenConfig>,
+) -> anyhow::Result<(String, String)> {
+    let (content, revision, subscription_id) = core_payload(ctx, frozen).await?;
+    let request_id = format!("restart:{tag}:{}", short_revision(&revision));
+    let response = ipc::send_command(&ipc::DaemonCommand::RestartCore {
+        config_content: content,
+        config_revision: revision.clone(),
+        subscription_id,
+        token: None,
+    })
+    .await?;
+    match response {
+        ipc::DaemonResponse::Success { message } => {
+            print_replay_report(ctx, &request_id, &revision, &message, frozen);
+            Ok((request_id, message))
+        }
+        ipc::DaemonResponse::Error { message } => {
+            anyhow::bail!(daemon_command_error_message(ctx.os, &message))
+        }
+        other => anyhow::bail!("core 重启返回非预期响应：{other:?}"),
+    }
+}
+
+/// SPEC P5: start causality verdict for the running Core.
+///
+/// A missing receipt (daemon re-attached to a Core it did not launch) is
+/// **unprovable**, never "assume fine": it forces a managed restart and the
+/// post-restart proof still fails closed if the receipt stays absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StartCausality {
+    Satisfied,
+    NeedsStart,
+    NeedsRestart(String),
+}
+
+pub(crate) fn start_causality(
+    frozen: Option<&FrozenConfig>,
+    status: &DaemonStatusView,
+) -> StartCausality {
+    if !status.running {
+        return StartCausality::NeedsStart;
+    }
+    let Some(frozen) = frozen else {
+        return StartCausality::Satisfied;
+    };
+    match status.launched_config_revision.as_deref() {
+        None => StartCausality::NeedsRestart(
+            "受管 core 无法提供启动 receipt（daemon reattach 旧 core）：启动因果不可证".to_string(),
+        ),
+        Some(launched) if !frozen.revision.is_empty() && launched != frozen.revision => {
+            StartCausality::NeedsRestart(format!(
+                "core 运行快照 {} 不是本次冻结快照 {}",
+                short_revision(launched),
+                short_revision(&frozen.revision)
+            ))
+        }
+        Some(_) => StartCausality::Satisfied,
+    }
+}
+
+/// SPEC P5: Core-reported TUN state; `None` when it cannot be observed.
+async fn observe_runtime_tun(ctx: &instance::InstanceContext) -> Option<bool> {
+    let snapshot = status::StatusSnapshot::collect(ctx).await;
+    snapshot.runtime_tun.as_bool()
+}
+
+/// SPEC P5: target-identity running proof. Reports success only when every
+/// target artifact on disk equals the manifest, the daemon attests its own
+/// revision, and the running Core carries this attempt's start causality.
+async fn prove_runtime_identity(
+    ctx: &instance::InstanceContext,
+    plan: &ApplyPlan,
+    frozen: Option<&FrozenConfig>,
+    status: &DaemonStatusView,
+    _tun_before: Option<bool>,
+    degraded: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    for target in &plan.targets {
+        match file_sha256(&target.dest)? {
+            Some(actual) if actual == target.sha256 => {}
+            Some(actual) => anyhow::bail!(
+                "artifact {} 磁盘哈希 {} 与 manifest {} 不一致（目标身份运行证明失败）",
+                target.dest.display(),
+                short_revision(&actual),
+                short_revision(&target.sha256)
+            ),
+            None => anyhow::bail!(
+                "artifact {} 缺失（目标身份运行证明失败）",
+                target.dest.display()
+            ),
+        }
+    }
+    verify_running_daemon_revision(&plan.manifest.daemon.sha256).await?;
+    let config_path = lifecycle_system_config_path(ctx);
+    if !config_path.exists() {
+        return Ok(());
+    }
+    if !status.running {
+        anyhow::bail!("受管 core 未运行：目标身份无法证明，不允许报成功");
+    }
+    match start_causality(frozen, status) {
+        StartCausality::Satisfied => {}
+        other => anyhow::bail!("启动因果不可证（{other:?}）：不允许报成功"),
+    }
+    // SPEC P5: TUN attestation is an explicit component of the proof
+    // formula. The target is the effective config that was just promoted: a
+    // restore/enable (before=false → after=true) is valid when the target says
+    // TUN enabled; only a mismatch against the target, or an unobservable state,
+    // is a failure. This keeps the no-silent-TUN-loss guard without blocking a
+    // legitimate recovery from an earlier TUN-disabled rollback.
+    let target_tun = frozen
+        .and_then(|frozen| {
+            tun_transaction::parse_tun_enabled_from_bytes(frozen.content.as_bytes()).ok()
+        })
+        .or_else(|| {
+            std::fs::read(&config_path)
+                .ok()
+                .and_then(|bytes| tun_transaction::parse_tun_enabled_from_bytes(&bytes).ok())
+        });
+    match (target_tun, observe_runtime_tun(ctx).await) {
+        (Some(target), Some(after)) if target == after => {}
+        (Some(target), Some(after)) => anyhow::bail!(
+            "升级后 TUN 运行态 {after} 与目标配置 {target} 不一致：TUN attestation 失败"
+        ),
+        _ => degraded.push(
+            "TUN 运行态在升级前后不可完全观测：TUN attestation 显式降级（未证明）".to_string(),
+        ),
+    }
+    Ok(())
+}
+
+/// SPEC P5: start (or restart) and prove. At most one managed Core restart
+/// is spent on the mirror degradation path.
+async fn start_and_prove(
+    ctx: &instance::InstanceContext,
+    plan: &ApplyPlan,
+    frozen: Option<&FrozenConfig>,
+    mirror_ready: bool,
+    tun_before: Option<bool>,
+    degraded: &mut Vec<String>,
+) -> anyhow::Result<Option<String>> {
+    if !ipc::is_daemon_running().await {
+        start_daemon_service(ctx).await?;
+    }
+    verify_running_daemon_revision(&plan.manifest.daemon.sha256).await?;
+    ensure_system_daemon_access(ctx).await?;
+    maybe_auto_recover_active_transaction(
+        ctx,
+        tun_transaction::RecoveryDirection::Abort,
+        false,
+        false,
+        false,
+    )
+    .await?;
+
+    let mut mirror_rebuilt = false;
+    if !mirror_ready {
+        match frozen {
+            Some(frozen) if frozen.ownership_proven => {
+                match push_mirror_strict(ctx, frozen).await {
+                    Ok(()) => {
+                        mirror_rebuilt = true;
+                        degraded.push(
+                            "旧 daemon 不可用：镜像已在新 daemon 后重建，补偿 1 次受管 core 重启"
+                                .to_string(),
+                        );
+                    }
+                    Err(error) => degraded.push(format!(
+                        "新 daemon 后镜像重建失败（{error}）：选点回放可能缺失"
+                    )),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut request_id = None;
+    let config_path = lifecycle_system_config_path(ctx);
+    if config_path.exists() {
+        let status = daemon_status().await?;
+        match start_causality(frozen, &status) {
+            StartCausality::NeedsStart => {
+                let (id, _) = request_core_start(ctx, plan.pending_id.as_str(), frozen).await?;
+                request_id = Some(id);
+            }
+            StartCausality::NeedsRestart(reason) => {
+                // Single restart call site: the "at most one managed restart"
+                // budget is structural (P0-1: unknown receipt ⇒ restart, then
+                // the post-restart proof still fails closed if it stays absent).
+                degraded.push(reason);
+                let (id, _) = request_core_restart(ctx, plan.pending_id.as_str(), frozen).await?;
+                request_id = Some(id);
+            }
+            StartCausality::Satisfied if mirror_rebuilt => {
+                let (id, _) = request_core_restart(ctx, plan.pending_id.as_str(), frozen).await?;
+                request_id = Some(id);
+            }
+            StartCausality::Satisfied => {}
+        }
+        wait_for_instance_readiness(ctx).await?;
+    }
+
+    let status = daemon_status().await?;
+    prove_runtime_identity(ctx, plan, frozen, &status, tun_before, degraded).await?;
+    Ok(request_id)
+}
+
+/// SPEC P3/P4/P5 for one attempt.
+async fn run_apply_pipeline(
+    ctx: &instance::InstanceContext,
+    plan: &ApplyPlan,
+    frozen: Option<&FrozenConfig>,
+) -> anyhow::Result<ApplyReport> {
+    let change = change_set(plan)?;
+    let mut degraded = Vec::new();
+
+    // Mirror timing: push through the old daemon while it is still alive.
+    let mirror_ready = match frozen {
+        Some(frozen) if frozen.ownership_proven => match push_mirror_strict(ctx, frozen).await {
+            Ok(()) => true,
+            Err(error) => {
+                degraded.push(format!(
+                    "旧 daemon 镜像推送不可用（{error}）：退化到新 daemon 后重建 + 至多一次受管 core 重启"
+                ));
+                false
+            }
+        },
+        // Ownership unprovable → replays are skipped (explicit degradation).
+        Some(_) => false,
+        // No managed config at all → nothing to replay; not a degradation.
+        None => true,
+    };
+
+    // SPEC P5: TUN state snapshot before any downtime (old runtime alive).
+    let tun_before = observe_runtime_tun(ctx).await;
+
+    if change.has_changes() {
+        quiesce_for_apply(ctx, &change).await?;
+        let replaced = replace_artifacts(plan, &change)?;
+        for replacement in &replaced {
+            println!(
+                "  · 替换 {}{}",
+                replacement.relative_path,
+                if replacement.had_pre_image {
+                    ""
+                } else {
+                    "（替换前不存在）"
+                }
+            );
+        }
+    } else {
+        println!("  P3/P4 跳过：全部 artifact 与 manifest 一致（零 inode churn）");
+    }
+
+    let core_request_id =
+        start_and_prove(ctx, plan, frozen, mirror_ready, tun_before, &mut degraded).await?;
+    Ok(ApplyReport {
+        core_request_id,
+        degraded,
+    })
+}
+
+fn print_apply_success(plan: &ApplyPlan, report: &ApplyReport) {
+    for line in &report.degraded {
+        println!("  ⚠ {line}");
+    }
+    if let Some(request_id) = &report.core_request_id {
+        println!("  · core 启动因果已绑定请求 {request_id}");
+    }
+    println!(
+        "  ✅ Successfully upgraded to generation {}（全部 artifact 与 manifest 一致 + 目标身份运行证明通过）",
+        plan.pending_id
+    );
+}
+
+/// SPEC N3: a succeeded explicit retry retires the tombstones of withdrawn
+/// generations that shipped the same daemon revision.
+fn retire_successful_tombstones(store: &generation::GenerationStore, plan: &ApplyPlan) {
+    let Ok(withdrawn) = store.list_withdrawn() else {
+        return;
+    };
+    for id in withdrawn {
+        let manifest = match store.read_withdrawn_manifest(&id) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                crate::log!("cannot read tombstone manifest {}: {error}", id);
+                eprintln!("  ⚠ 墓碑 {id} 无法读取（保留原状）：{error}");
+                continue;
+            }
+        };
+        // Unknown/migrated tombstones are evidence, not authenticated native retries.
+        if store
+            .withdrawn_path(&id)
+            .join(generation::UNTRUSTED_MARKER)
+            .exists()
+        {
+            continue;
+        }
+        let authenticated_binding = manifest
+            .metadata
+            .get("baseline")
+            .and_then(|value| generation::GenerationId::new(value).ok())
+            .filter(|baseline| !store.is_generation_untrusted(baseline))
+            .and_then(|baseline| store.validate_generation(&baseline).ok())
+            .is_some_and(|baseline| baseline.is_baseline());
+        if !authenticated_binding {
+            continue;
+        }
+        // SPEC N3 "同源" = the same daemon identity: the withdrawn
+        // generation's *core* was a failed candidate and carries no identity, so
+        // a successful retry of the same daemon revision retires it.
+        if manifest.daemon.sha256 != plan.manifest.daemon.sha256 {
+            continue;
+        }
+        match store.retire_withdrawn(&id) {
+            Ok(()) => println!(
+                "  ✓ 已退休墓碑 {}（本次升级成功应用同一 daemon/core 版本）",
+                id
+            ),
+            Err(error) => {
+                crate::log!("cannot retire tombstone {}: {error}", id);
+                eprintln!("  ⚠ 墓碑 {id} 退休失败（保留原状）：{error}");
+            }
+        }
+    }
+}
+
+/// SPEC P4/C: restoration draws from the bound baseline, including the
+/// "artifact did not exist" state (moved aside with a no-replace rename).
+fn restore_baseline_artifacts(
+    baseline_targets: &[ArtifactTarget],
+    missing: &std::collections::HashSet<String>,
+) -> anyhow::Result<()> {
+    for target in baseline_targets {
+        if missing.contains(&target.relative_path) {
+            if target.dest.exists() {
+                let moved = move_aside_no_replace(&target.dest)?;
+                println!(
+                    "  · 恢复缺失态：{} → {}",
+                    target.dest.display(),
+                    moved.display()
+                );
+            }
+            continue;
+        }
+        if target_matches(target)? {
+            continue;
+        }
+        let bytes = std::fs::read(&target.source).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot read baseline artifact {}: {error}",
+                target.source.display()
+            )
+        })?;
+        write_artifact(target, &bytes)?;
+        println!("  · 回滚 {}", target.relative_path);
+    }
+    Ok(())
+}
+
+fn move_aside_no_replace(path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid file name for {}", path.display()))?;
+    for seq in 0..64u32 {
+        let candidate = path.with_file_name(format!("{name}.rollback-removed-{seq:02}"));
+        if candidate.exists() {
+            continue;
+        }
+        std::fs::rename(path, &candidate).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot move {} aside to {}: {error}",
+                path.display(),
+                candidate.display()
+            )
+        })?;
+        return Ok(candidate);
+    }
+    anyhow::bail!(
+        "cannot allocate a no-replace rollback name for {}",
+        path.display()
+    )
+}
+
+async fn prove_baseline_identity(
+    ctx: &instance::InstanceContext,
+    store: &generation::GenerationStore,
+    baseline_id: &generation::GenerationId,
+    baseline_manifest: &generation::GenerationManifest,
+) -> anyhow::Result<()> {
+    let baseline_targets = build_artifact_targets(ctx, store, baseline_id, baseline_manifest)?;
+    let missing = manifest_missing_set(baseline_manifest);
+    for target in &baseline_targets {
+        if missing.contains(&target.relative_path) {
+            if target.dest.exists() {
+                anyhow::bail!(
+                    "基线声明 {} 本不存在，但安装态仍有该文件（补偿未收敛）",
+                    target.dest.display()
+                );
+            }
+            continue;
+        }
+        match file_sha256(&target.dest)? {
+            Some(actual) if actual == target.sha256 => {}
+            Some(actual) => anyhow::bail!(
+                "回滚后 {} 的哈希 {} 与基线 {} 不一致",
+                target.dest.display(),
+                short_revision(&actual),
+                short_revision(&target.sha256)
+            ),
+            None => anyhow::bail!("回滚后 {} 缺失", target.dest.display()),
+        }
+    }
+    if missing.contains(&baseline_manifest.daemon.relative_path) {
+        anyhow::bail!("基线不含 daemon 二进制，无法启动并证明回滚运行态");
+    }
+    verify_running_daemon_revision(&baseline_manifest.daemon.sha256).await?;
+    Ok(())
+}
+
+/// SPEC C: compensating rollback in the order that makes crash semantics
+/// convergent: stopped proof → per-artifact restore → start + proof →
+/// tombstone (no-replace) → slot consumption.
+async fn rollback_to_baseline(
+    ctx: &instance::InstanceContext,
+    store: &generation::GenerationStore,
+    lock: &generation::GenerationLockGuard,
+    plan: &ApplyPlan,
+    frozen: Option<&FrozenConfig>,
+) -> anyhow::Result<()> {
+    let baseline_targets =
+        build_artifact_targets(ctx, store, &plan.baseline_id, &plan.baseline_manifest)?;
+    let missing = manifest_missing_set(&plan.baseline_manifest);
+    let daemon_revert = match baseline_targets.iter().find(|target| target.is_daemon()) {
+        Some(target) => !missing.contains(&target.relative_path) && !target_matches(target)?,
+        None => false,
+    };
+    if daemon_revert {
+        quiesce_daemon_service(ctx).await?;
+    } else if ipc::is_daemon_running().await {
+        let _ = ipc::send_command(&ipc::DaemonCommand::StopCore { token: None }).await;
+        wait_for_core_stopped_proof(ctx).await?;
+    } else {
+        quiesce_managed_core_after_daemon_stop(ctx).await?;
+    }
+
+    restore_baseline_artifacts(&baseline_targets, &missing)?;
+
+    if !ipc::is_daemon_running().await {
+        start_daemon_service(ctx).await?;
+    }
+    ensure_system_daemon_access(ctx).await?;
+    if lifecycle_system_config_path(ctx).exists() {
+        let status = daemon_status().await?;
+        if !status.running {
+            let _ = request_core_start(ctx, plan.baseline_id.as_str(), frozen).await?;
+        }
+        wait_for_instance_readiness(ctx).await?;
+    }
+    prove_baseline_identity(ctx, store, &plan.baseline_id, &plan.baseline_manifest).await?;
+
+    // SPEC 裁决 A1: mark "rollback proven" (inside the generation dir, so the
+    // marker travels with the tombstone rename). Without this marker a tombstone
+    // only means "candidate revoked", never "runtime restored".
+    store
+        .mark_rollback_proven(&plan.pending_id)
+        .map_err(|error| anyhow::anyhow!("回滚证明标记写入失败（补偿不算成功）：{error}"))?;
+    // SPEC N2: tombstone first, then consume the slots. Collision refuses
+    // (an existing tombstone means the withdrawn semantics are undefined).
+    store
+        .withdraw_generation(&plan.pending_id)
+        .map_err(|error| anyhow::anyhow!("撤销墓碑发布失败（补偿不算成功）：{error}"))?;
+    store
+        .compensate_with_lock(lock, Some(&plan.baseline_id))
+        .map_err(|error| anyhow::anyhow!("槽位消费失败：{error}"))?;
+    Ok(())
+}
+
+async fn compensate_after_failure(
+    ctx: &instance::InstanceContext,
+    store: &generation::GenerationStore,
+    lock: &generation::GenerationLockGuard,
+    plan: &ApplyPlan,
+    frozen: Option<&FrozenConfig>,
+    cause: &anyhow::Error,
+) -> anyhow::Result<bool> {
+    println!("  ⚠ 代际 {} 应用失败：{cause:#}", plan.pending_id);
+    match rollback_to_baseline(ctx, store, lock, plan, frozen).await {
+        Ok(()) => {
+            println!(
+                "  ✅ 已从绑定基线 {} 回退，升级未生效（墓碑 {}.withdrawn 已发布）",
+                plan.baseline_id, plan.pending_id
+            );
+            println!("  重试请显式运行: mihomo-cli install --system");
+            Ok(true)
+        }
+        Err(rollback_error) => anyhow::bail!(
+            "⚠ upgrade failed and rollback failed\n  \
+             Pending {pending} retained; runtime has not been restored.\n  \
+             cause: {cause:#}\n  \
+             rollback: {rollback_error:#}\n  \
+             Fix: mihomo-cli install --system --discard-pending={pending}",
+            pending = plan.pending_id
+        ),
+    }
+}
+
+/// SPEC C: `pending = P` with the `P.withdrawn` tombstone already published
+/// means compensation is nearly complete — finish the slot consumption.
+async fn finish_withdrawn_compensation(
+    ctx: &instance::InstanceContext,
+    store: &generation::GenerationStore,
+    lock: &generation::GenerationLockGuard,
+    state: &generation::GenerationState,
+    pending_id: &generation::GenerationId,
+) -> anyhow::Result<bool> {
+    let Some(baseline_id) = state.previous.clone() else {
+        anyhow::bail!(
+            "代际 {} 已发布撤销墓碑但槽位未消费，且缺少基线引用（state.previous 为空）。\n  Fix: mihomo-cli install --system",
+            pending_id
+        );
+    };
+    // a migrated pending may share an ID with a copied tombstone. It must
+    // never be consumed here without the explicit combined adoption+discard.
+    if is_migrated_generation_evidence(store, pending_id) {
+        anyhow::bail!(
+            "待应用代际 {pending_id} 来自存量迁移、未经认证，拒绝自动消费槽位。\n  \
+             管理员核对后显式采纳并撤销：mihomo-cli install --system --adopt-current --discard-pending={pending_id}"
+        );
+    }
+    verify_native_withdrawal(store, pending_id, &baseline_id)?;
+    // SPEC 裁决 A1: a tombstone WITHOUT the rollback-proof marker is an
+    // explicit discard — consume the metadata-only revoked terminal state and
+    // never claim (or require) a restored runtime; zero stops/starts happen here.
+    if !store.has_rollback_proof(pending_id) {
+        store
+            .consume_revoked_with_lock(lock, Some(&baseline_id))
+            .map_err(|error| anyhow::anyhow!("槽位消费失败：{error}"))?;
+        println!(
+            "  ✅ 撤销已收敛：待应用代际 {} 已撤销，运行态未恢复（active=∅, previous={}）",
+            pending_id, baseline_id
+        );
+        return Ok(true);
+    }
+    // SPEC C/P2-8: never consume the slots on an unproven baseline — the
+    // runtime must still be the verified baseline before it becomes `active`.
+    let baseline_manifest = store.validate_generation(&baseline_id).map_err(|error| {
+        anyhow::anyhow!(
+            "补偿重入：绑定基线 {} 不可验证（{error}），拒绝消费槽位。\n  Fix: mihomo-cli restart --system",
+            baseline_id
+        )
+    })?;
+    prove_baseline_identity(ctx, store, &baseline_id, &baseline_manifest)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "补偿重入：运行态未能证明为基线 {}（{error}），拒绝消费槽位。\n  Fix: mihomo-cli restart --system",
+                baseline_id
+            )
+        })?;
+    store
+        .compensate_with_lock(lock, Some(&baseline_id))
+        .map_err(|error| anyhow::anyhow!("槽位消费失败：{error}"))?;
+    println!(
+        "  ✅ 补偿已收敛：槽位回到基线 {}（pending 已清空）",
+        baseline_id
+    );
+    Ok(true)
+}
+
+/// SPEC C/P2-7: verify the already-committed generation and report the
+/// outcome (never a silent convergence claim). Returns without mutating anything.
+async fn verify_committed_generation(
+    ctx: &instance::InstanceContext,
+    store: &generation::GenerationStore,
+    state: &generation::GenerationState,
+) -> anyhow::Result<()> {
+    let Some(active_id) = state.active.clone() else {
+        return Ok(());
+    };
+    let Ok(manifest) = store.validate_generation(&active_id) else {
+        println!(
+            "  ⚠ 已提交代际 {} 不可验证：请运行 mihomo-cli install --system 重新暂存",
+            active_id
+        );
+        return Ok(());
+    };
+    let mut mismatched = Vec::new();
+    for target in build_artifact_targets(ctx, store, &active_id, &manifest)? {
+        if !target_matches(&target)? {
+            mismatched.push(target.relative_path.clone());
+        }
+    }
+    if !mismatched.is_empty() {
+        println!(
+            "  ⚠ 运行态与已提交代际 {} 不一致（{}）：本次仅执行普通 restart 收敛，升级报告已丢失",
+            active_id,
+            mismatched.join(", ")
+        );
+        return Ok(());
+    }
+    if ipc::is_daemon_running().await {
+        match verify_running_daemon_revision(&manifest.daemon.sha256).await {
+            Ok(()) => println!(
+                "  ✓ 运行态与已提交代际 {} 一致（提交后崩溃重入：本次仅复验，升级报告已丢失）",
+                active_id
+            ),
+            Err(error) => println!(
+                "  ⚠ 已提交代际 {} 的 daemon 身份未能验证（{error}）：本次仅执行普通 restart 收敛",
+                active_id
+            ),
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn apply_pending_generation(
     ctx: &instance::InstanceContext,
 ) -> anyhow::Result<bool> {
     if ctx.mode != instance::InstanceMode::System {
         return Ok(false);
     }
+    // SPEC §12.3.1（裁决 B）：代际信任根是独立的 root 专属域；应用代际属于业务
+    // 阶段，可在首次特权读取之前请求一次授权（绝不宣称权限异常）。
+    authorize_protected_domain_operations(ctx, "restart --system", "重启")?;
     if is_current_process_root() {
         utils::ensure_mihomo_system_state_dir()?;
     }
     let store = system_generation_store(ctx);
-    let state = match store.read_state() {
-        Ok(s) => s,
-        Err(_) => return Ok(false),
-    };
-    let Some(pending_id) = state.pending else {
+
+    // SPEC P1-1: the trust root authenticates baselines — owner/mode drift
+    // means the store cannot be trusted, so the pipeline refuses before any work.
+    utils::verify_generation_trust_root(store.root_dir())
+        .map_err(|error| generation_trust_root_refusal("进入升级管线", &error))?;
+
+    // SPEC P1-1: trust root migration precedes every side effect.
+    migrate_generation_store_if_needed(ctx, &store)?;
+    // Create/normalise the root with its contract (0750, root-owned) before the
+    // lock file or any staged write can inherit the process umask.
+    store
+        .init()
+        .map_err(|error| anyhow::anyhow!("failed to init generation store: {error}"))?;
+
+    // SPEC P0: evidence preservation + transaction convergence, lock-out.
+    preserve_upgrade_evidence(ctx)?;
+    refuse_inflight_transaction(ctx)?;
+
+    // The generation lock spans the whole pipeline (P1-P6).
+    let lock = store
+        .acquire_lock()
+        .map_err(|error| anyhow::anyhow!("failed to acquire generation lock: {error}"))?;
+
+    let state = store
+        .read_state()
+        .map_err(|error| anyhow::anyhow!("代际状态损坏，拒绝应用（零替换）：{error}"))?;
+    let Some(pending_id) = state.pending.clone() else {
+        // SPEC P6/C (P2-7): a crash after the CAS commit leaves no pending.
+        // The normal restart path converges, but the terminal claim must still be
+        // verified and reported instead of silently returning `false`.
+        verify_committed_generation(ctx, &store, &state).await?;
         return Ok(false);
     };
 
-    let manifest = store.validate_generation(&pending_id).map_err(|e| {
-        anyhow::anyhow!("Failed to validate pending generation {}: {e}", pending_id)
+    if store.has_withdrawn(&pending_id) {
+        return finish_withdrawn_compensation(ctx, &store, &lock, &state, &pending_id).await;
+    }
+
+    // === P1: manifest verification + expected ID snapshot (spans P2-P6) ===
+    let manifest = store.validate_generation(&pending_id).map_err(|error| {
+        anyhow::anyhow!(
+            "Failed to validate pending generation {}: {error}",
+            pending_id
+        )
+    })?;
+    verify_pending_daemon_identity(ctx, &manifest, &pending_id)?;
+
+    // === P2: binding verification (strict) ===
+    let baseline_id = verify_baseline_binding(&store, &manifest, &state, &pending_id)?;
+    let baseline_manifest = store.validate_generation(&baseline_id).map_err(|error| {
+        anyhow::anyhow!(
+            "代际 {} 的绑定基线 {} 不可验证（{error}）：事实不明，零替换。\n  \
+             请使用 mihomo-cli install --system 重新暂存。",
+            pending_id,
+            baseline_id
+        )
     })?;
 
-    let gen_dir = store.generation_dir(&pending_id);
-    let pending_cli_path = gen_dir.join(&manifest.daemon.relative_path);
-    let pending_core_path = gen_dir.join(&manifest.core.relative_path);
-
-    let daemon_changed = !ctx.paths.cli_binary.exists()
-        || !utils::file_contents_equal(&pending_cli_path, &ctx.paths.cli_binary);
-    let core_changed = !ctx.paths.core_binary.exists()
-        || !utils::file_contents_equal(&pending_core_path, &ctx.paths.core_binary);
+    let targets = build_artifact_targets(ctx, &store, &pending_id, &manifest)?;
+    let plan = ApplyPlan {
+        pending_id: pending_id.clone(),
+        manifest,
+        baseline_id,
+        baseline_manifest,
+        targets,
+    };
 
     println!("  Pending generation detected: {}", pending_id);
+    let frozen = freeze_config_triple(ctx)?;
+    if frozen
+        .as_ref()
+        .is_some_and(|frozen| !frozen.ownership_proven)
+    {
+        println!("  ⚠ 配置归属不可证：本次跳过选点回放（显式降级，0 次回放）");
+    }
 
-    if daemon_changed {
-        println!("  Applying daemon and core update...");
-        if ipc::is_daemon_running().await {
-            let _ = ipc::send_command(&ipc::DaemonCommand::StopCore { token: None }).await;
+    match run_apply_pipeline(ctx, &plan, frozen.as_ref()).await {
+        Ok(report) => {
+            store
+                .commit_active_cas(&lock, &plan.pending_id, Some(&plan.baseline_id))
+                .map_err(|error| anyhow::anyhow!("CAS commit failed: {error}"))?;
+            retire_successful_tombstones(&store, &plan);
+            let _ = cleanup_system_generation_old(ctx, &store, &lock, 2);
+            print_apply_success(&plan, &report);
+            Ok(true)
         }
-
-        let stop_plan = instance::planned_generation_quiesce_plan(ctx);
-        for command in &stop_plan.commands {
-            service::run_instance_command(command)?;
+        Err(error) => {
+            compensate_after_failure(ctx, &store, &lock, &plan, frozen.as_ref(), &error).await
         }
-        wait_for_system_daemon_shutdown().await?;
-
-        let cli_bytes = std::fs::read(&pending_cli_path)?;
-        utils::atomic_write_bytes_no_follow(&ctx.paths.cli_binary, &cli_bytes, 0o755)?;
-
-        let core_bytes = std::fs::read(&pending_core_path)?;
-        utils::atomic_write_bytes_no_follow(&ctx.paths.core_binary, &core_bytes, 0o755)?;
-
-        for extra in &manifest.extra_artifacts {
-            let src = gen_dir.join(&extra.relative_path);
-            if src.exists() {
-                if let Some(parent) = ctx.paths.tun_config_file.parent() {
-                    let dst = parent.join(&extra.relative_path);
-                    let bytes = std::fs::read(&src)?;
-                    let mode = extra.unix_mode.unwrap_or(0o644) as u16;
-                    service::PrivilegeExecutor::write_file(&dst, &bytes, mode)?;
-                }
-            }
-        }
-
-        let start_plan = instance::planned_generation_resume_plan(ctx);
-        for command in &start_plan.commands {
-            service::run_instance_command(command)?;
-        }
-
-        wait_for_system_daemon_readiness().await?;
-        verify_running_daemon_revision(&manifest.daemon.sha256).await?;
-        ensure_system_daemon_access(ctx).await?;
-        maybe_auto_recover_active_transaction(
-            ctx,
-            tun_transaction::RecoveryDirection::Abort,
-            false,
-            false,
-        )
-        .await?;
-
-        let config_path = lifecycle_system_config_path(ctx);
-        let core_running = matches!(
-            ipc::send_command(&ipc::DaemonCommand::GetStatus { token: None }).await?,
-            ipc::DaemonResponse::Status { running: true, .. }
-        );
-        if config_path.exists() && !core_running {
-            let (config_content, config_revision) = lifecycle_system_config_payload(ctx)?;
-            let subscription_id =
-                config::get_active_id_at(&utils::AppPaths::new(ctx.paths.config_dir.clone()))?;
-            let resp = ipc::send_command(&ipc::DaemonCommand::StartCore {
-                config_content,
-                config_revision,
-                subscription_id,
-                token: None,
-            })
-            .await?;
-            match resp {
-                ipc::DaemonResponse::Success { .. } => {}
-                ipc::DaemonResponse::Error { message } => {
-                    anyhow::bail!(daemon_command_error_message(ctx.os, &message));
-                }
-                _ => {}
-            }
-        }
-        if config_path.exists() {
-            wait_for_instance_readiness(ctx).await?;
-        }
-
-        commit_system_generation_active(ctx, &store)?;
-        let _ = cleanup_system_generation_old(ctx, &store, 2);
-        println!(
-            "  ✅ Successfully upgraded daemon and core to generation {}",
-            pending_id
-        );
-        Ok(true)
-    } else if core_changed {
-        println!("  Applying core update...");
-        if ipc::is_daemon_running().await {
-            let _ = ipc::send_command(&ipc::DaemonCommand::StopCore { token: None }).await;
-        }
-
-        let core_bytes = std::fs::read(&pending_core_path)?;
-        utils::atomic_write_bytes_no_follow(&ctx.paths.core_binary, &core_bytes, 0o755)?;
-
-        for extra in &manifest.extra_artifacts {
-            let src = gen_dir.join(&extra.relative_path);
-            if src.exists() {
-                if let Some(parent) = ctx.paths.tun_config_file.parent() {
-                    let dst = parent.join(&extra.relative_path);
-                    let bytes = std::fs::read(&src)?;
-                    let mode = extra.unix_mode.unwrap_or(0o644) as u16;
-                    service::PrivilegeExecutor::write_file(&dst, &bytes, mode)?;
-                }
-            }
-        }
-
-        let config_path = lifecycle_system_config_path(ctx);
-        if config_path.exists() {
-            let (config_content, config_revision) = lifecycle_system_config_payload(ctx)?;
-            let subscription_id =
-                config::get_active_id_at(&utils::AppPaths::new(ctx.paths.config_dir.clone()))?;
-            let resp = ipc::send_command(&ipc::DaemonCommand::StartCore {
-                config_content,
-                config_revision,
-                subscription_id,
-                token: None,
-            })
-            .await?;
-            match resp {
-                ipc::DaemonResponse::Success { .. } => {}
-                ipc::DaemonResponse::Error { message } => {
-                    anyhow::bail!(daemon_command_error_message(ctx.os, &message));
-                }
-                _ => {}
-            }
-            wait_for_instance_readiness(ctx).await?;
-        }
-
-        commit_system_generation_active(ctx, &store)?;
-        let _ = cleanup_system_generation_old(ctx, &store, 2);
-        println!(
-            "  ✅ Successfully upgraded core to generation {}",
-            pending_id
-        );
-        Ok(true)
-    } else {
-        commit_system_generation_active(ctx, &store)?;
-        let _ = cleanup_system_generation_old(ctx, &store, 2);
-        Ok(true)
     }
 }
 
@@ -4808,10 +7197,30 @@ pub(crate) async fn maybe_auto_recover_active_transaction(
     direction: tun_transaction::RecoveryDirection,
     allow_runtime_reset: bool,
     prompt_runtime_reset: bool,
+    allow_legacy_reset: bool,
 ) -> anyhow::Result<()> {
     if ctx.mode != instance::InstanceMode::System {
         return Ok(());
     }
+    let active_journal = tun_transaction::read_active_journal(ctx)?;
+    if active_journal.is_none() && !tun_transaction::legacy_journal_path(ctx).exists() {
+        return Ok(());
+    }
+    // SPEC P0/P1-3: single-point evidence preservation for EVERY recovery
+    // entry (restart / tun on-off / uninstall / install post-steps). It must run
+    // before the recovery marker and before any recovery action, because a
+    // recovery may start the old Core whose bbolt init deletes a broken cache.db.
+    // The helper is idempotent (identical bytes reuse the existing artifact).
+    preserve_upgrade_evidence(ctx)?;
+    // SPEC B5: non-blocking recovery admission. A concurrent recovery must
+    // fail immediately instead of queueing behind the coordinator lock; the RAII
+    // guard releases the marker on every exit path, including failures.
+    // R2: every durable recovery mutation (including legacy migration below)
+    // happens under the marker.
+    let _recovery_admission = match tun_transaction::try_acquire_recovery_marker(ctx)? {
+        Some(guard) => guard,
+        None => anyhow::bail!("recovery already in progress"),
+    };
     if tun_transaction::check_and_migrate_legacy_journal(ctx)?.is_some()
         && is_current_process_root()
     {
@@ -4871,28 +7280,72 @@ pub(crate) async fn maybe_auto_recover_active_transaction(
 
     let snap_cls = tun_transaction::classify_snapshot(ctx, &journal);
     let intent_cls = tun_transaction::classify_intent(&ctx.paths.intent_config_file, &journal);
-    let action = tun_transaction::plan_recovery(&journal, snap_cls, intent_cls, &obs, direction);
+    let action = tun_transaction::plan_recovery(
+        &journal,
+        snap_cls,
+        intent_cls,
+        tun_transaction::classify_old_runtime_evidence(ctx, &journal),
+        &obs,
+        direction,
+    );
 
-    match action {
-        tun_transaction::RecoveryAction::RefuseNeedsEvidence(_)
-            if allow_runtime_reset || prompt_runtime_reset =>
-        {
-            if prompt_runtime_reset && !confirm_managed_runtime_reset()? {
+    match route_recovery_action(action, allow_runtime_reset, prompt_runtime_reset) {
+        RecoveryRoute::ControlledReset => {
+            let confirmed = if prompt_runtime_reset {
+                confirm_managed_runtime_reset()?
+            } else {
+                // `--yes` replaces the question, never the impact statement: the
+                // consequence is printed before anything is stopped.
+                print_runtime_reset_impact();
+                true
+            };
+            if !confirmed {
                 anyhow::bail!(
                     "未执行修复；你的配置未被修改。需要修复时请重新执行：mihomo-cli restart --yes"
                 );
             }
-            let reset_message = reset_managed_system_runtime(ctx).await?;
+            let reset_message = reset_managed_system_runtime(ctx, allow_legacy_reset).await?;
             println!("  ⚠ {reset_message}");
         }
-        tun_transaction::RecoveryAction::RefuseNeedsEvidence(_) => {
-            anyhow::bail!(managed_recovery_required_message());
+        RecoveryRoute::Refuse(message) => {
+            anyhow::bail!("{message}\n  {}", managed_recovery_required_message());
         }
-        other_action => {
-            execute_recovery_action(ctx, &journal, other_action, &obs, direction).await?;
+        RecoveryRoute::Execute(action) => {
+            execute_recovery_action(ctx, &journal, action, &obs, direction, allow_runtime_reset)
+                .await?;
         }
     }
     Ok(())
+}
+
+/// a refusal carries its own Fix guidance, so routing keeps the
+/// planner's message instead of collapsing every refusal into one generic hint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecoveryRoute {
+    /// The refusal authorizes the controlled reset (SPEC §12.3:8).
+    ControlledReset,
+    /// Surface the refusal with the planner's Fix line.
+    Refuse(String),
+    /// Run the planned action.
+    Execute(tun_transaction::RecoveryAction),
+}
+
+fn route_recovery_action(
+    action: tun_transaction::RecoveryAction,
+    allow_runtime_reset: bool,
+    prompt_runtime_reset: bool,
+) -> RecoveryRoute {
+    match action {
+        tun_transaction::RecoveryAction::RefuseNeedsEvidence(_)
+            if allow_runtime_reset || prompt_runtime_reset =>
+        {
+            RecoveryRoute::ControlledReset
+        }
+        tun_transaction::RecoveryAction::RefuseNeedsEvidence(message) => {
+            RecoveryRoute::Refuse(message)
+        }
+        other_action => RecoveryRoute::Execute(other_action),
+    }
 }
 
 fn managed_recovery_required_message() -> String {
@@ -4903,31 +7356,550 @@ fn confirm_managed_runtime_reset() -> anyhow::Result<bool> {
     use dialoguer::Confirm;
 
     Ok(Confirm::new()
-        .with_prompt("检测到旧的运行状态。将保留你的配置、重置运行状态，并可能暂时中断代理连接或关闭 TUN。是否继续修复")
+        .with_prompt(RUNTIME_RESET_IMPACT_PROMPT)
         .default(false)
         .interact()?)
 }
 
-async fn reset_managed_system_runtime(ctx: &instance::InstanceContext) -> anyhow::Result<String> {
+/// the impact statement shown for every controlled reset — as the
+/// prompt when a terminal can answer, and printed before the stop when `--yes`
+/// skips the question. `--yes` replaces the business confirmation only; the OS
+/// authorization (root daemon peer) is still required.
+const RUNTIME_RESET_IMPACT_PROMPT: &str = "检测到旧版本运行状态。将停止当前受管 Core，保留用户配置并重建运行状态；代理连接会暂时中断，TUN 可能关闭。是否继续修复";
+
+fn print_runtime_reset_impact() {
+    println!(
+        "  ⚠ 检测到旧版本运行状态。将停止当前受管 Core，保留用户配置并重建运行状态；代理连接会暂时中断，TUN 可能关闭。"
+    );
+}
+
+/// SPEC §12.3:8: controlled reset. Cleanup happens **only** after the single
+/// stopped proof (the same proof the quiesce path consumes). A refusal or a
+/// failed stop keeps every artifact and returns a non-zero result.
+/// `allow_legacy_reset` is set only by an explicit `restart --system` that the
+/// user confirmed (TTY prompt or `--yes`).
+async fn reset_managed_system_runtime(
+    ctx: &instance::InstanceContext,
+    allow_legacy_reset: bool,
+) -> anyhow::Result<String> {
+    reset_managed_system_runtime_with_proof(ctx, |fence| {
+        prove_managed_runtime_stopped(ctx, fence, allow_legacy_reset)
+    })
+    .await
+}
+
+async fn reset_managed_system_runtime_with_proof<F, Fut>(
+    ctx: &instance::InstanceContext,
+    prove_stopped: F,
+) -> anyhow::Result<String>
+where
+    F: FnOnce(tun_transaction::TransactionFence) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
     let Some(journal) = tun_transaction::read_active_journal(ctx)? else {
         return Ok("未发现需要重置的运行状态".to_string());
     };
     if !tun_transaction::validate_managed_active_transaction(ctx, &journal)? {
         anyhow::bail!(managed_recovery_required_message());
     }
-    let _ = ipc::send_command(&ipc::DaemonCommand::StopCore { token: None }).await?;
-    tun_transaction::quarantine_active_transaction(ctx, &journal)?;
-    tun_transaction::remove_managed_snapshot(ctx)?;
+    let fence = tun_transaction::TransactionFence {
+        transaction_id: journal.transaction_id.clone(),
+        generation: journal.generation,
+        expected_phase: journal.phase,
+        expected_candidate_revision: journal.candidate_revision.clone(),
+    };
+
+    if let Err(error) = prove_stopped(fence.clone()).await {
+        let (headline, detail) = match error.downcast_ref::<ManagedStopError>() {
+            Some(stop) if stop.phase == StopAttemptPhase::AttemptedButUnconfirmed => (
+                "受控重置未执行：已尝试停止 Core，但退出未被确认",
+                stop.detail.clone(),
+            ),
+            Some(stop) => ("受控重置未执行：未尝试停止 Core", stop.detail.clone()),
+            None => (
+                "受控重置未执行：无法证明运行中的 Core 已停止",
+                error.to_string(),
+            ),
+        };
+        anyhow::bail!(
+            "{headline}，运行状态证据全部保留。\n  {detail}\n  Fix: mihomo-cli restart --system"
+        );
+    }
+
+    reset_managed_runtime_artifacts(ctx, &journal)?;
+    println!("  ✓ 已保留用户配置并重置 mihomo 运行状态");
+    Ok("正在从用户配置重新建立运行状态".to_string())
+}
+
+/// The destructive half of a reset. Only reached behind a validated stopped proof.
+///
+/// 准入④: the active journal is the lifecycle gate that refuses every
+/// new Core start (SPEC §12.4), so it is quarantined **last**. From the stopped
+/// proof to the end of destructive cleanup no new Core start can be admitted by
+/// the daemon; the recovery marker alone would only exclude other recovery agents.
+fn reset_managed_runtime_artifacts(
+    ctx: &instance::InstanceContext,
+    journal: &tun_transaction::TunJournal,
+) -> anyhow::Result<()> {
     tun_transaction::remove_user_gate(
         &ctx.paths.config_dir,
         &journal.transaction_id,
         journal.generation,
     )?;
+    tun_transaction::remove_managed_snapshot(ctx)?;
     if journal.legacy_source {
         tun_transaction::remove_legacy_artifacts(ctx)?;
     }
-    println!("  ✓ 已保留用户配置并重置 mihomo 运行状态");
-    Ok("正在从用户配置重新建立运行状态".to_string())
+    // the broken cache.db is evidence too. It is moved aside with the
+    // same no-replace primitive only after the stopped proof; a failure here must
+    // not resurrect the transaction, so it is reported without undoing the reset.
+    if let Some(state_dir) = ctx.paths.tun_config_file.parent() {
+        let cache_db_path = state_dir.join(utils::CACHE_DB_FILE_NAME);
+        let classification =
+            utils::classify_cache_db_detailed(&cache_db_path, Some(SERVICE_ACCOUNT_USER));
+        if classification.needs_isolation() {
+            match utils::quarantine_cache_db(&cache_db_path) {
+                Ok(quarantined) => println!(
+                    "  ⚠ cache.db {} 已隔离为 {}（Core 将重新生成）",
+                    classification.state.as_str(),
+                    quarantined.display()
+                ),
+                Err(error) => {
+                    eprintln!("  ⚠ cache.db 隔离失败（{error}）；保留原文件，下次启动前会再次尝试")
+                }
+            }
+        }
+    }
+    // Last: releasing the gate is the end of the reset window.
+    tun_transaction::quarantine_active_transaction(ctx, journal)?;
+    Ok(())
+}
+
+/// SPEC B3: prove the managed runtime is stopped through the shared quiesce
+/// proof. When the daemon is unreachable, a process-level proof (pid file +
+/// endpoint) is required before any cleanup; otherwise the daemon is started
+/// first and the IPC proof is obtained.
+async fn prove_managed_runtime_stopped(
+    ctx: &instance::InstanceContext,
+    fence: tun_transaction::TransactionFence,
+    allow_legacy_reset: bool,
+) -> anyhow::Result<()> {
+    let first = ipc::send_command(&ipc::DaemonCommand::QuiesceCandidateRuntime {
+        fence: fence.clone(),
+        allow_legacy_reset,
+        allow_restored_old_quiesce: false,
+        token: None,
+    })
+    .await;
+
+    match first {
+        Ok(response) => match validate_quiesced_response(&response, &fence) {
+            Ok(()) => Ok(()),
+            // hard gate: `maybe_auto_recover_active_transaction` runs
+            // before the generation apply, so an upgrade can meet a daemon that
+            // predates this admission. The authorized reset then falls back to the
+            // privileged CLI executor — under the same admission and the same
+            // identity/exit proof, never by clearing evidence or faking a state.
+            Err(refusal)
+                if allow_legacy_reset && is_pre_admission_quiesce_refusal(ctx, &response) =>
+            {
+                cli_quiesce_legacy_managed_core(ctx, &fence)
+                    .await
+                    .map(|proof| {
+                        println!(
+                            "  ⚠ 旧 daemon 不识别本次准入；已由特权 CLI 完成停机（pid={}，退出已确认）",
+                            proof.pid
+                        );
+                    })
+                    .map_err(|fallback| match fallback.downcast_ref::<ManagedStopError>() {
+                        Some(_) => fallback,
+                        None => anyhow::Error::new(ManagedStopError::not_attempted(format!(
+                            "{refusal} / {fallback}"
+                        ))),
+                    })
+            }
+            Err(refusal) => Err(refusal),
+        },
+        Err(daemon_error) => {
+            if no_running_core_without_daemon(ctx).is_ok() {
+                println!(
+                    "  ⚠ system daemon is unreachable ({daemon_error}); no managed Core process is running — continuing"
+                );
+                return Ok(());
+            }
+            println!(
+                "  System daemon is unreachable and a Core may still be running. Starting the system daemon..."
+            );
+            start_system_daemon_for_recovery(ctx)
+                .await
+                .map_err(|error| {
+                    anyhow::Error::new(ManagedStopError::not_attempted(error.to_string()))
+                })?;
+            let response = ipc::send_command(&ipc::DaemonCommand::QuiesceCandidateRuntime {
+                fence: fence.clone(),
+                allow_legacy_reset,
+                allow_restored_old_quiesce: false,
+                token: None,
+            })
+            .await
+            .map_err(|error| {
+                anyhow::Error::new(ManagedStopError::not_attempted(format!(
+                    "system daemon is still unreachable after restart ({error})"
+                )))
+            })?;
+            validate_quiesced_response(&response, &fence)
+        }
+    }
+}
+
+/// the only refusal shape an upgrade still meets — a daemon built
+/// before the legacy reset admission. It either answers with the original
+/// "neither candidate nor attested old runtime" rejection, or (with
+/// `deny_unknown_fields`) rejects the request shape outright. The capability-free
+/// case is limited to an observable CLI/daemon binary skew so a generic daemon
+/// error can never unlock the compatibility executor.
+fn is_pre_admission_quiesce_refusal(
+    ctx: &instance::InstanceContext,
+    response: &ipc::DaemonResponse,
+) -> bool {
+    match response {
+        ipc::DaemonResponse::Transaction {
+            response: tun_transaction::TransactionResponse::EvidenceMismatch { error, .. },
+        } => matches!(
+            error.stage.as_str(),
+            "quiesce_candidate" | "quiesce_old_runtime" | "quiesce_legacy_reset"
+        ),
+        ipc::DaemonResponse::Error { .. } => is_system_cli_skewed(ctx),
+        _ => false,
+    }
+}
+
+/// hard gate: the privileged CLI as the compatibility executor for a
+/// daemon that predates the admission. It applies the same admission locally,
+/// uses the existing four-part managed-Core attribution (never a pid file, a path
+/// string or a journal flag alone) and accepts only a kernel-handle exit
+/// observation. Anything unprovable refuses with zero destructive cleanup.
+///
+/// Lifecycle exclusion on this path: the old daemon cannot lend its lock, but
+/// the active journal stays in a non-terminal phase for the whole window, so the
+/// SPEC §12.4 gate keeps refusing every Core-starting command, and the reset
+/// releases that journal last (`reset_managed_runtime_artifacts`). The recovery
+/// marker is held as well, but it only excludes other recovery agents.
+#[cfg(unix)]
+async fn cli_quiesce_legacy_managed_core(
+    ctx: &instance::InstanceContext,
+    fence: &tun_transaction::TransactionFence,
+) -> anyhow::Result<daemon::CoreStoppedProof> {
+    if !is_current_process_root() {
+        return Err(anyhow::Error::new(ManagedStopError::not_attempted(
+            "受管 Core 归属证明需要管理员授权，当前进程不是特权执行者",
+        )));
+    }
+    let Some(journal) = tun_transaction::read_active_journal(ctx)? else {
+        return Err(anyhow::Error::new(ManagedStopError::not_attempted(
+            "active transaction journal is missing",
+        )));
+    };
+    if journal.transaction_id != fence.transaction_id
+        || journal.generation != fence.generation
+        || journal.phase != fence.expected_phase
+    {
+        return Err(anyhow::Error::new(ManagedStopError::not_attempted(
+            "the active transaction changed before the compatibility stop",
+        )));
+    }
+    if let Err(reason) = tun_transaction::legacy_reset_evidence_admission(ctx, &journal) {
+        return Err(anyhow::Error::new(ManagedStopError::not_attempted(
+            format!("迁移占位证据不满足受控 reset 准入：{reason}"),
+        )));
+    }
+
+    // Read-only cross-check of the daemon's recorded pid (GetStatus stays admitted
+    // during the transaction gate). The pid is a cross-check, never the proof.
+    let daemon_pid = match ipc::send_command(&ipc::DaemonCommand::GetStatus { token: None }).await {
+        Ok(ipc::DaemonResponse::Status { core_pid, .. }) => core_pid,
+        _ => None,
+    };
+
+    let state_dir = managed_state_dir(ctx)?;
+    let endpoint = managed_core_endpoint(ctx);
+    match core_identity::prove_core_api_peer(
+        &endpoint,
+        &ctx.paths.core_binary,
+        &state_dir,
+        managed_service_uid(),
+    ) {
+        core_identity::CoreIdentityProof::Proven(identity) => {
+            if daemon_pid.is_some_and(|pid| pid != identity.pid) {
+                return Err(anyhow::Error::new(ManagedStopError::not_attempted(
+                    format!(
+                        "daemon 记录的 Core pid {daemon_pid:?} 与已认证 Core pid {} 冲突",
+                        identity.pid
+                    ),
+                )));
+            }
+            match send_terminate_signal(identity.pid) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+                Err(error) => {
+                    return Err(anyhow::Error::new(ManagedStopError::not_attempted(
+                        format!(
+                            "无法向已认证的受管 Core pid {} 发送终止信号（{error}）",
+                            identity.pid
+                        ),
+                    )))
+                }
+            }
+            match core_identity::observe_process_exit(
+                identity.pid,
+                std::time::Duration::from_secs(5),
+            ) {
+                core_identity::ProcessExitProof::Exited => {
+                    Ok(daemon::CoreStoppedProof::observed(identity.pid))
+                }
+                core_identity::ProcessExitProof::StillRunning => Err(anyhow::Error::new(
+                    ManagedStopError::attempted_but_unconfirmed(format!(
+                        "受管 Core pid {} 在 5s 内未退出（证据保留）",
+                        identity.pid
+                    )),
+                )),
+                core_identity::ProcessExitProof::Unprovable(reason) => Err(anyhow::Error::new(
+                    ManagedStopError::attempted_but_unconfirmed(format!(
+                        "无法观察受管 Core pid {} 的退出（{reason}；证据保留）",
+                        identity.pid
+                    )),
+                )),
+            }
+        }
+        core_identity::CoreIdentityProof::Absent => match daemon::live_managed_core_liveness() {
+            daemon::CoreLiveness::Stopped => Ok(daemon::CoreStoppedProof::observed(0)),
+            daemon::CoreLiveness::Running(pid) => {
+                Err(anyhow::Error::new(ManagedStopError::not_attempted(
+                    format!("受管 Core pid {pid} 仍在运行，但无法经 API 端点证明归属（证据保留）"),
+                )))
+            }
+            daemon::CoreLiveness::Unprovable(reason) => {
+                Err(anyhow::Error::new(ManagedStopError::not_attempted(
+                    format!("无法证明受管 Core 已停止（{reason}；证据保留）"),
+                )))
+            }
+        },
+        core_identity::CoreIdentityProof::Unprovable(reason) => {
+            Err(anyhow::Error::new(ManagedStopError::not_attempted(
+                format!("受管 Core 归属不可证（{reason}）：拒绝终止与清理，运行态证据已保留"),
+            )))
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn cli_quiesce_legacy_managed_core(
+    _ctx: &instance::InstanceContext,
+    _fence: &tun_transaction::TransactionFence,
+) -> anyhow::Result<daemon::CoreStoppedProof> {
+    Err(anyhow::Error::new(ManagedStopError::not_attempted(
+        "compatibility stop needs a provable managed Core identity, which this platform cannot provide",
+    )))
+}
+
+/// SPEC B3: process-level liveness proof used only when the daemon cannot
+/// answer. Requires both no live managed Core process and no reachable Core API.
+fn no_running_core_without_daemon(ctx: &instance::InstanceContext) -> anyhow::Result<()> {
+    // SPEC 裁决 D: the endpoint peer must be identified, not just probed for
+    // connectability. A reachable socket only proves "someone answers".
+    #[cfg(unix)]
+    let state_dir = managed_state_dir(ctx)?;
+    match &ctx.paths.api_endpoint {
+        #[cfg(not(unix))]
+        instance::ApiEndpoint::UnixSocket(_) => anyhow::bail!(
+            "cannot prove the managed Core stopped on this platform (peer identity probing is Unix-only); evidence retained"
+        ),
+        #[cfg(unix)]
+        instance::ApiEndpoint::UnixSocket(_) => {
+            let endpoint = managed_core_endpoint(ctx);
+            match core_identity::prove_core_api_peer(
+                &endpoint,
+                &ctx.paths.core_binary,
+                &state_dir,
+                managed_service_uid(),
+            ) {
+                core_identity::CoreIdentityProof::Absent => {}
+                core_identity::CoreIdentityProof::Proven(identity) => {
+                    anyhow::bail!(
+                        "managed Core process {} is still running (identity proven); refusing to continue without a stopped proof",
+                        identity.pid
+                    )
+                }
+                core_identity::CoreIdentityProof::Unprovable(reason) => {
+                    anyhow::bail!(
+                        "cannot prove the managed Core is stopped: {reason} (evidence retained; no termination attempted)"
+                    )
+                }
+            }
+        }
+        instance::ApiEndpoint::WindowsNamedPipe(pipe) => {
+            if windows_pipe_connectable(pipe) {
+                anyhow::bail!(
+                    "Core API endpoint is still reachable and its peer identity cannot be proven on this platform"
+                );
+            }
+        }
+    }
+    match daemon::live_managed_core_liveness() {
+        daemon::CoreLiveness::Stopped => Ok(()),
+        daemon::CoreLiveness::Running(pid) => {
+            anyhow::bail!("managed Core process {pid} is still running")
+        }
+        daemon::CoreLiveness::Unprovable(reason) => {
+            anyhow::bail!("cannot prove the managed Core is stopped: {reason}")
+        }
+    }
+}
+
+/// SPEC 裁决 D-1: the Core API endpoint string of the managed instance.
+#[cfg(unix)]
+fn managed_core_endpoint(ctx: &instance::InstanceContext) -> String {
+    match &ctx.paths.api_endpoint {
+        instance::ApiEndpoint::UnixSocket(path) => format!("unix://{}", path.display()),
+        instance::ApiEndpoint::WindowsNamedPipe(pipe) => pipe.clone(),
+    }
+}
+
+/// SPEC 裁决 D-3: an apply the user explicitly authorized (`restart` /
+/// `install`) may take over a *proven* managed orphan. Identity is established by
+/// [`core_identity::prove_core_api_peer`] (the peer is answering), and the stop is
+/// accepted only with a kernel-handle exit proof. Unprovable identity refuses to
+/// terminate or replace anything and keeps the runtime evidence.
+async fn quiesce_managed_core_after_daemon_stop(
+    ctx: &instance::InstanceContext,
+) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let state_dir = managed_state_dir(ctx)?;
+        let endpoint = managed_core_endpoint(ctx);
+        match core_identity::prove_core_api_peer(
+            &endpoint,
+            &ctx.paths.core_binary,
+            &state_dir,
+            managed_service_uid(),
+        ) {
+            core_identity::CoreIdentityProof::Absent => Ok(()),
+            core_identity::CoreIdentityProof::Unprovable(reason) => {
+                anyhow::bail!("受管 Core 归属不可证（{reason}）：拒绝终止与替换，运行态证据已保留")
+            }
+            core_identity::CoreIdentityProof::Proven(identity) => {
+                println!(
+                    "  P3 停机：接管归属可证的受管 Core 孤儿（pid {}，exe {}）",
+                    identity.pid,
+                    identity.exe.display()
+                );
+                match send_terminate_signal(identity.pid) {
+                    Ok(()) => {}
+                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+                    Err(error) => anyhow::bail!(
+                        "无法向受管 Core 孤儿 pid {} 发送终止信号（{error}）：无停机证明，拒绝替换（证据已保留）",
+                        identity.pid
+                    ),
+                }
+                match core_identity::observe_process_exit(
+                    identity.pid,
+                    std::time::Duration::from_secs(5),
+                ) {
+                    core_identity::ProcessExitProof::Exited => {
+                        println!(
+                            "  P3 停机：已观察到 pid {} 退出（pidfd 退出证明）",
+                            identity.pid
+                        );
+                        Ok(())
+                    }
+                    core_identity::ProcessExitProof::StillRunning => anyhow::bail!(
+                        "受管 Core 孤儿 pid {} 在 5s 内未退出：无停机证明，拒绝替换（证据已保留）",
+                        identity.pid
+                    ),
+                    core_identity::ProcessExitProof::Unprovable(reason) => anyhow::bail!(
+                        "无法观察受管 Core 孤儿 pid {} 的退出（{reason}）：无停机证明，拒绝替换（证据已保留）",
+                        identity.pid
+                    ),
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        no_running_core_without_daemon(ctx)
+    }
+}
+
+#[cfg(unix)]
+fn send_terminate_signal(pid: u32) -> std::io::Result<()> {
+    if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// SPEC 裁决 D-3: read-only orphan classification for `status` / `doctor`.
+/// Reports what can be proven and never stops, cleans or suggests manual kills.
+async fn orphan_core_observation(ctx: &instance::InstanceContext) -> Option<String> {
+    if ipc::is_daemon_running().await {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        let state_dir = managed_state_dir(ctx).ok()?;
+        let endpoint = managed_core_endpoint(ctx);
+        match core_identity::prove_core_api_peer(
+            &endpoint,
+            &ctx.paths.core_binary,
+            &state_dir,
+            managed_service_uid(),
+        ) {
+            core_identity::CoreIdentityProof::Absent => None,
+            core_identity::CoreIdentityProof::Proven(identity) => Some(format!(
+                "orphan core: managed pid {} exe {} (read-only; not stopped, not cleaned)",
+                identity.pid,
+                identity.exe.display()
+            )),
+            core_identity::CoreIdentityProof::Unprovable(reason) => Some(format!(
+                "orphan core: unprovable ({reason}) (read-only; evidence retained, nothing stopped)"
+            )),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctx;
+        None
+    }
+}
+
+/// SPEC 裁决 D: the service account that may own the managed Core.
+#[cfg(unix)]
+fn managed_service_uid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        let user = unsafe { libc::getpwnam(c"mihomo".as_ptr()) };
+        if user.is_null() {
+            return None;
+        }
+        Some(unsafe { (*user).pw_uid })
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+async fn start_system_daemon_for_recovery(ctx: &instance::InstanceContext) -> anyhow::Result<()> {
+    let start_plan = instance::planned_service_plan(ctx, instance::ServiceAction::Start);
+    for command in &start_plan.commands {
+        service::run_instance_command(command).map_err(|error| {
+            anyhow::anyhow!(
+                "failed to start the system daemon for recovery: {error}\n                   If you do not have administrator/sudo privileges, ask an administrator to start the service."
+            )
+        })?;
+    }
+    wait_for_system_daemon_readiness().await
 }
 
 async fn execute_system_tun_transaction(
@@ -4940,6 +7912,7 @@ async fn execute_system_tun_transaction(
     maybe_auto_recover_active_transaction(
         ctx,
         tun_transaction::RecoveryDirection::Resume,
+        false,
         false,
         false,
     )
@@ -4987,24 +7960,34 @@ async fn execute_system_tun_transaction(
         recorded_at_secs: None,
     };
 
-    // 3. Build candidate
-    let current_intent = std::fs::read(&ctx.paths.intent_config_file)?;
-    let base_intent_revision = tun_transaction::sha256_revision(&current_intent);
-    let candidate_bytes = build_tun_candidate(ctx, target_tun, stack, dns_hijack)?;
-
+    // 3./4. P1-1：intent 捕获（base revision + candidate）与事务发布在
+    // **同一个** CoordinatorLock → ConfigLock 临界区内完成（不再有「捕获后释放锁 →
+    // 再发布」的空档）；candidate 由同一份 intent 字节构建，base 描述其真实前置。
     let original_uid = crate::instance::PathInputs::from_current_env()
         .uid
         .unwrap_or(0);
-
-    // 4. Prepare and publish active transaction
-    let journal = tun_transaction::prepare_and_publish_active_transaction(
-        ctx,
-        original_uid,
-        target_tun,
-        base_intent_revision,
-        &candidate_bytes,
-        &evidence,
-    )?;
+    let journal =
+        tun_transaction::prepare_and_publish_active_transaction_capturing_intent_with_prepare(
+            ctx,
+            original_uid,
+            target_tun,
+            &evidence,
+            || {
+                // tun on 的 candidate 必须建立在 reconcile 后的 intent 上，
+                // 否则只写在 override 里的非控制键（route-exclude-address/mtu/device）
+                // 永远不会进入 snapshot。tun off 只翻转 enable，不在这里改 intent。
+                if !target_tun {
+                    return Ok(());
+                }
+                let paths = utils::AppPaths::new(ctx.paths.config_dir.clone());
+                let reconciled = config::reconcile_override_into_intent_checked(&paths, None)?;
+                if reconciled.changed {
+                    crate::log!("  ⚠ override.yaml 派生键已重新合并进 intent config.yaml");
+                }
+                Ok(())
+            },
+            |intent_bytes| build_tun_candidate(ctx, intent_bytes, target_tun, stack, dns_hijack),
+        )?;
 
     // 5. Validate prepared runtime
     let fence = tun_transaction::TransactionFence {
@@ -5176,11 +8159,49 @@ async fn execute_system_tun_transaction(
         tun_transaction::IntentCommitResult::Committed
         | tun_transaction::IntentCommitResult::AlreadyCandidate => {}
         tun_transaction::IntentCommitResult::Conflict => {
+            // 裁决点 4：Conflict 是安全闸。intent 已被外部合法改写 → 本事务
+            // **不写 intent**（当前内容原样保留），只回撤运行态。回滚失败时不得宣称
+            // "rolled back"：保留全部证据并落到 RecoveryRequired，如实报告。
             println!("  ⚠️ User configuration changed during transaction; rolling back runtime...");
-            let _ = execute_automatic_rollback(ctx, &journal, &evidence).await;
-            anyhow::bail!(
-                "User intent configuration was modified concurrently; transaction rolled back.\n                 Your local changes have been preserved."
-            );
+            match execute_automatic_rollback(ctx, &journal, &evidence).await {
+                Ok(()) => anyhow::bail!(
+                    "User intent configuration was modified concurrently; the runtime was rolled back and your configuration was NOT modified.\n                 Re-run the same command to apply your configuration: mihomo-cli tun {} --yes",
+                    if target_tun { "on" } else { "off" }
+                ),
+                Err(rollback_error) => {
+                    // 回滚可能已推进到 RollbackPending 才失败；按 canonical journal 的
+                    // 真实 phase 落 RecoveryRequired，而不是假设 CoreApplied。
+                    if let Ok(Some(current)) = tun_transaction::read_active_journal(ctx) {
+                        if current.transaction_id == journal.transaction_id
+                            && current.generation == journal.generation
+                            && current.phase != tun_transaction::JournalPhase::IntentCommitted
+                            && current.phase != tun_transaction::JournalPhase::RolledBack
+                        {
+                            let fence = tun_transaction::TransactionFence {
+                                transaction_id: current.transaction_id.clone(),
+                                generation: current.generation,
+                                expected_phase: current.phase,
+                                expected_candidate_revision: current.candidate_revision.clone(),
+                            };
+                            let _ = tun_transaction::cas_update_phase(
+                                ctx,
+                                &fence,
+                                tun_transaction::JournalPhase::RecoveryRequired,
+                                Some(tun_transaction::StructuredError {
+                                    code: tun_transaction::TransactionErrorCode::CoreStopFailed,
+                                    stage: "rollback_after_intent_conflict".to_string(),
+                                    retryable: true,
+                                    message: rollback_error.to_string(),
+                                }),
+                                None,
+                            );
+                        }
+                    }
+                    anyhow::bail!(
+                        "User intent configuration was modified concurrently and the automatic rollback could NOT be completed ({rollback_error}).\n                 Your configuration was NOT modified and every transaction artifact is kept.\n                 Fix: mihomo-cli restart --system (then `mihomo-cli status`)"
+                    );
+                }
+            }
         }
     }
 
@@ -5770,20 +8791,6 @@ async fn cmd_exit_ip(
     unreachable!("clap requires exactly one exit-ip target mode")
 }
 
-#[allow(dead_code)]
-async fn cmd_lifecycle_instance(
-    system: bool,
-    user: bool,
-    action: instance::ServiceAction,
-) -> anyhow::Result<()> {
-    let mode = match mode_request_from_flags(system, user) {
-        instance::ModeRequest::ExplicitSystem => instance::InstanceMode::System,
-        instance::ModeRequest::ExplicitUser => instance::InstanceMode::User,
-        instance::ModeRequest::Unspecified => unreachable!("caller handles unspecified lifecycle"),
-    };
-    cmd_lifecycle_instance_mode(mode, action, false, false).await
-}
-
 fn lifecycle_system_config_path(ctx: &instance::InstanceContext) -> std::path::PathBuf {
     ctx.paths.intent_config_file.clone()
 }
@@ -5792,12 +8799,19 @@ fn lifecycle_system_config_payload(
     ctx: &instance::InstanceContext,
 ) -> anyhow::Result<(String, String)> {
     let paths = utils::AppPaths::new(ctx.paths.config_dir.clone());
-    // Issue #022 B：restart/start 的 payload 直接取 intent；必须先保证 override 参与合并，
+    // B：restart/start 的 payload 直接取 intent；必须先保证 override 参与合并，
     // 否则任何漏掉合并的写入路径都会被 restart 静默放大成运行态丢配置。
     // review MAJOR-3：直接使用锁内 reconcile 返回的内容与 revision，锁外重读会漏检并发写入。
     let reconciled = config::reconcile_override_into_intent_checked(&paths, None)?;
     if reconciled.changed {
         crate::log!("  ⚠ override.yaml 派生键已重新合并进 intent config.yaml");
+    }
+    if ctx.mode == instance::InstanceMode::System {
+        return tun_transaction::merge_system_tun_snapshot_into_payload(
+            ctx,
+            &reconciled.content,
+            &reconciled.revision,
+        );
     }
     Ok((reconciled.content, reconciled.revision))
 }
@@ -5808,18 +8822,57 @@ enum ConfigOwnershipRepair {
     NotNeeded,
     ReexecAsRoot,
     RepairAsRoot,
+    ReportUndeterminable,
 }
 
 #[cfg(unix)]
-fn config_ownership_repair(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigAssetsVerdict {
+    Healthy,
+    NeedsRepair,
+    Undeterminable,
+}
+
+#[cfg(unix)]
+impl ConfigAssetsVerdict {
+    fn merge(self, other: Option<Self>) -> Self {
+        match other {
+            Some(other) if other.rank() > self.rank() => other,
+            _ => self,
+        }
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            ConfigAssetsVerdict::Healthy => 0,
+            ConfigAssetsVerdict::Undeterminable => 1,
+            ConfigAssetsVerdict::NeedsRepair => 2,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn config_assets_repair_action(
+    verdict: ConfigAssetsVerdict,
     is_root: bool,
+) -> ConfigOwnershipRepair {
+    match verdict {
+        ConfigAssetsVerdict::Healthy => ConfigOwnershipRepair::NotNeeded,
+        ConfigAssetsVerdict::Undeterminable => ConfigOwnershipRepair::ReportUndeterminable,
+        ConfigAssetsVerdict::NeedsRepair if is_root => ConfigOwnershipRepair::RepairAsRoot,
+        ConfigAssetsVerdict::NeedsRepair => ConfigOwnershipRepair::ReexecAsRoot,
+    }
+}
+
+#[cfg(unix)]
+fn probe_config_file_verdict(
     expected_uid: u32,
     actual_uid: u32,
     is_regular_file: bool,
     link_count: u64,
-) -> anyhow::Result<ConfigOwnershipRepair> {
+) -> anyhow::Result<ConfigAssetsVerdict> {
     if expected_uid == actual_uid {
-        return Ok(ConfigOwnershipRepair::NotNeeded);
+        return Ok(ConfigAssetsVerdict::Healthy);
     }
     if actual_uid != 0 {
         anyhow::bail!(
@@ -5831,14 +8884,23 @@ fn config_ownership_repair(
             "Mihomo configuration has an unsafe file type and cannot be repaired automatically"
         );
     }
-    Ok(if is_root {
-        ConfigOwnershipRepair::RepairAsRoot
-    } else {
-        ConfigOwnershipRepair::ReexecAsRoot
-    })
+    Ok(ConfigAssetsVerdict::NeedsRepair)
 }
 
-/// Issue #014: system deployments before the 2026-08-28 runtime convergence
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+fn config_ownership_repair(
+    is_root: bool,
+    expected_uid: u32,
+    actual_uid: u32,
+    is_regular_file: bool,
+    link_count: u64,
+) -> anyhow::Result<ConfigOwnershipRepair> {
+    let verdict = probe_config_file_verdict(expected_uid, actual_uid, is_regular_file, link_count)?;
+    Ok(config_assets_repair_action(verdict, is_root))
+}
+
+/// system deployments before the 2026-08-28 runtime convergence
 /// ran the core with `-d <user config dir>`, leaving service-owned runtime
 /// state files in the user config tree. Since the promotion to the managed
 /// runtime those files are dead artifacts; the lifecycle preflight must not
@@ -5881,110 +8943,98 @@ fn system_service_uid() -> Option<u32> {
 }
 
 #[cfg(unix)]
-fn detect_config_assets_repair(
+fn check_config_assets_verdict(
     config_dir: &std::path::Path,
     config_path: &std::path::Path,
     expected_uid: u32,
-    is_root: bool,
-) -> anyhow::Result<ConfigOwnershipRepair> {
+) -> anyhow::Result<ConfigAssetsVerdict> {
     use std::os::unix::fs::MetadataExt;
-
-    if !config_dir.exists() {
-        return Ok(ConfigOwnershipRepair::NotNeeded);
-    }
 
     // 1. 检查 config_dir 自身
     let dir_meta = match std::fs::symlink_metadata(config_dir) {
         Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Ok(if is_root {
-                ConfigOwnershipRepair::RepairAsRoot
-            } else {
-                ConfigOwnershipRepair::ReexecAsRoot
-            });
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ConfigAssetsVerdict::Healthy);
         }
-        Err(e) => return Err(e.into()),
+        Err(_) => return Ok(ConfigAssetsVerdict::Undeterminable),
     };
-    if dir_meta.uid() != expected_uid {
+    let mut verdict = if dir_meta.uid() != expected_uid {
         if dir_meta.uid() == 0 {
-            return Ok(if is_root {
-                ConfigOwnershipRepair::RepairAsRoot
-            } else {
-                ConfigOwnershipRepair::ReexecAsRoot
-            });
+            ConfigAssetsVerdict::NeedsRepair
         } else {
             anyhow::bail!(
                 "Mihomo configuration directory is owned by another user and cannot be repaired automatically"
             );
         }
-    }
+    } else {
+        ConfigAssetsVerdict::Healthy
+    };
 
     // 2. 检查 config_path
-    if let Ok(metadata) = std::fs::symlink_metadata(config_path) {
-        let repair = config_ownership_repair(
-            is_root,
-            expected_uid,
-            metadata.uid(),
-            metadata.file_type().is_file(),
-            metadata.nlink(),
-        )?;
-        if repair != ConfigOwnershipRepair::NotNeeded {
-            return Ok(repair);
+    match std::fs::symlink_metadata(config_path) {
+        Ok(metadata) => {
+            let file_verdict = probe_config_file_verdict(
+                expected_uid,
+                metadata.uid(),
+                metadata.file_type().is_file(),
+                metadata.nlink(),
+            )?;
+            verdict = verdict.merge(Some(file_verdict));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            verdict = verdict.merge(Some(ConfigAssetsVerdict::Undeterminable));
         }
     }
 
     // 3. 检查 subscriptions_dir
     let subscriptions_dir = config_dir.join("subscriptions");
-    if let Ok(sub_meta) = std::fs::symlink_metadata(&subscriptions_dir) {
-        if sub_meta.uid() != expected_uid {
-            if sub_meta.uid() == 0 {
-                return Ok(if is_root {
-                    ConfigOwnershipRepair::RepairAsRoot
+    let mut sub_is_dir = false;
+    match std::fs::symlink_metadata(&subscriptions_dir) {
+        Ok(sub_meta) => {
+            sub_is_dir = sub_meta.is_dir();
+            if sub_meta.uid() != expected_uid {
+                if sub_meta.uid() == 0 {
+                    verdict = verdict.merge(Some(ConfigAssetsVerdict::NeedsRepair));
                 } else {
-                    ConfigOwnershipRepair::ReexecAsRoot
-                });
+                    anyhow::bail!(
+                        "Mihomo subscriptions directory is owned by another user and cannot be repaired automatically"
+                    );
+                }
             } else {
-                anyhow::bail!(
-                    "Mihomo subscriptions directory is owned by another user and cannot be repaired automatically"
-                );
+                verdict = verdict.merge(Some(ConfigAssetsVerdict::Healthy));
             }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            verdict = verdict.merge(Some(ConfigAssetsVerdict::Undeterminable));
         }
     }
 
     // 4. 遍历 subscriptions_dir 下的文件
-    if subscriptions_dir.exists() {
+    if sub_is_dir {
         match std::fs::read_dir(&subscriptions_dir) {
             Ok(entries) => {
                 for entry in entries {
                     let entry = match entry {
                         Ok(e) => e,
-                        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                            return Ok(if is_root {
-                                ConfigOwnershipRepair::RepairAsRoot
-                            } else {
-                                ConfigOwnershipRepair::ReexecAsRoot
-                            });
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(_) => {
+                            verdict = verdict.merge(Some(ConfigAssetsVerdict::Undeterminable));
+                            continue;
                         }
-                        Err(e) => return Err(e.into()),
                     };
-                    let meta = match entry.metadata() {
+                    let meta = match std::fs::symlink_metadata(entry.path()) {
                         Ok(m) => m,
-                        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                            return Ok(if is_root {
-                                ConfigOwnershipRepair::RepairAsRoot
-                            } else {
-                                ConfigOwnershipRepair::ReexecAsRoot
-                            });
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(_) => {
+                            verdict = verdict.merge(Some(ConfigAssetsVerdict::Undeterminable));
+                            continue;
                         }
-                        Err(e) => return Err(e.into()),
                     };
                     if meta.uid() != expected_uid {
                         if meta.uid() == 0 {
-                            return Ok(if is_root {
-                                ConfigOwnershipRepair::RepairAsRoot
-                            } else {
-                                ConfigOwnershipRepair::ReexecAsRoot
-                            });
+                            verdict = verdict.merge(Some(ConfigAssetsVerdict::NeedsRepair));
                         } else {
                             anyhow::bail!(
                                 "Mihomo subscription asset is owned by another user and cannot be repaired automatically"
@@ -5993,14 +9043,10 @@ fn detect_config_assets_repair(
                     }
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                return Ok(if is_root {
-                    ConfigOwnershipRepair::RepairAsRoot
-                } else {
-                    ConfigOwnershipRepair::ReexecAsRoot
-                });
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                verdict = verdict.merge(Some(ConfigAssetsVerdict::Undeterminable));
             }
-            Err(e) => return Err(e.into()),
         }
     }
 
@@ -6012,33 +9058,23 @@ fn detect_config_assets_repair(
             for entry in entries {
                 let entry = match entry {
                     Ok(e) => e,
-                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                        return Ok(if is_root {
-                            ConfigOwnershipRepair::RepairAsRoot
-                        } else {
-                            ConfigOwnershipRepair::ReexecAsRoot
-                        });
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => {
+                        verdict = verdict.merge(Some(ConfigAssetsVerdict::Undeterminable));
+                        continue;
                     }
-                    Err(e) => return Err(e.into()),
                 };
-                let meta = match entry.metadata() {
+                let meta = match std::fs::symlink_metadata(entry.path()) {
                     Ok(m) => m,
-                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                        return Ok(if is_root {
-                            ConfigOwnershipRepair::RepairAsRoot
-                        } else {
-                            ConfigOwnershipRepair::ReexecAsRoot
-                        });
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => {
+                        verdict = verdict.merge(Some(ConfigAssetsVerdict::Undeterminable));
+                        continue;
                     }
-                    Err(e) => return Err(e.into()),
                 };
                 if meta.uid() != expected_uid {
                     if meta.uid() == 0 {
-                        return Ok(if is_root {
-                            ConfigOwnershipRepair::RepairAsRoot
-                        } else {
-                            ConfigOwnershipRepair::ReexecAsRoot
-                        });
+                        verdict = verdict.merge(Some(ConfigAssetsVerdict::NeedsRepair));
                     } else if is_legacy_service_runtime_artifact(
                         &entry.file_name(),
                         meta.uid(),
@@ -6055,34 +9091,43 @@ fn detect_config_assets_repair(
                 }
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Ok(if is_root {
-                ConfigOwnershipRepair::RepairAsRoot
-            } else {
-                ConfigOwnershipRepair::ReexecAsRoot
-            });
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            verdict = verdict.merge(Some(ConfigAssetsVerdict::Undeterminable));
         }
-        Err(e) => return Err(e.into()),
     }
 
-    // 扫描全程无硬失败后才收敛 Issue #014 的遗留运行时文件：
+    // 扫描全程无硬失败后才收敛 的遗留运行时文件：
     // 失败路径绝不产生副作用，删除动作不依赖 readdir 顺序。
-    for path in legacy_runtime_files {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        match std::fs::remove_file(&path) {
-            Ok(()) => crate::log!(
-                "  ⚠ Removed stale service-owned `{name}` left by a pre-2026-08 system deployment (Issue #014)."
-            ),
-            Err(err) => crate::log!(
-                "  ⚠ Stale service-owned `{name}` could not be removed ({err}); it is unused and ignored by this check."
-            ),
+    if verdict == ConfigAssetsVerdict::Healthy {
+        for path in legacy_runtime_files {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match std::fs::remove_file(&path) {
+                Ok(()) => crate::log!(
+                    "  ⚠ Removed stale service-owned `{name}` left by a pre-2026-08 system deployment ."
+                ),
+                Err(err) => crate::log!(
+                    "  ⚠ Stale service-owned `{name}` could not be removed ({err}); it is unused and ignored by this check."
+                ),
+            }
         }
     }
 
-    Ok(ConfigOwnershipRepair::NotNeeded)
+    Ok(verdict)
+}
+
+#[cfg(unix)]
+fn detect_config_assets_repair(
+    config_dir: &std::path::Path,
+    config_path: &std::path::Path,
+    expected_uid: u32,
+    is_root: bool,
+) -> anyhow::Result<ConfigOwnershipRepair> {
+    let verdict = check_config_assets_verdict(config_dir, config_path, expected_uid)?;
+    Ok(config_assets_repair_action(verdict, is_root))
 }
 
 #[cfg(unix)]
@@ -6347,6 +9392,12 @@ fn ensure_system_config_ownership_for_lifecycle(
             println!("  ✓ Mihomo configuration permissions repaired.");
             Ok(())
         }
+        ConfigOwnershipRepair::ReportUndeterminable => {
+            eprintln!(
+                "  ⚠ Cannot verify the Mihomo configuration directory ownership with the current identity; continuing without an automatic repair."
+            );
+            Ok(())
+        }
     }
 }
 
@@ -6357,33 +9408,250 @@ fn ensure_system_config_ownership_for_lifecycle(
     Ok(())
 }
 
+/// What the lifecycle repair gate is allowed to do with a state-directory verdict.
+/// `ReportUndeterminable` exists so that "the current identity cannot judge" never
+/// maps onto a privilege escalation (issue ).
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemStateRepairAction {
+    None,
+    RepairInPlace,
+    ReexecAsRoot,
+    ReportUndeterminable,
+}
+
+#[cfg(unix)]
+fn system_state_repair_action(
+    verdict: utils::SystemStateDirVerdict,
+    is_root: bool,
+) -> SystemStateRepairAction {
+    match verdict {
+        utils::SystemStateDirVerdict::Healthy => SystemStateRepairAction::None,
+        utils::SystemStateDirVerdict::Undeterminable => {
+            SystemStateRepairAction::ReportUndeterminable
+        }
+        utils::SystemStateDirVerdict::NeedsRepair if is_root => {
+            SystemStateRepairAction::RepairInPlace
+        }
+        utils::SystemStateDirVerdict::NeedsRepair => SystemStateRepairAction::ReexecAsRoot,
+    }
+}
+
 #[cfg(unix)]
 fn ensure_system_state_ownership_for_lifecycle() -> anyhow::Result<()> {
     if !utils::is_managed_system_state_dir_present() {
         return Ok(());
     }
 
-    let needs_repair = utils::check_system_state_dir_needs_repair().unwrap_or(true);
-    if !needs_repair {
-        return Ok(());
+    match system_state_repair_action(
+        utils::check_system_state_dir_needs_repair(),
+        is_current_process_root(),
+    ) {
+        SystemStateRepairAction::None => Ok(()),
+        SystemStateRepairAction::RepairInPlace => {
+            utils::ensure_mihomo_system_state_dir()?;
+            println!("  ✓ Mihomo system state directory permissions repaired.");
+            Ok(())
+        }
+        SystemStateRepairAction::ReexecAsRoot => {
+            println!("  Detected a system state permission issue. Repairing it via sudo and continuing restart...");
+            let exe = std::env::current_exe()?;
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            let status = sudo_reexec_command(&exe, &args).status()?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        SystemStateRepairAction::ReportUndeterminable => {
+            eprintln!(
+                "  ⚠ Cannot verify the system state directory ownership with the current identity; continuing without an automatic repair."
+            );
+            Ok(())
+        }
     }
-
-    if is_current_process_root() {
-        utils::ensure_mihomo_system_state_dir()?;
-        println!("  ✓ Mihomo system state directory permissions repaired.");
-        return Ok(());
-    }
-
-    println!("  Detected a system state permission issue. Repairing it via sudo and continuing restart...");
-    let exe = std::env::current_exe()?;
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let status = sudo_reexec_command(&exe, &args).status()?;
-    std::process::exit(status.code().unwrap_or(1));
 }
 
 #[cfg(not(unix))]
 fn ensure_system_state_ownership_for_lifecycle() -> anyhow::Result<()> {
     Ok(())
+}
+
+/// SPEC C1: Shared repair prerequisites for `start --system` / `restart --system`.
+/// Both commands run the same pre-flight contract:
+/// - managed state/config ownership repair (sudo re-entry when needed),
+/// - `cache.db` classification (A1/A2), with permission repair only,
+/// - SPEC §12.3.1 confirmation contract for every privilege-taking repair.
+async fn shared_repair_prerequisites(
+    ctx: &instance::InstanceContext,
+    allow_runtime_reset: bool,
+    prompt_runtime_reset: bool,
+    fix_command: &str,
+) -> anyhow::Result<()> {
+    ensure_system_state_ownership_for_lifecycle()?;
+    maybe_sudo_reexec_for_system_generation(ctx)?;
+    ensure_system_config_ownership_for_lifecycle(ctx)?;
+
+    let Some(state_dir) = ctx.paths.tun_config_file.parent() else {
+        return Ok(());
+    };
+    let cache_db_path = state_dir.join(utils::CACHE_DB_FILE_NAME);
+    let mut state = utils::classify_cache_db(&cache_db_path, Some(SERVICE_ACCOUNT_USER));
+    if state == utils::CacheDbState::PermissionDrift {
+        let decision =
+            cache_db_permission_repair_decision(allow_runtime_reset, prompt_runtime_reset);
+        if decision == CacheDbRepairDecision::RefuseRepairRequired {
+            anyhow::bail!(cache_db_repair_required_message(fix_command));
+        }
+        if !is_current_process_root() {
+            // SPEC §12.3.1: re-enter as root and re-probe there; the confirmation
+            // happens exactly once, on the side that performs the repair.
+            println!(
+                "  Detected a system cache.db permission issue. Repairing it via sudo and continuing..."
+            );
+            let exe = std::env::current_exe()?;
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            let status = sudo_reexec_command(&exe, &args).status()?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        if decision == CacheDbRepairDecision::Prompt
+            && !confirm_cache_db_permission_repair(&cache_db_path)?
+        {
+            anyhow::bail!(
+                "Repair not applied; your configuration was not modified.\n  Re-run to repair: {fix_command}"
+            );
+        }
+        preserve_unjudged_cache_db_evidence(&cache_db_path, Some(SERVICE_ACCOUNT_USER));
+        utils::repair_cache_db_permissions(&cache_db_path, Some(SERVICE_ACCOUNT_USER))?;
+        println!("  ✓ Mihomo cache.db permissions repaired.");
+        // SPEC A1: a combined permission+content anomaly must be
+        // re-classified inside the stop window — one pass never authorizes start.
+        state = utils::classify_cache_db(&cache_db_path, Some(SERVICE_ACCOUNT_USER));
+        if state == utils::CacheDbState::PermissionDrift {
+            anyhow::bail!(
+                "cache.db permissions are still invalid after repair ({}).\n  Fix: {fix_command}",
+                cache_db_path.display()
+            );
+        }
+    }
+
+    let classification =
+        utils::classify_cache_db_detailed(&cache_db_path, Some(SERVICE_ACCOUNT_USER));
+    if classification.needs_isolation() {
+        println!(
+            "  ⚠ cache.db is {} and will be quarantined before the Core starts.",
+            classification.state.as_str()
+        );
+    }
+    Ok(())
+}
+
+const SERVICE_ACCOUNT_USER: &str = "mihomo";
+
+/// `PermissionDrift` short-circuits the content verdict, so a drifted
+/// `cache.db` may also be corrupt and the Core would delete it once the repair
+/// lets it open the file. Copy the bytes aside first — the original is never
+/// mutated and a failed copy must not block the repair-first flow.
+fn preserve_unjudged_cache_db_evidence(
+    cache_db_path: &std::path::Path,
+    service_user: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    let classification = utils::classify_cache_db_detailed(cache_db_path, service_user);
+    if !classification.needs_evidence_preservation() {
+        return None;
+    }
+    // Judged-unsafe states are moved aside by the daemon's spawn gate / controlled
+    // reset; only the unjudged side (content verdict short-circuited by the drift)
+    // needs a copy here.
+    if classification.needs_isolation() {
+        return None;
+    }
+    match utils::preserve_cache_db_evidence(cache_db_path) {
+        Ok(preserved) => {
+            println!(
+                "  ⚠ cache.db {} 的内容未判定（权限漂移），已复制留证：{}",
+                classification.state.as_str(),
+                preserved.display()
+            );
+            Some(preserved)
+        }
+        Err(error) => {
+            eprintln!("  ⚠ cache.db 留证复制失败（{error}）；按修复优先继续");
+            None
+        }
+    }
+}
+
+/// SPEC C1: `start --system` and `restart --system` share one repair gate.
+fn lifecycle_shares_repair_prerequisites(
+    mode: instance::InstanceMode,
+    action: instance::ServiceAction,
+) -> bool {
+    mode == instance::InstanceMode::System
+        && matches!(
+            action,
+            instance::ServiceAction::Start | instance::ServiceAction::Restart
+        )
+}
+
+fn lifecycle_repair_fix_command(action: instance::ServiceAction) -> &'static str {
+    match action {
+        instance::ServiceAction::Start => "mihomo-cli start --system --yes",
+        _ => "mihomo-cli restart --system --yes",
+    }
+}
+
+/// SPEC §12.3.1（裁决 B）：授权提示里的操作名与影响面措辞。
+fn lifecycle_authorization_labels(action: instance::ServiceAction) -> (&'static str, &'static str) {
+    match action {
+        instance::ServiceAction::Start => ("start --system", "启动"),
+        instance::ServiceAction::Stop => ("stop --system", "停止"),
+        instance::ServiceAction::Restart => ("restart --system", "重启"),
+        instance::ServiceAction::Uninstall => ("uninstall --system", "卸载"),
+        instance::ServiceAction::Enable | instance::ServiceAction::Disable => {
+            ("autostart --system", "该操作")
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheDbRepairDecision {
+    /// `--yes`: repair without asking.
+    Apply,
+    /// Interactive TTY without `--yes`: explain the impact, then ask.
+    Prompt,
+    /// No TTY and no `--yes`: report `repair_required` and do not self-heal.
+    RefuseRepairRequired,
+}
+
+fn cache_db_permission_repair_decision(
+    allow_runtime_reset: bool,
+    prompt_runtime_reset: bool,
+) -> CacheDbRepairDecision {
+    if allow_runtime_reset {
+        CacheDbRepairDecision::Apply
+    } else if prompt_runtime_reset {
+        CacheDbRepairDecision::Prompt
+    } else {
+        CacheDbRepairDecision::RefuseRepairRequired
+    }
+}
+
+fn cache_db_repair_required_message(fix_command: &str) -> String {
+    format!(
+        "repair_required: cache.db ownership/permissions drifted from the mihomo service user \
+         and was not repaired (no terminal and no --yes).\n  Fix: {fix_command}"
+    )
+}
+
+fn confirm_cache_db_permission_repair(cache_db_path: &std::path::Path) -> anyhow::Result<bool> {
+    use dialoguer::Confirm;
+
+    println!(
+        "  cache.db permissions must be repaired ({}) so the Core can persist its state.",
+        cache_db_path.display()
+    );
+    Ok(Confirm::new()
+        .with_prompt("Repair cache.db ownership/permissions? The file content is not modified")
+        .default(false)
+        .interact()?)
 }
 
 async fn cmd_lifecycle_instance_mode(
@@ -6395,31 +9663,58 @@ async fn cmd_lifecycle_instance_mode(
     let ctx = instance::planned_current_context(mode)
         .ok_or_else(|| anyhow::anyhow!("Unsupported OS for instance lifecycle"))?;
 
+    // SPEC §12.3.1（裁决 B）：root 专属域的**业务操作授权**边界。必须在首次特权
+    // 读取/留证/写入之前完成（避免「先写用户 intent 再重入」），且与三态权限判定
+    // 严格分离：这里不判定漂移、不修复、不宣称检测到权限异常。
+    let (operation, impact) = lifecycle_authorization_labels(action);
+    authorize_protected_domain_operations(&ctx, operation, impact)?;
+
+    // SPEC C1: Shared repair prerequisites for start/restart --system
+    if lifecycle_shares_repair_prerequisites(mode, action) {
+        shared_repair_prerequisites(
+            &ctx,
+            allow_runtime_reset,
+            prompt_runtime_reset,
+            lifecycle_repair_fix_command(action),
+        )
+        .await?;
+    }
+
     if mode == instance::InstanceMode::System {
         if action == instance::ServiceAction::Restart {
             ensure_system_state_ownership_for_lifecycle()?;
             maybe_sudo_reexec_for_system_generation(&ctx)?;
             ensure_system_config_ownership_for_lifecycle(&ctx)?;
+            // SPEC P0/P1-3: evidence preservation precedes every recovery
+            // action — recovery may start the old Core, whose bbolt init deletes a
+            // broken cache.db. Idempotent, so the pipeline's own P0 call is free.
+            preserve_upgrade_evidence(&ctx)?;
             maybe_auto_recover_active_transaction(
                 &ctx,
                 tun_transaction::RecoveryDirection::Resume,
                 allow_runtime_reset,
                 prompt_runtime_reset,
+                // only the explicit `restart --system` origin may
+                // unlock the migrated-legacy reset admission.
+                true,
             )
             .await?;
+            // SPEC P2-4: a legacy intent config without external-controller
+            // must be repaired BEFORE the pipeline starts Core, otherwise the
+            // upgrade would fail and compensate on a pre-existing config defect.
+            ensure_instance_controller_endpoint(&ctx)?;
             maybe_prepare_cli_skew_generation(&ctx)?;
             if apply_pending_generation(&ctx).await? {
                 return Ok(());
             }
-        } else if matches!(
-            action,
-            instance::ServiceAction::Stop | instance::ServiceAction::Uninstall
-        ) && prepare_system_transaction_recovery().await?
+        } else if matches!(action, instance::ServiceAction::Stop)
+            && prepare_system_transaction_recovery().await?
         {
             ensure_system_state_ownership_for_lifecycle()?;
             maybe_auto_recover_active_transaction(
                 &ctx,
                 tun_transaction::RecoveryDirection::Abort,
+                false,
                 false,
                 false,
             )
@@ -6452,7 +9747,7 @@ async fn cmd_lifecycle_instance_mode(
                     return Ok(());
                 }
                 instance::ServiceAction::Start | instance::ServiceAction::Restart => {
-                    // Issue #015 lifecycle precheck: distinguish "no systemd"
+                    // lifecycle precheck: distinguish "no systemd"
                     // (WSL2/containers — cannot ever start) and "not installed"
                     // from "installed but not running" (recoverable below).
                     match service_runtime_state(&ctx) {
@@ -6499,12 +9794,17 @@ async fn cmd_lifecycle_instance_mode(
             }
         }
 
+        // Request-time subscription ID: the daemon may switch the active
+        // pointer before it replies, so the replay report must be judged
+        // against the requested slot (SPEC §3.8.1).
+        let subscription_id_at_request;
         let cmd = match action {
             instance::ServiceAction::Start => {
-                push_selection_mirror_full(&ctx).await;
                 let (config_content, config_revision) = lifecycle_system_config_payload(&ctx)?;
+                push_selection_mirror_full(&ctx, &config_revision).await;
                 let subscription_id =
                     config::get_active_id_at(&utils::AppPaths::new(ctx.paths.config_dir.clone()))?;
+                subscription_id_at_request = subscription_id.clone();
                 ipc::DaemonCommand::StartCore {
                     config_content,
                     config_revision,
@@ -6512,12 +9812,16 @@ async fn cmd_lifecycle_instance_mode(
                     token: None,
                 }
             }
-            instance::ServiceAction::Stop => ipc::DaemonCommand::StopCore { token: None },
+            instance::ServiceAction::Stop => {
+                subscription_id_at_request = None;
+                ipc::DaemonCommand::StopCore { token: None }
+            }
             instance::ServiceAction::Restart => {
-                push_selection_mirror_full(&ctx).await;
                 let (config_content, config_revision) = lifecycle_system_config_payload(&ctx)?;
+                push_selection_mirror_full(&ctx, &config_revision).await;
                 let subscription_id =
                     config::get_active_id_at(&utils::AppPaths::new(ctx.paths.config_dir.clone()))?;
+                subscription_id_at_request = subscription_id.clone();
                 ipc::DaemonCommand::RestartCore {
                     config_content,
                     config_revision,
@@ -6533,10 +9837,11 @@ async fn cmd_lifecycle_instance_mode(
                 // review MAJOR-5：daemon 不读用户 home，mirror 缺失只回传结构化信号；
                 // 由 CLI 结合用户 selections树决定最终措辞（§4.8 不得静默降级）。
                 let paths = utils::AppPaths::new(ctx.paths.config_dir.clone());
-                println!(
-                    "  ✅ {}",
-                    translate_selection_replay_signal(&message, &paths)
-                );
+                for line in
+                    lifecycle_success_lines(&message, subscription_id_at_request.as_deref(), &paths)
+                {
+                    println!("{line}");
+                }
                 // Readiness is confirmed by the daemon (it waits for the core
                 // API before replying Success). The CLI must not re-poll —
                 // aligned with clash-verge-service: client trusts the
@@ -6549,7 +9854,8 @@ async fn cmd_lifecycle_instance_mode(
             ipc::DaemonResponse::Status { .. } => return Ok(()),
             ipc::DaemonResponse::CoreApi { .. }
             | ipc::DaemonResponse::Transaction { .. }
-            | ipc::DaemonResponse::SelectionMirrorRevisions { .. } => {
+            | ipc::DaemonResponse::SelectionMirrorRevisions { .. }
+            | ipc::DaemonResponse::SelectionDrift { .. } => {
                 anyhow::bail!(
                     "unexpected Core API / Transaction / mirror revisions response to lifecycle command"
                 );
@@ -6623,7 +9929,12 @@ async fn cmd_lifecycle_instance_mode(
             ctx.mode,
             ctx.paths.api_endpoint.clone(),
         );
-        print_selection_replay_after_ready(&paths, &client, std::time::Instant::now()).await;
+        print_selection_replay_after_ready(
+            &paths,
+            &client,
+            std::time::Instant::now() + selection::REPLAY_TOTAL_BUDGET,
+        )
+        .await;
     }
 
     Ok(())
@@ -6728,7 +10039,8 @@ async fn ensure_system_daemon_access(ctx: &instance::InstanceContext) -> anyhow:
         }
         ipc::DaemonResponse::CoreApi { .. }
         | ipc::DaemonResponse::Transaction { .. }
-        | ipc::DaemonResponse::SelectionMirrorRevisions { .. } => {
+        | ipc::DaemonResponse::SelectionMirrorRevisions { .. }
+        | ipc::DaemonResponse::SelectionDrift { .. } => {
             anyhow::bail!(
                 "unexpected Core API / Transaction / mirror revisions response after IPC owner credentials setup"
             )
@@ -6881,7 +10193,7 @@ async fn cmd_status_instance_mode_with_source(
     cmd_status_context_with_source(ctx, source).await
 }
 
-/// Issue #015 status four-way: surface the service runtime diagnosis
+/// status four-way: surface the service runtime diagnosis
 /// (`no-systemd` / `not-installed` / `installed-not-running`) when nothing is
 /// actually up, so "installed but stopped" is never shown as a bare `unknown`.
 /// Returns `None` when the instance is up or running — callers fall back to the
@@ -6907,21 +10219,32 @@ fn snapshot_instance_up(snapshot: &status::StatusSnapshot) -> bool {
         || snapshot.core_running.as_bool() == Some(true)
 }
 
-fn status_health_label(snapshot: &status::StatusSnapshot) -> &'static str {
+/// Spec §0.6: the single user-visible health predicate. Both the text summary
+/// and `status --json` call this — never branch on raw snapshot fields in a
+/// formatter, or `TunRunningUnattested` degrades in one output and reads
+/// `healthy` in the other.
+fn status_health_label(
+    snapshot: &status::StatusSnapshot,
+    runtime: service::ServiceRuntimeState,
+) -> &'static str {
+    if let Some(label) = service_runtime_health_label(runtime, snapshot_instance_up(snapshot)) {
+        return label;
+    }
     if snapshot.daemon_reachable == status::TriState::True && !snapshot.intent_config_exists {
-        "ready"
-    } else {
-        match (snapshot.core_running.as_bool(), snapshot.api_reachable) {
-            (Some(false), _) => "inactive",
-            (Some(true), true)
-                if snapshot.tun_verdict == status::TunVerdict::TunDisabled
-                    || snapshot.tun_verdict == status::TunVerdict::TunRunning =>
-            {
-                "healthy"
-            }
-            (Some(true), _) | (None, true) => "degraded",
-            _ => "unknown",
+        return "ready";
+    }
+    match (snapshot.core_running.as_bool(), snapshot.api_reachable) {
+        (Some(false), _) => "inactive",
+        (Some(true), true)
+            if matches!(
+                snapshot.tun_verdict,
+                status::TunVerdict::TunDisabled | status::TunVerdict::TunRunning
+            ) =>
+        {
+            "healthy"
         }
+        (Some(true), _) | (None, true) => "degraded",
+        _ => "unknown",
     }
 }
 
@@ -6960,6 +10283,103 @@ fn status_configuration_label(snapshot: &status::StatusSnapshot) -> &'static str
     }
 }
 
+/// A2' observation line: purely observational, no action. Only
+/// when ≥1 registered (cache-valid), non-retired, non-active subscription slot
+/// holds persisted selections — retired slots are covered by the A1' revive
+/// path, not by `config --switch`. Explicit exception to SPEC §3.8.1's
+/// "status only reads the active intent" rule (contract table updated).
+fn print_status_fixed_selections_observation(ctx: &instance::InstanceContext) {
+    let paths = utils::AppPaths::new(ctx.paths.config_dir.clone());
+    let Ok(subs) = config::load_subscriptions_at(&paths) else {
+        return;
+    };
+    let active = config::get_active_id_at(&paths).ok().flatten();
+    let count = count_fixed_selection_slots(&paths, &subs, active.as_deref());
+    if count > 0 {
+        println!(
+            "Selections:      {count} registered subscription slot(s) hold fixed selections (config --switch <id>)"
+        );
+    }
+}
+
+fn count_fixed_selection_slots(
+    paths: &utils::AppPaths,
+    subs: &[config::SubscriptionMeta],
+    active: Option<&str>,
+) -> usize {
+    subs.iter()
+        .filter(|sub| {
+            sub.is_alive()
+                && active != Some(sub.id.as_str())
+                && subscription_cache_is_valid_yaml(paths, &sub.id)
+                && selection_slot_holds_selections(paths, &sub.id)
+        })
+        .count()
+}
+
+/// Cache validity: the file must exist AND be parseable as a non-empty
+/// subscription YAML (not just `is_file()`). A corrupt cache is not a
+/// switchable target.
+fn subscription_cache_is_valid_yaml(paths: &utils::AppPaths, id: &str) -> bool {
+    let path = paths.subscription_file_path(id);
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_yaml::from_str::<serde_yaml::Value>(&content).ok())
+        .is_some_and(|yaml| yaml.is_mapping() || yaml.is_sequence())
+}
+
+fn selection_slot_holds_selections(paths: &utils::AppPaths, id: &str) -> bool {
+    let path = paths.selection_state_path_for_subscription(id);
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_yaml::from_str::<selection::SelectionStateFile>(&content).ok())
+        .is_some_and(|state| !state.selections.is_empty())
+}
+
+/// B3: cached drift observation from the daemon. Read-only, no
+/// network, no fix; the one-click convergence command is printed for the user
+/// to run explicitly.
+async fn print_status_selection_drift_observation(ctx: &instance::InstanceContext) {
+    if ctx.mode != instance::InstanceMode::System || !ipc::is_daemon_running().await {
+        return;
+    }
+    // `send_command` injects the client token internally (with_ipc_token).
+    match ipc::send_command(&ipc::DaemonCommand::GetSelectionDrift { token: None }).await {
+        Ok(ipc::DaemonResponse::SelectionDrift {
+            observations,
+            unknown_samples,
+            sample_status,
+            journal,
+        }) => {
+            println!(
+                "Selection drift: {} observation(s), sampler {}, {} unknown sample(s)",
+                observations.len(),
+                sample_status,
+                unknown_samples
+            );
+            // N2: most recent observation by `at_unix` (ties broken by tail
+            // position). Shared with the daemon-side test so `.last()` cannot
+            // silently come back.
+            if let Some(latest) = daemon::latest_drift_observation(&observations) {
+                println!(
+                    "  Latest:         {} runtime={} intent={}",
+                    latest.group, latest.runtime, latest.intent
+                );
+                println!(
+                    "  Fix:            {}",
+                    crate::selection::select_fix_command(&latest.group, &latest.runtime)
+                );
+            }
+            if let Some(journal) = journal {
+                println!("  Journal:        {journal} (cache still served)");
+            }
+        }
+        Ok(_) | Err(_) => {
+            // Cached observation unavailable is not a status failure; stay quiet.
+        }
+    }
+}
+
 async fn cmd_status_context_with_source(
     ctx: instance::InstanceContext,
     source: Option<instance::ResolutionSource>,
@@ -6970,9 +10390,7 @@ async fn cmd_status_context_with_source(
     // 使用 StatusSnapshot 统一采集状态
     let snapshot = status::StatusSnapshot::collect(&ctx).await;
 
-    let health =
-        service_runtime_health_label(service_runtime_state(&ctx), snapshot_instance_up(&snapshot))
-            .unwrap_or_else(|| status_health_label(&snapshot));
+    let health = status_health_label(&snapshot, service_runtime_state(&ctx));
 
     let default_route = default_route_label(
         default_route_path(
@@ -6986,8 +10404,11 @@ async fn cmd_status_context_with_source(
     println!("Health:          {health}");
     println!("Instance:        {}", instance_mode_label(plan.mode));
     println!("Core:            {}", status_core_label(&snapshot));
+    if let Some(observation) = orphan_core_observation(&ctx).await {
+        println!("Orphan Core:     {observation}");
+    }
     println!("API:             {}", status_api_label(&snapshot));
-    println!("TUN:             {}", text_tun_status_label(&snapshot));
+    println!("TUN:             {}", status_tun_label(&snapshot));
     println!(
         "System proxy:    {}",
         match snapshot.system_proxy {
@@ -7008,6 +10429,8 @@ async fn cmd_status_context_with_source(
     println!("Rule mode:       {}", snapshot.rule_mode);
     println!("Default route:   {default_route}");
     println!("Configuration:   {}", status_configuration_label(&snapshot));
+    print_status_fixed_selections_observation(&ctx);
+    print_status_selection_drift_observation(&ctx).await;
 
     if verbose {
         if let Some(source) = source {
@@ -7058,13 +10481,17 @@ pub(crate) fn is_system_cli_skewed(ctx: &instance::InstanceContext) -> bool {
     if ctx.mode != instance::InstanceMode::System {
         return false;
     }
-    if !ctx.paths.cli_binary.exists() {
-        return false;
-    }
-    let Ok(current_cli) = std::env::current_exe() else {
+    let Ok(installed_sha) = file_sha256(&ctx.paths.cli_binary) else {
         return false;
     };
-    !utils::file_contents_equal(&current_cli, &ctx.paths.cli_binary)
+    let Some(installed_sha) = installed_sha else {
+        return false;
+    };
+    // Same identity criterion as P1 and the tombstone retry gate.
+    match daemon_identity_matches_current_exe(&installed_sha) {
+        Ok(matches) => !matches,
+        Err(_) => false,
+    }
 }
 
 pub(crate) fn check_and_warn_daemon_binary_skew(ctx: &instance::InstanceContext) {
@@ -7072,12 +10499,18 @@ pub(crate) fn check_and_warn_daemon_binary_skew(ctx: &instance::InstanceContext)
         return;
     }
     let store = system_generation_store(ctx);
-    if let Ok(state) = store.read_state() {
-        if let Some(pending_id) = state.pending {
+    match store.observe_pending() {
+        generation::PendingObservation::HasPending(pending_id) => {
             eprintln!("⚠ 提示: 存在待应用的系统更新 ({pending_id})。");
             eprintln!("  如需应用更新，请运行: mihomo-cli restart\n");
             return;
         }
+        // 读不动 ≠没有 pending——如实报「无法判定」并给授权检查指引，
+        // 不宣称有/无、不提权；随后照常展示独立可读的 skew 观测。
+        generation::PendingObservation::Undeterminable(error) => {
+            eprintln!("⚠ 提示: {}。\n", pending_generation_unknown_notice(&error));
+        }
+        generation::PendingObservation::Applied => {}
     }
     if is_system_cli_skewed(ctx) {
         let current_cli = std::env::current_exe().unwrap_or_default();
@@ -7113,19 +10546,23 @@ fn default_route_path<'a>(
     active_config_path.unwrap_or(intent_config_path)
 }
 
-fn runtime_tun_status_label(tun: status::TriState) -> &'static str {
-    match tun {
-        status::TriState::True => "enabled",
-        status::TriState::False => "disabled",
-        status::TriState::Unknown => "unknown",
-    }
-}
-
-fn text_tun_status_label(snapshot: &status::StatusSnapshot) -> &'static str {
+/// Spec §0.6: attested TUN judgment shared by the text summary and
+/// `status --json`. Raw runtime observation is only exposed as `core.tun`.
+fn status_tun_label(snapshot: &status::StatusSnapshot) -> &'static str {
     match snapshot.tun_verdict {
         status::TunVerdict::TunRunning => "enabled",
         status::TunVerdict::TunDisabled => "disabled",
         status::TunVerdict::TunRunningUnattested | status::TunVerdict::TunStateUnknown => "unknown",
+    }
+}
+
+/// Dashboard decoration on top of [`status_tun_label`]; unattested or unknown
+/// states stay `unknown` so they can never render as the green enabled badge.
+fn dashboard_tun_label(snapshot: &status::StatusSnapshot) -> &'static str {
+    match status_tun_label(snapshot) {
+        "enabled" => "✅ enabled",
+        "disabled" => "❌ disabled",
+        _ => "unknown",
     }
 }
 
@@ -7233,7 +10670,7 @@ fn status_endpoint_label(endpoint: &instance::ApiEndpoint) -> String {
 struct DoctorCheck {
     passed: bool,
     warning: bool,
-    /// `neutral` 表示「已观察但无法判定」：显示 ❓，且不计入问题数（ISS #022 P2 探测）。
+    /// `neutral` 表示「已观察但无法判定」：显示 ❓，且不计入问题数（ISS P2 探测）。
     neutral: bool,
     label: String,
     detail: String,
@@ -7396,7 +10833,7 @@ enum ProbeConfigSource {
     Unavailable(String),
 }
 
-/// 有界、不跟随 symlink 的配置读取（review MINOR-e：doctor 也用 #024 的加固读法）。
+/// 有界、不跟随 symlink 的配置读取（review MINOR-e：doctor 也用 的加固读法）。
 #[cfg(unix)]
 fn read_probe_config_text(path: &std::path::Path) -> anyhow::Result<String> {
     let bytes = crate::utils::read_file_no_follow_limited(
@@ -7447,7 +10884,7 @@ fn probe_config_source(
     ProbeConfigSource::Unavailable(failures.join("；"))
 }
 
-/// Issue #022 P2 本地解析器探测（SPEC 草案 D1–D4）。
+/// P2 本地解析器探测（SPEC 草案 D1–D4）。
 ///
 /// 仅在 `doctor` 默认启用（`--no-probe-dns` 关闭）、**运行态** TUN 生效且判据配置为 fake-ip
 /// 模式时执行一次 ≤2s 的有界查询；结果只生成独立的 `DoctorCheck`，不回填 `StatusSnapshot`，
@@ -7492,22 +10929,34 @@ async fn doctor_dns_probe_check(
                 dns_probe::PROBE_DOMAIN
             ),
         )),
-        dns_probe::ProbeVerdict::BypassesMihomo => Some(DoctorCheck::fail(
-            "系统 DNS 路径",
-            format!(
-                "{} → 真实地址（不在 {range} 内），系统解析未经过 mihomo（判据：{source_label}）",
-                dns_probe::PROBE_DOMAIN
-            ),
-            // review MAJOR-8：提示必须落在真正会改变状态的动作上。
-            // `restart` 不执行 TUN/DNS 归一化（只有 `tun on` 会），
-            // 而 Issue #022 场景里 resolv.conf 本来就指向 127.0.0.53，
-            // 旧提示会让用户“按提示做完但状态不变”（违反 §4.8 不得循环）。
-            "TUN 下域名规则会对真实流量失效。运行: mihomo-cli tun on --yes（重建并归一化 TUN/DNS 意图，\
-             含 dns-hijack 与 strict-route；事务会直接应用到 Core，无需再 restart）；\
-             若 Core 未运行则 mihomo-cli start --system。仍绕过说明系统解析器未被 TUN 劫持\
-             （Issue #022 A2 待真机验证的 strict-route 假说）。\
-             刚修复过时系统解析缓存可能仍返回旧地址，稍后重跑 doctor 复核",
-        )),
+        dns_probe::ProbeVerdict::BypassesMihomo => {
+            if has_split_dns_intent(&config_text) {
+                Some(DoctorCheck::neutral(
+                    "系统 DNS 路径",
+                    format!(
+                        "{} → 真实地址，系统解析直连内网（检测到 Split-DNS / route-exclude 策略配置，内网解析未受 TUN 劫持；判据：{source_label}）",
+                        dns_probe::PROBE_DOMAIN
+                    ),
+                ))
+            } else {
+                Some(DoctorCheck::fail(
+                    "系统 DNS 路径",
+                    format!(
+                        "{} → 真实地址（不在 {range} 内），系统解析未经过 mihomo（判据：{source_label}）",
+                        dns_probe::PROBE_DOMAIN
+                    ),
+                    // review MAJOR-8：提示必须落在真正会改变状态的动作上。
+                    // `restart` 不执行 TUN/DNS 归一化（只有 `tun on` 会），
+                    // 而 场景里 resolv.conf 本来就指向 127.0.0.53，
+                    // 旧提示会让用户“按提示做完但状态不变”（违反 §4.8 不得循环）。
+                    "TUN 下域名规则会对真实流量失效。运行: mihomo-cli tun on --yes（重建并归一化 TUN/DNS 意图，\
+                     含 dns-hijack 与 strict-route；事务会直接应用到 Core，无需再 restart）；\
+                     若 Core 未运行则 mihomo-cli start --system。仍绕过说明系统解析器未被 TUN 劫持\
+                     （A2 待真机验证的 strict-route 假说）。\
+                     刚修复过时系统解析缓存可能仍返回旧地址，稍后重跑 doctor 复核",
+                ))
+            }
+        }
         dns_probe::ProbeVerdict::Unknown(detail) => Some(DoctorCheck::neutral(
             "系统 DNS 路径",
             format!("无法判定：{detail}"),
@@ -7528,6 +10977,83 @@ fn doctor_checks_service(service: &instance::ServiceTarget) -> bool {
     !matches!(service, instance::ServiceTarget::WindowsUserProcess)
 }
 
+/// B3: immediate read-only drift comparison for `doctor --system`.
+/// Reuses the daemon's decision function ([`daemon::compare_selection_drift`]);
+/// intent comes from the user tree (never `/var/lib`), runtime from a single
+/// read-only `GET /proxies`. No write, no fix.
+///
+/// System mode routes through the authenticated daemon (SPEC §1.4/§3.8.3);
+/// intent source unreadable/corrupt → "不可判定" (not a false green).
+async fn doctor_selection_drift_check(
+    ctx: &instance::InstanceContext,
+) -> anyhow::Result<DoctorCheck> {
+    let paths = utils::AppPaths::new(ctx.paths.config_dir.clone());
+    let active = config::get_active_id_at(&paths)?;
+    let Some(active) = active else {
+        return Ok(DoctorCheck::pass(
+            "Selection drift",
+            "无 active 订阅，无意图可比对",
+        ));
+    };
+    let intent_path = paths.selection_state_path_for_subscription(&active);
+    let intent_result = std::fs::read_to_string(&intent_path)
+        .ok()
+        .and_then(|content| serde_yaml::from_str::<selection::SelectionStateFile>(&content).ok())
+        .map(|state| state.selections)
+        .filter(|selections| !selections.is_empty());
+    let Some(intent) = intent_result else {
+        // Intent unreadable or unparseable → "不可判定", not a false green.
+        if intent_path.exists() {
+            return Ok(DoctorCheck::neutral(
+                "Selection drift",
+                "active 订阅 intent 文件存在但不可解析，无法判定",
+            ));
+        }
+        return Ok(DoctorCheck::pass(
+            "Selection drift",
+            "active 订阅无持久化选点，无意图可比对",
+        ));
+    };
+    let client =
+        mihomo_api::EndpointMihomoApiClient::for_instance(ctx.mode, ctx.paths.api_endpoint.clone());
+    let proxies = match client.get("/proxies").await {
+        Ok(value) => value,
+        Err(err) => {
+            return Ok(DoctorCheck::neutral(
+                "Selection drift",
+                format!("Core API 不可达: {err:#}"),
+            ));
+        }
+    };
+    let at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let drifts = daemon::compare_selection_drift(&intent, &proxies, at_unix, None, None);
+    if drifts.is_empty() {
+        Ok(DoctorCheck::pass(
+            "Selection drift",
+            format!("runtime 与 persisted intent 一致（{} 项）", intent.len()),
+        ))
+    } else {
+        let detail = drifts
+            .iter()
+            .map(|d| format!("{} runtime={} intent={}", d.group, d.runtime, d.intent))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let hint = drifts
+            .iter()
+            .map(|d| crate::selection::select_fix_command(&d.group, &d.runtime))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Ok(DoctorCheck::fail(
+            "Selection drift",
+            detail,
+            format!("显式追平: {hint}"),
+        ))
+    }
+}
+
 impl DoctorCheck {
     fn pass(label: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
@@ -7540,8 +11066,7 @@ impl DoctorCheck {
         }
     }
 
-    /// 无法判定的观察结果：不算问题，但要在输出里显式标出来（仅 unix 的 P2 探测使用）。
-    #[cfg(unix)]
+    /// 无法判定的观察结果：不算问题，但要在输出里显式标出来。
     fn neutral(label: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
             passed: true,
@@ -8300,6 +11825,7 @@ fn format_install_service_skipped() -> Vec<String> {
     vec!["  ⚠ Service skipped — run: mihomo-cli restart".to_string()]
 }
 
+#[allow(clippy::too_many_arguments)] // install flags mirror the CLI surface 1:1
 async fn cmd_install_entry(
     system: bool,
     user: bool,
@@ -8308,7 +11834,23 @@ async fn cmd_install_entry(
     github_mirror: Option<&str>,
     skip_config: bool,
     yes: bool,
+    discard_pending: Option<&str>,
 ) -> anyhow::Result<()> {
+    // SPEC 裁决 A1: discarding a pending generation is an EXPLICIT, separate
+    // operation — it revokes metadata only and never pretends the runtime was
+    // restored. A plain `install --system` is never an authorization to discard.
+    if let Some(target) = discard_pending {
+        if !system {
+            anyhow::bail!(
+                "--discard-pending requires an explicit system instance: mihomo-cli install --system --discard-pending=<GENERATION> --yes"
+            );
+        }
+        let ctx = instance::planned_current_context(instance::InstanceMode::System)
+            .ok_or_else(|| anyhow::anyhow!("Unsupported OS for instance lifecycle"))?;
+        let target = generation::GenerationId::new(target)
+            .map_err(|error| anyhow::anyhow!("非法代际 ID: {error}"))?;
+        return discard_pending_generation(&ctx, &target);
+    }
     let mode = if system {
         instance::InstanceMode::System
     } else if user {
@@ -8461,7 +12003,7 @@ async fn cmd_install_instance(
             _ => {}
         }
     }
-    // Issue #015: fail fast on hosts without a running systemd (WSL2 default,
+    // fail fast on hosts without a running systemd (WSL2 default,
     // containers, minimal distros) before writing anything — a unit file that
     // can never be started must not be left behind as "installed".
     if mode == instance::InstanceMode::System
@@ -8530,7 +12072,16 @@ async fn cmd_install_instance(
         && config_exists
         && geo_valid
         && tun_geo_valid;
-    if components_complete {
+    // an adopted/revoked recovery store has no active generation. The
+    // "everything is up to date" fast path must not hide the need to prepare a
+    // candidate bound to the authenticated baseline.
+    let generation_recovery = mode == instance::InstanceMode::System
+        && system_generation_store(&ctx)
+            .read_state()
+            .is_ok_and(|state| {
+                state.active.is_none() && state.pending.is_none() && state.previous.is_some()
+            });
+    if components_complete && !generation_recovery {
         // ADR-23: also check runtime state. If daemon/core are not running,
         // don't return early — start them to ensure the system reaches running state.
         let core_running = if mode == instance::InstanceMode::System {
@@ -8617,7 +12168,19 @@ async fn cmd_install_instance(
     // prepare a staged pending generation rather than disrupting the active instance.
     let system_daemon_active =
         mode == instance::InstanceMode::System && ipc::is_daemon_running().await;
-    if system_daemon_active && !force && (!binary_valid || !cli_binary_valid || !geo_valid) {
+    // SPEC 裁决 A1: after an explicit discard the store sits in its recovery
+    // state (active=None, previous=B, pending=None). An explicit install is the
+    // ONLY way to prepare candidate C, so staging must trigger there even when all
+    // installed artifacts are already valid.
+    let recovery_state = mode == instance::InstanceMode::System
+        && system_generation_store(&ctx)
+            .read_state()
+            .is_ok_and(|state| {
+                state.active.is_none() && state.pending.is_none() && state.previous.is_some()
+            });
+    if recovery_state
+        || (system_daemon_active && !force && (!binary_valid || !cli_binary_valid || !geo_valid))
+    {
         if !is_current_process_root() {
             let exe = std::env::current_exe()?;
             let args: Vec<String> = std::env::args().skip(1).collect();
@@ -8625,16 +12188,34 @@ async fn cmd_install_instance(
             std::process::exit(status.code().unwrap_or(1));
         }
         println!();
-        println!("  System service is currently running. Preparing staged upgrade in pending generation...");
+        if recovery_state {
+            println!(
+                "  恢复态（已撤销上一次候选）：准备候选 C，继续绑定已认证基线（不捕获当前安装态）..."
+            );
+        } else {
+            println!("  System service is currently running. Preparing staged upgrade in pending generation...");
+        }
         let stage = tempfile::tempdir()?;
         let staged_core = stage.path().join("mihomo");
-        if !binary_valid {
-            installer::download_mihomo_to_with_mirror(version, &staged_core, github_mirror)
-                .await
-                .map_err(|e| anyhow::anyhow!(install_download_error(&e.to_string())))?;
+        // In recovery the candidate must draw from the authenticated baseline or
+        // from a freshly downloaded/validated artifact. A current Core that merely
+        // passes `-v` may be the very bytes that already failed.
+        let authenticated_core = if recovery_state {
+            recovery_baseline_artifact(&ctx, "mihomo")?
         } else {
-            let existing_core = std::fs::read(&ctx.paths.core_binary)?;
-            std::fs::write(&staged_core, existing_core)?;
+            None
+        };
+        match authenticated_core {
+            Some(bytes) => std::fs::write(&staged_core, bytes)?,
+            None if recovery_state || !binary_valid => {
+                installer::download_mihomo_to_with_mirror(version, &staged_core, github_mirror)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(install_download_error(&e.to_string())))?;
+            }
+            None => {
+                let existing_core = std::fs::read(&ctx.paths.core_binary)?;
+                std::fs::write(&staged_core, existing_core)?;
+            }
         }
         let core_bytes = std::fs::read(&staged_core)?;
 
@@ -8642,10 +12223,23 @@ async fn cmd_install_instance(
         let cli_bytes = std::fs::read(&current_cli)?;
 
         let mut extra_artifacts = Vec::new();
+        if recovery_state {
+            for name in ["geoip.metadb", "GeoSite.dat"] {
+                if let Some(bytes) = recovery_baseline_artifact(&ctx, name)? {
+                    extra_artifacts.push((name.to_string(), bytes, Some(0o644)));
+                }
+            }
+        }
         if !geo_valid {
             let geo_stage = tempfile::tempdir()?;
             let _ = installer::ensure_geo_files_in(geo_stage.path(), github_mirror).await;
             for name in ["geoip.metadb", "GeoSite.dat", "Country.mmdb"] {
+                if extra_artifacts
+                    .iter()
+                    .any(|(existing, _, _)| existing == name)
+                {
+                    continue;
+                }
                 let p = geo_stage.path().join(name);
                 if p.exists() {
                     let b = std::fs::read(&p)?;
@@ -8655,6 +12249,11 @@ async fn cmd_install_instance(
         }
 
         let gen_id = prepare_system_generation(&ctx, &core_bytes, &cli_bytes, extra_artifacts)?;
+        if recovery_state {
+            println!("  ✅ Candidate {gen_id} prepared; not yet applied.");
+            println!("  Apply: mihomo-cli restart --system");
+            return Ok(());
+        }
         println!("  ✅ Upgrade prepared in pending generation: {gen_id}");
         println!("  The running daemon and core were not interrupted.");
         println!(
@@ -8899,7 +12498,7 @@ async fn cmd_install_instance(
                 if is_best_effort_unload {
                     run_install_cleanup_command(command);
                 } else {
-                    // Issue #015 install atomicity: on activation failure make the
+                    // install atomicity: on activation failure make the
                     // half-installed state explicit instead of a raw error — the
                     // files are in place and a plain rerun resumes once the
                     // service manager is available and working.
@@ -8938,6 +12537,7 @@ async fn cmd_install_instance(
                     maybe_auto_recover_active_transaction(
                         &ctx,
                         tun_transaction::RecoveryDirection::Abort,
+                        false,
                         false,
                         false,
                     )
@@ -9282,7 +12882,7 @@ async fn apply_config_reload_lines(
 ) -> Vec<String> {
     match reload_configs_for_resolved_instance(system, user, paths, base_revision).await {
         Ok(RuntimeApplyOutcome::SystemPromoted) => system_config_applied_lines(),
-        // Issue #022 C + review 回归-2：既不得凭空怂恿 restart（原问题），
+        // C + review 回归-2：既不得凭空怂恿 restart（原问题），
         // 也不得在没有 revision attestation 时声称"已生效"——SPEC §12.3 要求
         // 无法证明时如实报 unknown，只去掉误导性的 restart 劝导。
         Ok(_) => vec![
@@ -9296,7 +12896,7 @@ async fn apply_config_reload_lines(
     }
 }
 
-/// Issue #022 C：配置应用结果的真实状态。
+/// C：配置应用结果的真实状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeApplyOutcome {
     /// system 模式：daemon promotion 成功，运行时已应用。
@@ -9317,7 +12917,7 @@ impl RuntimeApplyOutcome {
     }
 }
 
-/// 规则变更后的应用流程：先合并，再按真实结果汇报（Issue #022 C）。
+/// 规则变更后的应用流程：先合并，再按真实结果汇报（C）。
 async fn rule_apply_outcome(
     system: bool,
     user: bool,
@@ -9328,6 +12928,18 @@ async fn rule_apply_outcome(
         return Ok(RuntimeApplyOutcome::Pending);
     }
     reload_config_for_mutation(system, user, paths, config_base_revision(paths).as_deref()).await
+}
+
+/// review MAJOR-1：识别 daemon 的 TUN attestation/护栏 Error。
+/// 判据锚定 daemon 与 CLI 共享的标记常量（`ipc::TUN_GUARD_ERROR_MARKER`），
+/// 不再匹配自由文案—— 场景下 `tun_active` 为 false，这条判据是护栏
+/// Error 不被折叠为 Pending 的唯一防线；文案措辞改动若丢掉标记会被
+/// daemon 侧源码锁测试拦下，而不是静默回退。
+/// 这些错误宣告运行态 TUN 已被拆除或无法观测，必须作为 Err 显式呈现；
+/// 折叠为 Pending 会让用户只看到 "restart to apply"，而 restart 仍从
+/// active-config 启动，TUN 不会回来。
+fn is_tun_guard_error(message: &str) -> bool {
+    message.contains(crate::ipc::TUN_GUARD_ERROR_MARKER)
 }
 
 async fn reload_config_for_mutation(
@@ -9347,11 +12959,13 @@ async fn reload_config_for_mutation(
         reload_configs_for_resolved_instance(system, user, paths, base_revision).await?;
         Ok(RuntimeApplyOutcome::SystemPromoted)
     } else {
-        Ok(
-            reload_configs_for_resolved_instance(system, user, paths, base_revision)
-                .await
-                .unwrap_or(RuntimeApplyOutcome::Pending),
-        )
+        match reload_configs_for_resolved_instance(system, user, paths, base_revision).await {
+            Ok(outcome) => Ok(outcome),
+            // review MAJOR-3：TUN 护栏 Error 必须走 Err 分支显式
+            // 呈现，不得折叠为 Pending；其余失败保持既有 Pending 语义。
+            Err(error) if is_tun_guard_error(&error.to_string()) => Err(error),
+            Err(_) => Ok(RuntimeApplyOutcome::Pending),
+        }
     }
 }
 
@@ -9367,18 +12981,24 @@ async fn try_reload_group_config(
     }
 }
 
+/// The daemon-owned selection mirror exists only in system mode; resolve it
+/// runtime-first so the push does not depend on the user passing `--system`
+/// (issue 's invocation omits it in a system install).
+fn selection_mirror_target_is_system(system: bool, user: bool) -> bool {
+    matches!(
+        resolve_current_instance_context(system, user, instance::CommandIntent::ReadOnly),
+        Ok(resolved) if resolved.ctx.mode == instance::InstanceMode::System
+    )
+}
+
 async fn apply_config_reload_required(
     system: bool,
     user: bool,
     paths: &utils::AppPaths,
     base_revision: Option<&str>,
 ) -> anyhow::Result<Vec<String>> {
-    let mirror_target_is_system = matches!(
-        resolve_current_instance_context(system, user, instance::CommandIntent::ReadOnly),
-        Ok(resolved) if resolved.ctx.mode == instance::InstanceMode::System
-    );
-    if mirror_target_is_system {
-        push_active_subscription_mirror(paths).await;
+    if selection_mirror_target_is_system(system, user) {
+        push_active_subscription_mirror(paths, false).await;
     }
     Ok(apply_config_reload_lines(system, user, paths, base_revision).await)
 }
@@ -9446,7 +13066,7 @@ fn format_config_add_success(id: &str, apply_lines: Vec<String>) -> Vec<String> 
 fn format_legacy_url_add_success(id: &str, hot_reloaded: bool) -> Vec<String> {
     let mut lines = vec![format!("  Added and activated subscription {id}")];
     if hot_reloaded {
-        // Issue #022 C + review 回归-2：不要求无谓的 restart，但也不得越过 attestation 声称已生效。
+        // C + review 回归-2：不要求无谓的 restart，但也不得越过 attestation 声称已生效。
         lines.extend([
             "  ✓ Config reload request accepted by Core API".to_string(),
             "  ℹ Runtime status: unknown (revision attestation unavailable)".to_string(),
@@ -9480,7 +13100,7 @@ fn format_fix_result(fixed_controller: bool, hot_reloaded: bool) -> Vec<String> 
         vec!["  Config already has Unix socket — no fix needed.".to_string()]
     };
     if hot_reloaded {
-        // Issue #022 C：重载已接受是事实；controller 变更仍需 restart 的提示保留。
+        // C：重载已接受是事实；controller 变更仍需 restart 的提示保留。
         lines.push("  ✓ Config reload request accepted by Core API".to_string());
     }
     lines
@@ -9555,16 +13175,42 @@ fn print_json_envelope(
     Ok(())
 }
 
+fn json_error_envelope(command: &str, error: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ok": false,
+        "command": command,
+        "data": serde_json::Value::Null,
+        "warnings": Vec::<String>::new(),
+        "error": error,
+        "meta": {
+            "schema_version": 1,
+            "cli_version": env!("MIHOMO_CLI_VERSION"),
+        }
+    })
+}
+
 fn validate_config_at_paths_with_binary_json(
     paths: &utils::AppPaths,
     mihomo: &std::path::Path,
     json: bool,
 ) -> anyhow::Result<()> {
     let report = config::validate_config_at(paths, Some(mihomo))?;
+    let intranet_warnings = if let Ok(content) = std::fs::read_to_string(paths.config_path()) {
+        if let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+            config::lint_intranet_guard(&yaml)
+        } else {
+            vec![]
+        }
+    } else {
+        vec![]
+    };
     if json {
         let mut warnings = Vec::new();
         if !report.mihomo_tested {
             warnings.push(format!("mihomo binary not found: {}", mihomo.display()));
+        }
+        for w in &intranet_warnings {
+            warnings.push(format!("{}: {}", w.message, w.recommendation));
         }
         print_json_envelope(
             "config.validate",
@@ -9578,11 +13224,12 @@ fn validate_config_at_paths_with_binary_json(
             warnings,
         )
     } else {
-        print_lines(format_config_validation_result(
-            &paths.config_path(),
-            mihomo,
-            &report,
-        ));
+        let mut lines = format_config_validation_result(&paths.config_path(), mihomo, &report);
+        for w in &intranet_warnings {
+            lines.push(format!("  ⚠ [Intranet Guard] {}", w.message));
+            lines.push(format!("     💡 {}", w.recommendation));
+        }
+        print_lines(lines);
         Ok(())
     }
 }
@@ -9786,10 +13433,12 @@ fn system_config_requires_promotion(mode: instance::InstanceMode) -> bool {
 async fn send_record_selection_intent(
     subscription_id: &str,
     content_yaml: String,
+    config_revision: Option<String>,
 ) -> anyhow::Result<()> {
     match ipc::send_command(&ipc::DaemonCommand::RecordSelectionIntent {
         subscription_id: subscription_id.to_string(),
         content_yaml,
+        config_revision,
         token: None,
     })
     .await?
@@ -9804,52 +13453,92 @@ async fn send_record_selection_intent(
 /// system daemon mirror (SPEC §3.8.1 mirror contract). Never fails the caller,
 /// but R3.2 escalates failures: one self-heal retry on the same sanctioned
 /// path, then an actionable report instead of a bare warning log.
-async fn push_selection_mirror_update(paths: &utils::AppPaths, subscription_id: &str) {
+///
+/// Snapshot/lock boundary: the intent file is read without taking the
+/// selection lock here. The `select` path already holds that lock for the whole
+/// call, so its snapshot and push stay ordered against concurrent selects; the
+/// callers that push after releasing the lock (unpin, group delete) only need
+/// eventual consistency — a stale read can leave the mirror one generation
+/// behind, and `restart` / daemon start rebuild it from the full intent set
+/// (`push_selection_mirror_full`), which heals the gap. Taking the lock just to
+/// read the snapshot would not order the pushes themselves (IPC would still run
+/// outside the lock, so two callers can still land out of order) and would add
+/// a lock acquisition on a file that is already replaced atomically — so the
+/// extra lock is not worth it.
+async fn push_selection_mirror_update(paths: &utils::AppPaths, subscription_id: &str, json: bool) {
     let file = paths.selection_state_path_for_subscription(subscription_id);
     let Ok(content) = std::fs::read_to_string(&file) else {
         return;
     };
-    if let Err(err) = send_record_selection_intent(subscription_id, content.clone()).await {
-        match send_record_selection_intent(subscription_id, content).await {
-            Ok(()) => println!(
-                "⚠ runtime selection mirror first push failed ({err:#}); self-healed on retry"
-            ),
-            Err(retry_err) => println!(
-                "⚠ runtime selection mirror not updated ({retry_err:#});\n  replay after daemon restart may be skipped\n  repair: mihomo-cli restart --system (rebuilds the runtime selection mirror)"
-            ),
+    let revision = config_base_revision(paths);
+    if let Err(err) =
+        send_record_selection_intent(subscription_id, content.clone(), revision.clone()).await
+    {
+        match send_record_selection_intent(subscription_id, content, revision).await {
+            Ok(()) => {
+                if json {
+                    eprintln!(
+                        "⚠ runtime selection mirror first push failed ({err:#}); self-healed on retry"
+                    );
+                } else {
+                    println!(
+                        "⚠ runtime selection mirror first push failed ({err:#}); self-healed on retry"
+                    );
+                }
+            }
+            Err(retry_err) => {
+                if json {
+                    eprintln!(
+                        "⚠ runtime selection mirror not updated ({retry_err:#});\n  replay after daemon restart may be skipped\n  repair: mihomo-cli restart --system (rebuilds the runtime selection mirror)"
+                    );
+                } else {
+                    println!(
+                        "⚠ runtime selection mirror not updated ({retry_err:#});\n  replay after daemon restart may be skipped\n  repair: mihomo-cli restart --system (rebuilds the runtime selection mirror)"
+                    );
+                }
+            }
         }
     }
 }
 
 /// Best-effort push of the active subscription mirror plus its selection map.
-async fn push_active_subscription_mirror(paths: &utils::AppPaths) {
+async fn push_active_subscription_mirror(paths: &utils::AppPaths, json: bool) {
     let Ok(Some(active)) = config::get_active_id_at(paths) else {
         return;
     };
     if let Err(err) = ipc::send_command(&ipc::DaemonCommand::RecordActiveSubscription {
         subscription_id: active.clone(),
+        config_revision: config_base_revision(paths),
         token: None,
     })
     .await
     {
-        println!(
-            "⚠ runtime selection mirror not updated; replay after daemon restart may be skipped ({err:#})"
-        );
+        if json {
+            eprintln!(
+                "⚠ runtime selection mirror not updated; replay after daemon restart may be skipped ({err:#})"
+            );
+        } else {
+            println!(
+                "⚠ runtime selection mirror not updated; replay after daemon restart may be skipped ({err:#})"
+            );
+        }
         return;
     }
-    push_selection_mirror_update(paths, &active).await;
+    push_selection_mirror_update(paths, &active, json).await;
 }
 
 /// Idempotent full mirror rebuild used by lifecycle start/restart: pushes the
 /// active pointer and every persisted selection file before the daemon
 /// (re)starts the Core, so daemon-side replay reads only the fixed runtime.
-async fn push_selection_mirror_full(ctx: &instance::InstanceContext) {
+async fn push_selection_mirror_full(ctx: &instance::InstanceContext, config_revision: &str) {
     let paths = utils::AppPaths::new(ctx.paths.config_dir.clone());
     let Ok(Some(active)) = config::get_active_id_at(&paths) else {
         return;
     };
+    let revision = config_revision.to_string();
     if let Err(err) = ipc::send_command(&ipc::DaemonCommand::RecordActiveSubscription {
         subscription_id: active,
+        config_revision: Some(revision.clone()),
         token: None,
     })
     .await
@@ -9865,7 +13554,9 @@ async fn push_selection_mirror_full(ctx: &instance::InstanceContext) {
             if path.extension().is_some_and(|ext| ext == "yaml") {
                 if let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) {
                     let content = std::fs::read_to_string(&path).unwrap_or_default();
-                    if let Err(err) = send_record_selection_intent(id, content).await {
+                    if let Err(err) =
+                        send_record_selection_intent(id, content, Some(revision.clone())).await
+                    {
                         println!(
                             "⚠ runtime selection mirror not updated; replay after daemon restart may be skipped ({err:#})"
                         );
@@ -9997,7 +13688,13 @@ async fn reconcile_selection_mirror(paths: &utils::AppPaths) -> anyhow::Result<V
     {
         let file = paths.selection_state_path_for_subscription(id);
         match std::fs::read_to_string(&file) {
-            Ok(content) => match send_record_selection_intent(id, content).await {
+            Ok(content) => match send_record_selection_intent(
+                id,
+                content,
+                config_base_revision(paths),
+            )
+            .await
+            {
                 Ok(()) => lines.push(format!(
                     "✅ selection mirror {id} repaired from user-tree intent ({kind:?})"
                 )),
@@ -10021,7 +13718,7 @@ async fn reload_configs_for_resolved_instance(
 ) -> anyhow::Result<RuntimeApplyOutcome> {
     let resolved =
         resolve_current_instance_context(system, user, instance::CommandIntent::ReadOnly)?;
-    // Issue #022 B + review MAJOR-3：基线比对与 reconcile 在同一把锁内完成，
+    // B + review MAJOR-3：基线比对与 reconcile 在同一把锁内完成，
     // 直接使用锁内返回的内容，不在锁外重读（reconcile 主动改写不再跳过并发检查）。
     let reconciled = config::reconcile_override_into_intent_checked(paths, base_revision)?;
     if reconciled.changed {
@@ -10031,6 +13728,7 @@ async fn reload_configs_for_resolved_instance(
     if system_config_requires_promotion(resolved.ctx.mode) {
         let revision = tun_transaction::content_revision(content.as_bytes());
         let subscription_id = config::get_active_id_at(paths)?;
+        let subscription_id_at_request = subscription_id.clone();
         match ipc::send_command(&ipc::DaemonCommand::PromoteSystemConfig {
             config_content: content,
             config_revision: revision,
@@ -10040,7 +13738,20 @@ async fn reload_configs_for_resolved_instance(
         })
         .await?
         {
-            ipc::DaemonResponse::Success { .. } => return Ok(RuntimeApplyOutcome::SystemPromoted),
+            ipc::DaemonResponse::Success { message } => {
+                // Consume the promotion message: it carries the daemon-side
+                // replay report (remedies included) and any identity-mismatch
+                // signal — it must not be swallowed. Bind to the
+                // subscription_id sent with the promotion request.
+                for line in selection_replay_message_lines(
+                    &message,
+                    subscription_id_at_request.as_deref(),
+                    paths,
+                ) {
+                    println!("{line}");
+                }
+                return Ok(RuntimeApplyOutcome::SystemPromoted);
+            }
             ipc::DaemonResponse::Error { message } => anyhow::bail!(message),
             response => anyhow::bail!("unexpected daemon promotion response: {response:?}"),
         }
@@ -10051,7 +13762,12 @@ async fn reload_configs_for_resolved_instance(
     );
     let config_path = paths.config_path().display().to_string();
     mihomo_api::reload_configs_with_client(&client, &config_path).await?;
-    print_selection_replay_after_ready(paths, &client, std::time::Instant::now()).await;
+    print_selection_replay_after_ready(
+        paths,
+        &client,
+        std::time::Instant::now() + selection::REPLAY_TOTAL_BUDGET,
+    )
+    .await;
     Ok(RuntimeApplyOutcome::from_mode(resolved.ctx.mode))
 }
 
@@ -10089,7 +13805,7 @@ async fn cmd_config(args: ConfigCmd) -> anyhow::Result<()> {
         json,
     } = args;
 
-    // Issue #013: `config validate` is accepted as a subcommand, equivalent to `--validate`.
+    // `config validate` is accepted as a subcommand, equivalent to `--validate`.
     let validate = validate || matches!(command, Some(ConfigSubcommand::Validate));
 
     // ADR-02: System config is now per-user, same write path as User config.
@@ -10306,46 +14022,50 @@ async fn cmd_config(args: ConfigCmd) -> anyhow::Result<()> {
             return Ok(());
         }
         print_lines(format_config_add_start());
-        let _lock = crate::lock::ConfigLock::acquire(paths.config_dir())?;
-        let meta_snapshot = snapshot_file(&paths.subscriptions_meta_path())?;
-        let active_snapshot = snapshot_file(&paths.active_file_path())?;
         let activate_flag = resolve_activate_flag(activate, no_activate, yes);
-        drop(_lock);
-        let id = config::add_subscription_at_with_user_agent(
+        // Defect 1: download stays outside the lock (slow network must not
+        // block other config commands); the URL match, THIS transaction's
+        // pre-image, the commit, the activate prompt and the merge validation
+        // all happen inside one lock hold via `commit_subscription_matched_
+        // checked_at`, so a merge failure restores only this transaction's
+        // true pre-image and can never clobber a concurrent successful commit.
+        let prepared =
+            config::prepare_subscription_with_user_agent(&url, user_agent.clone()).await?;
+        let commit = config::commit_subscription_matched_checked_at(
             &paths,
             &url,
+            &prepared.yaml_content,
             user_agent.clone(),
             activate_flag,
-        )
-        .await?;
-        let _lock = crate::lock::ConfigLock::acquire(paths.config_dir())?;
-        // If not auto-activated and no explicit flag, prompt or hint
-        if activate_flag.is_none() {
-            let active_id = std::fs::read_to_string(paths.active_file_path()).unwrap_or_default();
-            if active_id.trim() != id {
-                if std::io::stdin().is_terminal() {
-                    use dialoguer::Confirm;
-                    if Confirm::new()
-                        .with_prompt("  Activate this subscription?")
-                        .default(true)
-                        .interact()?
-                    {
-                        config::set_active_id_at(&paths, &id)?;
+            |commit, pre_images| {
+                print_subscription_commit_kind(commit);
+                let id = &commit.id;
+                // If not auto-activated and no explicit flag, prompt or hint
+                if activate_flag.is_none() {
+                    let active_id =
+                        std::fs::read_to_string(paths.active_file_path()).unwrap_or_default();
+                    if active_id.trim() != id {
+                        if std::io::stdin().is_terminal() {
+                            use dialoguer::Confirm;
+                            if Confirm::new()
+                                .with_prompt("  Activate this subscription?")
+                                .default(true)
+                                .interact()?
+                            {
+                                config::set_active_id_at(&paths, id)?;
+                                // The prompt changed `active`: mark it so a
+                                // later merge failure also restores `active`.
+                                pre_images.activated = true;
+                            }
+                        } else {
+                            println!("  Run `mihomo-cli config --switch {id}` to activate.");
+                        }
                     }
-                } else {
-                    println!("  Run `mihomo-cli config --switch {id}` to activate.");
                 }
-            }
-        }
-        merge_subscription_change_checked(
-            &paths,
-            &core_binary,
-            &config_endpoint,
-            &id,
-            meta_snapshot,
-            active_snapshot,
+                merge_subscription_change_checked(&paths, &core_binary, &config_endpoint)
+            },
         )?;
-        drop(_lock);
+        let id = commit.id.clone();
         let apply_lines = apply_config_reload_required(
             system,
             user,
@@ -10425,34 +14145,33 @@ async fn cmd_config(args: ConfigCmd) -> anyhow::Result<()> {
 
     if refresh_all {
         let subs = config::load_subscriptions_at(&paths)?;
-        if subs.is_empty() {
+        let living: Vec<_> = subs.iter().filter(|s| s.is_alive()).collect();
+        if living.is_empty() {
             println!("  No subscriptions to refresh.");
             return Ok(());
         }
         if dry_run {
             print_lines(format_config_dry_run(ConfigDryRunAction::RefreshAll {
-                count: subs.len(),
+                count: living.len(),
             }));
             return Ok(());
         }
         print_lines(format_refresh_all_start());
-        let _lock = crate::lock::ConfigLock::acquire(paths.config_dir())?;
-        let ids = subs.iter().map(|sub| sub.id.clone()).collect::<Vec<_>>();
-        let snapshots = snapshot_subscription_refresh(&paths, &ids)?;
-        drop(_lock);
-        let report = config::refresh_all_at(&paths).await?;
-        let _lock = crate::lock::ConfigLock::acquire(paths.config_dir())?;
-        if let Err(error) = config::merge_user_config_checked_at_endpoint(
-            &paths,
-            Some(&core_binary),
-            &config_endpoint,
-        ) {
-            restore_subscription_refresh(snapshots)?;
-            anyhow::bail!(
-                "Subscription refresh produced an invalid config; restored all last-known-good caches.\n  {error}"
-            );
-        }
-        drop(_lock);
+        // Defect 1/3: all downloads happen outside the config write lock; the
+        // lock-internal commit takes this transaction's pre-images, runs the
+        // merge validation and restores them on failure — never a pre-download
+        // snapshot that could clobber a concurrent commit.
+        let (prepared, mut download_failures) =
+            config::prepare_subscription_refresh_all_at(&paths, user_agent.as_deref()).await?;
+        let report = config::commit_refreshes_checked_at(&paths, prepared, || {
+            config::merge_user_config_checked_at_endpoint(
+                &paths,
+                Some(&core_binary),
+                &config_endpoint,
+            )
+        })?;
+        let mut report = report;
+        report.failed.append(&mut download_failures);
         let apply_lines = apply_config_reload_required(
             system,
             user,
@@ -10482,23 +14201,18 @@ async fn cmd_config(args: ConfigCmd) -> anyhow::Result<()> {
                     return Ok(());
                 }
                 print_lines(format_refresh_active_start(&id));
-                let _lock = crate::lock::ConfigLock::acquire(paths.config_dir())?;
-                let snapshots = snapshot_subscription_refresh(&paths, std::slice::from_ref(&id))?;
-                drop(_lock);
-                config::refresh_subscription_at_with_user_agent(&paths, &id, user_agent.as_deref())
-                    .await?;
-                let _lock = crate::lock::ConfigLock::acquire(paths.config_dir())?;
-                if let Err(error) = config::merge_user_config_checked_at_endpoint(
-                    &paths,
-                    Some(&core_binary),
-                    &config_endpoint,
-                ) {
-                    restore_subscription_refresh(snapshots)?;
-                    anyhow::bail!(
-                        "Subscription refresh produced an invalid config; restored the last-known-good cache.\n  {error}"
-                    );
-                }
-                drop(_lock);
+                // Defect 1/3: download outside the lock; commit + merge +
+                // failure recovery are one lock-internal transaction.
+                let prepared =
+                    config::prepare_subscription_refresh_at(&paths, &id, user_agent.as_deref())
+                        .await?;
+                config::commit_refreshes_checked_at(&paths, vec![(id.clone(), prepared)], || {
+                    config::merge_user_config_checked_at_endpoint(
+                        &paths,
+                        Some(&core_binary),
+                        &config_endpoint,
+                    )
+                })?;
                 let apply_lines = apply_config_reload_required(
                     system,
                     user,
@@ -10548,14 +14262,12 @@ async fn cmd_config(args: ConfigCmd) -> anyhow::Result<()> {
         }
 
         let _lock = crate::lock::ConfigLock::acquire(paths.config_dir())?;
-        let meta_snapshot = snapshot_file(&paths.subscriptions_meta_path())?;
-        let active_snapshot = snapshot_file(&paths.active_file_path())?;
         let existing_subscriptions = config::load_subscriptions_at(&paths)?;
 
         let activate_decision = resolve_activate_flag(activate, no_activate, yes);
         let should_activate = match activate_decision {
             Some(v) => v,
-            None if existing_subscriptions.is_empty() => true,
+            None if !existing_subscriptions.iter().any(|s| s.is_alive()) => true,
             None if std::io::stdin().is_terminal() => {
                 use dialoguer::Confirm;
                 Confirm::new()
@@ -10565,26 +14277,27 @@ async fn cmd_config(args: ConfigCmd) -> anyhow::Result<()> {
             }
             None => false,
         };
+        drop(_lock);
 
-        let id = config::generate_subscription_id();
-        config::commit_imported_subscription_at(
+        // Defect 1: import content is already local (no download window), but
+        // the commit + merge + failure-restore must still be one lock-internal
+        // transaction with this transaction's own pre-images.
+        let commit = config::commit_subscription_matched_checked_at(
             &paths,
-            &id,
-            &yaml_content,
             &format!("file://{}", file),
-            should_activate,
+            &yaml_content,
+            None,
+            Some(should_activate),
+            |commit, _pre_images| {
+                print_subscription_commit_kind(commit);
+                if should_activate {
+                    merge_subscription_change_checked(&paths, &core_binary, &config_endpoint)?;
+                }
+                Ok(())
+            },
         )?;
-
+        let id = commit.id.clone();
         if should_activate {
-            merge_subscription_change_checked(
-                &paths,
-                &core_binary,
-                &config_endpoint,
-                &id,
-                meta_snapshot,
-                active_snapshot,
-            )?;
-            drop(_lock);
             let apply_lines = apply_config_reload_required(
                 system,
                 user,
@@ -10594,7 +14307,6 @@ async fn cmd_config(args: ConfigCmd) -> anyhow::Result<()> {
             .await?;
             print_lines(format_import_success(&id, true, apply_lines));
         } else {
-            drop(_lock);
             print_lines(format_import_success(&id, false, Vec::new()));
             if !std::io::stdin().is_terminal() {
                 println!("  Run `mihomo-cli config --switch {id}` to activate.");
@@ -10612,41 +14324,42 @@ async fn cmd_config(args: ConfigCmd) -> anyhow::Result<()> {
             return Ok(());
         }
         print_lines(format_config_add_start());
-        let _lock = crate::lock::ConfigLock::acquire(paths.config_dir())?;
-        let meta_snapshot = snapshot_file(&paths.subscriptions_meta_path())?;
-        let active_snapshot = snapshot_file(&paths.active_file_path())?;
         let activate_flag = resolve_activate_flag(activate, no_activate, yes);
-        drop(_lock);
-        let id =
-            config::add_subscription_at_with_user_agent(&paths, &u, None, activate_flag).await?;
-        let _lock = crate::lock::ConfigLock::acquire(paths.config_dir())?;
-        // If not auto-activated and no explicit flag, prompt or hint
-        if activate_flag.is_none() {
-            let active_id = std::fs::read_to_string(paths.active_file_path()).unwrap_or_default();
-            if active_id.trim() != id {
-                if std::io::stdin().is_terminal() {
-                    use dialoguer::Confirm;
-                    if Confirm::new()
-                        .with_prompt("  Activate this subscription?")
-                        .default(true)
-                        .interact()?
-                    {
-                        config::set_active_id_at(&paths, &id)?;
-                    }
-                } else {
-                    println!("  Run `mihomo-cli config --switch {id}` to activate.");
-                }
-            }
-        }
-        merge_subscription_change_checked(
+        // Defect 1 (legacy URL entry): same lock-internal transaction contract
+        // as `--add`.
+        let prepared = config::prepare_subscription_with_user_agent(&u, None).await?;
+        let commit = config::commit_subscription_matched_checked_at(
             &paths,
-            &core_binary,
-            &config_endpoint,
-            &id,
-            meta_snapshot,
-            active_snapshot,
+            &u,
+            &prepared.yaml_content,
+            None,
+            activate_flag,
+            |commit, pre_images| {
+                print_subscription_commit_kind(commit);
+                let id = &commit.id;
+                if activate_flag.is_none() {
+                    let active_id =
+                        std::fs::read_to_string(paths.active_file_path()).unwrap_or_default();
+                    if active_id.trim() != id {
+                        if std::io::stdin().is_terminal() {
+                            use dialoguer::Confirm;
+                            if Confirm::new()
+                                .with_prompt("  Activate this subscription?")
+                                .default(true)
+                                .interact()?
+                            {
+                                config::set_active_id_at(&paths, id)?;
+                                pre_images.activated = true;
+                            }
+                        } else {
+                            println!("  Run `mihomo-cli config --switch {id}` to activate.");
+                        }
+                    }
+                }
+                merge_subscription_change_checked(&paths, &core_binary, &config_endpoint)
+            },
         )?;
-        drop(_lock);
+        let id = commit.id.clone();
         let apply_lines = apply_config_reload_required(
             system,
             user,
@@ -10668,13 +14381,7 @@ fn validate_config_at_paths_with_binary(
     paths: &utils::AppPaths,
     mihomo: &std::path::Path,
 ) -> anyhow::Result<()> {
-    let report = config::validate_config_at(paths, Some(mihomo))?;
-    print_lines(format_config_validation_result(
-        &paths.config_path(),
-        mihomo,
-        &report,
-    ));
-    Ok(())
+    validate_config_at_paths_with_binary_json(paths, mihomo, false)
 }
 
 /// Interactive subscription management with keyboard shortcuts.
@@ -10861,6 +14568,9 @@ async fn show_subscription_menu_inner(
                 let selected_id = &subs[*cursor].id;
                 terminal::disable_raw_mode()?;
                 if active.as_deref() != Some(selected_id.as_str()) {
+                    // Defect 1 pattern: snapshot + switch + merge + rollback in
+                    // ONE lock hold so the pre-image cannot go stale.
+                    let _lock = crate::lock::ConfigLock::acquire(paths.config_dir())?;
                     let active_snapshot = snapshot_file(&paths.active_file_path())?;
                     config::switch_subscription_at(paths, selected_id)?;
                     if let Err(err) =
@@ -10877,6 +14587,7 @@ async fn show_subscription_menu_inner(
                         }
                         anyhow::bail!(subscription_switch_rollback_error(&err.to_string()));
                     }
+                    drop(_lock);
                     print_lines(format_tui_switch_result(
                         selected_id,
                         true,
@@ -10890,17 +14601,14 @@ async fn show_subscription_menu_inner(
             KeyCode::Char('R') => {
                 terminal::disable_raw_mode()?;
                 print_lines(format_refresh_all_start());
-                let ids = subs.iter().map(|sub| sub.id.clone()).collect::<Vec<_>>();
-                let snapshots = snapshot_subscription_refresh(paths, &ids)?;
-                let report = config::refresh_all_at(paths).await?;
-                if let Err(error) =
+                // Defect 1/3: downloads outside the lock; lock-internal commit
+                // + merge + recovery with this transaction's pre-images.
+                let (prepared, mut download_failures) =
+                    config::prepare_subscription_refresh_all_at(paths, None).await?;
+                let mut report = config::commit_refreshes_checked_at(paths, prepared, || {
                     config::merge_user_config_checked_at_endpoint(paths, Some(mihomo), endpoint)
-                {
-                    restore_subscription_refresh(snapshots)?;
-                    anyhow::bail!(
-                        "Subscription refresh produced an invalid config; restored all last-known-good caches.\n  {error}"
-                    );
-                }
+                })?;
+                report.failed.append(&mut download_failures);
                 print_lines(format_refresh_all_result(
                     &report,
                     config_restart_apply_lines(),
@@ -10918,19 +14626,19 @@ async fn show_subscription_menu_inner(
                 match &active {
                     Some(id) => {
                         print_lines(format_tui_refresh_active_start(id));
-                        let snapshots =
-                            snapshot_subscription_refresh(paths, std::slice::from_ref(id))?;
-                        config::refresh_subscription_at(paths, id).await?;
-                        if let Err(error) = config::merge_user_config_checked_at_endpoint(
+                        let prepared =
+                            config::prepare_subscription_refresh_at(paths, id, None).await?;
+                        config::commit_refreshes_checked_at(
                             paths,
-                            Some(mihomo),
-                            endpoint,
-                        ) {
-                            restore_subscription_refresh(snapshots)?;
-                            anyhow::bail!(
-                                "Subscription refresh produced an invalid config; restored the last-known-good cache.\n  {error}"
-                            );
-                        }
+                            vec![(id.clone(), prepared)],
+                            || {
+                                config::merge_user_config_checked_at_endpoint(
+                                    paths,
+                                    Some(mihomo),
+                                    endpoint,
+                                )
+                            },
+                        )?;
                         print_lines(format_refresh_active_success(config_restart_apply_lines()));
                     }
                     None => {
@@ -11115,86 +14823,66 @@ fn restore_file_snapshot(path: &std::path::Path, snapshot: Option<String>) -> an
     Ok(())
 }
 
-type PathSnapshot = (std::path::PathBuf, Option<String>);
-
-fn snapshot_subscription_refresh(
-    paths: &utils::AppPaths,
-    ids: &[String],
-) -> anyhow::Result<Vec<PathSnapshot>> {
-    let meta_path = paths.subscriptions_meta_path();
-    let mut snapshots = vec![(meta_path.clone(), snapshot_file(&meta_path)?)];
-    for id in ids {
-        let path = paths.subscription_file_path(id);
-        snapshots.push((path.clone(), snapshot_file(&path)?));
-    }
-    Ok(snapshots)
-}
-
-fn restore_subscription_refresh(snapshots: Vec<PathSnapshot>) -> anyhow::Result<()> {
-    let mut errors = Vec::new();
-    for (path, snapshot) in snapshots {
-        if let Err(error) = restore_file_snapshot(&path, snapshot) {
-            errors.push(format!("{}: {error}", path.display()));
+/// One-line user feedback for URL-matched subscription commits (A1').
+fn subscription_commit_messages(commit: &config::SubscriptionCommit) -> Vec<String> {
+    match &commit.kind {
+        config::SubscriptionCommitKind::New => Vec::new(),
+        config::SubscriptionCommitKind::Reuse => {
+            vec![format!(
+                "  Existing subscription {} reused (same URL).",
+                commit.id
+            )]
+        }
+        config::SubscriptionCommitKind::Revive {
+            retired_at,
+            other_retired,
+        } => {
+            let retired_hint = retired_at
+                .map(|at| at.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                .unwrap_or_else(|| "unknown date".to_string());
+            let mut lines = vec![format!(
+                "  Subscription {} revived (was retired {retired_hint}).",
+                commit.id
+            )];
+            if !other_retired.is_empty() {
+                lines.push(format!(
+                    "  Other retired entries share this URL and stay retired: {}.",
+                    other_retired.join(", ")
+                ));
+            }
+            lines
         }
     }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "subscription refresh rollback incomplete: {}",
-            errors.join("; ")
-        )
+}
+
+fn print_subscription_commit_kind(commit: &config::SubscriptionCommit) {
+    for line in subscription_commit_messages(commit) {
+        println!("{line}");
     }
 }
 
-fn rollback_subscription_change(
-    paths: &utils::AppPaths,
-    new_subscription_id: &str,
-    meta_snapshot: Option<String>,
-    active_snapshot: Option<String>,
-) -> anyhow::Result<()> {
-    let mut errors = Vec::new();
-    if let Err(err) = restore_file_snapshot(&paths.subscriptions_meta_path(), meta_snapshot) {
-        errors.push(format!("subscriptions metadata: {err}"));
-    }
-    if let Err(err) = restore_file_snapshot(&paths.active_file_path(), active_snapshot) {
-        errors.push(format!("active subscription: {err}"));
-    }
-    if let Err(err) =
-        utils::remove_file_if_exists(&paths.subscription_file_path(new_subscription_id))
-    {
-        errors.push(format!("new subscription file: {err}"));
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        anyhow::bail!("subscription rollback incomplete: {}", errors.join("; "))
-    }
-}
-
+/// Merge + validate the generated config after a subscription commit. The
+/// caller must hold the config write lock and perform the merge inside the
+/// commit transaction (`commit_subscription_matched_checked_at`): on failure
+/// the commit transaction restores its own pre-images, so this function only
+/// reports the error.
 fn merge_subscription_change_checked(
     paths: &utils::AppPaths,
     mihomo: &std::path::Path,
     endpoint: &instance::ApiEndpoint,
-    new_subscription_id: &str,
-    meta_snapshot: Option<String>,
-    active_snapshot: Option<String>,
 ) -> anyhow::Result<()> {
+    let _lock = crate::lock::ConfigLock::acquire(paths.config_dir())?;
     if let Err(err) = config::merge_user_config_checked_at_endpoint(paths, Some(mihomo), endpoint) {
-        if let Err(rollback_err) =
-            rollback_subscription_change(paths, new_subscription_id, meta_snapshot, active_snapshot)
-        {
-            anyhow::bail!(
-                "Subscription change failed; rollback incomplete: {}.\n  Original error: {}",
-                rollback_err,
-                err
-            );
-        }
         anyhow::bail!(subscription_change_rollback_error(&err.to_string()));
     }
     Ok(())
 }
 
+/// Rollback of a subscription commit is handled inside the commit transaction
+/// (`config::commit_subscription_matched_checked_at`), which restores this
+/// transaction's true pre-images. The outer download-window snapshots are gone
+/// (defect 1), so no stale pre-download restore can clobber a concurrent
+/// successful commit.
 fn merge_rules_change_checked(
     paths: &utils::AppPaths,
     mihomo: &std::path::Path,
@@ -11417,11 +15105,17 @@ fn format_subscription_list(
         } else {
             " "
         };
+        let retired = if sub.is_alive() {
+            String::new()
+        } else {
+            " [retired]".to_string()
+        };
         format!(
-            "  {} {} ({})",
+            "  {} {} ({}{})",
             marker,
             sub.id,
-            shorten_subscription_url(&sub.url)
+            shorten_subscription_url(&sub.url),
+            retired
         )
     }));
     lines
@@ -11493,7 +15187,16 @@ fn format_dns_status<T: std::fmt::Display>(
     lines
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn format_rule_list(rules: &[String], pos: crate::rules::RulePosition) -> Vec<String> {
+    format_rule_list_annotated(rules, pos, None)
+}
+
+pub(crate) fn format_rule_list_annotated(
+    rules: &[String],
+    pos: crate::rules::RulePosition,
+    available_policies: Option<&[String]>,
+) -> Vec<String> {
     let mut lines = vec![format!("  Insert position: {pos}"), String::new()];
     if rules.is_empty() {
         lines.extend([
@@ -11502,14 +15205,69 @@ fn format_rule_list(rules: &[String], pos: crate::rules::RulePosition) -> Vec<St
             "  Add a rule:  mihomo-cli rule add DOMAIN-SUFFIX,example.com,DIRECT".to_string(),
         ]);
     } else {
-        lines.extend(
-            rules
-                .iter()
-                .enumerate()
-                .map(|(i, rule)| format!("  {}. {}", i + 1, rule)),
-        );
+        lines.extend(rules.iter().enumerate().map(|(i, rule)| {
+            let annotation = if let Some(policies) = available_policies {
+                if let Some(target) = crate::rules::rule_policy(rule) {
+                    let is_builtin = target.eq_ignore_ascii_case("DIRECT")
+                        || target.eq_ignore_ascii_case("REJECT")
+                        || target.eq_ignore_ascii_case("REJECT-DROP")
+                        || target.eq_ignore_ascii_case("PASS");
+                    let is_available =
+                        is_builtin || policies.iter().any(|p| p.eq_ignore_ascii_case(target));
+                    if is_available {
+                        " [Active]".to_string()
+                    } else {
+                        format!(" ⚠ [Fallback: DIRECT (target `{target}` missing)]")
+                    }
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+            format!("  {}. {}{}", i + 1, rule, annotation)
+        }));
     }
     lines
+}
+
+pub(crate) fn doctor_daemon_binary_skew_hint() -> &'static str {
+    "应用更新: mihomo-cli restart --system"
+}
+
+pub(crate) fn has_split_dns_intent(config_text: &str) -> bool {
+    let Ok(val) = serde_yaml::from_str::<serde_yaml::Value>(config_text) else {
+        return false;
+    };
+    if let Some(map) = val
+        .get("dns")
+        .and_then(|d| d.get("nameserver-policy"))
+        .and_then(|np| np.as_mapping())
+    {
+        if !map.is_empty() {
+            return true;
+        }
+    }
+    if let Some(seq) = val
+        .get("tun")
+        .and_then(|t| t.get("route-exclude-address"))
+        .and_then(|r| r.as_sequence())
+    {
+        for item in seq {
+            if let Some(s) = item.as_str() {
+                let trimmed = s.trim();
+                if trimmed.starts_with("10.")
+                    || trimmed.starts_with("172.")
+                    || trimmed.starts_with("192.168.")
+                    || trimmed.starts_with("fd")
+                    || trimmed.starts_with("fc")
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn format_rule_apply_result(merged: bool, apply: RuntimeApplyOutcome) -> Vec<String> {
@@ -11519,7 +15277,7 @@ fn format_rule_apply_result(merged: bool, apply: RuntimeApplyOutcome) -> Vec<Str
             "  Run: mihomo-cli restart  to apply".to_string(),
         ];
     }
-    // Issue #022 C：按真实应用结果汇报，不得在规则已生效时声称
+    // C：按真实应用结果汇报，不得在规则已生效时声称
     // "Runtime status: unknown" 并要求 restart。
     match apply {
         RuntimeApplyOutcome::SystemPromoted => vec![
@@ -11529,7 +15287,7 @@ fn format_rule_apply_result(merged: bool, apply: RuntimeApplyOutcome) -> Vec<Str
         RuntimeApplyOutcome::HotReloadAccepted => vec![
             "  ✓ Rule intent committed".to_string(),
             // review 回归-2：user 实例没有 revision attestation，如实报 unknown；
-            // Issue #022 C 要解决的是"误导性 restart 循环"，不是抬高判定结论。
+            // C 要解决的是"误导性 restart 循环"，不是抬高判定结论。
             "  ℹ Runtime status: unknown (revision attestation unavailable)".to_string(),
         ],
         RuntimeApplyOutcome::Pending => vec![
@@ -11894,8 +15652,8 @@ async fn cmd_group(
                     .and_then(serde_yaml::Value::as_sequence)
                     .cloned()
                     .unwrap_or_default();
-                let known_proxies = known_subscription_proxies(&subscription);
-                let known_providers = known_subscription_providers(&subscription);
+                let known_proxies = known_effective_proxies(&paths, &subscription);
+                let known_providers = known_effective_providers(&paths, &subscription);
                 overlay
                     .merged_groups(&original_seq, &known_proxies, &known_providers)
                     .unwrap_or(original_seq)
@@ -11989,8 +15747,8 @@ async fn cmd_group(
                     .and_then(serde_yaml::Value::as_sequence)
                     .cloned()
                     .unwrap_or_default();
-                let known_proxies = known_subscription_proxies(&subscription);
-                let known_providers = known_subscription_providers(&subscription);
+                let known_proxies = known_effective_proxies(&paths, &subscription);
+                let known_providers = known_effective_providers(&paths, &subscription);
                 overlay
                     .merged_groups(&original_seq, &known_proxies, &known_providers)
                     .unwrap_or(original_seq)
@@ -12059,7 +15817,7 @@ async fn cmd_group(
                 println!("Type:     {group_type}");
                 println!("Source:   {source_label}");
                 if let Some(ref node) = selected_node {
-                    println!("Selected: {node} (#007 persisted)");
+                    println!("Selected: {node} (persisted)");
                 }
                 if let Some(patch) = patch_info {
                     println!("Patch:");
@@ -12078,6 +15836,7 @@ async fn cmd_group(
             name,
             group_type,
             members,
+            uses,
             url,
             interval,
             strategy,
@@ -12093,10 +15852,18 @@ async fn cmd_group(
                 let mut map = serde_yaml::Mapping::new();
                 map.insert("name".into(), name.clone().into());
                 map.insert("type".into(), gt.clone().into());
-                map.insert(
-                    "proxies".into(),
-                    serde_yaml::Value::Sequence(members.into_iter().map(Into::into).collect()),
-                );
+                if !members.is_empty() || uses.is_empty() {
+                    map.insert(
+                        "proxies".into(),
+                        serde_yaml::Value::Sequence(members.into_iter().map(Into::into).collect()),
+                    );
+                }
+                if !uses.is_empty() {
+                    map.insert(
+                        "use".into(),
+                        serde_yaml::Value::Sequence(uses.into_iter().map(Into::into).collect()),
+                    );
+                }
                 // Insert explicit user-provided params
                 if let Some(u) = url {
                     map.insert("url".into(), u.into());
@@ -12160,8 +15927,8 @@ async fn cmd_group(
                 .and_then(serde_yaml::Value::as_sequence)
                 .cloned()
                 .unwrap_or_default();
-            let known_proxies = known_subscription_proxies(&subscription);
-            let known_providers = known_subscription_providers(&subscription);
+            let known_proxies = known_effective_proxies(&paths, &subscription);
+            let known_providers = known_effective_providers(&paths, &subscription);
             let overlay_path = paths.groups_override_path_for_subscription(&scope.subscription_id);
             let mut overlay = crate::groups::GroupsOverlay::load(&overlay_path)?;
             let existing = overlay.merged_groups(&original, &known_proxies, &known_providers)?;
@@ -12243,26 +16010,48 @@ async fn cmd_group(
             )
             .await
         }
-        GroupAction::Add { name, members } => {
+        GroupAction::Add {
+            name,
+            members,
+            uses,
+        } => {
+            if members.is_empty() && uses.is_empty() {
+                anyhow::bail!("at least one of --member or --use is required");
+            }
             drop(_config_lock);
             update_group_overlay(
                 &paths,
                 &scope,
                 &subscription_path,
-                GroupMutation::Add { name, members },
+                GroupMutation::Add {
+                    name,
+                    members,
+                    uses,
+                },
                 system,
                 user,
                 json,
             )
             .await
         }
-        GroupAction::Remove { name, members } => {
+        GroupAction::Remove {
+            name,
+            members,
+            uses,
+        } => {
+            if members.is_empty() && uses.is_empty() {
+                anyhow::bail!("at least one of --member or --use is required");
+            }
             drop(_config_lock);
             update_group_overlay(
                 &paths,
                 &scope,
                 &subscription_path,
-                GroupMutation::Remove { name, members },
+                GroupMutation::Remove {
+                    name,
+                    members,
+                    uses,
+                },
                 system,
                 user,
                 json,
@@ -12329,6 +16118,56 @@ fn known_subscription_providers(
         .collect()
 }
 
+fn known_effective_proxies(
+    paths: &utils::AppPaths,
+    subscription: &serde_yaml::Value,
+) -> std::collections::HashSet<String> {
+    let mut proxies = known_subscription_proxies(subscription);
+    let override_path = paths.override_path();
+    if override_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&override_path) {
+            if let Ok(val) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+                for p in config::extract_override_proxies(&val) {
+                    proxies.insert(p);
+                }
+            }
+        }
+    }
+    proxies
+}
+
+fn known_effective_providers(
+    paths: &utils::AppPaths,
+    subscription: &serde_yaml::Value,
+) -> std::collections::HashSet<String> {
+    let mut providers = known_subscription_providers(subscription);
+    let override_path = paths.override_path();
+    if override_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&override_path) {
+            if let Ok(val) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+                for p in config::extract_override_providers(&val) {
+                    providers.insert(p);
+                }
+            }
+        }
+    }
+    providers
+}
+
+fn known_provider_payload_nodes(
+    paths: &utils::AppPaths,
+) -> std::collections::HashMap<String, String> {
+    let override_path = paths.override_path();
+    if override_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&override_path) {
+            if let Ok(val) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+                return config::extract_inline_provider_payload_nodes(&val);
+            }
+        }
+    }
+    std::collections::HashMap::new()
+}
+
 #[derive(Debug)]
 enum GroupMutation {
     Replace {
@@ -12338,10 +16177,12 @@ enum GroupMutation {
     Add {
         name: String,
         members: Vec<String>,
+        uses: Vec<String>,
     },
     Remove {
         name: String,
         members: Vec<String>,
+        uses: Vec<String>,
     },
     Delete {
         name: String,
@@ -12369,8 +16210,8 @@ async fn update_group_overlay(
         .and_then(serde_yaml::Value::as_sequence)
         .cloned()
         .unwrap_or_default();
-    let known_proxies = known_subscription_proxies(&subscription);
-    let known_providers = known_subscription_providers(&subscription);
+    let known_proxies = known_effective_proxies(paths, &subscription);
+    let known_providers = known_effective_providers(paths, &subscription);
     let overlay_path = paths.groups_override_path_for_subscription(subscription_id);
     let mut overlay = crate::groups::GroupsOverlay::load(&overlay_path)?;
 
@@ -12388,6 +16229,10 @@ async fn update_group_overlay(
         GroupMutation::Remove { .. } => "remove",
         GroupMutation::Delete { .. } => "delete",
     };
+    // only delete makes the persisted selection an orphan; the
+    // cleanup runs after the merge commits, so it is captured before `mutation`
+    // is moved into the match below.
+    let is_delete = matches!(&mutation, GroupMutation::Delete { .. });
 
     let is_prepend = overlay
         .prepend
@@ -12414,7 +16259,23 @@ async fn update_group_overlay(
             let had_patch = overlay.patches.contains_key(&name);
             let was_deleted = overlay.delete.iter().any(|d| d == &name);
             if !had_patch && !was_deleted {
-                println!("proxy group `{name}` is already at upstream state (no-op)");
+                if json {
+                    eprintln!("proxy group `{name}` is already at upstream state (no-op)");
+                    let report = serde_json::json!({
+                        "status": "success",
+                        "action": action_name,
+                        "group": name,
+                        "intent": "Committed",
+                        "control_plane": "Applied",
+                        "runtime_attestation": "Attested",
+                        "pending": false,
+                        "error": serde_json::Value::Null,
+                        "selection_cleanup": serde_json::Value::Null,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("proxy group `{name}` is already at upstream state (no-op)");
+                }
                 return Ok(());
             }
             // Clear patches and remove from delete list, as well as any append/prepend duplicate
@@ -12479,12 +16340,10 @@ async fn update_group_overlay(
                 overlay
                     .prepend
                     .retain(|group| crate::groups::group_name(group) != Some(name.as_str()));
-                let _ = crate::selection::unpin_selection_for_scope(scope, &name);
             } else if is_append {
                 overlay
                     .append
                     .retain(|group| crate::groups::group_name(group) != Some(name.as_str()));
-                let _ = crate::selection::unpin_selection_for_scope(scope, &name);
             }
             // For native groups (including those that may also have patches), add to delete list
             // and clean up patches
@@ -12493,8 +16352,11 @@ async fn update_group_overlay(
                     overlay.delete.push(name.clone());
                 }
                 overlay.patches.remove(&name);
-                let _ = crate::selection::unpin_selection_for_scope(scope, &name);
-                println!("原生组 `{name}` 已标记隐藏（将在配置合成时被过滤）");
+                if json {
+                    eprintln!("原生组 `{name}` 已标记隐藏（将在配置合成时被过滤）");
+                } else {
+                    println!("原生组 `{name}` 已标记隐藏（将在配置合成时被过滤）");
+                }
             }
             // Persist falls through to the shared path after the match.
         }
@@ -12526,38 +16388,82 @@ async fn update_group_overlay(
                 overlay.append.push(group);
             }
         }
-        GroupMutation::Add { members, .. } => {
+        GroupMutation::Add { members, uses, .. } => {
             if !is_prepend && !is_append && !is_original {
                 anyhow::bail!("proxy group not found: {name}");
             }
+            let payload_nodes = known_provider_payload_nodes(paths);
+            for m in &members {
+                if let Some(p) = payload_nodes.get(m) {
+                    anyhow::bail!(
+                        "Node `{m}` is defined inside proxy-provider `{p}`. In Mihomo, provider nodes cannot be added to group `proxies`; use `--use {p}`, or define the node under `proxies-append` in override.yaml."
+                    );
+                }
+                if known_providers.contains(m) {
+                    anyhow::bail!(
+                        "`{m}` is a proxy-provider, not a proxy node. Did you mean: mihomo-cli group add --group {name} --use {m} ?"
+                    );
+                }
+            }
+            for u in &uses {
+                if !known_providers.contains(u) {
+                    anyhow::bail!("proxy group `{name}` references unknown proxy provider `{u}`");
+                }
+            }
+
             if is_original && !is_custom {
-                // Native group: write/update patches[name].add_proxies
+                // Native group: write/update patches[name].add_proxies and add_use
                 let current_group = original
                     .iter()
                     .find(|g| crate::groups::group_name(g) == Some(name.as_str()))
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("proxy group not found: {name}"))?;
                 let current_members = crate::groups::group_members(&current_group)?;
+                let current_uses: Vec<String> = current_group
+                    .get("use")
+                    .and_then(serde_yaml::Value::as_sequence)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_yaml::Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
+
                 let patch = overlay.patches.entry(name.clone()).or_default();
-                // Effective members = current_members + patch.add_proxies - patch.remove_proxies
-                let mut effective: std::collections::HashSet<String> = current_members
+                let mut effective_members: std::collections::HashSet<String> = current_members
                     .iter()
                     .chain(patch.add_proxies.iter())
                     .filter(|m| !patch.remove_proxies.contains(*m))
                     .cloned()
                     .collect();
                 for member in members {
-                    if effective.contains(&member) {
+                    if effective_members.contains(&member) {
                         anyhow::bail!("proxy group `{name}` already contains member `{member}`");
                     }
-                    effective.insert(member.clone());
+                    effective_members.insert(member.clone());
                     patch.remove_proxies.retain(|m| m != &member);
                     if !current_members.contains(&member) && !patch.add_proxies.contains(&member) {
                         patch.add_proxies.push(member.clone());
                     }
                 }
-                // Clean up empty patch
-                if patch.add_proxies.is_empty() && patch.remove_proxies.is_empty() {
+
+                let mut effective_uses: std::collections::HashSet<String> = current_uses
+                    .iter()
+                    .chain(patch.add_use.iter())
+                    .filter(|u| !patch.remove_use.contains(*u))
+                    .cloned()
+                    .collect();
+                for u in uses {
+                    if effective_uses.contains(&u) {
+                        anyhow::bail!("proxy group `{name}` already uses provider `{u}`");
+                    }
+                    effective_uses.insert(u.clone());
+                    patch.remove_use.retain(|item| item != &u);
+                    if !current_uses.contains(&u) && !patch.add_use.contains(&u) {
+                        patch.add_use.push(u.clone());
+                    }
+                }
+
+                if patch.is_empty() {
                     overlay.patches.remove(&name);
                 }
             } else {
@@ -12568,22 +16474,49 @@ async fn update_group_overlay(
                     .find(|group| crate::groups::group_name(group) == Some(name.as_str()))
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("proxy group not found: {name}"))?;
-                let mut existing = crate::groups::group_members(&current_group)?;
+                let mut existing_members = crate::groups::group_members(&current_group)?;
                 for member in members {
-                    if existing.iter().any(|item| item == &member) {
+                    if existing_members.iter().any(|item| item == &member) {
                         anyhow::bail!("proxy group `{name}` already contains member `{member}`");
                     }
-                    existing.push(member);
+                    existing_members.push(member);
                 }
+                let mut existing_uses: Vec<String> = current_group
+                    .get("use")
+                    .and_then(serde_yaml::Value::as_sequence)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_yaml::Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
+                for u in uses {
+                    if existing_uses.iter().any(|item| item == &u) {
+                        anyhow::bail!("proxy group `{name}` already uses provider `{u}`");
+                    }
+                    existing_uses.push(u);
+                }
+
                 let updated_group = {
                     let mut map = current_group
                         .as_mapping()
                         .cloned()
                         .ok_or_else(|| anyhow::anyhow!("proxy group `{name}` is not a mapping"))?;
-                    map.insert(
-                        serde_yaml::Value::String("proxies".into()),
-                        serde_yaml::Value::Sequence(existing.into_iter().map(Into::into).collect()),
-                    );
+                    if !existing_members.is_empty() {
+                        map.insert(
+                            serde_yaml::Value::String("proxies".into()),
+                            serde_yaml::Value::Sequence(
+                                existing_members.into_iter().map(Into::into).collect(),
+                            ),
+                        );
+                    }
+                    if !existing_uses.is_empty() {
+                        map.insert(
+                            serde_yaml::Value::String("use".into()),
+                            serde_yaml::Value::Sequence(
+                                existing_uses.into_iter().map(Into::into).collect(),
+                            ),
+                        );
+                    }
                     serde_yaml::Value::Mapping(map)
                 };
                 let target = if is_prepend {
@@ -12598,43 +16531,52 @@ async fn update_group_overlay(
                 }
             }
         }
-        GroupMutation::Remove { members, .. } => {
+        GroupMutation::Remove { members, uses, .. } => {
             if !is_prepend && !is_append && !is_original {
                 anyhow::bail!("proxy group not found: {name}");
             }
             if is_original && !is_custom {
-                // Native group: write/update patches[name].remove_proxies
                 let current_group = original
                     .iter()
                     .find(|g| crate::groups::group_name(g) == Some(name.as_str()))
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("proxy group not found: {name}"))?;
                 let current_members = crate::groups::group_members(&current_group)?;
-                let patch = overlay.patches.entry(name.clone()).or_default();
-                // Effective members = current_members + patch.add_proxies - patch.remove_proxies
-                let mut effective: Vec<String> = current_members
-                    .iter()
-                    .chain(patch.add_proxies.iter())
-                    .filter(|m| !patch.remove_proxies.contains(*m))
-                    .cloned()
+                let current_uses: Vec<String> = current_group
+                    .get("use")
+                    .and_then(serde_yaml::Value::as_sequence)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_yaml::Value::as_str)
+                    .map(str::to_owned)
                     .collect();
+
+                let patch = overlay.patches.entry(name.clone()).or_default();
                 for member in members {
-                    if !effective.contains(&member) {
-                        anyhow::bail!("proxy group `{name}` does not contain member `{member}`");
-                    }
-                    effective.retain(|m| m != &member);
-                    // If it was added via patch, just remove from add_proxies
                     if patch.add_proxies.contains(&member) {
                         patch.add_proxies.retain(|m| m != &member);
-                    } else {
-                        // Original member: add to remove_proxies
+                    } else if current_members.contains(&member) {
                         if !patch.remove_proxies.contains(&member) {
                             patch.remove_proxies.push(member);
                         }
+                    } else {
+                        anyhow::bail!("proxy group `{name}` does not contain member `{member}`");
                     }
                 }
-                // Clean up empty patch
-                if patch.add_proxies.is_empty() && patch.remove_proxies.is_empty() {
+
+                for u in uses {
+                    if patch.add_use.contains(&u) {
+                        patch.add_use.retain(|item| item != &u);
+                    } else if current_uses.contains(&u) {
+                        if !patch.remove_use.contains(&u) {
+                            patch.remove_use.push(u);
+                        }
+                    } else {
+                        anyhow::bail!("proxy group `{name}` does not use provider `{u}`");
+                    }
+                }
+
+                if patch.is_empty() {
                     overlay.patches.remove(&name);
                 }
             } else {
@@ -12645,23 +16587,55 @@ async fn update_group_overlay(
                     .find(|group| crate::groups::group_name(group) == Some(name.as_str()))
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("proxy group not found: {name}"))?;
-                let mut existing = crate::groups::group_members(&current_group)?;
+                let mut existing_members = crate::groups::group_members(&current_group)?;
                 for member in members {
-                    if let Some(index) = existing.iter().position(|item| item == &member) {
-                        existing.remove(index);
+                    if let Some(index) = existing_members.iter().position(|item| item == &member) {
+                        existing_members.remove(index);
                     } else {
                         anyhow::bail!("proxy group `{name}` does not contain member `{member}`");
                     }
                 }
+                let mut existing_uses: Vec<String> = current_group
+                    .get("use")
+                    .and_then(serde_yaml::Value::as_sequence)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_yaml::Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
+                for u in uses {
+                    if let Some(index) = existing_uses.iter().position(|item| item == &u) {
+                        existing_uses.remove(index);
+                    } else {
+                        anyhow::bail!("proxy group `{name}` does not use provider `{u}`");
+                    }
+                }
+
                 let updated_group = {
                     let mut map = current_group
                         .as_mapping()
                         .cloned()
                         .ok_or_else(|| anyhow::anyhow!("proxy group `{name}` is not a mapping"))?;
-                    map.insert(
-                        serde_yaml::Value::String("proxies".into()),
-                        serde_yaml::Value::Sequence(existing.into_iter().map(Into::into).collect()),
-                    );
+                    if existing_members.is_empty() {
+                        map.remove(serde_yaml::Value::String("proxies".into()));
+                    } else {
+                        map.insert(
+                            serde_yaml::Value::String("proxies".into()),
+                            serde_yaml::Value::Sequence(
+                                existing_members.into_iter().map(Into::into).collect(),
+                            ),
+                        );
+                    }
+                    if existing_uses.is_empty() {
+                        map.remove(serde_yaml::Value::String("use".into()));
+                    } else {
+                        map.insert(
+                            serde_yaml::Value::String("use".into()),
+                            serde_yaml::Value::Sequence(
+                                existing_uses.into_iter().map(Into::into).collect(),
+                            ),
+                        );
+                    }
                     serde_yaml::Value::Mapping(map)
                 };
                 let target = if is_prepend {
@@ -12696,6 +16670,31 @@ async fn update_group_overlay(
         }
     }
     drop(_lock);
+    // (P3-3): additive report field; `null` for actions that have
+    // no selection cleanup. Existing fields and their semantics are unchanged.
+    let mut selection_cleanup = serde_json::Value::Null;
+    if is_delete {
+        // the group is gone from the merged config, so its persisted
+        // selection is now an orphan. Clean it here — after the merge committed —
+        // and re-push the daemon mirror so a daemon-initiated restart (no CLI
+        // push) does not replay the orphan.
+        let outcome = cleanup_deleted_group_selection(scope, &name);
+        selection_cleanup = serde_json::json!(selection_cleanup_label(&outcome));
+        if let Some(notice) = deleted_group_selection_notice(&name, &outcome) {
+            // `--json` keeps stdout pure (docs/user-guide/json.md §AI/脚本 JSON 输出).
+            if json {
+                eprintln!("{notice}");
+            } else {
+                println!("{notice}");
+            }
+        }
+        if should_push_selection_mirror_after_delete(
+            &outcome,
+            selection_mirror_target_is_system(system, user),
+        ) {
+            push_selection_mirror_update(paths, &scope.subscription_id, json).await;
+        }
+    }
     let reload_error =
         try_reload_group_config(system, user, paths, config_base_revision(paths).as_deref())
             .await?;
@@ -12709,6 +16708,7 @@ async fn update_group_overlay(
             "runtime_attestation": if reload_error.is_none() { "Attested" } else { "Unknown (offline/pending)" },
             "pending": reload_error.is_some(),
             "error": reload_error.map(|e| format!("{e:#}")),
+            "selection_cleanup": selection_cleanup,
         });
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else if let Some(error) = reload_error {
@@ -12719,6 +16719,60 @@ async fn update_group_overlay(
         println!("updated proxy group `{name}` (runtime_applied=true)");
     }
     Ok(())
+}
+
+/// Outcome of the post-merge selection cleanup for a deleted group.
+#[derive(Debug)]
+enum DeletedGroupSelection {
+    /// No persisted selection for this group: nothing to clean, no mirror push.
+    Absent,
+    /// Record removed; the daemon-owned mirror is now stale and must be pushed.
+    Unpinned,
+    /// Cleanup failed. The delete itself committed, so this is non-fatal — but
+    /// it must never be swallowed: a leftover record is what the user sees as a
+    /// repeated `⚠ ... not applied` on every replay (issue ).
+    Failed(anyhow::Error),
+}
+
+fn cleanup_deleted_group_selection(
+    scope: &crate::selection::SelectionScope,
+    group: &str,
+) -> DeletedGroupSelection {
+    match crate::selection::unpin_selection_for_scope(scope, group) {
+        Ok(true) => DeletedGroupSelection::Unpinned,
+        Ok(false) => DeletedGroupSelection::Absent,
+        Err(err) => DeletedGroupSelection::Failed(err),
+    }
+}
+
+/// (P3-2): the mirror push polarity, split from the environment
+/// probe so the truth table is runtime-testable without a real daemon.
+fn should_push_selection_mirror_after_delete(
+    outcome: &DeletedGroupSelection,
+    target_is_system: bool,
+) -> bool {
+    target_is_system && matches!(outcome, DeletedGroupSelection::Unpinned)
+}
+
+/// Machine-readable `selection_cleanup` value for the `--json` report.
+fn selection_cleanup_label(outcome: &DeletedGroupSelection) -> &'static str {
+    match outcome {
+        DeletedGroupSelection::Absent => "absent",
+        DeletedGroupSelection::Unpinned => "unpinned",
+        DeletedGroupSelection::Failed(_) => "failed",
+    }
+}
+
+/// Report line for a failed cleanup; `None` when there is nothing to report.
+fn deleted_group_selection_notice(group: &str, outcome: &DeletedGroupSelection) -> Option<String> {
+    match outcome {
+        DeletedGroupSelection::Failed(err) => Some(format!(
+            "⚠ Selection for group `{group}` was not cleaned up ({err:#});\n  \
+             replay will keep reporting it as not applied\n  \
+             repair: mihomo-cli select --unpin --group '{group}'"
+        )),
+        DeletedGroupSelection::Absent | DeletedGroupSelection::Unpinned => None,
+    }
 }
 
 async fn cmd_rule(system: bool, user: bool, action: RuleAction) -> anyhow::Result<()> {
@@ -12751,6 +16805,19 @@ async fn cmd_rule(system: bool, user: bool, action: RuleAction) -> anyhow::Resul
             if let Some(policy) = target_policy.as_deref() {
                 let policies = crate::rules::available_policies_at(&paths)?;
                 if !policies.iter().any(|p| p == policy) {
+                    let payload_nodes = known_provider_payload_nodes(&paths);
+                    if let Some(pname) = payload_nodes.get(policy) {
+                        anyhow::bail!(
+                            "Rule target `{policy}` is defined inside proxy-provider `{pname}`. Mihomo rules cannot directly target provider nodes; please target the proxy group using this provider, or declare the node under `proxies-append` in override.yaml."
+                        );
+                    }
+                    let known_providers =
+                        known_effective_providers(&paths, &serde_yaml::Value::Null);
+                    if known_providers.contains(policy) {
+                        anyhow::bail!(
+                            "Rule target `{policy}` is a proxy-provider. Mihomo rules cannot directly target providers; please target a proxy group that uses this provider."
+                        );
+                    }
                     anyhow::bail!(
                         "Rule target `{policy}` is not available in current config. Run `mihomo-cli rule policies` or `mihomo-cli list` to inspect valid policy/group names."
                     );
@@ -12768,7 +16835,8 @@ async fn cmd_rule(system: bool, user: bool, action: RuleAction) -> anyhow::Resul
             let paths = read_paths()?;
             let rules = crate::rules::list_rules_at(&paths)?;
             let pos = crate::rules::get_position_at(&paths).unwrap_or_default();
-            for line in format_rule_list(&rules, pos) {
+            let policies = crate::rules::available_policies_at(&paths).ok();
+            for line in format_rule_list_annotated(&rules, pos, policies.as_deref()) {
                 println!("{line}");
             }
             Ok(())
@@ -12878,7 +16946,8 @@ async fn cmd_rule(system: bool, user: bool, action: RuleAction) -> anyhow::Resul
             Ok(())
         }
         RuleAction::Policies => {
-            let policies = crate::rules::available_policies()?;
+            let paths = read_paths()?;
+            let policies = crate::rules::available_policies_at(&paths)?;
             print_lines(format_rule_policies(&policies));
             Ok(())
         }
@@ -13454,6 +17523,7 @@ async fn run_uninstall_preflight(ctx: &instance::InstanceContext) -> anyhow::Res
                     tun_transaction::RecoveryDirection::Abort,
                     false,
                     false,
+                    false,
                 )
                 .await?;
             }
@@ -13996,11 +18066,19 @@ async fn cmd_override(system: bool, user: bool, action: OverrideAction) -> anyho
             if !parsed.is_mapping() {
                 anyhow::bail!("override.yaml must be a YAML mapping");
             }
-            // Issue #022 B：被 TUN 事务管辖的键必须显式警告，不得“看起来生效、实际被丢弃”。
-            if let Some(warning) = tun_owned_override_keys_warning(&parsed) {
+            // B：被 TUN 事务管辖的键必须显式警告，不得“看起来生效、实际被丢弃”。
+            // P2-5：告警在**写入成功后**输出，避免用户先看到「会被拒绝」再看到
+            // refused 的时序误读（失败时唯一结论应是失败原因）。
+            let warning = tun_owned_override_keys_warning(&parsed);
+            let extra_warnings = override_content_warnings(&parsed, system);
+            apply_override_change(system, user, &paths, Some(content), "updated").await?;
+            if let Some(warning) = warning {
                 println!("{warning}");
             }
-            apply_override_change(system, user, &paths, Some(content), "updated").await
+            for w in extra_warnings {
+                println!("{w}");
+            }
+            Ok(())
         }
         OverrideAction::Clear { yes } => {
             let path = paths.override_path();
@@ -14024,11 +18102,37 @@ async fn cmd_override(system: bool, user: bool, action: OverrideAction) -> anyho
     }
 }
 
-/// Issue #022 B：`override.yaml` 中被 TUN 事务管辖的键必须显式告警。
+/// B：`override.yaml` 中被 TUN 事务管辖的键必须显式告警。
 ///
 /// `tun on/off` 按 CLI 参数与参考实现默认重建 `tun` 块，promotion 阶段还会沿用当前
 /// 运行中的 `tun` 块（`prepare_promoted_system_config_content`），因此 override 里的
 /// `tun.*` 在运行快照中可能不生效。这种“看起来生效、实际被丢弃”的情况必须可观察。
+fn override_content_warnings(override_yaml: &serde_yaml::Value, system: bool) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if let Some(map) = override_yaml.as_mapping() {
+        if map.contains_key("proxies") {
+            warnings.push(
+                "  ⚠ override 中的 proxies 会整体替换订阅自带的全部节点；如果只是追加自定义节点，建议使用 proxies-append".to_string()
+            );
+        }
+        if system {
+            if let Some(providers) = map.get("proxy-providers").and_then(|v| v.as_mapping()) {
+                for (pname, pcfg) in providers {
+                    let ptype = pcfg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    let path = pcfg.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                    if ptype == "file" && !path.starts_with("/var/lib/mihomo-cli") {
+                        let name_str = pname.as_str().unwrap_or("unknown");
+                        warnings.push(format!(
+                            "  ⚠ 提示：proxy-provider `{name_str}` (type: file) 路径为 `{path}`。在 system 模式下，Mihomo Core 要求 provider 文件置于 Core home (/var/lib/mihomo-cli) 下且对 mihomo 用户可读；建议改用 type: inline 或将文件移入 /var/lib/mihomo-cli"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    warnings
+}
+
 fn tun_owned_override_keys_warning(override_yaml: &serde_yaml::Value) -> Option<String> {
     // 只告警**控制键**（会被拒绝的那些）；mtu/device/route-exclude-address 等
     // 非控制键照常生效，不得误报（review 回归-3）。
@@ -14043,10 +18147,11 @@ fn tun_owned_override_keys_warning(override_yaml: &serde_yaml::Value) -> Option<
     }
     Some(format!(
         "  ⚠ override 中的 tun.{} 由 TUN 事务管辖：合并时会被**拒绝**（不会写入 intent/启动配置），\
-         TUN 由 `tun on/off` 的 candidate/snapshot 事务独占管辖（Issue #022 §4.7）；\
+         TUN 由 `tun on/off` 的 candidate/snapshot 事务独占管辖（§4.7）；\
          如需修改请用 `mihomo-cli tun on --stack <stack> --dns-hijack <targets>`；\
          mtu / device / route-exclude-address 等非控制键不受影响：会写入 intent；TUN 已开启时，\
-         运行中的 TUN 快照在下次 `mihomo-cli tun on --yes` 重建候选后才采纳它们",
+         `mihomo-cli tun on --yes` 与 `mihomo-cli restart --system` 都会按 intent/override \
+         合并进运行快照",
         owned.join("、tun.")
     ))
 }
@@ -14059,35 +18164,139 @@ fn tun_owned_override_keys_warning(override_yaml: &serde_yaml::Value) -> Option<
 /// - 无法确定 active 订阅 → 只陈述事实，不给动作。
 ///
 /// review MAJOR-5：这个判断必须在 CLI（用户权限）完成，daemon 按 SPEC 不读用户 home。
-fn translate_selection_replay_signal(message: &str, paths: &utils::AppPaths) -> String {
-    if !message.contains("[selection-mirror-missing]") {
+/// POSIX shell single-quote escaping for remediation command arguments
+/// (A3': group/node names may contain spaces or quotes).
+/// Per-outcome remediation lines (A3' outcome matrix).
+/// `members`: current core members of the target group (top-10, `None` if the
+/// group is missing or lookup failed); `groups`: current selectable groups
+/// (top-10, only used for group-missing).
+fn print_selection_replay_remedies(report: &crate::selection::ReplayReport) {
+    for line in crate::selection::selection_replay_remedy_lines(report) {
+        println!("{line}");
+    }
+}
+
+/// Signal identification: must NOT use substring `contains()` to prevent
+/// injection (e.g., a node named `[selection-mirror-missing]`). Match the
+/// exact fixed signal lines emitted by the daemon.
+fn is_mirror_missing_signal(line: &str) -> bool {
+    line.starts_with("[selection-mirror-missing]")
+}
+
+fn is_identity_mismatch_signal(line: &str) -> bool {
+    line.starts_with("[selection-identity-mismatch]")
+}
+
+fn translate_selection_replay_signal(
+    message: &str,
+    subscription_id_at_request: Option<&str>,
+    paths: &utils::AppPaths,
+) -> String {
+    let has_signal = message
+        .lines()
+        .any(|line| is_mirror_missing_signal(line) || is_identity_mismatch_signal(line));
+    if !has_signal {
         return message.to_string();
     }
-    // `Err` / `None`（没有 active 订阅）都归入“无法确定”，只陈述事实、不给动作。
-    let active = config::get_active_id_at(paths).ok().flatten();
-    let persisted = active
-        .as_ref()
-        .map(|id| paths.selection_state_path_for_subscription(id).exists())
-        .unwrap_or(false);
+    // N4: bind to the subscription ID at request time, NOT the current active
+    // (which may have changed during the in-flight request).
+    let persisted_selections: Option<std::collections::BTreeMap<String, String>> =
+        subscription_id_at_request.and_then(|id| {
+            let path = paths.selection_state_path_for_subscription(id);
+            if !path.exists() {
+                return None;
+            }
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|content| {
+                    serde_yaml::from_str::<selection::SelectionStateFile>(&content).ok()
+                })
+                .map(|state| state.selections)
+        });
     message
         .lines()
         .filter_map(|line| {
-            if !line.contains("[selection-mirror-missing]") {
+            if is_identity_mismatch_signal(line) {
+                // A3': mirror active ≠ request identity. Give
+                // per-group remedy + identity check guidance.
+                let mut lines = vec![
+                    "⚠ Selections not replayed: selection subscription identity mismatch"
+                        .to_string(),
+                ];
+                if let Some(selections) = &persisted_selections {
+                    for (group, node) in selections {
+                        lines.push(format!(
+                            "  If the target still exists: {}",
+                            crate::selection::select_fix_command(group, node)
+                        ));
+                    }
+                }
+                lines.push("  Check identity: mihomo-cli config --list".to_string());
+                return Some(lines.join("\n"));
+            }
+            if !is_mirror_missing_signal(line) {
                 return Some(line.to_string());
             }
-            match (&active, persisted) {
-                (Some(_), true) => Some(
-                    "⚠ Selections not replayed: selection mirror unavailable; run any selection command to rebuild it"
-                        .to_string(),
-                ),
-                (Some(_), false) => None,
-                (None, _) => Some(
-                    "⚠ Selections not replayed: selection mirror unavailable".to_string(),
-                ),
+            match (&subscription_id_at_request, &persisted_selections) {
+                // A3': per-group remedy, prefix with "target existence
+                // unverified" (mirror missing means we can't confirm the group/node
+                // still exists in Core).
+                (Some(_), Some(selections)) if !selections.is_empty() => {
+                    let mut lines =
+                        vec!["⚠ Selections not replayed: selection mirror unavailable".to_string()];
+                    for (group, node) in selections {
+                        lines.push(format!(
+                            "  If the target still exists: {}",
+                            crate::selection::select_fix_command(group, node)
+                        ));
+                    }
+                    Some(lines.join("\n"))
+                }
+                (Some(_), Some(_)) => None,
+                (Some(_), None) => None,
+                (None, _) => {
+                    Some("⚠ Selections not replayed: selection mirror unavailable".to_string())
+                }
             }
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Success lines for a lifecycle command. The daemon `Success` message can
+/// carry replay lines, and any `⚠` line in that report means part of the
+/// outcome did not apply — a mixed result must not be dressed in the success
+/// glyph (issue §2.5).
+fn lifecycle_success_lines(
+    message: &str,
+    subscription_id_at_request: Option<&str>,
+    paths: &utils::AppPaths,
+) -> Vec<String> {
+    let translated = translate_selection_replay_signal(message, subscription_id_at_request, paths);
+    if translated.lines().any(|line| line.starts_with('⚠')) {
+        return translated.lines().map(ToString::to_string).collect();
+    }
+    if translated.trim().is_empty() {
+        return vec!["  ✅".to_string()];
+    }
+    vec![format!("  ✅ {}", translated.trim_end())]
+}
+
+/// Lines the promotion success message must surface: the daemon-side replay
+/// report (remedies included) and any mirror/identity signal, translated
+/// against the subscription ID sent with the request. Never dropped.
+fn selection_replay_message_lines(
+    message: &str,
+    subscription_id_at_request: Option<&str>,
+    paths: &utils::AppPaths,
+) -> Vec<String> {
+    if message.is_empty() {
+        return Vec::new();
+    }
+    translate_selection_replay_signal(message, subscription_id_at_request, paths)
+        .lines()
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn override_action_intent(action: &OverrideAction) -> instance::CommandIntent {
@@ -14099,6 +18308,25 @@ fn override_action_intent(action: &OverrideAction) -> instance::CommandIntent {
     }
 }
 
+/// 裁决点 1：把「非终态事务 owner 存在时禁止配置写入」接到 CLI 写入入口。
+///
+/// 只做只读解析与 journal 读取，不触碰任何配置；拒绝时零写入。
+fn ensure_no_transaction_owner_before_config_write(
+    system: bool,
+    user: bool,
+    action: &str,
+) -> anyhow::Result<()> {
+    // 未安装任何实例时没有 system 事务 owner（模式解析会以 "mode required" 失败）：
+    // 此时跳过闸门，保持 `override import` 在全新机器上的既有可用性；真正的模式
+    // 冲突/不可解析会在后续 resolved_*_for_config_command 处以同样原因拒绝。
+    let Ok(resolved) =
+        resolve_current_instance_context(system, user, instance::CommandIntent::ReadOnly)
+    else {
+        return Ok(());
+    };
+    tun_transaction::ensure_no_non_terminal_transaction(&resolved.ctx, action)
+}
+
 async fn apply_override_change(
     system: bool,
     user: bool,
@@ -14106,7 +18334,18 @@ async fn apply_override_change(
     content: Option<String>,
     action_label: &str,
 ) -> anyhow::Result<()> {
+    // 缺陷 2：类型绕过（tun: null/标量/数组）在写 override.yaml 之前拒绝。
+    if let Some(ref text) = content {
+        let parsed: serde_yaml::Value = serde_yaml::from_str(text)
+            .map_err(|error| anyhow::anyhow!("override.yaml is not valid YAML: {error}"))?;
+        config::validate_override_tun_shape(&parsed)?;
+        config::validate_override_proxies_append_shape(&parsed)?;
+    }
     let _lock = crate::lock::ConfigLock::acquire(paths.config_dir())?;
+    // P1-1：非终态事务 owner 闸门必须与「首次写入」处在**同一把 ConfigLock**
+    // 内，否则 `guard → 并发 prepare 发布 journal → 写入` 的 TOCTOU 窗口仍然存在
+    // （事务窗口内改写 intent 会让 base_intent_revision 立刻失真）。
+    ensure_no_transaction_owner_before_config_write(system, user, "override import/clear")?;
     let snapshot = snapshot_file(&paths.override_path())?;
     if let Some(content) = content {
         if let Some(parent) = paths.override_path().parent() {

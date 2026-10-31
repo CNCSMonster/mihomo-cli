@@ -29,6 +29,34 @@ host_os="$(uname -s)"
 host_arch="$(rustc -vV | sed -n 's/^host: //p')"
 container_arch="$("$container_cli" version --format '{{.Server.Arch}}' 2>/dev/null || true)"
 
+# the "old daemon + new CLI" upgrade combination needs a daemon built
+# before the legacy reset admission existed. It is built once from the recorded
+# baseline commit and cached; when the commit is unavailable (shallow clone) the
+# contract script skips that one scenario with an explicit SKIP line.
+LEGACY_DAEMON_COMMIT="${MIHOMO_LEGACY_DAEMON_COMMIT:-5441e84}"
+LEGACY_DAEMON_DIR="$ARTIFACT_DIR/legacy"
+
+prepare_legacy_daemon() {
+    mkdir -p "$LEGACY_DAEMON_DIR"
+    if [[ -x "$LEGACY_DAEMON_DIR/mihomo-cli" ]]; then
+        echo "复用现有旧 daemon 基线产物: $LEGACY_DAEMON_DIR/mihomo-cli"
+        return 0
+    fi
+    if ! git -C "$PROJECT_ROOT" cat-file -e "${LEGACY_DAEMON_COMMIT}^{commit}" 2>/dev/null; then
+        echo "prepare-artifacts: git 中缺少 $LEGACY_DAEMON_COMMIT；旧 daemon 升级组合测试将跳过" >&2
+        return 0
+    fi
+    local work
+    work="$(mktemp -d "${TMPDIR:-/tmp}/mihomo-legacy-daemon.XXXXXX")"
+    git -C "$PROJECT_ROOT" archive "$LEGACY_DAEMON_COMMIT" | tar -x -C "$work"
+    CARGO_TARGET_DIR="$PROJECT_ROOT/target/legacy-daemon" \
+        cargo build --locked --release --manifest-path "$work/Cargo.toml"
+    cp "$PROJECT_ROOT/target/legacy-daemon/release/mihomo-cli" \
+        "$LEGACY_DAEMON_DIR/mihomo-cli"
+    rm -rf "$work"
+    echo "已构建旧 daemon 基线产物 ($LEGACY_DAEMON_COMMIT): $LEGACY_DAEMON_DIR/mihomo-cli"
+}
+
 if [[ "${MIHOMO_ARTIFACTS:-}" == "existing" ]]; then
     # 复用已就位的产物（如 musl 静态版或上一次构建），不重新编译；缺失则失败。
     if [[ ! -x "$ARTIFACT_DIR/mihomo-cli" ]]; then
@@ -45,3 +73,5 @@ elif [[ "$host_os" == "Linux" && "$host_arch" == x86_64-* && "$container_arch" =
 else
     prepare_with_container_rust
 fi
+
+prepare_legacy_daemon

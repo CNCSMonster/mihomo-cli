@@ -56,7 +56,7 @@ detect_environment() {
             HAS_PRIVILEGED=true
         fi
     fi
-    
+
     # 自动检测并行度
     if [[ "$PARALLEL" == "auto" ]]; then
         local cpu_jobs=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)
@@ -142,7 +142,7 @@ list_tests() {
             if [[ "$requires" == *"real-proxy"* ]]; then
                 status="⊘ (需要: $requires)"
             elif [[ "$requires" == *"systemd"* ]]; then
-                status="✅ (由 just test-systemd-contract 严格覆盖)"
+                status="✅ (由 systemd 严格合约覆盖)"
             elif [[ "$requires" == *"privileged"* ]] && [[ "$HAS_PRIVILEGED" != "true" ]]; then
                 status="⊘ (需要特权模式)"
             elif [[ -n "$requires" && "$RUN_ALL" != "true" ]]; then
@@ -233,14 +233,14 @@ build_test_image() {
     local image_name="${1:-mihomo-cli-test}"
     local runtime_image="${2:-$DEFAULT_IMAGE}"
     local dockerfile="${SCRIPT_DIR}/Dockerfile.simple"
-    
+
     if [[ ! -f "$dockerfile" ]]; then
         echo "❌ Dockerfile 不存在: $dockerfile"
         return 1
     fi
-    
+
     echo "构建测试镜像: $image_name"
-    
+
     # 获取项目根目录（tests/container 的上级）
     local project_root="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
@@ -294,7 +294,7 @@ run_test() {
 
     # 检查环境依赖
     if [[ "$requires" == *"systemd"* ]]; then
-        skip_test "跳过 $test_name (由 just test-systemd-contract 覆盖)"
+        skip_test "跳过 $test_name (由 systemd 严格合约覆盖)"
         return
     fi
     if [[ "$requires" == *"privileged"* ]] && [[ "$HAS_PRIVILEGED" != "true" ]]; then
@@ -441,7 +441,7 @@ main() {
             fi
         done
     fi
-    
+
     # 运行测试
     local failed=0
     local passed=0

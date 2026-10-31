@@ -5,3 +5,5 @@
 /cobertura.xml
 # Temporary sync logs
 /.sync-commits.txt
+# Local task briefs (not part of the public project)
+/.task-brief*.md

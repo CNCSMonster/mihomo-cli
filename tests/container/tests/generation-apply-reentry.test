@@ -1,0 +1,6 @@
+NAME=generation-apply-reentry
+DESC=真进程退出后新进程续跑管线收敛（含提交后重入不得假成功）
+IMAGE=ubuntu:24.04
+SCRIPT=test-generation-apply-reentry.sh
+TAGS=generation,upgrade,resilience
+REQUIRES=systemd

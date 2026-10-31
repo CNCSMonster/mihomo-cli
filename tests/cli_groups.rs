@@ -954,12 +954,420 @@ fn group_show_outputs_rich_details_and_selection() {
     assert!(show_out.status.success());
     let stdout = String::from_utf8_lossy(&show_out.stdout);
 
-    // Must show Source, Selected node (#007), and Patch details
+    // Must show Source, Selected node, and Patch details
     assert!(stdout.contains("Source:   [patched]"), "stdout: {stdout}");
     assert!(
-        stdout.contains("Selected: Node-A (#007 persisted)"),
+        stdout.contains("Selected: Node-A (persisted)"),
         "stdout: {stdout}"
     );
     assert!(stdout.contains("Patch:"), "stdout: {stdout}");
     assert!(stdout.contains("Node-B"), "stdout: {stdout}");
+}
+
+#[test]
+fn group_delete_json_stdout_pure_for_custom_group() {
+    let tmp = TempDir::new().unwrap();
+    setup(tmp.path());
+
+    let create_out = run(
+        tmp.path(),
+        &[
+            "group",
+            "create",
+            "CustomSel",
+            "--type",
+            "select",
+            "--member",
+            "Node-A",
+        ],
+    );
+    assert!(create_out.status.success());
+
+    let del_out = run(tmp.path(), &["--json", "group", "delete", "CustomSel"]);
+    assert!(
+        del_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&del_out.stderr)
+    );
+    let val: serde_json::Value =
+        serde_json::from_slice(&del_out.stdout).expect("valid JSON envelope on stdout");
+    assert_eq!(val["status"].as_str(), Some("success"));
+    assert_eq!(val["action"].as_str(), Some("delete"));
+    assert_eq!(val["group"].as_str(), Some("CustomSel"));
+    let stdout_str = String::from_utf8_lossy(&del_out.stdout);
+    assert!(stdout_str.trim().starts_with('{'));
+}
+
+#[test]
+fn group_delete_json_stdout_pure_for_native_group_and_notice_to_stderr() {
+    let tmp = TempDir::new().unwrap();
+    setup(tmp.path());
+
+    let del_out = run(tmp.path(), &["--json", "group", "delete", "Original"]);
+    assert!(
+        del_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&del_out.stderr)
+    );
+    let val: serde_json::Value =
+        serde_json::from_slice(&del_out.stdout).expect("valid JSON envelope on stdout");
+    assert_eq!(val["status"].as_str(), Some("success"));
+    assert_eq!(val["action"].as_str(), Some("delete"));
+    assert_eq!(val["group"].as_str(), Some("Original"));
+
+    let stdout_str = String::from_utf8_lossy(&del_out.stdout);
+    assert!(
+        !stdout_str.contains("原生组"),
+        "stdout must not contain text notice: {stdout_str}"
+    );
+
+    let stderr_str = String::from_utf8_lossy(&del_out.stderr);
+    assert!(
+        stderr_str.contains("原生组 `Original` 已标记隐藏"),
+        "stderr must contain hide notice: {stderr_str}"
+    );
+
+    // Non-json mode check: notice remains on stdout
+    let tmp2 = TempDir::new().unwrap();
+    setup(tmp2.path());
+    let plain_del = run(tmp2.path(), &["group", "delete", "Original"]);
+    assert!(plain_del.status.success());
+    let plain_stdout = String::from_utf8_lossy(&plain_del.stdout);
+    assert!(
+        plain_stdout.contains("原生组 `Original` 已标记隐藏"),
+        "plain mode stdout must keep hide notice: {plain_stdout}"
+    );
+}
+
+#[test]
+fn group_delete_json_cleanup_failure_routes_warning_to_stderr_and_stdout_is_pure_json() {
+    let tmp = TempDir::new().unwrap();
+    setup(tmp.path());
+
+    let create_out = run(
+        tmp.path(),
+        &[
+            "group",
+            "create",
+            "CustomSel",
+            "--type",
+            "select",
+            "--member",
+            "Node-A",
+        ],
+    );
+    assert!(create_out.status.success());
+
+    // Corrupt selections file to induce unpin failure
+    let sel_dir = tmp.path().join("selections");
+    std::fs::create_dir_all(&sel_dir).unwrap();
+    std::fs::write(sel_dir.join("sub-12345678.yaml"), "not: valid: [yaml").unwrap();
+
+    let del_out = run(tmp.path(), &["--json", "group", "delete", "CustomSel"]);
+    assert!(
+        del_out.status.success(),
+        "delete commits even if unpin fails: {}",
+        String::from_utf8_lossy(&del_out.stderr)
+    );
+    let val: serde_json::Value =
+        serde_json::from_slice(&del_out.stdout).expect("valid JSON envelope on stdout");
+    assert_eq!(val["status"].as_str(), Some("success"));
+    assert_eq!(val["group"].as_str(), Some("CustomSel"));
+
+    let stderr_str = String::from_utf8_lossy(&del_out.stderr);
+    assert!(
+        stderr_str.contains('⚠') && stderr_str.contains("was not cleaned up"),
+        "stderr must contain cleanup failure warning: {stderr_str}"
+    );
+
+    let stdout_str = String::from_utf8_lossy(&del_out.stdout);
+    assert!(
+        !stdout_str.contains('⚠'),
+        "stdout must not be polluted with warning: {stdout_str}"
+    );
+}
+
+#[test]
+fn group_reset_json_noop_routes_notice_to_stderr_and_stdout_is_pure_json() {
+    let tmp = TempDir::new().unwrap();
+    setup(tmp.path());
+
+    // Original is at upstream state (no patch, not deleted)
+    let reset_out = run(tmp.path(), &["--json", "group", "reset", "Original"]);
+    assert!(
+        reset_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&reset_out.stderr)
+    );
+    let val: serde_json::Value =
+        serde_json::from_slice(&reset_out.stdout).expect("valid JSON envelope on stdout");
+    assert_eq!(val["status"].as_str(), Some("success"));
+    assert_eq!(val["action"].as_str(), Some("reset"));
+    assert_eq!(val["group"].as_str(), Some("Original"));
+
+    let stderr_str = String::from_utf8_lossy(&reset_out.stderr);
+    assert!(
+        stderr_str.contains("proxy group `Original` is already at upstream state (no-op)"),
+        "stderr must contain no-op notice: {stderr_str}"
+    );
+
+    let stdout_str = String::from_utf8_lossy(&reset_out.stdout);
+    assert!(
+        !stdout_str.contains("upstream state"),
+        "stdout must not contain no-op notice text: {stdout_str}"
+    );
+
+    // Non-json mode check: notice remains on stdout
+    let tmp2 = TempDir::new().unwrap();
+    setup(tmp2.path());
+    let plain_reset = run(tmp2.path(), &["group", "reset", "Original"]);
+    assert!(plain_reset.status.success());
+    let plain_stdout = String::from_utf8_lossy(&plain_reset.stdout);
+    assert!(
+        plain_stdout.contains("proxy group `Original` is already at upstream state (no-op)"),
+        "plain mode stdout must keep no-op notice: {plain_stdout}"
+    );
+}
+
+#[test]
+fn group_edit_with_provider_from_override_succeeds() {
+    let tmp = TempDir::new().unwrap();
+    setup(tmp.path());
+
+    let override_src = tmp.path().join("my-override.yaml");
+    std::fs::write(
+        &override_src,
+        r#"
+proxy-providers:
+  corp-host:
+    type: inline
+    payload:
+      - name: SG-corp-host
+        type: socks5
+        server: 127.0.0.1
+        port: 11080
+"#,
+    )
+    .unwrap();
+    let import_out = run(
+        tmp.path(),
+        &["override", "import", override_src.to_str().unwrap()],
+    );
+    assert!(
+        import_out.status.success(),
+        "override import must succeed: {}",
+        String::from_utf8_lossy(&import_out.stderr)
+    );
+
+    let edit_file = tmp.path().join("group-edit.yaml");
+    std::fs::write(
+        &edit_file,
+        r#"
+name: Original
+type: select
+proxies:
+  - Node-A
+use:
+  - corp-host
+"#,
+    )
+    .unwrap();
+
+    let edit_out = run(
+        tmp.path(),
+        &["group", "edit", "Original", edit_file.to_str().unwrap()],
+    );
+    assert!(
+        edit_out.status.success(),
+        "group edit referencing override provider must succeed: {}",
+        String::from_utf8_lossy(&edit_out.stderr)
+    );
+
+    let config_content = std::fs::read_to_string(tmp.path().join("config.yaml")).unwrap();
+    assert!(
+        config_content.contains("corp-host"),
+        "config.yaml must contain corp-host provider reference"
+    );
+}
+
+#[test]
+fn group_add_use_provider_succeeds() {
+    let tmp = TempDir::new().unwrap();
+    setup(tmp.path());
+
+    let override_src = tmp.path().join("my-override.yaml");
+    std::fs::write(
+        &override_src,
+        r#"
+proxy-providers:
+  corp-host:
+    type: inline
+    payload:
+      - name: SG-corp-host
+        type: socks5
+        server: 127.0.0.1
+        port: 11080
+"#,
+    )
+    .unwrap();
+    let import_out = run(
+        tmp.path(),
+        &["override", "import", override_src.to_str().unwrap()],
+    );
+    assert!(
+        import_out.status.success(),
+        "override import must succeed: {}",
+        String::from_utf8_lossy(&import_out.stderr)
+    );
+
+    let add_out = run(
+        tmp.path(),
+        &["group", "add", "Original", "--use", "corp-host"],
+    );
+    assert!(
+        add_out.status.success(),
+        "group add --use corp-host must succeed: {}",
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+
+    let show_out = run(tmp.path(), &["group", "show", "Original"]);
+    let stdout = String::from_utf8_lossy(&show_out.stdout);
+    assert!(
+        stdout.contains("corp-host"),
+        "show output must show add_use: {stdout}"
+    );
+
+    let config_content = std::fs::read_to_string(tmp.path().join("config.yaml")).unwrap();
+    assert!(
+        config_content.contains("corp-host"),
+        "config.yaml must contain corp-host"
+    );
+}
+
+#[test]
+fn group_add_member_from_proxies_append_succeeds() {
+    let tmp = TempDir::new().unwrap();
+    setup(tmp.path());
+
+    let override_src = tmp.path().join("my-override.yaml");
+    std::fs::write(
+        &override_src,
+        r#"
+proxies-append:
+  - name: SG-corp-host
+    type: socks5
+    server: 127.0.0.1
+    port: 11080
+"#,
+    )
+    .unwrap();
+    let import_out = run(
+        tmp.path(),
+        &["override", "import", override_src.to_str().unwrap()],
+    );
+    assert!(
+        import_out.status.success(),
+        "override import must succeed: {}",
+        String::from_utf8_lossy(&import_out.stderr)
+    );
+
+    let add_out = run(
+        tmp.path(),
+        &["group", "add", "Original", "--member", "SG-corp-host"],
+    );
+    assert!(
+        add_out.status.success(),
+        "group add --member SG-corp-host must succeed: {}",
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+
+    let config_content = std::fs::read_to_string(tmp.path().join("config.yaml")).unwrap();
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&config_content).unwrap();
+    let proxies = parsed["proxies"].as_sequence().unwrap();
+    assert!(
+        proxies.iter().any(|p| p["name"] == "SG-corp-host"),
+        "config.yaml proxies must contain SG-corp-host"
+    );
+}
+
+#[test]
+fn group_add_provider_payload_node_rejected_with_helpful_error() {
+    let tmp = TempDir::new().unwrap();
+    setup(tmp.path());
+
+    let override_src = tmp.path().join("my-override.yaml");
+    std::fs::write(
+        &override_src,
+        r#"
+proxy-providers:
+  corp-host:
+    type: inline
+    payload:
+      - name: SG-corp-host
+        type: socks5
+        server: 127.0.0.1
+        port: 11080
+"#,
+    )
+    .unwrap();
+    let import_out = run(
+        tmp.path(),
+        &["override", "import", override_src.to_str().unwrap()],
+    );
+    assert!(import_out.status.success());
+
+    let add_out = run(
+        tmp.path(),
+        &["group", "add", "Original", "--member", "SG-corp-host"],
+    );
+    assert!(
+        !add_out.status.success(),
+        "adding provider payload node as member must fail"
+    );
+    let stderr = String::from_utf8_lossy(&add_out.stderr);
+    assert!(
+        stderr.contains("defined inside proxy-provider `corp-host`"),
+        "stderr must contain helpful provider guidance: {stderr}"
+    );
+}
+
+#[test]
+fn group_add_provider_name_as_member_rejected_with_helpful_error() {
+    let tmp = TempDir::new().unwrap();
+    setup(tmp.path());
+
+    let override_src = tmp.path().join("my-override.yaml");
+    std::fs::write(
+        &override_src,
+        r#"
+proxy-providers:
+  corp-host:
+    type: inline
+    payload:
+      - name: SG-corp-host
+        type: socks5
+        server: 127.0.0.1
+        port: 11080
+"#,
+    )
+    .unwrap();
+    let import_out = run(
+        tmp.path(),
+        &["override", "import", override_src.to_str().unwrap()],
+    );
+    assert!(import_out.status.success());
+
+    let add_out = run(
+        tmp.path(),
+        &["group", "add", "Original", "--member", "corp-host"],
+    );
+    assert!(
+        !add_out.status.success(),
+        "adding provider name as member must fail"
+    );
+    let stderr = String::from_utf8_lossy(&add_out.stderr);
+    assert!(
+        stderr.contains("is a proxy-provider, not a proxy node"),
+        "stderr must guide user to --use: {stderr}"
+    );
 }

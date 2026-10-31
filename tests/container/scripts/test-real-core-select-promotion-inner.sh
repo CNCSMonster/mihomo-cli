@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Real-Core 终审：#007 按订阅选择持久化 + #004 TUN active promotion dispatcher。
+# Real-Core 终审： 按订阅选择持久化 + TUN active promotion dispatcher。
 # 在 privileged systemd 容器内由 root 执行；通过 TEST_IDENTITY（testuser|root）
 # 分别以普通用户与 root 两种身份完整跑两遍旅程。
 set -euo pipefail
@@ -196,7 +196,7 @@ write_fixture "$WORK/sub-b.yaml" BB-01 BB-02 ""
 write_fixture "$WORK/sub-a2.yaml" AA-01 AA-02 AA-03
 printf 'mixed-port: [broken\n' > "$WORK/broken.yaml"
 
-# ---------------------------------------------------------------- Journey A (#007)
+# ---------------------------------------------------------------- Journey A
 printf '=== [%s] Journey A: per-subscription select persistence and replay ===\n' "$TEST_IDENTITY"
 reset_state
 
@@ -280,9 +280,9 @@ as_id "$CLI" select --system --unpin --group 自动选择 \
 [ -z "$(selection_of "$A_ID" 自动选择)" ] || fail "unpin did not clear sub-a selection"
 [ "$(proxy_now 自动选择)" = AA-02 ] || fail "unpin must not change runtime selection"
 
-echo "PASS [$TEST_IDENTITY]: #007 select persistence, cross-subscription isolation, switch replay, unpin"
+echo "PASS [$TEST_IDENTITY]:  select persistence, cross-subscription isolation, switch replay, unpin"
 
-# ---------------------------------------------------------------- Journey B (#004)
+# ---------------------------------------------------------------- Journey B
 printf '=== [%s] Journey B: TUN-active promotion dispatcher with real Core ===\n' "$TEST_IDENTITY"
 reset_state
 
@@ -328,4 +328,4 @@ wait_status 'json.load(sys.stdin)["data"]["tun"]' disabled \
 as_id "$CLI" uninstall --all --yes >/dev/null 2>"$WORK/uninstall.err" \
     || fail "uninstall after journey B failed"
 
-echo "PASS [$TEST_IDENTITY]: #004 TUN-active promotion, last-known-good on failure, tun off"
+echo "PASS [$TEST_IDENTITY]:  TUN-active promotion, last-known-good on failure, tun off"

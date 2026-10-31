@@ -1,6 +1,6 @@
 //! Selection intent persistence (selections/<subscription_id>.yaml) and the per-instance
 //! selection lock that serializes select (kernel PUT + persist) with replay
-//! (re-read + PUT). See SPEC.md §3.8.1.
+//! (re-read + PUT). See SPEC §3.8.1.
 
 use crate::utils::AppPaths;
 use anyhow::{Context, Result};
@@ -134,7 +134,7 @@ pub fn format_selection_map(map: &BTreeMap<String, String>) -> String {
     .expect("selection state serialization cannot fail")
 }
 
-fn load_selection_state_path(path: &std::path::Path) -> Result<BTreeMap<String, String>> {
+pub fn load_selection_state_path(path: &std::path::Path) -> Result<BTreeMap<String, String>> {
     if !path.exists() {
         return Ok(BTreeMap::new());
     }
@@ -171,13 +171,99 @@ pub fn save_selection_state_for_scope(
     Ok(())
 }
 
+/// Persist one `group → node` entry, taking the selection lock itself.
+///
+/// This is the entry point for writers that do not already hold the lock: the
+/// load→modify→save runs inside the lock so a concurrent `select` cannot lose
+/// the entry (or resurrect a removed one). Production's only writer today is
+/// `select`, which holds the lock across Core PUT + persist and therefore must
+/// use [`remember_selection_for_scope_locked`] (the lock is not reentrant).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn remember_selection_for_scope(scope: &SelectionScope, group: &str, node: &str) -> Result<()> {
+    let _guard = acquire_selection_lock_for_scope(scope)?;
+    remember_selection_for_scope_locked(scope, group, node)
+}
+
+/// Lock-held variant of [`remember_selection_for_scope`].
+///
+/// Contract: the caller already holds this scope's selection lock
+/// (`acquire_selection_lock_at` on its config dir). Calling it unlocked
+/// silently re-opens the lost-update window against a concurrent `select`
+/// (the race fixed), so debug builds assert the contract. The `select`
+/// path uses this variant to keep exactly one lock acquisition across Core
+/// PUT + persist (SPEC §3.8.1); the lock is not reentrant.
+pub fn remember_selection_for_scope_locked(
+    scope: &SelectionScope,
+    group: &str,
+    node: &str,
+) -> Result<()> {
+    // `debug_assert!` keeps its argument in the AST for every profile (it is only
+    // guarded by `cfg!(debug_assertions)`), so the probe must be gated here as
+    // well — otherwise release builds fail to compile.
+    #[cfg(debug_assertions)]
+    debug_assert!(
+        selection_lock_is_held_for_scope(scope),
+        "remember_selection_for_scope_locked called without the selection lock; \
+         use remember_selection_for_scope instead"
+    );
     let mut selections = load_selection_state_for_scope(scope)?;
     selections.insert(group.to_string(), node.to_string());
     save_selection_state_for_scope(scope, &selections)
 }
 
+/// Debug-only probe for the `_locked` contract: an exclusive flock/LockFileEx
+/// taken on a second descriptor of the same file fails while the process holds
+/// the lock through another descriptor.
+#[cfg(debug_assertions)]
+fn selection_lock_is_held_for_scope(scope: &SelectionScope) -> bool {
+    let Some(config_dir) = scope.path.parent().and_then(|p| p.parent()) else {
+        return false;
+    };
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .open(config_dir.join(".selection-state.lock"))
+    else {
+        return false;
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        // Unobservable (unsupported filesystem, permission): stay permissive,
+        // the assertion is a development aid, not a production gate.
+        Err(_) => true,
+    }
+}
+
+/// Selection lock of the config directory that owns `scope`'s intent file.
+/// Not reentrant: callers of the unpin paths must not already hold it.
+fn acquire_selection_lock_for_scope(scope: &SelectionScope) -> Result<SelectionLockGuard> {
+    let config_dir = scope
+        .path
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Selection state path has no config directory: {}",
+                scope.path.display()
+            )
+        })?;
+    acquire_selection_lock_at(&AppPaths::new(config_dir))
+}
+
+/// Remove the pinned selection for `group`.
+///
+/// The load→modify→save runs inside the selection lock: an
+/// unlocked save would let a concurrent `select`, which holds the lock across
+/// its own load→modify→save, either lose the record it just persisted or
+/// resurrect the record removed here. The lock is taken by this function rather
+/// than by its callers because the delete-group cleanup runs after `ConfigLock`
+/// is released — both locks are never held together, so the project-wide order
+/// (`config transaction lock → selection lock`) is unaffected.
 pub fn unpin_selection_for_scope(scope: &SelectionScope, group: &str) -> Result<bool> {
+    let _guard = acquire_selection_lock_for_scope(scope)?;
     let mut selections = load_selection_state_for_scope(scope)?;
     let removed = selections.remove(group).is_some();
     if removed {
@@ -187,6 +273,7 @@ pub fn unpin_selection_for_scope(scope: &SelectionScope, group: &str) -> Result<
 }
 
 pub fn unpin_all_selections_for_scope(scope: &SelectionScope) -> Result<usize> {
+    let _guard = acquire_selection_lock_for_scope(scope)?;
     match load_selection_state_for_scope(scope) {
         Ok(selections) if selections.is_empty() => Ok(0),
         Ok(selections) => {
@@ -204,7 +291,20 @@ pub fn unpin_all_selections_for_scope(scope: &SelectionScope) -> Result<usize> {
 /// Guard holding the per-instance selection lock (`<config_dir>/.selection-state.lock`).
 /// The lock is released when the guard drops (the underlying file handle closes).
 pub struct SelectionLockGuard {
-    _file: std::fs::File,
+    file: std::fs::File,
+}
+
+impl Drop for SelectionLockGuard {
+    fn drop(&mut self) {
+        // Closing the descriptor alone is not enough: a child forked while the
+        // guard was alive inherits the descriptor (same open file description)
+        // and keeps the flock alive past this process's close. Unlock the open
+        // file description explicitly, as `ConfigLockGuard` does. Since the
+        // descriptor is also opened with O_CLOEXEC, so only a fork without exec
+        // can still carry it; the explicit unlock remains the guarantee, CLOEXEC
+        // narrows the inheritance window.
+        let _ = self.file.unlock();
+    }
 }
 
 /// Acquire the per-instance selection lock with the default timeout (10s).
@@ -235,7 +335,7 @@ fn acquire_selection_lock_with_timeout(
     let deadline = Instant::now() + timeout;
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(SelectionLockGuard { _file: file }),
+            Ok(()) => return Ok(SelectionLockGuard { file }),
             Err(std::fs::TryLockError::WouldBlock) => {
                 if Instant::now() >= deadline {
                     anyhow::bail!(
@@ -322,8 +422,15 @@ pub const REPLAY_PER_GROUP_TIMEOUT: Duration = Duration::from_secs(2);
 pub enum ReplayOutcome {
     Applied,
     SkippedGroupMissing,
-    SkippedNodeMissing { current: Option<String> },
-    Failed { error: String },
+    SkippedNodeMissing {
+        current: Option<String>,
+        /// Group members observed by the replay query itself: reused by the
+        /// remedy matrix (no secondary fetch).
+        members: Vec<String>,
+    },
+    Failed {
+        error: String,
+    },
     BudgetExceeded,
 }
 
@@ -341,13 +448,19 @@ pub struct ReplayReport {
     pub results: Vec<ReplayGroupResult>,
     /// Intent file exists but could not be read/parsed; no group was attempted.
     pub intent_error: Option<String>,
+    /// Selectable groups fetched once (within the replay budget) when a group
+    /// turned out to be missing; reused by the remedy matrix.
+    pub selectable_groups: Option<Vec<String>>,
 }
 
 impl ReplayReport {
     pub fn format_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         if let Some(err) = &self.intent_error {
-            lines.push(format!("⚠ Selection intent not replayed: {err}"));
+            lines.push(format!(
+                "⚠ Selection intent not replayed: {}",
+                sanitize_for_display(err)
+            ));
             lines.push(
                 "  Run: mihomo-cli select --unpin --all  (to reset stored selections)".to_string(),
             );
@@ -357,7 +470,13 @@ impl ReplayReport {
             .results
             .iter()
             .filter(|r| r.outcome == ReplayOutcome::Applied)
-            .map(|r| format!("{} → {}", r.group, r.node))
+            .map(|r| {
+                format!(
+                    "{} → {}",
+                    sanitize_for_display(&r.group),
+                    sanitize_for_display(&r.node)
+                )
+            })
             .collect();
         if !applied.is_empty() {
             lines.push(format!("✓ Selections restored: {}", applied.join(", ")));
@@ -366,18 +485,24 @@ impl ReplayReport {
             let reason = match &r.outcome {
                 ReplayOutcome::Applied => continue,
                 ReplayOutcome::SkippedGroupMissing => "group no longer exists".to_string(),
-                ReplayOutcome::SkippedNodeMissing { current } => match current {
+                ReplayOutcome::SkippedNodeMissing { current, .. } => match current {
                     Some(current) => {
-                        format!("node no longer in group (current: {current})")
+                        format!(
+                            "node no longer in group (current: {})",
+                            sanitize_for_display(current)
+                        )
                     }
                     None => "node no longer in group".to_string(),
                 },
-                ReplayOutcome::Failed { error } => format!("apply failed: {error}"),
+                ReplayOutcome::Failed { error } => {
+                    format!("apply failed: {}", sanitize_for_display(error))
+                }
                 ReplayOutcome::BudgetExceeded => "time budget exceeded".to_string(),
             };
             lines.push(format!(
                 "⚠ Selection {} → {} not applied: {reason}",
-                r.group, r.node
+                sanitize_for_display(&r.group),
+                sanitize_for_display(&r.node)
             ));
         }
         lines
@@ -410,6 +535,7 @@ async fn replay_scope_with_deadline(
             return Ok(ReplayReport {
                 results: Vec::new(),
                 intent_error: Some(format!("{err:#}")),
+                selectable_groups: None,
             });
         }
     };
@@ -456,10 +582,65 @@ async fn replay_map_with_deadline(
             outcome,
         });
     }
+    // A missing group needs the current group list for the remedy matrix:
+    // fetch it once, within the remaining replay budget, and carry it in the
+    // report so downstream printing never queries the Core again.
+    let needs_groups = results
+        .iter()
+        .any(|r| matches!(r.outcome, ReplayOutcome::SkippedGroupMissing));
+    let selectable_groups = if needs_groups {
+        match remedy_query_budget(deadline) {
+            Some(remaining) => tokio::time::timeout(remaining, list_selectable_groups(client))
+                .await
+                .ok()
+                .and_then(|r| r.ok()),
+            None => None,
+        }
+    } else {
+        None
+    };
     Ok(ReplayReport {
         results,
         intent_error: None,
+        selectable_groups,
     })
+}
+
+/// Selectable group names (entries with an `all` array) from a Core
+/// `/proxies` payload; `GLOBAL`/`COMPATIBLE` are synthetic and excluded.
+pub fn selectable_groups_from_proxies(data: &serde_json::Value) -> Vec<String> {
+    let Some(proxies) = data["proxies"].as_object() else {
+        return Vec::new();
+    };
+    let mut groups: Vec<String> = proxies
+        .iter()
+        .filter(|(name, p)| {
+            name.as_str() != "GLOBAL"
+                && name.as_str() != "COMPATIBLE"
+                && p.get("all").and_then(|v| v.as_array()).is_some()
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    groups.sort();
+    groups
+}
+
+/// Remaining shared replay budget for a remediation query (`GET /proxies`).
+/// `None` once the replay deadline is reached: stop querying and render the
+/// "list unavailable" guidance instead of guessing members.
+fn remedy_query_budget(deadline: Instant) -> Option<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    (!remaining.is_zero()).then_some(remaining)
+}
+
+pub async fn list_selectable_groups(
+    client: &impl crate::mihomo_api::MihomoApiClient,
+) -> anyhow::Result<Vec<String>> {
+    let data = client.get("/proxies").await?;
+    if data["proxies"].as_object().is_none() {
+        anyhow::bail!("no proxies");
+    }
+    Ok(selectable_groups_from_proxies(&data))
 }
 
 pub async fn replay_selections_until(
@@ -510,6 +691,7 @@ async fn replay_one_group(
     if !members.contains(&node) {
         return ReplayOutcome::SkippedNodeMissing {
             current: group_state["now"].as_str().map(ToString::to_string),
+            members: members.iter().map(|m| (*m).to_string()).collect(),
         };
     }
     match tokio::time::timeout(
@@ -526,6 +708,128 @@ async fn replay_one_group(
             error: format!("select timed out after {}s", per_group_timeout.as_secs()),
         },
     }
+}
+
+/// POSIX shell single-quote escaping for remediation command arguments.
+pub fn shell_single_quote(s: &str) -> String {
+    // Replace every `'` with `'\''` (close quote, escaped literal quote, reopen).
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Sanitize untrusted strings (group/node names, error messages) to prevent
+/// CR/LF/ESC injection into control lines.
+fn sanitize_for_display(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Build a `mihomo-cli select -g <group> --node <node>` command with POSIX
+/// single-quote escaping. The `--node=<quoted>` form binds the parameter
+/// explicitly (no ambiguity with positional args).
+pub fn select_fix_command(group: &str, node: &str) -> String {
+    format!(
+        "mihomo-cli select -g {} --node={}",
+        shell_single_quote(&sanitize_for_display(group)),
+        shell_single_quote(&sanitize_for_display(node))
+    )
+}
+
+/// Per-outcome remediation lines (A3' outcome matrix).
+/// Shared by CLI and daemon: both render the same remedy text from the same
+/// ReplayReport structure.
+pub fn selection_remedy_lines(
+    outcome: &ReplayOutcome,
+    group: &str,
+    members: Option<&[String]>,
+    groups: Option<&[String]>,
+) -> Vec<String> {
+    match outcome {
+        ReplayOutcome::Applied => Vec::new(),
+        ReplayOutcome::SkippedNodeMissing { .. } => {
+            let mut lines = Vec::new();
+            if let Some(members) = members {
+                lines.push(format!(
+                    "  Current members of {}: {}",
+                    sanitize_for_display(group),
+                    members
+                        .iter()
+                        .take(10)
+                        .map(|m| sanitize_for_display(m))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            lines.push(format!(
+                "  Pick interactively: mihomo-cli select -g {}  (interactive terminal only)",
+                shell_single_quote(&sanitize_for_display(group))
+            ));
+            lines.push(
+                "  Non-interactive: run one of the member commands above, e.g.".to_string(),
+            );
+            if let Some(first) = members.and_then(|m| m.first()) {
+                lines.push(format!("    {}", select_fix_command(group, first)));
+            }
+            lines
+        }
+        ReplayOutcome::SkippedGroupMissing => {
+            let mut lines = Vec::new();
+            match groups {
+                Some(groups) => {
+                    lines.push(format!(
+                        "  Current groups: {}",
+                        groups
+                            .iter()
+                            .take(10)
+                            .map(|g| sanitize_for_display(g))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                None => {
+                    // (b′) 共享预算超尽：replay 内的 /proxies 查询未在 deadline 内返回，
+                    // 不猜测成员，给显式重试指引。
+                    lines.push(
+                        "  Group list unavailable (budget exhausted or query failed). Retry: mihomo-cli select --replay or mihomo-cli restart --system"
+                            .to_string(),
+                    );
+                }
+            }
+            lines.push(
+                "  Pick interactively: mihomo-cli select  (interactive terminal only)".to_string(),
+            );
+            lines
+        }
+        ReplayOutcome::Failed { error } => vec![format!(
+            "  Intent kept; apply failed: {}. Retry explicitly: mihomo-cli select --replay or mihomo-cli restart --system",
+            sanitize_for_display(error)
+        )],
+        ReplayOutcome::BudgetExceeded => vec![
+            "  Intent kept; replay time budget exceeded.".to_string(),
+            "  Retry explicitly: mihomo-cli select --replay or mihomo-cli restart --system"
+                .to_string(),
+        ],
+    }
+}
+
+/// Remedy lines for non-applied replay outcomes, reusing the data the replay
+/// already fetched (node-missing members come from the replay's own group
+/// query; the group list is carried on the report). Network-free:
+/// defect 7 (no unbounded/duplicate secondary fetches), usable from both the
+/// CLI and the daemon exits.
+pub fn selection_replay_remedy_lines(report: &ReplayReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    for r in &report.results {
+        let members = match &r.outcome {
+            ReplayOutcome::SkippedNodeMissing { members, .. } => Some(members.as_slice()),
+            _ => None,
+        };
+        lines.extend(selection_remedy_lines(
+            &r.outcome,
+            &r.group,
+            members,
+            report.selectable_groups.as_deref(),
+        ));
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -582,6 +886,64 @@ proxy-groups:
         assert!(paths.config_dir().join(".selection-state.lock").exists());
         drop(guard);
         let _guard2 = acquire_selection_lock_at(&paths).unwrap();
+    }
+
+    /// 锁文件不以 O_CLOEXEC 打开：guard 存活期间 fork 的子进程会继承该描述符。
+    /// 释放因此不能依赖「最后一份描述符关闭」，否则锁会活到子进程退出，之后每次
+    /// select/清理都要空等 10s 超时（全量测试暴露的确定性复现）。
+    #[cfg(unix)]
+    #[test]
+    fn selection_lock_release_survives_a_duplicated_descriptor() {
+        use std::os::unix::io::AsRawFd;
+
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let guard = acquire_selection_lock_at(&paths).unwrap();
+        let inherited = unsafe { libc::dup(guard.file.as_raw_fd()) };
+        assert!(inherited >= 0, "dup failed");
+
+        drop(guard);
+        let reacquired =
+            acquire_selection_lock_with_timeout(&paths, Duration::from_millis(500)).is_ok();
+        unsafe { libc::close(inherited) };
+
+        assert!(
+            reacquired,
+            "guard 释放必须显式解锁，不得等到最后一份描述符关闭"
+        );
+    }
+
+    /// 锁描述符不得跨 exec 继承。父进程持锁期间 spawn 子进程，子进程 exec
+    /// 后不得再持有锁文件描述符（`O_CLOEXEC`）；父进程显式 unlock 后，另一执行体
+    /// 必须立即取到锁，不等待任何子进程退出。修前（无 `O_CLOEXEC`）子进程能
+    /// `readlink` 到锁文件，一旦 guard 只 close 不解锁，锁会活到子进程退出。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selection_lock_fd_is_not_inherited_across_exec() {
+        use std::os::unix::io::AsRawFd;
+
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let guard = acquire_selection_lock_at(&paths).unwrap();
+        let fd = guard.file.as_raw_fd();
+
+        // 子进程在 exec 之后自报 fd 指向哪里：O_CLOEXEC 生效时该 fd 已关闭。
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("readlink /proc/self/fd/{fd} 2>/dev/null || true"))
+            .output()
+            .expect("spawn probe shell");
+        let seen = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !seen.contains(".selection-state.lock"),
+            "锁描述符被 exec 出的子进程继承（O_CLOEXEC 缺失）：{seen:?}"
+        );
+
+        drop(guard);
+        assert!(
+            acquire_selection_lock_with_timeout(&paths, Duration::from_millis(500)).is_ok(),
+            "父进程显式解锁后必须立即可再取锁，不得等待任何子进程"
+        );
     }
 
     fn setup_test_active_subscription(paths: &AppPaths, id: &str) -> SelectionScope {
@@ -654,14 +1016,59 @@ proxy-groups:
     }
 
     #[test]
-    fn remember_selection_round_trips_under_lock() {
+    fn remember_locked_variant_round_trips_under_lock() {
         let tmp = TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());
         let scope = setup_test_active_subscription(&paths, "sub-12345678");
         let _guard = acquire_selection_lock_at(&paths).unwrap();
-        remember_selection_for_scope(&scope, "OpenAI", "US-01").unwrap();
+        remember_selection_for_scope_locked(&scope, "OpenAI", "US-01").unwrap();
         let selections = load_selection_state_for_scope(&scope).unwrap();
         assert_eq!(selections.get("OpenAI"), Some(&"US-01".to_string()));
+    }
+
+    /// 自持锁变体在另一执行体真实持锁期间不得完成落盘——证明它真的取锁，
+    /// 而不是回到旧实现的裸读改写。
+    #[test]
+    fn remember_self_locking_variant_waits_for_the_selection_lock() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let scope = setup_test_active_subscription(&paths, "sub-12345678");
+        let guard = acquire_selection_lock_at(&paths).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer_scope = scope.clone();
+        let handle = std::thread::spawn(move || {
+            tx.send(remember_selection_for_scope(&writer_scope, "A", "a1").is_ok())
+                .unwrap();
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "remember 在锁被占用时完成了落盘：仍是锁外读改写"
+        );
+        drop(guard);
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "锁释放后写入必须成功"
+        );
+        handle.join().unwrap();
+        assert_eq!(
+            load_selection_state_for_scope(&scope).unwrap().get("A"),
+            Some(&"a1".to_string())
+        );
+    }
+
+    /// 误用负控：`_locked` 变体要求调用方真实持锁，无锁调用在 debug
+    /// 构建必须被断言拦下（release 构建不做运行时检查）。
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "without the selection lock")]
+    fn remember_locked_variant_rejects_callers_without_the_lock() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let scope = setup_test_active_subscription(&paths, "sub-12345678");
+        drop(acquire_selection_lock_at(&paths).unwrap());
+        let _ = remember_selection_for_scope_locked(&scope, "A", "a1");
     }
 
     struct ReplayFakeClient {
@@ -669,6 +1076,9 @@ proxy-groups:
         put_failures: std::collections::BTreeSet<String>,
         puts: std::sync::Mutex<Vec<(String, String)>>,
         get_calls: std::sync::Mutex<usize>,
+        get_paths: std::sync::Mutex<Vec<String>>,
+        slow_groups: BTreeMap<String, Duration>,
+        proxies: Option<serde_json::Value>,
     }
 
     impl ReplayFakeClient {
@@ -678,7 +1088,26 @@ proxy-groups:
                 put_failures: std::collections::BTreeSet::new(),
                 puts: std::sync::Mutex::new(Vec::new()),
                 get_calls: std::sync::Mutex::new(0),
+                get_paths: std::sync::Mutex::new(Vec::new()),
+                slow_groups: BTreeMap::new(),
+                proxies: None,
             }
+        }
+
+        /// Make a group query hang for this long (budget exhaustion tests).
+        fn with_slow_group(mut self, group: &str, delay: Duration) -> Self {
+            self.slow_groups.insert(group.to_string(), delay);
+            self
+        }
+
+        /// Serve this payload for `/proxies` (remedy group list).
+        fn with_proxies(mut self, data: serde_json::Value) -> Self {
+            self.proxies = Some(data);
+            self
+        }
+
+        fn get_paths(&self) -> Vec<String> {
+            self.get_paths.lock().unwrap().clone()
         }
 
         fn with_group(mut self, group: &str, now: &str, members: &[&str]) -> Self {
@@ -709,10 +1138,26 @@ proxy-groups:
     impl crate::mihomo_api::MihomoApiClient for ReplayFakeClient {
         async fn get(&self, path: &str) -> Result<serde_json::Value> {
             *self.get_calls.lock().unwrap() += 1;
+            self.get_paths.lock().unwrap().push(path.to_string());
+            if path == "/proxies" {
+                if let Some(data) = &self.proxies {
+                    return Ok(data.clone());
+                }
+            }
+            if let Some(delay) = self
+                .group_for_path(path)
+                .and_then(|g| self.slow_groups.get(g))
+            {
+                tokio::time::sleep(*delay).await;
+            }
             match self.group_for_path(path) {
                 Some(group) => Ok(self.groups[group].clone()),
                 None => anyhow::bail!("mihomo API returned: HTTP/1.0 404 Not Found"),
             }
+        }
+
+        async fn get_bounded(&self, path: &str, _byte_limit: usize) -> Result<serde_json::Value> {
+            self.get(path).await
         }
 
         async fn put(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
@@ -817,7 +1262,8 @@ proxy-groups:
         assert_eq!(
             report.results[0].outcome,
             ReplayOutcome::SkippedNodeMissing {
-                current: Some("a2".to_string())
+                current: Some("a2".to_string()),
+                members: vec!["a1".to_string(), "a2".to_string()],
             }
         );
         assert!(client.puts().is_empty());
@@ -947,6 +1393,113 @@ proxy-groups:
         assert_eq!(*client.get_calls.lock().unwrap(), 0);
     }
 
+    #[tokio::test]
+    async fn replay_group_list_fetched_once_within_shared_budget() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let scope = setup_test_active_subscription(&paths, "sub-11111111");
+        remember_selection_for_scope(&scope, "Gone-A", "a1").unwrap();
+        remember_selection_for_scope(&scope, "Gone-B", "b1").unwrap();
+        let client = ReplayFakeClient::new().with_proxies(serde_json::json!({
+            "proxies": {
+                "GLOBAL": {"all": ["X"]},
+                "COMPATIBLE": {"all": ["X"]},
+                "X 组": {"all": ["X"]},
+                "Y": {"all": ["Y"]},
+                "node-only": {"type": "Direct"}
+            }
+        }));
+        let report = replay_selections_until(&paths, &client, Instant::now() + REPLAY_TOTAL_BUDGET)
+            .await
+            .unwrap();
+        assert!(report
+            .results
+            .iter()
+            .all(|r| r.outcome == ReplayOutcome::SkippedGroupMissing));
+        // One shared /proxies query for both missing groups (no per-group 5s).
+        assert_eq!(
+            client
+                .get_paths()
+                .iter()
+                .filter(|p| p.as_str() == "/proxies")
+                .count(),
+            1
+        );
+        assert_eq!(
+            report.selectable_groups,
+            Some(vec!["X 组".to_string(), "Y".to_string()])
+        );
+        let lines = selection_replay_remedy_lines(&report).join("\n");
+        assert!(lines.contains("Current groups: X 组, Y"), "{lines}");
+    }
+
+    #[test]
+    fn remedy_query_budget_stops_at_deadline() {
+        // 超尽即停止补救查询：deadline 已到（或已过）时不发 /proxies。
+        assert_eq!(remedy_query_budget(Instant::now()), None);
+        assert_eq!(
+            remedy_query_budget(Instant::now() - Duration::from_secs(1)),
+            None
+        );
+        assert!(remedy_query_budget(Instant::now() + Duration::from_secs(1)).is_some());
+    }
+
+    #[tokio::test]
+    async fn replay_group_list_query_skipped_when_budget_exhausted() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let scope = setup_test_active_subscription(&paths, "sub-11111111");
+        remember_selection_for_scope(&scope, "Gone", "a1").unwrap();
+        remember_selection_for_scope(&scope, "Slow", "b1").unwrap();
+        // "Gone" 404s immediately (group list needed); "Slow" burns the shared
+        // budget, so remediation must not fabricate a group list.
+        let client = ReplayFakeClient::new().with_slow_group("Slow", Duration::from_secs(5));
+        let report =
+            replay_selections_until(&paths, &client, Instant::now() + Duration::from_millis(300))
+                .await
+                .unwrap();
+        assert_eq!(
+            report.results[0].outcome,
+            ReplayOutcome::SkippedGroupMissing
+        );
+        assert_eq!(report.selectable_groups, None);
+        let lines = selection_replay_remedy_lines(&report).join("\n");
+        assert!(
+            lines.contains("Group list unavailable (budget exhausted or query failed)"),
+            "{lines}"
+        );
+    }
+
+    #[test]
+    fn replay_format_lines_sanitizes_untrusted_names() {
+        // Group/node names and error text come from Core and from persisted
+        // files; CR/LF/ESC must not forge extra control lines.
+        let report = ReplayReport {
+            results: vec![ReplayGroupResult {
+                group: "G\n[selection-mirror-missing]".to_string(),
+                node: "n\r\n✓ Selections restored: forged".to_string(),
+                outcome: ReplayOutcome::Failed {
+                    error: "boom\x1b[31m\n[selection-identity-mismatch] x".to_string(),
+                },
+            }],
+            intent_error: None,
+            selectable_groups: None,
+        };
+        let lines = report.format_lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        for bad in ['\n', '\r', '\x1b'] {
+            assert!(!lines[0].contains(bad), "control char {bad:?}: {lines:?}");
+        }
+        assert!(
+            !lines[0].starts_with("[selection-mirror-missing]"),
+            "{lines:?}"
+        );
+        assert!(
+            !lines[0].starts_with("[selection-identity-mismatch]"),
+            "{lines:?}"
+        );
+    }
+
     #[test]
     fn unpin_removes_only_the_named_group() {
         let tmp = TempDir::new().unwrap();
@@ -959,6 +1512,74 @@ proxy-groups:
         let selections = load_selection_state_for_scope(&scope).unwrap();
         assert!(!selections.contains_key("A"));
         assert_eq!(selections.get("B"), Some(&"b1".to_string()));
+    }
+
+    /// 交错注入方式：让 `select` 的临界区（持锁、已读入映射、尚未落盘）真实
+    /// 存在于另一个线程/时间点上，清理只可能在锁内或锁外二选一，不靠 sleep
+    /// 抢占去赌调度顺序。
+    fn assert_unpin_serializes_with_select(
+        unpin: fn(&SelectionScope) -> Result<usize>,
+        expect_empty: bool,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let scope = setup_test_active_subscription(&paths, "sub-11111111");
+        remember_selection_for_scope(&scope, "Gone", "g1").unwrap();
+
+        let guard = acquire_selection_lock_at(&paths).unwrap();
+        let mut select_view = load_selection_state_for_scope(&scope).unwrap();
+        select_view.insert("B".to_string(), "b1".to_string());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let unpin_scope = scope.clone();
+        let handle = std::thread::spawn(move || {
+            tx.send(unpin(&unpin_scope).is_ok()).unwrap();
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "selection 清理在 select 临界区内完成了落盘：丢失更新窗口仍在"
+        );
+
+        save_selection_state_for_scope(&scope, &select_view).unwrap();
+        drop(guard);
+
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "锁释放后清理必须成功"
+        );
+        handle.join().unwrap();
+
+        let selections = load_selection_state_for_scope(&scope).unwrap();
+        assert!(
+            !selections.contains_key("Gone"),
+            "被删组的记录必须清除：{selections:?}"
+        );
+        if expect_empty {
+            assert!(
+                selections.is_empty(),
+                "清理全部必须在 select 落盘之后执行（不得留下复活记录）：{selections:?}"
+            );
+        } else {
+            assert_eq!(
+                selections.get("B"),
+                Some(&"b1".to_string()),
+                "select 在临界区内落盘的记录不得被清理回写覆盖/复活：{selections:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unpin_waits_for_the_selection_lock_and_keeps_a_concurrent_select() {
+        assert_unpin_serializes_with_select(
+            |scope| unpin_selection_for_scope(scope, "Gone").map(usize::from),
+            false,
+        );
+    }
+
+    #[test]
+    fn unpin_all_waits_for_the_selection_lock() {
+        assert_unpin_serializes_with_select(unpin_all_selections_for_scope, true);
     }
 
     #[test]

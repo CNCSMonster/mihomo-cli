@@ -153,8 +153,35 @@ fn handle(mut stream: UnixStream) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Test-only failure injection (E2E): when the marker exists it holds a
+/// count N; the mock then exits non-zero for the next N starts (decrementing the
+/// counter). The marker lives under `/var/log/mihomo` because the service unit
+/// runs with `PrivateTmp=true`, so a `/tmp` marker would be invisible to the
+/// daemon-started core. This models a candidate whose bytes start fine later,
+/// keeping the binary a valid ELF so the installer never re-downloads it offline.
+fn flaky_start_gate() -> Result<(), ()> {
+    let path = Path::new("/var/log/mihomo/inject-fail-first");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let remaining: u32 = raw.trim().parse().unwrap_or(0);
+    if remaining == 0 {
+        let _ = fs::remove_file(path);
+        return Ok(());
+    }
+    let _ = fs::write(path, (remaining - 1).to_string());
+    Err(())
+}
+
 fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Validation/version invocations never consume the injected failure budget.
+    let validating = args
+        .iter()
+        .any(|arg| arg == "-t" || arg == "--validate" || arg == "-v" || arg == "--version");
+    if !validating && flaky_start_gate().is_err() {
+        return Err("injected start failure".to_string());
+    }
     if args.iter().any(|arg| arg == "-v" || arg == "--version") {
         println!("Mihomo Meta fake-container-test");
         return Ok(());

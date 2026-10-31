@@ -234,6 +234,10 @@ pub struct InstancePaths {
     pub backup_dir: PathBuf,
     /// Root-owned isolated config used when enabling system-wide TUN.
     pub tun_config_file: PathBuf,
+    /// SPEC: independent trust root for generation store, physically
+    /// separated from the daemon runtime directory. System mode only;
+    /// user mode reuses the config dir as a placeholder.
+    pub generation_store_root: PathBuf,
 }
 
 /// System-mode paths (root-owned runtime/install paths, ADR-22).
@@ -271,7 +275,7 @@ impl SystemPaths {
             TargetOs::Windows => {
                 let config = std::env::var_os("APPDATA")
                     .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from(r"C:\Users\Default\AppData\Roaming"))
+                    .unwrap_or_else(|| PathBuf::from(r"C:\Users\user\AppData\Roaming"))
                     .join("mihomo")
                     .join("config.yaml");
                 // Windows runtime is a named pipe, not a filesystem path.
@@ -338,8 +342,8 @@ impl PathInputs {
             gid: Some(20),
             xdg_runtime_dir: Some(PathBuf::from("/run/user/1000")),
             program_data: PathBuf::from(r"C:\ProgramData"),
-            app_data: PathBuf::from(r"C:\Users\alice\AppData\Roaming"),
-            local_app_data: PathBuf::from(r"C:\Users\alice\AppData\Local"),
+            app_data: PathBuf::from(r"C:\Users\user\AppData\Roaming"),
+            local_app_data: PathBuf::from(r"C:\Users\user\AppData\Local"),
             username_or_sid: "alice".to_string(),
         }
     }
@@ -696,6 +700,18 @@ pub fn planned_tun_config_file(os: TargetOs, inputs: &PathInputs) -> PathBuf {
     }
 }
 
+/// SPEC N1/P1-1: independent generation store root, physically separated
+/// from the daemon runtime directory (`/var/lib/mihomo-cli/`).
+/// System mode: root-owned, service account cannot write.
+/// User mode: under the user's local data dir (not security-critical).
+pub fn planned_generation_store_root(os: TargetOs, inputs: &PathInputs) -> PathBuf {
+    match os {
+        TargetOs::Linux => PathBuf::from("/var/lib/mihomo-cli-generations"),
+        TargetOs::Macos => PathBuf::from("/Library/Application Support/mihomo-cli-generations"),
+        TargetOs::Windows => inputs.program_data.join("mihomo-cli-generations"),
+    }
+}
+
 fn planned_paths(os: TargetOs, mode: InstanceMode, inputs: &PathInputs) -> InstancePaths {
     match (os, mode) {
         (TargetOs::Macos, InstanceMode::System) => {
@@ -717,11 +733,13 @@ fn planned_paths(os: TargetOs, mode: InstanceMode, inputs: &PathInputs) -> Insta
                 config_dir: intent_config_dir,
                 runtime_dir: Some(runtime_dir),
                 tun_config_file: planned_tun_config_file(os, inputs),
+                generation_store_root: planned_generation_store_root(os, inputs),
             }
         }
         (TargetOs::Macos, InstanceMode::User) => {
             let config_dir = inputs.home.join(".config/mihomo");
             let runtime_dir = PathBuf::from(format!("/tmp/mihomo-{}", inputs.uid.unwrap_or(0)));
+            let gen_store_root = config_dir.join("generations");
             InstancePaths {
                 core_binary: inputs.home.join(".local/bin/mihomo"),
                 cli_binary: inputs.home.join(".local/bin/mihomo-cli"),
@@ -735,6 +753,7 @@ fn planned_paths(os: TargetOs, mode: InstanceMode, inputs: &PathInputs) -> Insta
                 config_dir,
                 runtime_dir: Some(runtime_dir),
                 tun_config_file: planned_tun_config_file(os, inputs),
+                generation_store_root: gen_store_root,
             }
         }
         (TargetOs::Linux, InstanceMode::System) => {
@@ -755,6 +774,7 @@ fn planned_paths(os: TargetOs, mode: InstanceMode, inputs: &PathInputs) -> Insta
                 config_dir: intent_config_dir,
                 runtime_dir: Some(runtime_dir),
                 tun_config_file: planned_tun_config_file(os, inputs),
+                generation_store_root: planned_generation_store_root(os, inputs),
             }
         }
         (TargetOs::Linux, InstanceMode::User) => {
@@ -769,6 +789,7 @@ fn planned_paths(os: TargetOs, mode: InstanceMode, inputs: &PathInputs) -> Insta
                     PathBuf::from(format!("/run/user/{}", inputs.uid.unwrap_or(1000)))
                 })
                 .join("mihomo");
+            let gen_store_root = config_dir.join("generations");
             InstancePaths {
                 core_binary: inputs.home.join(".local/bin/mihomo"),
                 cli_binary: inputs.home.join(".local/bin/mihomo-cli"),
@@ -782,6 +803,7 @@ fn planned_paths(os: TargetOs, mode: InstanceMode, inputs: &PathInputs) -> Insta
                 config_dir,
                 runtime_dir: Some(runtime_dir),
                 tun_config_file: planned_tun_config_file(os, inputs),
+                generation_store_root: gen_store_root,
             }
         }
         (TargetOs::Windows, InstanceMode::System) => {
@@ -802,6 +824,7 @@ fn planned_paths(os: TargetOs, mode: InstanceMode, inputs: &PathInputs) -> Insta
                 backup_dir: intent_config_dir.join("backups"),
                 config_dir: intent_config_dir,
                 tun_config_file: planned_tun_config_file(os, inputs),
+                generation_store_root: planned_generation_store_root(os, inputs),
             }
         }
         (TargetOs::Windows, InstanceMode::User) => {
@@ -823,6 +846,7 @@ fn planned_paths(os: TargetOs, mode: InstanceMode, inputs: &PathInputs) -> Insta
                 backup_dir: config_dir.join("backups"),
                 config_dir,
                 tun_config_file: planned_tun_config_file(os, inputs),
+                generation_store_root: inputs.local_app_data.join("mihomo").join("generations"),
             }
         }
     }
@@ -1196,6 +1220,10 @@ pub fn planned_linux_install_plan(ctx: &InstanceContext) -> Option<InstanceInsta
             mode: 0o750,
             privileged: true,
         });
+        // the generation trust root is deliberately absent here.
+        // It is created only by GenerationStore::init or by the migration
+        // publish; pre-creating it makes the four-state matrix mistake an
+        // empty root for a broken migration and permanently blocks upgrades.
     }
 
     let service_file = ctx.paths.service_file.clone()?;
@@ -2203,13 +2231,32 @@ pub fn privilege_invocation_plan(command: PlannedCommand) -> Option<PrivilegeInv
 }
 
 fn manual_fallback_for_command(command: &PlannedCommand) -> String {
-    if command.program.eq_ignore_ascii_case("sc.exe") {
-        let direct = std::iter::once(command.program.as_str())
-            .chain(command.args.iter().map(String::as_str))
-            .collect::<Vec<_>>()
-            .join(" ");
-        return format!("Run in an Administrator PowerShell/Terminal: {direct}");
+    // SPEC C2: system scenario prefers mihomo-cli restart --system
+    // Platform commands (sc.exe/systemctl/launchctl) are last resort
+    let is_system_service_command = command.program.eq_ignore_ascii_case("sc.exe")
+        || command.program.contains("systemctl")
+        || command.program.contains("launchctl");
+
+    if is_system_service_command {
+        // Primary guidance: use mihomo-cli
+        let mihomo_cmd = "mihomo-cli restart --system";
+        if command.program.eq_ignore_ascii_case("sc.exe") {
+            let direct = std::iter::once(command.program.as_str())
+                .chain(command.args.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(" ");
+            return format!(
+                "{mihomo_cmd}\n  (platform-related, last resort: Run in an Administrator PowerShell/Terminal: {direct})"
+            );
+        }
+        let mut parts = Vec::with_capacity(command.args.len() + 2);
+        parts.push("sudo".to_string());
+        parts.push(command.program.clone());
+        parts.extend(command.args.iter().cloned());
+        let platform_cmd = parts.join(" ");
+        return format!("{mihomo_cmd}\n  (platform-related, last resort: {platform_cmd})");
     }
+
     let mut parts = Vec::with_capacity(command.args.len() + 2);
     parts.push("sudo".to_string());
     parts.push(command.program.clone());
@@ -2738,17 +2785,17 @@ mod tests {
         let resolved = resolve_identity_with(
             0,
             Some(1000),
-            Some("/home/victim".to_string()),
+            Some("/home/user".to_string()),
             Some(1001),
             |uid| {
                 assert_eq!(uid, 1000);
-                Some(PathBuf::from("/home/real"))
+                Some(PathBuf::from("/home/user"))
             },
             Some(0),
             PathBuf::from("/root"),
         )
         .unwrap();
-        assert_eq!(resolved.home, PathBuf::from("/home/real"));
+        assert_eq!(resolved.home, PathBuf::from("/home/user"));
         assert_eq!(resolved.uid, Some(1000));
     }
 
@@ -2759,7 +2806,7 @@ mod tests {
         let err = resolve_identity_with(
             0,
             Some(1000),
-            Some("/home/victim".to_string()),
+            Some("/home/user".to_string()),
             Some(1001),
             |_| None,
             Some(0),
@@ -2779,14 +2826,14 @@ mod tests {
         let resolved = resolve_identity_with(
             0,
             None,
-            Some("/home/alice".to_string()),
+            Some("/home/user".to_string()),
             Some(1000),
             |_| None,
             Some(0),
             PathBuf::from("/root"),
         )
         .unwrap();
-        assert_eq!(resolved.home, PathBuf::from("/home/alice"));
+        assert_eq!(resolved.home, PathBuf::from("/home/user"));
         assert_eq!(resolved.uid, Some(1000));
     }
 
@@ -2814,14 +2861,14 @@ mod tests {
         let resolved = resolve_identity_with(
             1000,
             None,
-            Some("/home/alice".to_string()),
+            Some("/home/user".to_string()),
             None,
             |_| None,
             Some(1000),
-            PathBuf::from("/home/fallback"),
+            PathBuf::from("/home/user"),
         )
         .unwrap();
-        assert_eq!(resolved.home, PathBuf::from("/home/alice"));
+        assert_eq!(resolved.home, PathBuf::from("/home/user"));
         assert_eq!(resolved.uid, Some(1000));
 
         let resolved = resolve_identity_with(
@@ -2831,10 +2878,10 @@ mod tests {
             None,
             |_| None,
             Some(1000),
-            PathBuf::from("/home/fallback"),
+            PathBuf::from("/home/user"),
         )
         .unwrap();
-        assert_eq!(resolved.home, PathBuf::from("/home/fallback"));
+        assert_eq!(resolved.home, PathBuf::from("/home/user"));
         assert_eq!(resolved.uid, Some(1000));
     }
 
@@ -2854,6 +2901,51 @@ mod tests {
             PathBuf::from(r"C:\ProgramData")
                 .join("mihomo-cli")
                 .join("tun-config.yaml")
+        );
+    }
+
+    #[test]
+    fn generation_store_root_is_independent_from_runtime_dir() {
+        let inputs = inputs();
+        let linux_root = planned_generation_store_root(TargetOs::Linux, &inputs);
+        let macos_root = planned_generation_store_root(TargetOs::Macos, &inputs);
+        let windows_root = planned_generation_store_root(TargetOs::Windows, &inputs);
+
+        assert_eq!(linux_root, PathBuf::from("/var/lib/mihomo-cli-generations"));
+        assert_eq!(
+            macos_root,
+            PathBuf::from("/Library/Application Support/mihomo-cli-generations")
+        );
+        assert_eq!(
+            windows_root,
+            PathBuf::from(r"C:\ProgramData").join("mihomo-cli-generations")
+        );
+
+        // SPEC N1: generation root physically separated from daemon runtime dir
+        assert_ne!(
+            linux_root,
+            PathBuf::from("/var/lib/mihomo-cli"),
+            "generation store root must not equal daemon runtime dir"
+        );
+        assert!(
+            !linux_root.starts_with("/var/lib/mihomo-cli/"),
+            "generation store root must not be under daemon runtime dir"
+        );
+    }
+
+    #[test]
+    fn planned_paths_include_generation_store_root() {
+        let inputs = inputs();
+        let ctx = InstanceContext::planned(TargetOs::Linux, InstanceMode::System, &inputs);
+        assert_eq!(
+            ctx.paths.generation_store_root,
+            PathBuf::from("/var/lib/mihomo-cli-generations")
+        );
+
+        let ctx_user = InstanceContext::planned(TargetOs::Linux, InstanceMode::User, &inputs);
+        assert_eq!(
+            ctx_user.paths.generation_store_root,
+            inputs.home.join(".config/mihomo/generations")
         );
     }
 
@@ -3048,7 +3140,7 @@ mod tests {
         // ADR-02: system config_dir is per-user and follows Windows APPDATA convention.
         assert_eq!(
             system.paths.config_dir,
-            PathBuf::from(r"C:\Users\alice\AppData\Roaming").join("mihomo")
+            PathBuf::from(r"C:\Users\user\AppData\Roaming").join("mihomo")
         );
         // binary and logs remain under ProgramData
         assert_eq!(
@@ -3067,7 +3159,7 @@ mod tests {
         let user = InstanceContext::planned(TargetOs::Windows, InstanceMode::User, &inputs());
         assert_eq!(
             user.paths.config_dir,
-            PathBuf::from(r"C:\Users\alice\AppData\Roaming").join("mihomo")
+            PathBuf::from(r"C:\Users\user\AppData\Roaming").join("mihomo")
         );
         assert_eq!(
             user.paths.api_endpoint,
@@ -3427,6 +3519,25 @@ mod tests {
                 required_privileged_dir.display()
             );
         }
+        // the generation trust root has a single owner —
+        // GenerationStore::init / the migration publish. The install plan must
+        // not pre-create it (or chown/chmod it) before migration, otherwise the
+        // four-state matrix mistakes an empty root for a broken migration.
+        let generation_root = ctx.paths.generation_store_root.to_string_lossy();
+        assert!(
+            !plan
+                .directories
+                .iter()
+                .any(|d| d.path == ctx.paths.generation_store_root),
+            "generation trust root must not be created by the install plan: {plan:#?}"
+        );
+        assert!(
+            !plan
+                .commands
+                .iter()
+                .any(|c| c.args.iter().any(|arg| arg.as_str() == generation_root)),
+            "generation trust root must not be chowned/chmoded by the install plan: {plan:#?}"
+        );
         assert!(plan.files.iter().all(|f| f.privileged));
         assert!(plan.commands.iter().all(|c| c.privileged));
         let touch_log = plan
@@ -3552,7 +3663,7 @@ mod tests {
 
         // ADR-02: system config_dir is per-user and follows Windows APPDATA convention.
         assert!(plan.directories.iter().any(|d| {
-            d.path == PathBuf::from(r"C:\Users\alice\AppData\Roaming").join("mihomo")
+            d.path == PathBuf::from(r"C:\Users\user\AppData\Roaming").join("mihomo")
                 && !d.privileged
         }));
         assert!(plan.directories.iter().any(|d| {
@@ -3583,16 +3694,17 @@ mod tests {
 
         assert!(plan.directories.iter().all(|d| !d.privileged));
         assert!(plan.commands.iter().all(|c| !c.privileged));
+        assert!(plan
+            .directories
+            .iter()
+            .any(|d| { d.path == PathBuf::from(r"C:\Users\user\AppData\Roaming").join("mihomo") }));
         assert!(plan.directories.iter().any(|d| {
-            d.path == PathBuf::from(r"C:\Users\alice\AppData\Roaming").join("mihomo")
-        }));
-        assert!(plan.directories.iter().any(|d| {
-            d.path == PathBuf::from(r"C:\Users\alice\AppData\Local").join("mihomo/bin")
+            d.path == PathBuf::from(r"C:\Users\user\AppData\Local").join("mihomo/bin")
         }));
         assert!(plan
             .directories
             .iter()
-            .any(|d| { d.path == PathBuf::from(r"C:\Users\alice\AppData\Local").join("mihomo") }));
+            .any(|d| { d.path == PathBuf::from(r"C:\Users\user\AppData\Local").join("mihomo") }));
         assert_eq!(
             ctx.paths.api_endpoint,
             ApiEndpoint::WindowsNamedPipe(r"\\.\pipe\mihomo-alice".to_string())
@@ -3765,7 +3877,7 @@ mod tests {
             ServiceAction::Uninstall,
         );
         assert!(windows_system.remove_paths.iter().any(|p| {
-            p.path == PathBuf::from(r"C:\Users\alice\AppData\Roaming").join("mihomo")
+            p.path == PathBuf::from(r"C:\Users\user\AppData\Roaming").join("mihomo")
                 && !p.privileged
         }));
         assert!(windows_system.remove_paths.iter().any(|p| {
@@ -3901,7 +4013,7 @@ mod tests {
         );
         assert_eq!(
             plan.manual_fallback,
-            "sudo launchctl kickstart -k system/io.mihomo"
+            "mihomo-cli restart --system\n  (platform-related, last resort: sudo launchctl kickstart -k system/io.mihomo)"
         );
     }
 
@@ -3994,7 +4106,7 @@ mod tests {
         );
         assert_eq!(
             plan.failure_hint_command.unwrap().manual_fallback,
-            "sudo systemctl restart mihomo"
+            "mihomo-cli restart --system\n  (platform-related, last resort: sudo systemctl restart mihomo)"
         );
     }
 
@@ -4446,7 +4558,7 @@ mod tests {
         let marker = windows_user_install_marker(&ctx).expect("user marker for windows user");
         assert_eq!(
             marker,
-            PathBuf::from(r"C:\Users\alice\AppData\Local").join("mihomo/bin/.user-installed")
+            PathBuf::from(r"C:\Users\user\AppData\Local").join("mihomo/bin/.user-installed")
         );
         // System mode and non-Windows must not produce a user marker.
         let system_ctx =

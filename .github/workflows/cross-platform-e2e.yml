@@ -234,11 +234,11 @@ jobs:
           # N1c: strong assertion — service must be installed (system service)
           $CLI status | grep -i "system service"
 
-      - name: Unit test isolation with active system service (#012 regression)
+      - name: Unit test isolation with active system service (regression)
         shell: bash
         run: |
           # Verify that running unit tests with active system service directories/files
-          # does not leak into live service or fail with EACCES (Issue #012)
+          # does not leak into live service or fail with EACCES
           cargo test --bin mihomo-cli daemon
 
       - name: System mode lifecycle (stop/start/status)
@@ -250,7 +250,7 @@ jobs:
           $CLI start
           $CLI status
 
-      - name: Core API forwarding and Selection Mirror replay (#017 regression)
+      - name: Core API forwarding and Selection Mirror replay (regression)
         shell: bash
         run: |
           # Prepare offline direct proxy and group fixture

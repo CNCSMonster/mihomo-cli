@@ -2160,10 +2160,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn credential_write_target_must_match_canonical_identity_path() {
-        let home = std::path::Path::new("/home/alice");
+        let home = std::path::Path::new("/home/user");
         assert!(validate_unix_client_token_target(
             home,
-            std::path::Path::new("/home/alice/.config/mihomo/service-token")
+            std::path::Path::new("/home/user/.config/mihomo/service-token")
         )
         .is_ok());
         assert!(validate_unix_client_token_target(
@@ -2321,18 +2321,18 @@ mod tests {
     #[test]
     fn direct_start_and_config_test_commands_are_planned() {
         assert_eq!(
-            config_test_command("/opt/mihomo", "/home/u/.config/mihomo"),
-            PlannedCommand::new("/opt/mihomo", ["-t", "-d", "/home/u/.config/mihomo"])
+            config_test_command("/opt/mihomo", "/home/user/.config/mihomo"),
+            PlannedCommand::new("/opt/mihomo", ["-t", "-d", "/home/user/.config/mihomo"])
         );
         #[cfg(unix)]
         assert_eq!(
-            direct_start_command("/opt/mihomo", "/home/u/.config/mihomo"),
-            PlannedCommand::new("nohup", ["/opt/mihomo", "-d", "/home/u/.config/mihomo"])
+            direct_start_command("/opt/mihomo", "/home/user/.config/mihomo"),
+            PlannedCommand::new("nohup", ["/opt/mihomo", "-d", "/home/user/.config/mihomo"])
         );
         #[cfg(not(unix))]
         assert_eq!(
-            direct_start_command("/opt/mihomo", "/home/u/.config/mihomo"),
-            PlannedCommand::new("/opt/mihomo", ["-d", "/home/u/.config/mihomo"])
+            direct_start_command("/opt/mihomo", "/home/user/.config/mihomo"),
+            PlannedCommand::new("/opt/mihomo", ["-d", "/home/user/.config/mihomo"])
         );
     }
 
@@ -2597,11 +2597,11 @@ e"
     #[test]
     fn service_start_stop_commands_respect_os_and_mode() {
         assert_eq!(
-            service_start_command(ServiceOs::Linux, ServiceMode::User, "/home/alice"),
+            service_start_command(ServiceOs::Linux, ServiceMode::User, "/home/user"),
             PlannedCommand::new("systemctl", ["--user", "start", "mihomo"])
         );
         assert_eq!(
-            service_stop_command(ServiceOs::Linux, ServiceMode::System, "/home/alice"),
+            service_stop_command(ServiceOs::Linux, ServiceMode::System, "/home/user"),
             PlannedCommand::privileged("systemctl", ["stop", "mihomo"])
         );
         assert_eq!(
@@ -2631,7 +2631,7 @@ e"
 
     #[test]
     fn restart_command_plan_matches_current_platform_behavior() {
-        let home = "/home/alice";
+        let home = "/home/user";
         assert_eq!(
             service_restart_commands(ServiceOs::Linux, ServiceMode::User, home),
             vec![PlannedCommand::new(
@@ -2669,16 +2669,16 @@ e"
     #[test]
     fn windows_install_commands_quote_paths_with_spaces() {
         let commands = windows_install_commands(
-            r"C:\Users\Alice Smith\AppData\Local\mihomo",
-            r"C:\Users\Alice Smith\AppData\Local\mihomo\mihomo.exe",
+            r"C:\Users\user Smith\AppData\Local\mihomo",
+            r"C:\Users\user Smith\AppData\Local\mihomo\mihomo.exe",
         );
 
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0].program, "sc.exe");
         assert_eq!(commands[0].args[0], "create");
         assert!(commands[0].args[3]
-            .contains(r#""C:\Users\Alice Smith\AppData\Local\mihomo\mihomo.exe""#));
-        assert!(commands[0].args[3].contains(r#"-d "C:\Users\Alice Smith\AppData\Local\mihomo""#));
+            .contains(r#""C:\Users\user Smith\AppData\Local\mihomo\mihomo.exe""#));
+        assert!(commands[0].args[3].contains(r#"-d "C:\Users\user Smith\AppData\Local\mihomo""#));
         assert_eq!(
             commands[1],
             PlannedCommand::new("sc.exe", ["start", "mihomo"])
@@ -2866,7 +2866,7 @@ e"
             ]
         ));
         assert!(is_windows_detached_start(
-            r"C:\Users\test\AppData\Local\mihomo\bin\mihomo.exe",
+            r"C:\Users\user\AppData\Local\mihomo\bin\mihomo.exe",
             &[
                 "-d".into(),
                 "C:\\Users\\test\\AppData\\Roaming\\mihomo".into()

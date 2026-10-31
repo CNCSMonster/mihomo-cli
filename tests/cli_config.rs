@@ -6,6 +6,46 @@ fn bin() -> &'static str {
 }
 
 #[test]
+fn verbose_flag_expands_the_error_chain_and_default_points_to_it() {
+    let tmp = TempDir::new().unwrap();
+    // Malformed subscriptions.yaml makes `config --list` fail through a
+    // `with_context` layer, so the plain/verbose renderings differ observably.
+    std::fs::write(tmp.path().join("subscriptions.yaml"), "subscriptions: [\n").unwrap();
+
+    let plain = Command::new(bin())
+        .env("MIHOMO_CLI_CONFIG_DIR", tmp.path())
+        .args(["config", "--list"])
+        .output()
+        .unwrap();
+    assert!(!plain.status.success(), "malformed metadata must fail");
+    let plain_err = String::from_utf8_lossy(&plain.stderr);
+    assert!(
+        plain_err.contains("Failed to parse subscriptions.yaml"),
+        "stderr was: {plain_err}"
+    );
+    assert!(
+        plain_err.contains("Run with -v for more details"),
+        "default rendering must point at -v: {plain_err}"
+    );
+
+    let verbose = Command::new(bin())
+        .env("MIHOMO_CLI_CONFIG_DIR", tmp.path())
+        .args(["-v", "config", "--list"])
+        .output()
+        .unwrap();
+    assert!(!verbose.status.success(), "malformed metadata must fail");
+    let verbose_err = String::from_utf8_lossy(&verbose.stderr);
+    assert!(
+        !verbose_err.contains("Run with -v for more details"),
+        "verbose rendering must not ask for -v again: {verbose_err}"
+    );
+    assert!(
+        verbose_err.contains("Failed to parse subscriptions.yaml:"),
+        "verbose rendering must expand the cause chain: {verbose_err}"
+    );
+}
+
+#[test]
 fn config_validate_rejects_invalid_yaml_in_isolated_config_dir() {
     let tmp = TempDir::new().unwrap();
     std::fs::write(tmp.path().join("config.yaml"), "port: [\n").unwrap();
@@ -314,4 +354,102 @@ fn config_set_ua_updates_subscription_metadata_and_info() {
     let meta = std::fs::read_to_string(config_dir.join("subscriptions.yaml")).unwrap();
     assert!(meta.contains("user_agent_mode: auto"), "meta was: {meta}");
     assert!(!meta.contains("user_agent:"), "meta was: {meta}");
+}
+
+#[test]
+fn custom_proxies_append_and_group_rule_survive_config_regeneration() {
+    let tmp = TempDir::new().unwrap();
+    let config_dir = tmp.path().join("config");
+    std::fs::create_dir_all(config_dir.join("subscriptions")).unwrap();
+    std::fs::write(config_dir.join("subscriptions/active"), "sub-12345678\n").unwrap();
+    std::fs::write(
+        config_dir.join("subscriptions.yaml"),
+        "- id: sub-12345678\n  url: https://example.test/sub\n  updated: 2026-09-02T00:00:00Z\n",
+    )
+    .unwrap();
+    std::fs::write(
+        config_dir.join("subscriptions/sub-12345678.yaml"),
+        r#"proxies:
+  - name: Node-A
+    type: direct
+proxy-groups:
+  - name: Original
+    type: select
+    proxies:
+      - Node-A
+rules:
+  - MATCH,Original
+"#,
+    )
+    .unwrap();
+
+    let override_src = config_dir.join("override.yaml");
+    std::fs::write(
+        &override_src,
+        r#"
+proxies-append:
+  - name: SG-corp-host
+    type: socks5
+    server: 127.0.0.1
+    port: 11080
+"#,
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_mihomo-cli");
+
+    // Add group patch
+    let add_out = Command::new(bin)
+        .env("MIHOMO_CLI_CONFIG_DIR", &config_dir)
+        .args(["group", "add", "Original", "--member", "SG-corp-host"])
+        .output()
+        .unwrap();
+    assert!(
+        add_out.status.success(),
+        "group add must succeed: {}",
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+
+    // Add rule targeting SG-corp-host
+    let rule_out = Command::new(bin)
+        .env("MIHOMO_CLI_CONFIG_DIR", &config_dir)
+        .args(["rule", "add", "DOMAIN-SUFFIX,apple.com,SG-corp-host"])
+        .output()
+        .unwrap();
+    assert!(
+        rule_out.status.success(),
+        "rule add must succeed: {}",
+        String::from_utf8_lossy(&rule_out.stderr)
+    );
+
+    // Now re-generate config using config --fix (which runs merge_user_config_checked_at_endpoint)
+    let fix_out = Command::new(bin)
+        .env("MIHOMO_CLI_CONFIG_DIR", &config_dir)
+        .args(["config", "--fix"])
+        .output()
+        .unwrap();
+    assert!(
+        fix_out.status.success(),
+        "config --fix must succeed: {}",
+        String::from_utf8_lossy(&fix_out.stderr)
+    );
+
+    let config_content = std::fs::read_to_string(config_dir.join("config.yaml")).unwrap();
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&config_content).unwrap();
+
+    // 1. Proxies array has SG-corp-host
+    let proxies = parsed["proxies"].as_sequence().unwrap();
+    assert!(proxies.iter().any(|p| p["name"] == "SG-corp-host"));
+
+    // 2. Original group has SG-corp-host
+    let groups = parsed["proxy-groups"].as_sequence().unwrap();
+    let original = groups.iter().find(|g| g["name"] == "Original").unwrap();
+    let members = original["proxies"].as_sequence().unwrap();
+    assert!(members.iter().any(|m| m == "SG-corp-host"));
+
+    // 3. Rules has DOMAIN-SUFFIX,apple.com,SG-corp-host (NOT DIRECT!)
+    let rules = parsed["rules"].as_sequence().unwrap();
+    assert!(rules
+        .iter()
+        .any(|r| r == "DOMAIN-SUFFIX,apple.com,SG-corp-host"));
 }

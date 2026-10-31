@@ -162,3 +162,38 @@ fn select_unpin_migrates_legacy_file_on_demand() {
     let content = std::fs::read_to_string(&target).unwrap();
     assert!(!content.contains("Proxy:"), "target was: {content}");
 }
+
+#[test]
+fn select_json_failure_outputs_error_envelope_on_stdout_and_details_on_stderr() {
+    let tmp = TempDir::new().unwrap();
+    let config_dir = tmp.path();
+
+    setup_subscription(config_dir, "sub-aaaaaaaa");
+    std::fs::write(config_dir.join("subscriptions/active"), "sub-aaaaaaaa").unwrap();
+
+    let output = Command::new(bin())
+        .env("MIHOMO_CLI_CONFIG_DIR", config_dir)
+        .args([
+            "--json",
+            "select",
+            "--group",
+            "NonExistent",
+            "--node",
+            "NodeA",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let val: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid JSON error envelope on stdout");
+    assert_eq!(val["ok"].as_bool(), Some(false));
+    assert_eq!(val["command"].as_str(), Some("select"));
+    assert!(val["error"].is_string());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Error:"),
+        "stderr must contain error details: {stderr}"
+    );
+}

@@ -52,19 +52,19 @@ if command -v mihomo-cli &>/dev/null; then
     # 模拟 mihomo-cli 的 sudo reexec 行为
     ORIGINAL_HOME="$HOME"
     ORIGINAL_UID=$(id -u)
-    
+
     SUDO_ENV=$(sudo _MIHOMO_CLI_ORIGINAL_HOME="$ORIGINAL_HOME" \
                     _MIHOMO_CLI_ORIGINAL_UID="$ORIGINAL_UID" \
                     bash -c 'echo "ORIGINAL_HOME=$_MIHOMO_CLI_ORIGINAL_HOME ORIGINAL_UID=$_MIHOMO_CLI_ORIGINAL_UID"')
     echo "传递结果: $SUDO_ENV"
-    
+
     if echo "$SUDO_ENV" | grep -q "ORIGINAL_HOME=$ORIGINAL_HOME"; then
         echo "✅ _MIHOMO_CLI_ORIGINAL_HOME 传递成功"
     else
         echo "❌ _MIHOMO_CLI_ORIGINAL_HOME 传递失败"
         exit 1
     fi
-    
+
     if echo "$SUDO_ENV" | grep -q "ORIGINAL_UID=$ORIGINAL_UID"; then
         echo "✅ _MIHOMO_CLI_ORIGINAL_UID 传递成功"
     else

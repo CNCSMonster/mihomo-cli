@@ -91,10 +91,13 @@ fn reload_config_payload(path: &str) -> Value {
     serde_json::json!({"path": path})
 }
 
-/// Reads HTTP response bytes from stream, parsing Content-Length so that
-/// client does not hang waiting for EOF when the server keeps connection alive.
-async fn read_http_socket_response<R: AsyncReadExt + Unpin>(
+/// Bounded response reader: aborts accumulation once `byte_limit` is exceeded,
+/// returning an error rather than allocating unboundedly. Used by the drift
+/// sampler to enforce the 1MiB cap at the read layer (B1).
+/// When `byte_limit` is `None`, the reader is unbounded (legacy behavior).
+async fn read_http_socket_response_with_limit<R: AsyncReadExt + Unpin>(
     stream: &mut R,
+    byte_limit: Option<usize>,
 ) -> anyhow::Result<Vec<u8>> {
     let mut data = Vec::new();
     let mut buf = [0u8; 8192];
@@ -106,6 +109,16 @@ async fn read_http_socket_response<R: AsyncReadExt + Unpin>(
             break;
         }
         data.extend_from_slice(&buf[..n]);
+
+        if let Some(limit) = byte_limit {
+            if data.len() > limit {
+                anyhow::bail!(
+                    "response body exceeded {} bytes (got {}); aborting",
+                    limit,
+                    data.len()
+                );
+            }
+        }
 
         if expected_total_bytes.is_none() {
             if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -155,6 +168,12 @@ async fn read_http_socket_response<R: AsyncReadExt + Unpin>(
 #[allow(async_fn_in_trait)]
 trait SocketTransport {
     async fn roundtrip(&self, socket: &str, request: &[u8]) -> anyhow::Result<Vec<u8>>;
+    async fn roundtrip_with_limit(
+        &self,
+        socket: &str,
+        request: &[u8],
+        byte_limit: usize,
+    ) -> anyhow::Result<Vec<u8>>;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -162,6 +181,20 @@ struct PlatformSocketTransport;
 
 impl SocketTransport for PlatformSocketTransport {
     async fn roundtrip(&self, socket: &str, request: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.roundtrip_with_limit(socket, request, usize::MAX).await
+    }
+
+    async fn roundtrip_with_limit(
+        &self,
+        socket: &str,
+        request: &[u8],
+        byte_limit: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        let limit = if byte_limit == usize::MAX {
+            None
+        } else {
+            Some(byte_limit)
+        };
         #[cfg(unix)]
         {
             let mut stream = tokio::time::timeout(
@@ -170,14 +203,14 @@ impl SocketTransport for PlatformSocketTransport {
             )
             .await??;
             stream.write_all(request).await?;
-            read_http_socket_response(&mut stream).await
+            read_http_socket_response_with_limit(&mut stream, limit).await
         }
 
         #[cfg(windows)]
         {
             let mut stream = ClientOptions::new().open(socket)?;
             stream.write_all(request).await?;
-            read_http_socket_response(&mut stream).await
+            read_http_socket_response_with_limit(&mut stream, limit).await
         }
     }
 }
@@ -194,9 +227,26 @@ async fn do_socket_request_with<T: SocketTransport>(
     parse_socket_http_response(&response)
 }
 
+/// Bounded socket request: aborts if the response body exceeds `byte_limit`.
+async fn do_socket_request_with_limit<T: SocketTransport>(
+    transport: &T,
+    socket: &str,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    byte_limit: usize,
+) -> anyhow::Result<Value> {
+    let request = build_socket_http_request(method, path, body);
+    let response = transport
+        .roundtrip_with_limit(socket, &request, byte_limit)
+        .await?;
+    parse_socket_http_response(&response)
+}
+
 #[allow(async_fn_in_trait)]
 pub(crate) trait MihomoApiClient {
     async fn get(&self, path: &str) -> anyhow::Result<Value>;
+    async fn get_bounded(&self, path: &str, byte_limit: usize) -> anyhow::Result<Value>;
     async fn put(&self, path: &str, body: Value) -> anyhow::Result<Value>;
     async fn patch(&self, path: &str, body: Value) -> anyhow::Result<Value>;
     async fn delete(&self, path: &str) -> anyhow::Result<Value>;
@@ -281,11 +331,57 @@ impl EndpointMihomoApiClient {
             }
         }
     }
+
+    /// Bounded request: aborts if the response body exceeds `byte_limit`.
+    /// Only applies to direct socket transports; daemon-routed requests are
+    /// bounded by the daemon's own limits.
+    async fn request_bounded(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        byte_limit: usize,
+    ) -> anyhow::Result<Value> {
+        match &self.transport {
+            ApiTransport::Endpoint(crate::instance::ApiEndpoint::UnixSocket(socket)) => {
+                do_socket_request_with_limit(
+                    &PlatformSocketTransport,
+                    &socket.display().to_string(),
+                    method,
+                    path,
+                    body,
+                    byte_limit,
+                )
+                .await
+            }
+            ApiTransport::Endpoint(crate::instance::ApiEndpoint::WindowsNamedPipe(pipe)) => {
+                do_socket_request_with_limit(
+                    &PlatformSocketTransport,
+                    pipe,
+                    method,
+                    path,
+                    body,
+                    byte_limit,
+                )
+                .await
+            }
+            #[cfg(unix)]
+            ApiTransport::SystemDaemon => {
+                // Daemon-routed requests are already bounded by the daemon's
+                // own response handling; fall back to the unbounded path.
+                self.request(method, path, body).await
+            }
+        }
+    }
 }
 
 impl MihomoApiClient for EndpointMihomoApiClient {
     async fn get(&self, path: &str) -> anyhow::Result<Value> {
         self.request("GET", path, None).await
+    }
+
+    async fn get_bounded(&self, path: &str, byte_limit: usize) -> anyhow::Result<Value> {
+        self.request_bounded("GET", path, None, byte_limit).await
     }
 
     async fn put(&self, path: &str, body: Value) -> anyhow::Result<Value> {
@@ -328,16 +424,32 @@ pub async fn wait_for_api_ready_at_endpoint(
     endpoint: &crate::instance::ApiEndpoint,
     timeout_secs: u64,
 ) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    wait_for_api_ready_with_deadline(endpoint, deadline).await
+}
+
+/// SPEC B3: Poll /configs with a shared deadline (no independent timing).
+/// Each request is bounded to 5s. Returns true if ready, false if deadline exceeded.
+pub async fn wait_for_api_ready_with_deadline(
+    endpoint: &crate::instance::ApiEndpoint,
+    deadline: std::time::Instant,
+) -> bool {
     let start = std::time::Instant::now();
-    let deadline = start + std::time::Duration::from_secs(timeout_secs);
     let mut warned_5s = false;
     let mut warned_10s = false;
     let client = EndpointMihomoApiClient::new(endpoint.clone());
     while std::time::Instant::now() < deadline {
-        match client.get("/configs").await {
-            Ok(_) => return true,
-            Err(e) => {
+        // SPEC B3: each HTTP exchange ≤5s including response read
+        let request_timeout = std::time::Duration::from_secs(5);
+        match tokio::time::timeout(request_timeout, client.get_bounded("/configs", 1024 * 1024))
+            .await
+        {
+            Ok(Ok(_)) => return true,
+            Ok(Err(e)) => {
                 crate::log!("connection to {:?} failed: {e}", endpoint);
+            }
+            Err(_) => {
+                crate::log!("connection to {:?} timed out (5s limit)", endpoint);
             }
         }
         let elapsed = start.elapsed().as_secs();
@@ -636,7 +748,7 @@ pub(crate) fn tun_patch_payload(
         );
     }
     if let Some(dns_hijack) = dns_hijack {
-        // Issue #022: `--dns-hijack` 支持逗号分隔的多个目标（如 any:53,tcp://any:53）。
+        // `--dns-hijack` 支持逗号分隔的多个目标（如 any:53,tcp://any:53）。
         let entries: Vec<serde_json::Value> = crate::config::dns_hijack_entries(dns_hijack)
             .into_iter()
             .map(serde_json::Value::String)
@@ -1060,6 +1172,15 @@ mod tests {
 
     impl SocketTransport for FakeSocketTransport {
         async fn roundtrip(&self, socket: &str, request: &[u8]) -> anyhow::Result<Vec<u8>> {
+            self.roundtrip_with_limit(socket, request, usize::MAX).await
+        }
+
+        async fn roundtrip_with_limit(
+            &self,
+            socket: &str,
+            request: &[u8],
+            _byte_limit: usize,
+        ) -> anyhow::Result<Vec<u8>> {
             self.calls
                 .lock()
                 .unwrap()
@@ -1306,7 +1427,9 @@ mod tests {
         use std::io::Cursor;
         let response_bytes = b"HTTP/1.0 200 OK\r\nContent-Length: 17\r\n\r\n{\"hello\":\"world\"}extra_trailing_bytes_not_read";
         let mut cursor = Cursor::new(response_bytes);
-        let result = read_http_socket_response(&mut cursor).await.unwrap();
+        let result = read_http_socket_response_with_limit(&mut cursor, None)
+            .await
+            .unwrap();
         assert_eq!(
             result,
             b"HTTP/1.0 200 OK\r\nContent-Length: 17\r\n\r\n{\"hello\":\"world\"}"
@@ -1370,6 +1493,10 @@ mod api_client_tests {
                 .unwrap()
                 .pop()
                 .ok_or_else(|| anyhow::anyhow!("no fake GET response for {path}"))
+        }
+
+        async fn get_bounded(&self, path: &str, _byte_limit: usize) -> anyhow::Result<Value> {
+            self.get(path).await
         }
 
         async fn put(&self, path: &str, body: Value) -> anyhow::Result<Value> {

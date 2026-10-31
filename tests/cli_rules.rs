@@ -1,6 +1,29 @@
 use std::process::Command;
 use tempfile::TempDir;
 
+fn setup_test_paths_with_sub(root: &std::path::Path) {
+    std::fs::create_dir_all(root.join("subscriptions")).unwrap();
+    std::fs::write(root.join("subscriptions/active"), "sub-a").unwrap();
+    std::fs::write(
+        root.join("subscriptions/sub-a.yaml"),
+        r#"
+proxies:
+  - name: Proxy
+    type: direct
+proxy-groups:
+  - name: ProxyGroup
+    type: select
+    proxies:
+      - Proxy
+rules:
+  - MATCH,DIRECT
+"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("subscriptions.yaml"), "[]\n").unwrap();
+    std::fs::write(root.join("config.yaml"), "port: 7890\n").unwrap();
+}
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_mihomo-cli")
 }
@@ -248,5 +271,110 @@ fn concurrent_rule_add_both_rules_preserved() {
     assert!(
         rules.contains("DOMAIN-SUFFIX,b.com,DIRECT"),
         "rule B missing. rules: {rules}"
+    );
+}
+
+#[test]
+fn rule_add_custom_proxy_from_proxies_append_succeeds() {
+    let tmp = TempDir::new().unwrap();
+    setup_test_paths_with_sub(tmp.path());
+
+    let override_src = tmp.path().join("my-override.yaml");
+    std::fs::write(
+        &override_src,
+        r#"
+proxies-append:
+  - name: SG-corp-host
+    type: socks5
+    server: 127.0.0.1
+    port: 11080
+"#,
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_mihomo-cli");
+    let import_out = Command::new(bin)
+        .env("MIHOMO_CLI_CONFIG_DIR", tmp.path())
+        .args(["override", "import", override_src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        import_out.status.success(),
+        "override import must succeed: {}",
+        String::from_utf8_lossy(&import_out.stderr)
+    );
+
+    let policies_out = Command::new(bin)
+        .env("MIHOMO_CLI_CONFIG_DIR", tmp.path())
+        .args(["rule", "policies"])
+        .output()
+        .unwrap();
+    assert!(policies_out.status.success());
+    let stdout = String::from_utf8_lossy(&policies_out.stdout);
+    assert!(
+        stdout.contains("SG-corp-host"),
+        "policies must include SG-corp-host: {stdout}"
+    );
+
+    let add_out = Command::new(bin)
+        .env("MIHOMO_CLI_CONFIG_DIR", tmp.path())
+        .args(["rule", "add", "DOMAIN-SUFFIX,apple.com,SG-corp-host"])
+        .output()
+        .unwrap();
+    assert!(
+        add_out.status.success(),
+        "rule add targeting custom proxy must succeed: {}",
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+
+    let config_content = std::fs::read_to_string(tmp.path().join("config.yaml")).unwrap();
+    assert!(
+        config_content.contains("DOMAIN-SUFFIX,apple.com,SG-corp-host"),
+        "config.yaml must retain rule targeting SG-corp-host"
+    );
+}
+
+#[test]
+fn rule_add_provider_payload_node_rejected_with_helpful_guidance() {
+    let tmp = TempDir::new().unwrap();
+    setup_test_paths_with_sub(tmp.path());
+
+    let override_src = tmp.path().join("my-override.yaml");
+    std::fs::write(
+        &override_src,
+        r#"
+proxy-providers:
+  corp-host:
+    type: inline
+    payload:
+      - name: SG-corp-host
+        type: socks5
+        server: 127.0.0.1
+        port: 11080
+"#,
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_mihomo-cli");
+    let import_out = Command::new(bin)
+        .env("MIHOMO_CLI_CONFIG_DIR", tmp.path())
+        .args(["override", "import", override_src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(import_out.status.success(), "override import must succeed");
+
+    let add_out = Command::new(bin)
+        .env("MIHOMO_CLI_CONFIG_DIR", tmp.path())
+        .args(["rule", "add", "DOMAIN-SUFFIX,apple.com,SG-corp-host"])
+        .output()
+        .unwrap();
+    assert!(
+        !add_out.status.success(),
+        "targeting provider payload node in rule must fail"
+    );
+    let stderr = String::from_utf8_lossy(&add_out.stderr);
+    assert!(
+        stderr.contains("defined inside proxy-provider `corp-host`"),
+        "stderr must contain provider node guidance: {stderr}"
     );
 }

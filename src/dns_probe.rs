@@ -1,11 +1,11 @@
-//! Issue #022 子问题 A：`doctor` 的 P2 本地解析器探测（Local Resolver Probe）。
+//! 子问题 A：`doctor` 的 P2 本地解析器探测（Local Resolver Probe）。
 //!
-//! 语义依据：`docs/drafts/SPEC-doctor-local-resolver-probe.draft.md` 的已确认决策
+//! 语义依据：doctor 本地解析器探测设计的已确认决策
 //! - **D1** 默认探测（opt-out，`doctor --no-probe-dns` 关闭）；
 //! - **D2** 仅当**运行态 TUN 生效**且**运行配置**（launched/active，非 intent）为
 //!   `dns.enhanced-mode: fake-ip` 时探测，否则跳过（review MAJOR-7 修订）；
 //! - **D3** 探测目标是**系统解析器**（`/etc/resolv.conf` 的 nameserver）——这是被观测对象本身，
-//!   也是 #022 实测中唯一给出决定性证据的检查（`resolvectl query` 返回真实地址 → 未进 TUN）；
+//!   也是实测中唯一给出决定性证据的检查（`resolvectl query` 返回真实地址 → 未进 TUN）；
 //! - **D4** 结果只作为 `doctor` 的独立诊断字段，不进入 Health / attestation / `status`。
 //!
 //! 硬边界：
@@ -86,7 +86,7 @@ impl FakeIpRange {
 pub(crate) enum ProbeVerdict {
     /// 返回地址落在 fake-ip 范围内 → 系统解析路径经过 mihomo。
     RoutedThroughMihomo,
-    /// 返回真实地址 → 系统解析路径绕过 mihomo（#022 的失效签名）。
+    /// 返回真实地址 → 系统解析路径绕过 mihomo（失效签名）。
     BypassesMihomo,
     /// NXDOMAIN / SERVFAIL / 超时 / 无法确定 fake-ip 范围 → 不告警、不阻断。
     Unknown(String),
@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn fake_ip_range_parses_legacy_28_over_8() {
-        // Issue #022 实测环境的旧默认值，必须能正确识别其派生地址。
+        // 实测环境的旧默认值，必须能正确识别其派生地址。
         let range = FakeIpRange::parse("28.0.0.1/8").unwrap();
         assert!(range.contains(Ipv4Addr::new(28, 0, 0, 4)));
         assert!(!range.contains(Ipv4Addr::new(198, 18, 0, 1)));

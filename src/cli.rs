@@ -38,7 +38,7 @@ pub(crate) struct Cli {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Command {
     /// Install mihomo binary and configure subscription
-    #[command(visible_alias = "i")]
+    #[command(visible_alias = "i", after_help = "See: mihomo-cli manual install")]
     Install {
         /// Install TUN/system service mode (advanced; daily use can run `mihomo-cli tun on`)
         #[arg(long = "system", conflicts_with = "user")]
@@ -62,9 +62,21 @@ pub(crate) enum Command {
         /// Assume yes for install prompts (currently: service install confirmation)
         #[arg(short, long)]
         yes: bool,
+        /// Explicitly discard ONE pending generation (metadata-only revocation).
+        /// Does not stop services, does not replace installed files. Required when
+        /// a pending upgrade failed and the runtime could not be rolled back.
+        #[arg(long = "discard-pending", value_name = "GENERATION")]
+        discard_pending: Option<String>,
+        /// Explicitly trust a migrated installation's exact current snapshot; does not apply an update
+        #[arg(long, requires = "system", conflicts_with_all = ["user", "force", "version", "github_mirror", "skip_config"])]
+        adopt_current: bool,
+        /// Preview adoption without writing, migrating, locking, or requesting administrator access
+        #[arg(long, requires = "adopt_current")]
+        dry_run: bool,
     },
 
     /// Check for and install the latest mihomo core version
+    #[command(after_help = "See: mihomo-cli manual upgrade")]
     Upgrade {
         /// Force the system service instance (advanced/debugging)
         #[arg(long = "system")]
@@ -79,6 +91,19 @@ pub(crate) enum Command {
         /// Force the system service instance when probing core version (advanced/debugging)
         #[arg(long = "system")]
         system: bool,
+    },
+
+    /// Read the embedded user manual (no repository checkout required)
+    #[command(
+        visible_alias = "doc",
+        after_help = "See also: mihomo-cli manual --list (alias: mihomo-cli doc)"
+    )]
+    Manual {
+        /// List `<slug>\t<title>` for every topic instead of rendering a topic
+        #[arg(long, conflicts_with = "topic")]
+        list: bool,
+        /// Topic slug; omit to render the manual index (`index`)
+        topic: Option<String>,
     },
 
     /// Interactive subscription TUI, or use flags to manage subscriptions (add/remove/refresh/validate)
@@ -211,6 +236,7 @@ pub(crate) enum Command {
     },
 
     /// Manage proxy groups for the active subscription
+    #[command(after_help = "See: mihomo-cli manual nodes")]
     Group {
         #[command(subcommand)]
         action: GroupAction,
@@ -220,6 +246,7 @@ pub(crate) enum Command {
     },
 
     /// Select a node — interactive TUI (no --node) or non-interactive CLI (with --node)
+    #[command(after_help = "See: mihomo-cli manual nodes")]
     Select {
         /// Force the system service instance (advanced/debugging)
         #[arg(long = "system", conflicts_with = "user")]
@@ -271,7 +298,7 @@ pub(crate) enum Command {
     },
 
     /// Toggle or check TUN mode
-    #[command(name = "tun")]
+    #[command(name = "tun", after_help = "See: mihomo-cli manual tun")]
     Tun {
         /// Force the system service instance (advanced/debugging)
         #[arg(long = "system")]
@@ -367,6 +394,7 @@ Limitations:
     },
 
     /// Show a read-only running status overview
+    #[command(after_help = "See: mihomo-cli manual install")]
     Status {
         /// Force the system service instance (advanced/debugging)
         #[arg(long = "system")]
@@ -399,6 +427,7 @@ Limitations:
         follow: bool,
     },
     /// Manage user-defined routing rules
+    #[command(after_help = "See: mihomo-cli manual subscription")]
     Rule {
         /// Force the system service instance for validation/reload (advanced/debugging)
         #[arg(long = "system")]
@@ -432,9 +461,12 @@ Limitations:
         /// Force the user service instance (advanced/debugging)
         #[arg(long = "user", conflicts_with = "system")]
         user: bool,
-        /// Skip the bounded local DNS resolver probe (Issue #022)
+        /// Skip the bounded local DNS resolver probe
         #[arg(long = "no-probe-dns")]
         no_probe_dns: bool,
+        /// Explicitly request administrator access for a read-only generation inspection (no repairs)
+        #[arg(long, requires = "system", conflicts_with = "user")]
+        privileged: bool,
     },
 
     /// Backup mihomo-cli configuration files
@@ -478,6 +510,45 @@ Limitations:
     /// Show real-time status dashboard (TUI)
     #[command(visible_alias = "dash")]
     Dashboard,
+}
+
+impl Command {
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Command::Install { .. } => "install",
+            Command::Upgrade { .. } => "upgrade",
+            Command::Version { .. } => "version",
+            Command::Manual { .. } => "manual",
+            Command::Config { .. } => "config",
+            Command::Uninstall { .. } => "uninstall",
+            Command::Update { .. } => "update",
+            Command::Start { .. } => "start",
+            Command::Stop { .. } => "stop",
+            Command::Restart { .. } => "restart",
+            Command::Group { .. } => "group",
+            Command::Select { .. } => "select",
+            Command::List { .. } => "list",
+            Command::Delay { .. } => "delay",
+            Command::Tun { .. } => "tun",
+            Command::Connections { .. } => "connections",
+            Command::Ip { .. } => "ip",
+            Command::ExitIp { .. } => "exit-ip",
+            Command::Proxy { .. } => "proxy",
+            Command::SystemProxy { .. } => "system-proxy",
+            Command::Status { .. } => "status",
+            Command::Use { .. } => "use",
+            Command::Logs { .. } => "logs",
+            Command::Rule { .. } => "rule",
+            Command::Dns { .. } => "dns",
+            Command::Override { .. } => "override",
+            Command::Doctor { .. } => "doctor",
+            Command::Backup { .. } => "backup",
+            Command::Restore { .. } => "restore",
+            Command::Daemon => "daemon",
+            Command::Autostart { .. } => "autostart",
+            Command::Dashboard => "dashboard",
+        }
+    }
 }
 
 #[derive(Clone, ValueEnum)]
@@ -556,6 +627,8 @@ pub(crate) enum GroupAction {
         group_type: Option<String>,
         #[arg(long = "member")]
         members: Vec<String>,
+        #[arg(long = "use")]
+        uses: Vec<String>,
         #[arg(long)]
         url: Option<String>,
         #[arg(long)]
@@ -569,17 +642,21 @@ pub(crate) enum GroupAction {
     },
     /// Replace a group definition from a YAML file
     Edit { name: String, file: String },
-    /// Add static members to a group
+    /// Add static members or providers to a group
     Add {
         name: String,
-        #[arg(long = "member", required = true)]
+        #[arg(long = "member")]
         members: Vec<String>,
+        #[arg(long = "use")]
+        uses: Vec<String>,
     },
-    /// Remove static members from a group
+    /// Remove static members or providers from a group
     Remove {
         name: String,
-        #[arg(long = "member", required = true)]
+        #[arg(long = "member")]
         members: Vec<String>,
+        #[arg(long = "use")]
+        uses: Vec<String>,
     },
     /// Delete a custom group or hide an original group
     Delete { name: String },

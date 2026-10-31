@@ -1989,9 +1989,9 @@ mod target_tests {
     #[test]
     fn install_plan_builds_bin_part_and_download_url() {
         let linux = MihomoTarget::resolve("linux", "x86_64");
-        let plan = mihomo_install_plan(&linux, "/home/alice", "v1.2.3");
-        assert_eq!(plan.bin_path, "/home/alice/.local/bin/mihomo");
-        assert_eq!(plan.part_path, "/home/alice/.local/bin/mihomo.part");
+        let plan = mihomo_install_plan(&linux, "/home/user", "v1.2.3");
+        assert_eq!(plan.bin_path, "/home/user/.local/bin/mihomo");
+        assert_eq!(plan.part_path, "/home/user/.local/bin/mihomo.part");
         assert_eq!(plan.archive_ext, "gz");
         assert_eq!(
             plan.url,
@@ -1999,14 +1999,14 @@ mod target_tests {
         );
 
         let windows = MihomoTarget::resolve("windows", "x86_64");
-        let plan = mihomo_install_plan(&windows, r"C:\Users\Alice\AppData\Local", "v9");
+        let plan = mihomo_install_plan(&windows, r"C:\Users\user\AppData\Local", "v9");
         assert_eq!(
             plan.bin_path,
-            r"C:\Users\Alice\AppData\Local\mihomo\mihomo.exe"
+            r"C:\Users\user\AppData\Local\mihomo\mihomo.exe"
         );
         assert_eq!(
             plan.part_path,
-            r"C:\Users\Alice\AppData\Local\mihomo\mihomo.exe.part"
+            r"C:\Users\user\AppData\Local\mihomo\mihomo.exe.part"
         );
         assert_eq!(plan.archive_ext, "zip");
     }

@@ -3,9 +3,9 @@
 #   A) `group create` with TUN on promotes into the running snapshot (runtime_applied)
 #   B) pending group change (daemon down) is applied by `mihomo-cli restart`
 #   C) persisted selection is replayed to the core after restart
-#   D) override 派生键在 restart 前后都不丢，且 restart 后运行时对账闭环 (Issue #022 B/C)
-#   E) doctor 本地解析器探测：绕过可检出、fake-ip 判健康、--no-probe-dns 关闭 (Issue #022 A)
-#   F) override 中 TUN 事务管辖键显式告警，且不顶掉 TUN 意图 (Issue #022 B)
+# D) override 派生键在 restart 前后都不丢，且 restart 后运行时对账闭环 (B/C)
+# E) doctor 本地解析器探测：绕过可检出、fake-ip 判健康、--no-probe-dns 关闭 (A)
+# F) override 中 TUN 事务管辖键显式告警，且不顶掉 TUN 意图 (B)
 set -u
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -98,7 +98,7 @@ sleep 2
 OUT=$($CLI restart --system --yes 2>&1) || { echo "$OUT"; fail "restart failed"; }
 echo "$OUT"
 sleep 2
-printf '%s' "$OUT" | grep -q 'Selections not replayed' && fail "B: misleading selection replay warning without persisted intent (Issue #022 C)"
+printf '%s' "$OUT" | grep -q 'Selections not replayed' && fail "B: misleading selection replay warning without persisted intent (C)"
 LCFG=$(launched_config)
 [ -n "$LCFG" ] || fail "B: no launched config recorded"
 grep -q 'StreamB' "$LCFG" || fail "B: restart did not apply pending StreamB (launched $LCFG)"
@@ -123,7 +123,7 @@ AFTER=$(puts_count)
 grep -q 'PUT /proxies/Test' "$PUT_REC" || fail "C: selection for Test not replayed after restart"
 echo "C PASS: selection replayed to core after restart ($BASE -> $AFTER PUTs)"
 
-step "5 scenario D: override keys survive restart (Issue #022 B)"
+step "5 scenario D: override keys survive restart (B)"
 cat > /tmp/override-issue022.yaml <<'OEOF'
 sniffer:
   enable: true
@@ -148,25 +148,25 @@ LCFG=$(launched_config)
 grep -q '^sniffer:' "$CFG/config.yaml" || fail "D: intent config.yaml lost override keys after restart"
 grep -q '^sniffer:' "$LCFG" || fail "D: launched config ($LCFG) lost override keys after restart"
 grep -q 'fake-ip' "$LCFG" || fail "D: launched config ($LCFG) lost override dns keys after restart"
-# Issue #022 C：restart 之后运行时对账必须闭环，不得留下 unknown/degraded
-# Issue #022 C：三份证据（intent / 启动配置 / 受管 TUN 快照）必须收敛到同一 revision，
+# C：restart 之后运行时对账必须闭环，不得留下 unknown/degraded
+# C：三份证据（intent / 启动配置 / 受管 TUN 快照）必须收敛到同一 revision，
 # 否则 attestation 无法闭环，status 会长期显示 unknown / degraded。
 I_REV=$(sha256sum "$CFG/config.yaml" | cut -d' ' -f1)
 L_REV=$(sha256sum "$LCFG" | cut -d' ' -f1)
 T_REV=$(sha256sum "$RT/tun-config.yaml" | cut -d' ' -f1)
 [ "$I_REV" = "$L_REV" ] || fail "D: launched revision != intent revision ($L_REV != $I_REV)"
-[ "$I_REV" = "$T_REV" ] || fail "D: TUN snapshot revision != intent revision (Issue #022 C)"
+[ "$I_REV" = "$T_REV" ] || fail "D: TUN snapshot revision != intent revision (C)"
 ST=$($CLI status 2>&1)
 echo "$ST"
-printf '%s' "$ST" | grep -qE 'Configuration: +unknown' && fail "D: status Configuration unknown after restart (Issue #022 C)"
-printf '%s' "$ST" | grep -qE 'TUN: +unknown' && fail "D: status TUN unknown after restart (Issue #022 C)"
-printf '%s' "$ST" | grep -qE 'Health: +degraded' && fail "D: status Health degraded after restart (Issue #022 C)"
+printf '%s' "$ST" | grep -qE 'Configuration: +unknown' && fail "D: status Configuration unknown after restart (C)"
+printf '%s' "$ST" | grep -qE 'TUN: +unknown' && fail "D: status TUN unknown after restart (C)"
+printf '%s' "$ST" | grep -qE 'Health: +degraded' && fail "D: status Health degraded after restart (C)"
 echo "D PASS: override keys survived restart (intent + launched)"
 
-step "6 scenario E: doctor local DNS probe (Issue #022 A)"
+step "6 scenario E: doctor local DNS probe (A)"
 
 # 用本机 UDP DNS 模拟器扮演系统解析器：
-#   mode=real 返回真实地址（#022 的绕过签名），mode=fake 返回 fake-ip（正常状态）。
+# mode=real 返回真实地址（的绕过签名），mode=fake 返回 fake-ip（正常状态）。
 cat > /tmp/mock-dns.py <<'PYEOF'
 import socket, struct, sys
 
@@ -212,7 +212,7 @@ restore_e_env() {
 trap restore_e_env EXIT
 query_count() { grep -c '^query$' /tmp/mock-dns.log 2>/dev/null || echo 0; }
 
-# E-1：系统解析器返回真实地址 → doctor 必须报出绕过（#022 当初漏检的正是这一状态）
+# E-1：系统解析器返回真实地址 → doctor 必须报出绕过（当初漏检的正是这一状态）
 start_mock_dns real
 OUT=$($CLI doctor 2>&1)
 echo "$OUT"
@@ -257,9 +257,9 @@ restore_e_env
 trap - EXIT
 echo "E PASS: probe detects bypass, recognises fake-ip, and honours --no-probe-dns"
 
-step "7 scenario F: override tun.* explicitly rejected (Issue #022 §4.7)"
+step "7 scenario F: override tun.* explicitly rejected (§4.7)"
 # 控制键（enable/stack/dns-hijack/strict-route/auto-route/auto-detect-interface）被拒绝；
-# 非控制键（route-exclude-address 等）按 ADR-22 照常生效——后者正是 #023 的推荐手段。
+# 非控制键（route-exclude-address 等）按 ADR-22 照常生效——后者正是 的推荐手段。
 cat > /tmp/override-tun-owned.yaml <<'OEOF'
 tun:
   enable: false
@@ -281,7 +281,7 @@ TUN_HEAD=$(awk '/^tun:/{f=1} f&&/enable:/{print; exit}' "$CFG/config.yaml")
 printf '%s' "$TUN_HEAD" | grep -q 'enable: true' || fail "F: tun.enable must stay true after override import (got: $TUN_HEAD)"
 # F-2：非控制键正常生效（ADR-22 override 权威不受影响，review 回归-3）
 grep -q 'override-destination: true' "$CFG/config.yaml" || fail "F: non-tun override key must merge into intent"
-grep -q 'route-exclude-address' "$CFG/config.yaml" || fail "F: non-controlled tun key must merge into intent (issue #023 path)"
+grep -q 'route-exclude-address' "$CFG/config.yaml" || fail "F: non-controlled tun key must merge into intent (issue  path)"
 grep -q '169.254.0.0/16' "$CFG/config.yaml" || fail "F: route-exclude-address value missing from intent"
 # F-3：restart（reconcile 路径）不得把 override 的 tun.enable:false 写回 intent
 OUT=$($CLI restart --system --yes 2>&1) || { echo "$OUT"; fail "F: restart failed"; }

@@ -1,0 +1,6 @@
+NAME=generation-apply-failure-recovery
+DESC=注入启动失败后补偿回滚到基线（槽位消费+墓碑+服务恢复）
+IMAGE=ubuntu:24.04
+SCRIPT=test-generation-apply-failure-recovery.sh
+TAGS=generation,upgrade,resilience
+REQUIRES=systemd

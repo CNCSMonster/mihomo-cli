@@ -1,0 +1,6 @@
+NAME=generation-apply-withdrawn-gate
+DESC=墓碑阻断自动重暂存 + 显式重试后墓碑退休
+IMAGE=ubuntu:24.04
+SCRIPT=test-generation-apply-withdrawn-gate.sh
+TAGS=generation,upgrade,resilience
+REQUIRES=systemd

@@ -12,7 +12,7 @@ use crate::instance::{SystemPaths, TargetOs};
 #[cfg(any(unix, windows))]
 use crate::ipc::CoreApiMethod;
 #[cfg(any(unix, windows))]
-use crate::ipc::{DaemonCommand, DaemonResponse};
+use crate::ipc::{DaemonCommand, DaemonResponse, TUN_GUARD_ERROR_MARKER};
 #[cfg(any(unix, windows))]
 use crate::mihomo_api;
 #[cfg(any(unix, windows))]
@@ -530,7 +530,9 @@ pub async fn run_daemon(pipe_path: PathBuf, cancel: CancellationToken) -> anyhow
     let autostart_marker = daemon_config_dir().join("autostart");
     if autostart_marker.exists() {
         let runtime_dir = system_runtime_data_dir();
-        if let Some(config_path) = resolve_autostart_target_config_path(&runtime_dir) {
+        if let Some(reason) = autostart_transaction_blocker() {
+            eprintln!("[mihomo-daemon] autostart skipped: {reason}");
+        } else if let Some(config_path) = resolve_autostart_target_config_path(&runtime_dir) {
             eprintln!(
                 "[mihomo-daemon] autostart marker present; starting core with {}",
                 config_path.display()
@@ -554,16 +556,23 @@ pub async fn run_daemon(pipe_path: PathBuf, cancel: CancellationToken) -> anyhow
     // replay the selection mirror once — idempotent and best-effort.
     let core_running_at_startup = state.lock().await.core_running;
     if core_running_at_startup {
-        if let Some(subscription_id) = read_mirror_active_id() {
-            for line in replay_mirror_selection_intent(&state, &subscription_id).await {
-                eprintln!("[mihomo-daemon] {}", render_replay_line_for_log(&line));
-            }
-        } else {
-            eprintln!("[mihomo-daemon] selection mirror unavailable; startup replay skipped");
+        // SPEC §3.8.3: normal boot recovers selections when the mirror can be
+        // proven to belong to the loaded configuration; otherwise every entry
+        // skips replay with an explicit annotation (never a silent claim).
+        for line in startup_replay_lines(&state).await {
+            eprintln!("[mihomo-daemon] {}", render_replay_line_for_log(&line));
         }
     }
 
     eprintln!("[mihomo-daemon] listening on {pipe_name}");
+
+    // SPEC A2/A3: read-only cache.db diagnosis at startup, then every tick.
+    diagnose_cache_db_hygiene();
+
+    tokio::spawn(run_selection_drift_sampler(
+        Arc::clone(&state),
+        cancel.child_token(),
+    ));
 
     // first_pipe_instance only for the first create (P1-2).
     let mut first_instance = true;
@@ -584,7 +593,7 @@ pub async fn run_daemon(pipe_path: PathBuf, cancel: CancellationToken) -> anyhow
                         let st = Arc::clone(&state);
                         tokio::spawn(async move {
                             if let Err(e) = handle_windows_pipe(server, st).await {
-                                eprintln!("[mihomo-daemon] pipe connection error: {e}");
+                                log_connection_error(&e);
                             }
                         });
                     }
@@ -897,7 +906,7 @@ async fn handle_windows_pipe(
     };
     // Mirrors the Unix connection handler: lifecycle commands serialize
     // end-to-end under OWNER_LIFECYCLE_LOCK while non-lifecycle commands stay
-    // lock-free (Issue #020).
+    // lock-free.
     let response = if is_lifecycle_command(&cmd) {
         let lock = OWNER_LIFECYCLE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
         let _guard = lock.lock().await;
@@ -1035,7 +1044,7 @@ fn daemon_config_dir() -> std::path::PathBuf {
     system_runtime_data_dir()
 }
 
-/// Issue #012: test-only override for the privileged runtime directory.
+/// test-only override for the privileged runtime directory.
 /// On machines where the system service is installed, `/var/lib/mihomo-cli`
 /// is root-owned mode 0770 and unit tests reading it fail with EACCES.
 /// Tests that exercise `process_command` (journal gate) call
@@ -1133,6 +1142,51 @@ fn record_active_subscription_mirror(subscription_id: &str) -> anyhow::Result<()
     record_active_subscription_mirror_in(&daemon_config_dir(), subscription_id)
 }
 
+/// SPEC §3.8.3: the mirror is bound to the `(config revision, subscription id)`
+/// the CLI asked to run. The daemon is the only writer and publishes the sidecar
+/// atomically next to the mirror files (same directory, tmp + rename).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct MirrorBinding {
+    pub subscription_id: String,
+    /// Missing on bindings recorded before this binding existed: such a record is
+    /// unauthenticated (not trusted, and not a permanent disable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_revision: Option<String>,
+}
+
+fn selection_mirror_binding_path_in(base: &std::path::Path) -> PathBuf {
+    selection_mirror_dir_in(base).join("binding.json")
+}
+
+fn record_mirror_binding_in(
+    base: &std::path::Path,
+    subscription_id: &str,
+    config_revision: Option<&str>,
+) -> anyhow::Result<()> {
+    if !valid_mirror_subscription_id(subscription_id) {
+        anyhow::bail!("invalid subscription id for mirror binding: {subscription_id}");
+    }
+    let binding = MirrorBinding {
+        subscription_id: subscription_id.to_string(),
+        config_revision: config_revision.map(str::to_string),
+    };
+    let json = serde_json::to_vec(&binding)?;
+    write_selection_mirror_file(&selection_mirror_binding_path_in(base), &json)
+}
+
+fn record_mirror_binding(
+    subscription_id: &str,
+    config_revision: Option<&str>,
+) -> anyhow::Result<()> {
+    record_mirror_binding_in(&daemon_config_dir(), subscription_id, config_revision)
+}
+
+fn read_mirror_binding_in(base: &std::path::Path) -> Option<MirrorBinding> {
+    let raw = std::fs::read(selection_mirror_binding_path_in(base)).ok()?;
+    let binding: MirrorBinding = serde_json::from_slice(&raw).ok()?;
+    valid_mirror_subscription_id(&binding.subscription_id).then_some(binding)
+}
+
 fn read_mirror_active_id_in(base: &std::path::Path) -> Option<String> {
     let raw = std::fs::read_to_string(selection_mirror_active_path_in(base)).ok()?;
     let id = raw.trim();
@@ -1157,23 +1211,35 @@ fn read_mirror_selection_map(
     read_mirror_selection_map_in(&daemon_config_dir(), subscription_id)
 }
 
+/// Sampler-side mirror read outcome: absence of intent is "nothing to compare"
+/// (not drift), while an existing-but-unreadable/unparsable mirror is a fault
+/// that must never be recorded as a healthy sample.
+enum MirrorSample {
+    Absent,
+    Map(std::collections::BTreeMap<String, String>),
+    Fault(anyhow::Error),
+}
+
+fn read_mirror_selection_map_for_sample(subscription_id: &str) -> MirrorSample {
+    let path = selection_mirror_file_path_in(&daemon_config_dir(), subscription_id);
+    match std::fs::read(&path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => MirrorSample::Absent,
+        Err(err) => MirrorSample::Fault(anyhow::anyhow!("read {}: {err}", path.display())),
+        Ok(raw) => match crate::selection::parse_selection_map(&raw) {
+            Ok(map) => MirrorSample::Map(map),
+            Err(err) => MirrorSample::Fault(anyhow::anyhow!("parse {}: {err:#}", path.display())),
+        },
+    }
+}
+
 /// 结构化信号：selection mirror 缺失。
 ///
 /// review MAJOR-5：daemon 按 SPEC（§3.8.1）**从不读用户 home**，因此无法判断用户是否
 /// 真有持久化选点——把它当 mirror 自己去判断会恒等于 mirror 是否存在（判断退化）。
 /// daemon 只回传这个信号，最终措辞（“无事可回放” vs “需要重建 mirror”）由 CLI 用
-/// **用户自己的 selections 树**决定，避免把真实 mirror 丢失掩盖成 `✓`（Issue #022 §4.8）。
+/// **用户自己的 selections 树**决定，避免把真实 mirror 丢失掩盖成 `✓`（§4.8）。
 pub(crate) const SELECTION_MIRROR_MISSING_SIGNAL: &[u8] = b"[selection-mirror-missing]";
-
-/// daemon 日志侧渲染：信号只写事实，不下“有没有东西可回放”的结论。
-fn render_replay_line_for_log(line: &str) -> String {
-    if line.starts_with("[selection-mirror-missing]") {
-        "⚠ selection mirror unavailable; replay skipped (daemon does not consult the user tree)"
-            .to_string()
-    } else {
-        line.to_string()
-    }
-}
+pub(crate) const SELECTION_IDENTITY_MISMATCH_SIGNAL: &[u8] = b"[selection-identity-mismatch]";
 
 /// Content revisions of selection mirror files for reconciliation (R3.2).
 /// `None` per id means the mirror file is absent. Ids that would not be
@@ -1200,6 +1266,538 @@ fn selection_mirror_revisions_in(
         .collect())
 }
 
+// ---------------- Selection drift tracker (B1) ----------------
+
+const DRIFT_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const DRIFT_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const DRIFT_RESPONSE_BYTE_LIMIT: usize = 1024 * 1024;
+const DRIFT_RING_CAPACITY: usize = 256;
+const DRIFT_WARN_INTERVAL_PER_GROUP: std::time::Duration = std::time::Duration::from_secs(3600);
+const DRIFT_REPLAY_SUPPRESSION: std::time::Duration = std::time::Duration::from_secs(30);
+
+struct DriftTrackerState {
+    /// Monotonic operation sequence: every managed mutation (selection,
+    /// promote, replay, mirror scope change) increments it on start AND end.
+    seq: u64,
+    /// Managed mutations currently in flight.
+    in_flight: u64,
+    /// A select segment is open (runtime PUT → intent persistence → mirror
+    /// push). Sampling is deferred until the segment closes explicitly.
+    /// No TTL self-heal: operations that cannot prove completion stay unknown.
+    select_segment_open: bool,
+    /// Subscription the open segment belongs to (mirror active id captured at
+    /// open). A `RecordSelectionIntent` only closes the segment when it is
+    /// addressed to this subscription (or the owner was unknown).
+    select_segment_owner: Option<String>,
+    /// While set, replay suppression is active (do not sample).
+    suppress_until: Option<std::time::Instant>,
+    /// Single-flight guard for the sampler.
+    sampling: bool,
+    observations: std::collections::VecDeque<crate::ipc::SelectionDriftObservation>,
+    unknown_samples: u64,
+    last_sample_status: String,
+    last_warn_at: std::collections::HashMap<String, std::time::Instant>,
+}
+
+impl Default for DriftTrackerState {
+    fn default() -> Self {
+        DriftTrackerState {
+            seq: 0,
+            in_flight: 0,
+            select_segment_open: false,
+            select_segment_owner: None,
+            suppress_until: None,
+            sampling: false,
+            observations: std::collections::VecDeque::new(),
+            unknown_samples: 0,
+            // Never an empty string: `status` consumers must see a valid value
+            // from the very first observation.
+            last_sample_status: "unknown".to_string(),
+            last_warn_at: std::collections::HashMap::new(),
+        }
+    }
+}
+
+fn drift_tracker() -> &'static std::sync::Mutex<DriftTrackerState> {
+    static TRACKER: std::sync::OnceLock<std::sync::Mutex<DriftTrackerState>> =
+        std::sync::OnceLock::new();
+    TRACKER.get_or_init(|| std::sync::Mutex::new(DriftTrackerState::default()))
+}
+
+/// RAII bracket for a managed mutation: bumps the monotonic sequence and the
+/// in-flight counter on both edges so a sampler that straddles the operation
+/// observes a sequence change and discards its sample (ABA-safe).
+struct DriftOpGuard;
+
+impl DriftOpGuard {
+    fn open() -> Self {
+        if let Ok(mut tracker) = drift_tracker().lock() {
+            tracker.seq = tracker.seq.wrapping_add(1);
+            tracker.in_flight += 1;
+        }
+        DriftOpGuard
+    }
+}
+
+impl Drop for DriftOpGuard {
+    fn drop(&mut self) {
+        if let Ok(mut tracker) = drift_tracker().lock() {
+            tracker.in_flight = tracker.in_flight.saturating_sub(1);
+            tracker.seq = tracker.seq.wrapping_add(1);
+        }
+    }
+}
+
+/// Replay bracket: same as [`DriftOpGuard`] but arms the post-replay
+/// suppression window on every exit path (success/failure/cancel/budget).
+struct ReplayDriftGuard {
+    _op: DriftOpGuard,
+}
+
+impl ReplayDriftGuard {
+    fn open() -> Self {
+        ReplayDriftGuard {
+            _op: DriftOpGuard::open(),
+        }
+    }
+}
+
+impl Drop for ReplayDriftGuard {
+    fn drop(&mut self) {
+        if let Ok(mut tracker) = drift_tracker().lock() {
+            tracker.suppress_until = Some(std::time::Instant::now() + DRIFT_REPLAY_SUPPRESSION);
+        }
+    }
+}
+
+/// Open a select segment: managed selection writes bracket the runtime PUT
+/// and the companion mirror record. Sampling is deferred until the segment
+/// closes explicitly (no TTL self-heal: unproven completion stays unknown).
+/// The segment is owned by the mirror active subscription at open time so
+/// that records for other subscriptions cannot clear it.
+fn drift_open_select_segment() {
+    if let Ok(mut tracker) = drift_tracker().lock() {
+        tracker.select_segment_open = true;
+        tracker.select_segment_owner = read_mirror_active_id();
+    }
+}
+
+/// The companion `RecordSelectionIntent` closes the segment only when it
+/// belongs to the segment's subscription; records for other subscriptions
+/// (and active-subscription records) must never clear an open segment.
+fn drift_close_select_segment_for(subscription_id: &str) {
+    if let Ok(mut tracker) = drift_tracker().lock() {
+        if tracker
+            .select_segment_owner
+            .as_deref()
+            .is_none_or(|owner| owner == subscription_id)
+        {
+            tracker.select_segment_open = false;
+            tracker.select_segment_owner = None;
+        }
+    }
+}
+
+/// Unconditional close for select error exits: no companion record is coming,
+/// and closing lets the sampler observe the true post-attempt state instead
+/// of wedging on an unprovable segment.
+fn drift_close_select_segment() {
+    if let Ok(mut tracker) = drift_tracker().lock() {
+        tracker.select_segment_open = false;
+        tracker.select_segment_owner = None;
+    }
+}
+
+/// Arm the replay suppression window (covers a managed API-path selection
+/// write and the gap after it; also armed by [`ReplayDriftGuard`]).
+fn drift_arm_suppression() {
+    if let Ok(mut tracker) = drift_tracker().lock() {
+        tracker.suppress_until = Some(std::time::Instant::now() + DRIFT_REPLAY_SUPPRESSION);
+    }
+}
+
+fn drift_snapshot() -> (Vec<crate::ipc::SelectionDriftObservation>, u64, String) {
+    match drift_tracker().lock() {
+        Ok(tracker) => (
+            tracker.observations.iter().cloned().collect(),
+            tracker.unknown_samples,
+            tracker.last_sample_status.clone(),
+        ),
+        Err(_) => (Vec::new(), 0, "unknown".to_string()),
+    }
+}
+
+/// Most recent observation by `at_unix` (ties broken by tail position).
+/// In-place updates keep an observation at its original insertion index, so
+/// "latest" must not be taken as `.last()`.
+pub(crate) fn latest_drift_observation(
+    observations: &[crate::ipc::SelectionDriftObservation],
+) -> Option<&crate::ipc::SelectionDriftObservation> {
+    observations
+        .iter()
+        .enumerate()
+        .max_by(|(i, a), (j, b)| a.at_unix.cmp(&b.at_unix).then_with(|| i.cmp(j)))
+        .map(|(_, o)| o)
+}
+
+/// Compare the daemon-owned mirror intent map against a Core `/proxies`
+/// payload. Comparison set = mirror map keys, excluding `GLOBAL`/`COMPATIBLE`
+/// (synthetic entries); groups absent from the Core response produce no
+/// drift (no comparable runtime). Shared by the daemon sampler and the CLI
+/// doctor check (B3).
+pub(crate) fn compare_selection_drift(
+    mirror: &std::collections::BTreeMap<String, String>,
+    proxies: &serde_json::Value,
+    at_unix: u64,
+    subscription_id: Option<&str>,
+    mirror_revision: Option<&str>,
+) -> Vec<crate::ipc::SelectionDriftObservation> {
+    let Some(map) = proxies.get("proxies").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let mut drifts = Vec::new();
+    for (group, intent) in mirror {
+        if group == "GLOBAL" || group == "COMPATIBLE" {
+            continue;
+        }
+        let Some(runtime) = map
+            .get(group)
+            .and_then(|entry| entry.get("now"))
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        if runtime != intent {
+            drifts.push(crate::ipc::SelectionDriftObservation {
+                group: group.clone(),
+                intent: intent.clone(),
+                runtime: runtime.to_string(),
+                at_unix,
+                subscription_id: subscription_id.map(str::to_string),
+                mirror_revision: mirror_revision.map(str::to_string),
+            });
+        }
+    }
+    drifts
+}
+
+/// Apply sampled drift observations to the tracker: per-group in-place update
+/// (ring never grows on repeat drift), FIFO eviction beyond the cap, and
+/// per-group warning throttling (1/group/hour).
+fn apply_drift_observations(
+    tracker: &mut DriftTrackerState,
+    drifts: Vec<crate::ipc::SelectionDriftObservation>,
+    now: std::time::Instant,
+) {
+    for drift in drifts {
+        let should_warn = tracker
+            .last_warn_at
+            .get(&drift.group)
+            .map(|at| now.duration_since(*at) >= DRIFT_WARN_INTERVAL_PER_GROUP)
+            .unwrap_or(true);
+        if should_warn {
+            tracker.last_warn_at.insert(drift.group.clone(), now);
+            eprintln!(
+                "⚠ selection drift: {} runtime={} intent={}",
+                drift.group, drift.runtime, drift.intent
+            );
+        }
+        if let Some(existing) = tracker
+            .observations
+            .iter_mut()
+            .find(|obs| obs.group == drift.group)
+        {
+            *existing = drift;
+        } else {
+            if tracker.observations.len() >= DRIFT_RING_CAPACITY {
+                tracker.observations.pop_front();
+            }
+            tracker.observations.push_back(drift);
+        }
+    }
+}
+
+/// One sampler tick: read-only comparison of the mirror intent vs the live
+/// Core. Discards the sample (records `unknown`) whenever the daemon was
+/// mutating around the fetch, and skips sampling inside suppression/select
+/// windows. Never writes config, never fixes, never touches the user tree.
+async fn drift_sample_once(state: &Arc<Mutex<DaemonState>>) {
+    let seq_before;
+    {
+        let Ok(mut tracker) = drift_tracker().lock() else {
+            return;
+        };
+        if tracker.sampling {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let replay_suppressed = tracker.suppress_until.is_some_and(|until| now < until);
+        if replay_suppressed || tracker.select_segment_open || tracker.in_flight > 0 {
+            // N4: discarded ticks (suppressed/segment/in_flight) do NOT count
+            // as unknown samples — they are pure skips, not failed attempts.
+            // Only real failures (Core down, fetch timeout, mirror fault,
+            // consistency check failure) increment unknown_samples.
+            tracker.last_sample_status = if replay_suppressed && !tracker.select_segment_open {
+                "suppressed".to_string()
+            } else {
+                "unknown".to_string()
+            };
+            return;
+        }
+        tracker.sampling = true;
+        seq_before = tracker.seq;
+    }
+
+    // Final consistency check + publish happen under one tracker lock: the
+    // sample is verified only after ALL sampling reads (Core /proxies and the
+    // mirror) completed, and observations are published atomically with the
+    // verification — no window for a mutation between check and publish.
+    // N4: `status="unknown"` means a real failure (Core down, fetch timeout,
+    // mirror fault) — these increment unknown_samples. Consistency check
+    // failures also increment unknown_samples.
+    let finish = |status: &str, drifts: Vec<crate::ipc::SelectionDriftObservation>| {
+        if let Ok(mut tracker) = drift_tracker().lock() {
+            tracker.sampling = false;
+            if status == "unknown" || tracker.seq != seq_before || tracker.in_flight > 0 {
+                tracker.unknown_samples = tracker.unknown_samples.wrapping_add(1);
+                tracker.last_sample_status = "unknown".to_string();
+                return;
+            }
+            tracker.last_sample_status = status.to_string();
+            apply_drift_observations(&mut tracker, drifts, std::time::Instant::now());
+        }
+    };
+
+    let endpoint = {
+        let mut s = state.lock().await;
+        reap_exited_core(&mut s);
+        if !s.core_running {
+            finish("unknown", Vec::new());
+            return;
+        }
+        s.api_endpoint.clone()
+    };
+    let Some(core_endpoint) = endpoint.as_deref().and_then(api_endpoint_transport) else {
+        finish("unknown", Vec::new());
+        return;
+    };
+    let client = mihomo_api::EndpointMihomoApiClient::new(core_endpoint);
+    let fetched = tokio::time::timeout(
+        DRIFT_FETCH_TIMEOUT,
+        client.get_bounded("/proxies", DRIFT_RESPONSE_BYTE_LIMIT),
+    )
+    .await;
+    let proxies = match fetched {
+        Ok(Ok(value)) => value,
+        _ => {
+            finish("unknown", Vec::new());
+            return;
+        }
+    };
+
+    let at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let Some(active_id) = read_mirror_active_id() else {
+        // No active mirror intent → nothing to compare (missing intent is not
+        // drift); the consistency verdict is still made inside `finish`.
+        finish("ok", Vec::new());
+        return;
+    };
+    let mirror = match read_mirror_selection_map_for_sample(&active_id) {
+        MirrorSample::Map(map) => map,
+        // The mirror exists but cannot be read/parsed: the comparison basis is
+        // unavailable — record `unknown`, never `ok`.
+        MirrorSample::Fault(error) => {
+            crate::log!("selection mirror sample read failed (recorded as unknown): {error:#}");
+            finish("unknown", Vec::new());
+            return;
+        }
+        MirrorSample::Absent => {
+            finish("ok", Vec::new());
+            return;
+        }
+    };
+
+    let mirror_path = selection_mirror_file_path_in(&daemon_config_dir(), &active_id);
+    let mirror_revision = std::fs::read(&mirror_path)
+        .ok()
+        .map(|bytes| crate::tun_transaction::content_revision(&bytes));
+    let drifts = compare_selection_drift(
+        &mirror,
+        &proxies,
+        at_unix,
+        Some(&active_id),
+        mirror_revision.as_deref(),
+    );
+    finish("ok", drifts);
+}
+
+/// Sampler loop: fixed 60s cadence; daemon restart starts fresh (no inherited
+/// `ok`, counters reset with the process).
+async fn run_selection_drift_sampler(state: Arc<Mutex<DaemonState>>, cancel: CancellationToken) {
+    let mut interval = tokio::time::interval(DRIFT_SAMPLE_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // First tick fires immediately; skip it so the sampler starts from a
+    // quiet baseline rather than racing daemon startup replay.
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = interval.tick() => {
+                drift_sample_once(&state).await;
+                // SPEC B2 / A2: merged diagnostic tick (60s cycle, same as drift sampler)
+                diagnose_transaction_staleness().await;
+                diagnose_cache_db_hygiene();
+                diagnose_quarantine_strays();
+            },
+        }
+    }
+}
+
+/// SPEC B2: diagnostic tick for transaction staleness detection.
+/// Reads journal without holding locks, alerts on stale or age=unknown
+/// non-terminal phases. Rate limited to 1 alert per hour.
+async fn diagnose_transaction_staleness() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_ALERT_SECS: AtomicU64 = AtomicU64::new(0);
+
+    let Some(ctx) = daemon_transaction_context() else {
+        return;
+    };
+
+    let journal = match crate::tun_transaction::read_active_journal(&ctx) {
+        Ok(Some(j)) => j,
+        Ok(None) => return,
+        Err(_) => return,
+    };
+
+    let age = match crate::tun_transaction::journal_age_classification(&journal) {
+        Some(age) => age,
+        // Old journals without `updated_at`: diagnose only, never write. Not
+        // silent — B2 requires an alert for age=unknown as well.
+        None => crate::tun_transaction::JournalAge::Unknown,
+    };
+
+    let age_info = match age {
+        crate::tun_transaction::JournalAge::Stale { age_secs } => format!("stale ({}s)", age_secs),
+        crate::tun_transaction::JournalAge::Unknown => "unknown age".to_string(),
+        crate::tun_transaction::JournalAge::Terminal
+        | crate::tun_transaction::JournalAge::Fresh { .. } => return,
+    };
+
+    // Rate limit: 1 alert per hour
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last_alert = LAST_ALERT_SECS.load(Ordering::Relaxed);
+    if now_secs.saturating_sub(last_alert) < 3600 {
+        return;
+    }
+    LAST_ALERT_SECS.store(now_secs, Ordering::Relaxed);
+
+    eprintln!(
+        "⚠ TUN transaction {} (gen {}, phase {:?}) is {} — fix: mihomo-cli restart --system",
+        journal.transaction_id, journal.generation, journal.phase, age_info
+    );
+}
+
+/// SPEC A2/A3: read-only cache.db diagnosis on the merged 60s tick.
+/// Zero write actions; at most one alert per hour per anomaly kind.
+#[cfg(any(unix, windows))]
+fn diagnose_cache_db_hygiene() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_ALERT_SECS: AtomicU64 = AtomicU64::new(0);
+
+    let path = system_runtime_data_dir().join(crate::utils::CACHE_DB_FILE_NAME);
+    let classification = crate::utils::classify_cache_db_detailed(&path, cache_db_service_user());
+    let state = classification.state;
+    let needs_attention = matches!(
+        state,
+        crate::utils::CacheDbState::PermissionDrift
+            | crate::utils::CacheDbState::ContentInvalid
+            | crate::utils::CacheDbState::Unrecognized
+    ) || classification.needs_isolation();
+    if !needs_attention {
+        return;
+    }
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let last_alert = LAST_ALERT_SECS.load(Ordering::Relaxed);
+    if now_secs.saturating_sub(last_alert) < 3600 {
+        return;
+    }
+    LAST_ALERT_SECS.store(now_secs, Ordering::Relaxed);
+
+    eprintln!(
+        "⚠ cache.db is {} at {} — fix: mihomo-cli restart --system",
+        state.as_str(),
+        path.display()
+    );
+}
+
+#[cfg(not(any(unix, windows)))]
+fn diagnose_cache_db_hygiene() {}
+
+/// SPEC A2: patrol the runtime data dir for `cache.db.corrupt-*` files
+/// that do not match the strict quarantine artifact name (hand-crafted or
+/// foreign). These滞留 silently; the diagnostic tick surfaces them as a
+/// rate-limited warning (1/hour) without deleting.
+#[cfg(any(unix, windows))]
+fn diagnose_quarantine_strays() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_ALERT_SECS: AtomicU64 = AtomicU64::new(0);
+
+    let dir = system_runtime_data_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let prefix = crate::utils::CACHE_DB_QUARANTINE_PREFIX;
+    let strays: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name_str = name.to_str()?;
+            if !name_str.starts_with(prefix) {
+                return None;
+            }
+            if crate::utils::is_quarantine_artifact_name(name_str) {
+                return None;
+            }
+            Some(name_str.to_string())
+        })
+        .collect();
+    if strays.is_empty() {
+        return;
+    }
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let last_alert = LAST_ALERT_SECS.load(Ordering::Relaxed);
+    if now_secs.saturating_sub(last_alert) < 3600 {
+        return;
+    }
+    LAST_ALERT_SECS.store(now_secs, Ordering::Relaxed);
+
+    let sample = strays.first().cloned().unwrap_or_default();
+    eprintln!(
+        "⚠ {} unrecognized quarantine-like file(s) in {} (e.g. {}) — inspect manually, not auto-removed",
+        strays.len(),
+        dir.display(),
+        sample
+    );
+}
+
+#[cfg(not(any(unix, windows)))]
+fn diagnose_quarantine_strays() {}
+
 /// Best-effort replay of persisted selection intent against the running Core
 /// (SPEC-select-persistence §3.2/§3.3). Returns user-facing report lines;
 /// failures degrade to warning lines instead of failing the caller. Holds no
@@ -1214,6 +1812,14 @@ impl mihomo_api::MihomoApiClient for DaemonSelectionApiClient {
         self.inner.get(path).await
     }
 
+    async fn get_bounded(
+        &self,
+        path: &str,
+        byte_limit: usize,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.inner.get_bounded(path, byte_limit).await
+    }
+
     async fn put(&self, path: &str, body: serde_json::Value) -> anyhow::Result<serde_json::Value> {
         let prefix = "/proxies/";
         if let Some(encoded_group) = path.strip_prefix(prefix) {
@@ -1221,7 +1827,13 @@ impl mihomo_api::MihomoApiClient for DaemonSelectionApiClient {
             let node = body["name"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("proxy selection payload has no node name"))?;
-            return match select_system_proxy(Arc::clone(&self.state), group, node.to_string()).await
+            return match select_system_proxy(
+                Arc::clone(&self.state),
+                group,
+                node.to_string(),
+                SelectSegmentMode::ApiPath,
+            )
+            .await
             {
                 DaemonResponse::Success { .. } => Ok(serde_json::Value::Null),
                 DaemonResponse::Error { message } => anyhow::bail!(message),
@@ -1264,6 +1876,236 @@ fn percent_decode_proxy_segment(value: &str) -> anyhow::Result<String> {
     Ok(String::from_utf8(decoded)?)
 }
 
+/// SPEC §3.8.3 startup replay admission inputs. The decision is a pure function so
+/// the suppression table cannot drift between the two startup paths.
+pub(crate) struct StartupReplayInputs<'a> {
+    pub mirror_active: Option<&'a str>,
+    /// `"ready"` | `"missing"` | `"corrupt"`.
+    pub map_state: &'a str,
+    pub binding: Option<&'a MirrorBinding>,
+    pub launched_revision: Option<&'a str>,
+    pub transaction_unsettled: bool,
+}
+
+/// Why startup replay is suppressed (rendered as a fact line, never as success).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StartupReplaySkip {
+    pub reason: String,
+    /// True when the cause is an unprovable/mismatched subscription identity —
+    /// rendered with the structured identity signal so the CLI can translate it.
+    pub identity: bool,
+}
+
+/// SPEC §3.8.3: only replay when the mirror can be proven to belong to the
+/// configuration the Core actually loaded. Absence of a CLI request is NOT a
+/// suppression reason (normal boot must recover selections after a reboot).
+pub(crate) fn startup_replay_admission(
+    inputs: &StartupReplayInputs<'_>,
+) -> Result<(), StartupReplaySkip> {
+    let skip = |reason: String, identity: bool| Err(StartupReplaySkip { reason, identity });
+    if inputs.transaction_unsettled {
+        return skip(
+            "promotion/recovery transaction is not settled".to_string(),
+            false,
+        );
+    }
+    let Some(active) = inputs.mirror_active else {
+        return skip(
+            "selection mirror has no active subscription".to_string(),
+            false,
+        );
+    };
+    match inputs.map_state {
+        "missing" => return skip("selection mirror unavailable".to_string(), false),
+        "corrupt" => return skip("selection mirror unreadable".to_string(), false),
+        _ => {}
+    }
+    let Some(binding) = inputs.binding else {
+        return skip(
+            "launched configuration subscription identity unprovable (no mirror binding)"
+                .to_string(),
+            true,
+        );
+    };
+    if binding.subscription_id != active {
+        return skip(
+            format!(
+                "mirror identity mismatch: mirror_active={active}, binding={}",
+                binding.subscription_id
+            ),
+            true,
+        );
+    }
+    let Some(launched_revision) = inputs.launched_revision else {
+        return skip(
+            "launched configuration revision unknown (ownership unprovable)".to_string(),
+            true,
+        );
+    };
+    match binding.config_revision.as_deref() {
+        Some(bound) if bound == launched_revision => Ok(()),
+        Some(bound) => skip(
+            format!(
+                "mirror bound to configuration {} but the loaded configuration is {}",
+                crate::short_revision(bound),
+                crate::short_revision(launched_revision)
+            ),
+            true,
+        ),
+        None => skip(
+            "mirror binding carries no configuration revision (unauthenticated record)".to_string(),
+            true,
+        ),
+    }
+}
+
+fn startup_skip_line(skip: &StartupReplaySkip) -> String {
+    if skip.identity {
+        format!(
+            "{} selection subscription identity unprovable at startup: {} (0 replays); run `mihomo-cli restart --system` to replay",
+            String::from_utf8_lossy(SELECTION_IDENTITY_MISMATCH_SIGNAL),
+            skip.reason
+        )
+    } else {
+        format!(
+            "⚠ Selections not replayed at startup: {} (0 replays)",
+            skip.reason
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MirrorMapState {
+    Missing,
+    Corrupt,
+    Ready(std::collections::BTreeMap<String, String>),
+}
+
+fn read_mirror_map_state_in(base: &std::path::Path, subscription_id: &str) -> MirrorMapState {
+    match std::fs::read(selection_mirror_file_path_in(base, subscription_id)) {
+        Ok(raw) => match crate::selection::parse_selection_map(&raw) {
+            Ok(map) => MirrorMapState::Ready(map),
+            Err(_) => MirrorMapState::Corrupt,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => MirrorMapState::Missing,
+        Err(_) => MirrorMapState::Corrupt,
+    }
+}
+
+async fn wait_core_api_ready<C: crate::mihomo_api::MihomoApiClient>(
+    client: &C,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    loop {
+        if client.get("/configs").await.is_ok() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "⚠ Selections not replayed: Core API not ready within {}s (0 replays)",
+                crate::selection::REPLAY_TOTAL_BUDGET.as_secs()
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+/// SPEC §3.8.3: read the mirror + binding from `base`, apply the admission table
+/// and replay through the request-carrying budget/degradation path.
+pub(crate) async fn replay_mirror_at_startup<C: crate::mihomo_api::MihomoApiClient>(
+    base: &std::path::Path,
+    launched_revision: Option<&str>,
+    transaction_unsettled: bool,
+    client: &C,
+) -> Vec<String> {
+    let mirror_active = read_mirror_active_id_in(base);
+    let map = match mirror_active.as_deref() {
+        Some(id) => read_mirror_map_state_in(base, id),
+        None => MirrorMapState::Missing,
+    };
+    let map_state = match &map {
+        MirrorMapState::Missing => "missing",
+        MirrorMapState::Corrupt => "corrupt",
+        MirrorMapState::Ready(_) => "ready",
+    };
+    let binding = read_mirror_binding_in(base);
+    let inputs = StartupReplayInputs {
+        mirror_active: mirror_active.as_deref(),
+        map_state,
+        binding: binding.as_ref(),
+        launched_revision,
+        transaction_unsettled,
+    };
+    if let Err(skip) = startup_replay_admission(&inputs) {
+        return vec![startup_skip_line(&skip)];
+    }
+    let MirrorMapState::Ready(selections) = &map else {
+        return Vec::new();
+    };
+    let deadline = std::time::Instant::now() + crate::selection::REPLAY_TOTAL_BUDGET;
+    if let Err(line) = wait_core_api_ready(client, deadline).await {
+        return vec![line];
+    }
+    match crate::selection::replay_map_until(selections, client, deadline).await {
+        Ok(report) => selection_replay_report_lines(&report),
+        Err(err) => vec![format!("⚠ Selections not replayed: {err:#}")],
+    }
+}
+
+/// SPEC §3.8.3: an in-flight promotion/recovery transaction means the runtime is
+/// mid-commit — replay is suppressed until it settles.
+fn startup_transaction_unsettled() -> bool {
+    let Some(ctx) = crate::instance::planned_current_context(crate::instance::InstanceMode::System)
+    else {
+        return false;
+    };
+    match crate::tun_transaction::read_active_journal(&ctx) {
+        Ok(Some(journal)) => !matches!(
+            journal.phase,
+            crate::tun_transaction::JournalPhase::IntentCommitted
+                | crate::tun_transaction::JournalPhase::RolledBack
+        ),
+        Ok(None) => false,
+        // An unreadable journal is not proof of a settled runtime.
+        Err(_) => true,
+    }
+}
+
+async fn startup_replay_lines(state: &Arc<Mutex<DaemonState>>) -> Vec<String> {
+    let (endpoint, launched) = {
+        let guard = state.lock().await;
+        (
+            guard.api_endpoint.clone(),
+            guard.launched_config_revision.clone(),
+        )
+    };
+    let Some(endpoint) = endpoint.as_deref().and_then(api_endpoint_transport) else {
+        return vec![startup_skip_line(&StartupReplaySkip {
+            reason: "system Core has no usable API endpoint".to_string(),
+            identity: false,
+        })];
+    };
+    let _replay_guard = ReplayDriftGuard::open();
+    let client = mihomo_api::EndpointMihomoApiClient::new(endpoint);
+    replay_mirror_at_startup(
+        &daemon_config_dir(),
+        launched.as_deref(),
+        startup_transaction_unsettled(),
+        &client,
+    )
+    .await
+}
+
+/// daemon 日志侧渲染：信号只写事实，不下“有没有东西可回放”的结论。
+fn render_replay_line_for_log(line: &str) -> String {
+    if line.starts_with("[selection-mirror-missing]") {
+        "⚠ selection mirror unavailable; replay skipped (daemon does not consult the user tree)"
+            .to_string()
+    } else {
+        line.to_string()
+    }
+}
+
 async fn replay_mirror_selection_intent(
     state: &Arc<Mutex<DaemonState>>,
     subscription_id: &str,
@@ -1297,7 +2139,7 @@ async fn replay_mirror_selection_intent(
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
     let Some(selections) = read_mirror_selection_map(subscription_id) else {
-        // Issue #022 C + review MAJOR-5：mirror 缺失只回传结构化信号。
+        // C + review MAJOR-5：mirror 缺失只回传结构化信号。
         // 两种情形（从未持久化 vs mirror 真丢）由 CLI 侧用用户树判定，见
         // `main.rs::translate_selection_replay_signal`。
         return vec![format!(
@@ -1310,9 +2152,23 @@ async fn replay_mirror_selection_intent(
         inner: client,
     };
     match crate::selection::replay_map_until(&selections, &replay_client, deadline).await {
-        Ok(report) => report.format_lines(),
+        Ok(report) => {
+            // Defect 8: every replay exit (start/restart/promote) carries the
+            // remedy matrix, built from the replay's own fetched facts.
+            selection_replay_report_lines(&report)
+        }
         Err(err) => vec![format!("⚠ Selections not replayed: {err:#}")],
     }
+}
+
+/// Daemon-side rendering shared by every replay exit (startup, restart,
+/// promotion): the replay report plus the outcome remedy matrix. Regular
+/// outcomes are rendered here; mirror-missing / identity-mismatch stay
+/// structured signals for the CLI, which owns the user-tree decision.
+fn selection_replay_report_lines(report: &crate::selection::ReplayReport) -> Vec<String> {
+    let mut lines = report.format_lines();
+    lines.extend(crate::selection::selection_replay_remedy_lines(report));
+    lines
 }
 
 fn daemon_transaction_context() -> Option<crate::instance::InstanceContext> {
@@ -1356,7 +2212,86 @@ fn allowed_with_unreadable_journal(cmd: &DaemonCommand) -> bool {
         DaemonCommand::GetStatus { .. }
             | DaemonCommand::GetTransactionStatus { .. }
             | DaemonCommand::GetSelectionMirrorRevisions { .. }
+            | DaemonCommand::GetSelectionDrift { .. }
     )
+}
+
+/// SPEC §12.4: terminal phases release the gate for every command.
+fn transaction_gate_phase_allows_changes(phase: crate::tun_transaction::JournalPhase) -> bool {
+    matches!(
+        phase,
+        crate::tun_transaction::JournalPhase::IntentCommitted
+            | crate::tun_transaction::JournalPhase::RolledBack
+    )
+}
+
+/// The per-command matrix of SPEC §12.4: read-only commands always pass, fenced
+/// transaction commands pass only for their own transaction/generation/phase, and
+/// every other change command is refused.
+fn transaction_command_admitted(
+    cmd: &DaemonCommand,
+    journal: &crate::tun_transaction::TunJournal,
+) -> bool {
+    match cmd {
+        DaemonCommand::ValidatePreparedRuntime { fence, .. } => {
+            fence.transaction_id == journal.transaction_id
+                && fence.generation == journal.generation
+                && journal.phase == crate::tun_transaction::JournalPhase::Prepared
+        }
+        DaemonCommand::ApplyPromotedSnapshot { fence, .. } => {
+            fence.transaction_id == journal.transaction_id
+                && fence.generation == journal.generation
+                && journal.phase == crate::tun_transaction::JournalPhase::SnapshotPromoted
+        }
+        DaemonCommand::QuiesceCandidateRuntime { fence, .. } => {
+            fence.transaction_id == journal.transaction_id
+                && fence.generation == journal.generation
+                && fence.expected_candidate_revision == journal.candidate_revision
+                && matches!(
+                    journal.phase,
+                    crate::tun_transaction::JournalPhase::RollbackPending
+                        | crate::tun_transaction::JournalPhase::RecoveryRequired
+                )
+        }
+        DaemonCommand::RestoreOldRuntime { fence, .. } => {
+            fence.transaction_id == journal.transaction_id
+                && fence.generation == journal.generation
+                && journal.phase == crate::tun_transaction::JournalPhase::RollbackPending
+        }
+        DaemonCommand::AttestCurrentTransaction { fence, .. } => {
+            fence.transaction_id == journal.transaction_id
+                && fence.generation == journal.generation
+                && fence.expected_candidate_revision == journal.candidate_revision
+                && journal.phase == crate::tun_transaction::JournalPhase::CoreApplied
+        }
+        DaemonCommand::ApplyLegacyRecoveryTarget { fence, .. } => {
+            fence.transaction_id == journal.transaction_id
+                && fence.generation == journal.generation
+                && journal.phase == crate::tun_transaction::JournalPhase::RecoveryRequired
+        }
+        DaemonCommand::GetTransactionStatus { .. }
+        | DaemonCommand::GetStatus { .. }
+        | DaemonCommand::GetSelectionMirrorRevisions { .. }
+        | DaemonCommand::GetSelectionDrift { .. } => true,
+        // SPEC B6: Read-only Core API requests are allowed during non-terminal phases
+        DaemonCommand::CoreApiRequest { method, .. } => *method == crate::ipc::CoreApiMethod::Get,
+        _ => false,
+    }
+}
+
+/// the SPEC §12.4 gate as a pure decision, so the whole non-terminal
+/// matrix is unit-testable and `process_command` cannot drift away from it.
+pub(crate) fn gate_admits(
+    cmd: &DaemonCommand,
+    journal: Option<&crate::tun_transaction::TunJournal>,
+) -> bool {
+    match journal {
+        None => true,
+        Some(journal) => {
+            transaction_gate_phase_allows_changes(journal.phase)
+                || transaction_command_admitted(cmd, journal)
+        }
+    }
 }
 
 fn managed_system_tun_snapshot_path() -> Result<PathBuf, String> {
@@ -1413,7 +2348,9 @@ pub async fn run_daemon(socket_path: PathBuf, cancel: CancellationToken) -> anyh
     let autostart_marker = daemon_config_dir().join("autostart");
     if autostart_marker.exists() {
         let runtime_dir = system_runtime_data_dir();
-        if let Some(config_path) = resolve_autostart_target_config_path(&runtime_dir) {
+        if let Some(reason) = autostart_transaction_blocker() {
+            eprintln!("[mihomo-daemon] autostart skipped: {reason}");
+        } else if let Some(config_path) = resolve_autostart_target_config_path(&runtime_dir) {
             eprintln!(
                 "[mihomo-daemon] autostart marker present; starting core with {}",
                 config_path.display()
@@ -1439,16 +2376,23 @@ pub async fn run_daemon(socket_path: PathBuf, cancel: CancellationToken) -> anyh
     // degrades to a warning instead of a fallback read.
     let core_running_at_startup = state.lock().await.core_running;
     if core_running_at_startup {
-        if let Some(subscription_id) = read_mirror_active_id() {
-            for line in replay_mirror_selection_intent(&state, &subscription_id).await {
-                eprintln!("[mihomo-daemon] {}", render_replay_line_for_log(&line));
-            }
-        } else {
-            eprintln!("[mihomo-daemon] selection mirror unavailable; startup replay skipped");
+        // SPEC §3.8.3: normal boot recovers selections when the mirror can be
+        // proven to belong to the loaded configuration; otherwise every entry
+        // skips replay with an explicit annotation (never a silent claim).
+        for line in startup_replay_lines(&state).await {
+            eprintln!("[mihomo-daemon] {}", render_replay_line_for_log(&line));
         }
     }
 
     eprintln!("[mihomo-daemon] listening on {}", socket_path.display());
+
+    // SPEC A2/A3: read-only cache.db diagnosis at startup, then every tick.
+    diagnose_cache_db_hygiene();
+
+    tokio::spawn(run_selection_drift_sampler(
+        Arc::clone(&state),
+        cancel.child_token(),
+    ));
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -1498,7 +2442,7 @@ pub async fn run_daemon(socket_path: PathBuf, cancel: CancellationToken) -> anyh
 
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(stream, state).await {
-                        eprintln!("[mihomo-daemon] connection error: {e}");
+                        log_connection_error(&e);
                     }
                 });
             }
@@ -1509,7 +2453,7 @@ pub async fn run_daemon(socket_path: PathBuf, cancel: CancellationToken) -> anyh
 /// Determines if a command performs mutating lifecycle or transaction operations
 /// that require exclusive serialization under OWNER_LIFECYCLE_LOCK.
 /// Non-lifecycle commands (GetStatus, CoreApiRequest, SelectSystemProxy, RecordSelectionIntent, etc.)
-/// do not hold the lifecycle lock, avoiding head-of-line blocking (Issue #020).
+/// do not hold the lifecycle lock, avoiding head-of-line blocking.
 pub(crate) fn is_lifecycle_command(cmd: &DaemonCommand) -> bool {
     matches!(
         cmd,
@@ -1567,7 +2511,7 @@ async fn handle_connection(
     // single global mutex held for the entire operation — including core spawn and
     // readiness wait — so concurrent clients cannot interleave lifecycle transitions.
     // Non-lifecycle commands (GetStatus, CoreApiRequest, SelectSystemProxy, etc.)
-    // do not take the lifecycle lock, avoiding head-of-line blocking (Issue #020).
+    // do not take the lifecycle lock, avoiding head-of-line blocking.
     let is_lifecycle = is_lifecycle_command(&cmd);
     let response = if is_lifecycle {
         let lock = OWNER_LIFECYCLE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
@@ -1581,6 +2525,75 @@ async fn handle_connection(
     send_response(&mut writer, &response).await?;
 
     Ok(())
+}
+
+/// D3: a CLI probe connects, sends its command, and may drop the socket before the
+/// response is written. Those transport errors are expected; they are rate limited
+/// per kind so they cannot bury the real diagnostic lines.
+const PROBE_NOISE_INTERVAL_SECS: u64 = 60;
+
+fn probe_noise_kind(error: &anyhow::Error) -> Option<&'static str> {
+    error.chain().find_map(|cause| {
+        let io = cause.downcast_ref::<std::io::Error>()?;
+        match io.kind() {
+            std::io::ErrorKind::BrokenPipe => Some("broken-pipe"),
+            std::io::ErrorKind::ConnectionReset => Some("connection-reset"),
+            _ => None,
+        }
+    })
+}
+
+/// One emission per kind per window; `admit` returns the number of identical
+/// events it swallowed since the previous emission.
+#[derive(Default)]
+struct ProbeNoiseLimiter {
+    last_emitted_secs: std::collections::HashMap<&'static str, u64>,
+    suppressed: std::collections::HashMap<&'static str, u64>,
+}
+
+impl ProbeNoiseLimiter {
+    fn admit(&mut self, kind: &'static str, now_secs: u64) -> Option<u64> {
+        match self.last_emitted_secs.get(kind) {
+            Some(last) if now_secs.saturating_sub(*last) < PROBE_NOISE_INTERVAL_SECS => {
+                *self.suppressed.entry(kind).or_insert(0) += 1;
+                None
+            }
+            _ => {
+                self.last_emitted_secs.insert(kind, now_secs);
+                Some(self.suppressed.insert(kind, 0).unwrap_or_default())
+            }
+        }
+    }
+}
+
+fn daemon_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn log_connection_error(error: &anyhow::Error) {
+    let Some(kind) = probe_noise_kind(error) else {
+        // Real connection failures stay visible on every occurrence.
+        eprintln!("[mihomo-daemon] connection error: {error}");
+        return;
+    };
+    static LIMITER: std::sync::OnceLock<std::sync::Mutex<ProbeNoiseLimiter>> =
+        std::sync::OnceLock::new();
+    let limiter = LIMITER.get_or_init(std::sync::Mutex::default);
+    let now_secs = daemon_now_secs();
+    let admitted = match limiter.lock() {
+        Ok(mut limiter) => limiter.admit(kind, now_secs),
+        Err(poisoned) => poisoned.into_inner().admit(kind, now_secs),
+    };
+    match admitted {
+        None => {}
+        Some(0) => eprintln!("[mihomo-daemon] connection error (probe noise: {kind}): {error}"),
+        Some(suppressed) => eprintln!(
+            "[mihomo-daemon] connection error (probe noise: {kind}, {suppressed} similar suppressed): {error}"
+        ),
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -1609,7 +2622,7 @@ struct PeerAuth {
 }
 
 /// Pure TUN privilege decision, split from the per-OS peer probing so every
-/// branch is testable on any host (Issue #017).
+/// branch is testable on any host.
 fn tun_peer_privilege_allowed(
     is_windows: bool,
     peer_uid: Option<u32>,
@@ -1650,6 +2663,7 @@ async fn process_command(
         | DaemonCommand::RecordSelectionIntent { token, .. }
         | DaemonCommand::RecordActiveSubscription { token, .. }
         | DaemonCommand::GetSelectionMirrorRevisions { token, .. }
+        | DaemonCommand::GetSelectionDrift { token }
         | DaemonCommand::SelectSystemProxy { token, .. }
         | DaemonCommand::StopCore { token }
         | DaemonCommand::DisableTun { token }
@@ -1680,66 +2694,16 @@ async fn process_command(
     if let Some(ctx) = daemon_transaction_context() {
         match crate::tun_transaction::read_active_journal(&ctx) {
             Ok(Some(journal)) => {
-                if !matches!(
-                    journal.phase,
-                    crate::tun_transaction::JournalPhase::IntentCommitted
-                        | crate::tun_transaction::JournalPhase::RolledBack
-                ) {
-                    let is_allowed_txn_cmd = match &cmd {
-                        DaemonCommand::ValidatePreparedRuntime { fence, .. } => {
-                            fence.transaction_id == journal.transaction_id
-                                && fence.generation == journal.generation
-                                && journal.phase == crate::tun_transaction::JournalPhase::Prepared
-                        }
-                        DaemonCommand::ApplyPromotedSnapshot { fence, .. } => {
-                            fence.transaction_id == journal.transaction_id
-                                && fence.generation == journal.generation
-                                && journal.phase
-                                    == crate::tun_transaction::JournalPhase::SnapshotPromoted
-                        }
-                        DaemonCommand::QuiesceCandidateRuntime { fence, .. } => {
-                            fence.transaction_id == journal.transaction_id
-                                && fence.generation == journal.generation
-                                && fence.expected_candidate_revision == journal.candidate_revision
-                                && journal.phase
-                                    == crate::tun_transaction::JournalPhase::RollbackPending
-                        }
-                        DaemonCommand::RestoreOldRuntime { fence, .. } => {
-                            fence.transaction_id == journal.transaction_id
-                                && fence.generation == journal.generation
-                                && journal.phase
-                                    == crate::tun_transaction::JournalPhase::RollbackPending
-                        }
-                        DaemonCommand::AttestCurrentTransaction { fence, .. } => {
-                            fence.transaction_id == journal.transaction_id
-                                && fence.generation == journal.generation
-                                && fence.expected_candidate_revision == journal.candidate_revision
-                                && journal.phase
-                                    == crate::tun_transaction::JournalPhase::CoreApplied
-                        }
-                        DaemonCommand::ApplyLegacyRecoveryTarget { fence, .. } => {
-                            fence.transaction_id == journal.transaction_id
-                                && fence.generation == journal.generation
-                                && journal.phase
-                                    == crate::tun_transaction::JournalPhase::RecoveryRequired
-                        }
-                        DaemonCommand::GetTransactionStatus { .. }
-                        | DaemonCommand::GetStatus { .. }
-                        | DaemonCommand::GetSelectionMirrorRevisions { .. } => true,
-                        _ => false,
-                    };
-
-                    if !is_allowed_txn_cmd {
-                        return DaemonResponse::Error {
-                            message: format!(
-                                "A system TUN transaction ({}) is in progress (phase: {:?}).
-                             Inspect status or restart the service:
+                if !gate_admits(&cmd, Some(&journal)) {
+                    return DaemonResponse::Error {
+                        message: format!(
+                            "Change rejected: a system TUN transaction ({}) is in progress (phase: {:?}).
+                             Read-only commands remain available; inspect status or restart the service:
                                mihomo-cli status
                                mihomo-cli restart --system",
-                                journal.transaction_id, journal.phase
-                            ),
-                        };
-                    }
+                            journal.transaction_id, journal.phase
+                        ),
+                    };
                 }
             }
             Ok(None) => {}
@@ -1799,25 +2763,77 @@ async fn process_command(
         DaemonCommand::RecordSelectionIntent {
             subscription_id,
             content_yaml,
+            config_revision,
             ..
-        } => match record_selection_mirror(&subscription_id, &content_yaml) {
-            Ok(()) => DaemonResponse::Success {
-                message: "selection intent mirror recorded".to_string(),
-            },
-            Err(err) => DaemonResponse::Error {
-                message: format!("failed to record selection intent mirror: {err:#}"),
-            },
-        },
+        } => {
+            let _drift_op = DriftOpGuard::open();
+            // Companion edge of the select bracket: closes the segment only
+            // when this record belongs to the segment's subscription.
+            drift_close_select_segment_for(&subscription_id);
+            // SPEC §3.8.3: the binding follows whichever record carries the
+            // freshest request identity.
+            let _ = record_mirror_binding(&subscription_id, config_revision.as_deref());
+            match record_selection_mirror(&subscription_id, &content_yaml) {
+                Ok(()) => DaemonResponse::Success {
+                    message: "selection intent mirror recorded".to_string(),
+                },
+                Err(err) => DaemonResponse::Error {
+                    message: format!("failed to record selection intent mirror: {err:#}"),
+                },
+            }
+        }
         DaemonCommand::RecordActiveSubscription {
-            subscription_id, ..
-        } => match record_active_subscription_mirror(&subscription_id) {
-            Ok(()) => DaemonResponse::Success {
-                message: "active subscription mirror recorded".to_string(),
-            },
-            Err(err) => DaemonResponse::Error {
-                message: format!("failed to record active subscription mirror: {err:#}"),
-            },
-        },
+            subscription_id,
+            config_revision,
+            ..
+        } => {
+            let _drift_op = DriftOpGuard::open();
+            // SPEC §3.8.3: bind the mirror to the request-side config revision so
+            // a later startup can prove ownership against the loaded config.
+            let _ = record_mirror_binding(&subscription_id, config_revision.as_deref());
+            // Recording the active subscription is not the companion record
+            // of any select segment: it must never clear an open segment.
+            match record_active_subscription_mirror(&subscription_id) {
+                Ok(()) => DaemonResponse::Success {
+                    message: "active subscription mirror recorded".to_string(),
+                },
+                Err(err) => {
+                    // A2': mirror absence is a fact, not an error
+                    // verdict — log it without inferring user-tree intent.
+                    crate::log!(
+                        "active subscription mirror record failed (fact only, no intent inferred): {err:#}"
+                    );
+                    DaemonResponse::Error {
+                        message: format!("failed to record active subscription mirror: {err:#}"),
+                    }
+                }
+            }
+        }
+        DaemonCommand::GetSelectionDrift { .. } => {
+            let (observations, unknown_samples, sample_status) = drift_snapshot();
+            // Fault annotation only: the cache is returned regardless.
+            // Journal status comes from bounded read-only `read_active_journal`;
+            // it annotates faults but never blocks the cached response.
+            let journal = match active_journal_status() {
+                (Some(phase), None)
+                    if !matches!(
+                        phase,
+                        crate::tun_transaction::JournalPhase::IntentCommitted
+                            | crate::tun_transaction::JournalPhase::RolledBack
+                    ) =>
+                {
+                    Some(format!("in-flight ({phase:?})"))
+                }
+                (_, Some(error)) => Some(format!("unreadable: {error}")),
+                _ => None,
+            };
+            DaemonResponse::SelectionDrift {
+                observations,
+                unknown_samples,
+                sample_status,
+                journal,
+            }
+        }
         DaemonCommand::GetSelectionMirrorRevisions {
             subscription_ids, ..
         } => match selection_mirror_revisions_in(&daemon_config_dir(), &subscription_ids) {
@@ -1827,7 +2843,7 @@ async fn process_command(
             },
         },
         DaemonCommand::SelectSystemProxy { group, node, .. } => {
-            select_system_proxy(state, group, node).await
+            select_system_proxy(state, group, node, SelectSegmentMode::Explicit).await
         }
         // ADR-19: daemon owns the autostart marker (its config_dir is the
         // authoritative per-user path — the CLI under sudo would resolve a
@@ -1928,8 +2944,20 @@ async fn process_command(
             target_runtime_tun,
             ..
         } => handle_apply_promoted_snapshot(state, fence, target_runtime_tun, peer).await,
-        DaemonCommand::QuiesceCandidateRuntime { fence, .. } => {
-            handle_quiesce_candidate_runtime(state, fence, peer).await
+        DaemonCommand::QuiesceCandidateRuntime {
+            fence,
+            allow_legacy_reset,
+            allow_restored_old_quiesce,
+            ..
+        } => {
+            handle_quiesce_candidate_runtime(
+                state,
+                fence,
+                allow_legacy_reset,
+                allow_restored_old_quiesce,
+                peer,
+            )
+            .await
         }
         DaemonCommand::RestoreOldRuntime {
             fence,
@@ -1981,7 +3009,7 @@ async fn process_command(
 fn reap_exited_core(s: &mut DaemonState) {
     let Some(child) = s.core_child.as_mut() else {
         // Orphan recovery from the pid file (with process identity probing) is
-        // Unix-only for now; Windows stays child-tracked (Issue #017).
+        // Unix-only for now; Windows stays child-tracked.
         #[cfg(unix)]
         {
             if let Some(metadata) = read_pid_file(&s.pid_file)
@@ -2042,6 +3070,47 @@ struct CorePidMetadata {
     api_endpoint: Option<String>,
     #[serde(default)]
     config_revision: Option<String>,
+}
+
+/// SPEC B3: process-level Core liveness, used by the CLI reset path when the
+/// daemon is unreachable. Read-only: it never signals or writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CoreLiveness {
+    /// No managed Core process is alive.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Stopped,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Running(u32),
+    /// The platform cannot prove it (no cmdline identity probe). Only produced by
+    /// the non-Unix implementation.
+    #[cfg_attr(unix, allow(dead_code))]
+    Unprovable(String),
+}
+
+#[cfg(unix)]
+pub(crate) fn managed_core_liveness_at(pid_file: &std::path::Path) -> CoreLiveness {
+    let Some(metadata) = read_pid_file(pid_file).filter(pid_metadata_is_trusted_system_core) else {
+        return CoreLiveness::Stopped;
+    };
+    if !process_alive(metadata.pid) {
+        return CoreLiveness::Stopped;
+    }
+    if process_matches_core_metadata(&metadata) {
+        CoreLiveness::Running(metadata.pid)
+    } else {
+        // The recorded pid now belongs to an unrelated process: no managed Core.
+        CoreLiveness::Stopped
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn live_managed_core_liveness() -> CoreLiveness {
+    managed_core_liveness_at(&core_pid_file_path())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn live_managed_core_liveness() -> CoreLiveness {
+    CoreLiveness::Unprovable("process cmdline identity probing is Unix-only".to_string())
 }
 
 fn core_pid_file_path() -> PathBuf {
@@ -2331,6 +3400,40 @@ fn endpoint_is_connectable(endpoint: &str) -> bool {
 }
 
 #[cfg(any(unix, windows))]
+/// SPEC 裁决 D-4: "the API answers" only proves *someone* answers. A start
+/// may not borrow that response as this attempt's readiness: the peer must be
+/// bound to a trusted managed process, the artifact being started, the config
+/// revision and this start's causality. A proven managed orphan has identity but
+/// no causality; an unprovable peer has neither — both are refused, keeping the
+/// evidence and starting nothing.
+fn unreusable_endpoint_message(
+    endpoint: &str,
+    core_binary: &std::path::Path,
+    config_path: &std::path::Path,
+) -> String {
+    #[cfg(unix)]
+    {
+        let state_dir = runtime_data_dir_for_config(config_path);
+        let service_uid = Some(unsafe { libc::geteuid() });
+        match crate::core_identity::prove_core_api_peer(endpoint, core_binary, &state_dir, service_uid) {
+            crate::core_identity::CoreIdentityProof::Proven(identity) => format!(
+                "core API endpoint {endpoint} is served by the managed Core pid {} (exe {}), which this daemon did not start in this attempt: its start causality is unprovable, so its response is not this start's readiness. No Core was started. Run an explicit managed stop/restart (mihomo-cli restart --system) to take the orphan over with an exit proof.",
+                identity.pid,
+                identity.exe.display()
+            ),
+            crate::core_identity::CoreIdentityProof::Unprovable(reason) => format!(
+                "core API endpoint {endpoint} is reachable but the responding process's managed identity is unprovable ({reason}); refusing to start a second Core. No Core was started; runtime evidence is retained."
+            ),
+            crate::core_identity::CoreIdentityProof::Absent => duplicate_core_endpoint_message(endpoint),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (core_binary, config_path);
+        duplicate_core_endpoint_message(endpoint)
+    }
+}
+
 fn duplicate_core_endpoint_message(endpoint: &str) -> String {
     format!(
         "core API endpoint is already reachable at {endpoint}; refusing to start a duplicate core. Stop the existing instance first."
@@ -2428,13 +3531,28 @@ enum CoreFailure {
     PortConflict { detail: String },
     /// Permission denied — report with guidance.
     PermissionDenied { detail: String },
+    /// cache.db could not be handed to the Core (SPEC A3).
+    CacheDbInvalid,
     /// Unknown failure — report last N lines of log.
     Unknown { log_tail: String },
 }
 
 /// Classify a core startup failure from its log output (ADR-24).
-fn classify_core_startup_failure(log_tail: &str) -> CoreFailure {
+fn classify_core_startup_failure(
+    log_tail: &str,
+    cache_db: crate::utils::CacheDbState,
+) -> CoreFailure {
     let lower = log_tail.to_lowercase();
+
+    let cache_db_failure = lower.contains("invalid database")
+        || lower.contains("checksum error")
+        || lower.contains("unexpected magic")
+        || lower.contains("version mismatch");
+    if cache_db_failure
+        && (cache_db.requires_quarantine() || lower.contains(crate::utils::CACHE_DB_FILE_NAME))
+    {
+        return CoreFailure::CacheDbInvalid;
+    }
 
     if lower.contains("can't find mmdb")
         || lower.contains("can't download mmdb")
@@ -2573,6 +3691,11 @@ fn format_core_failure_message(failure: &CoreFailure, log_file: &std::path::Path
         CoreFailure::PermissionDenied { detail } => {
             format!("{detail}\n  Fix: check file permissions for mihomo binary and config")
         }
+        CoreFailure::CacheDbInvalid => {
+            "cache.db cannot be opened by the Core and could not be quarantined safely.\n  \
+             Fix: mihomo-cli restart --system"
+                .to_string()
+        }
         CoreFailure::Unknown { log_tail } => {
             let last_lines: String = log_tail
                 .lines()
@@ -2673,6 +3796,31 @@ pub(crate) fn resolve_autostart_target_config_path(
     None
 }
 
+/// 准入④: a Core start must stay impossible from the stopped proof
+/// until destructive cleanup ends. The recovery marker only excludes other
+/// recovery agents, so the lifecycle layer enforces the same rule: autostart
+/// never starts a Core behind a non-terminal transaction (or an un-migrated
+/// legacy journal), under the daemon's startup path.
+fn autostart_transaction_blocker() -> Option<String> {
+    daemon_transaction_context().and_then(|ctx| autostart_transaction_blocker_for(&ctx))
+}
+
+fn autostart_transaction_blocker_for(ctx: &crate::instance::InstanceContext) -> Option<String> {
+    if crate::tun_transaction::legacy_journal_path(ctx).exists() {
+        return Some("a legacy TUN transaction journal is pending migration".to_string());
+    }
+    match crate::tun_transaction::read_active_journal(ctx) {
+        Ok(Some(journal)) if !transaction_gate_phase_allows_changes(journal.phase) => {
+            Some(format!(
+                "an active TUN transaction ({}) is in phase {:?}",
+                journal.transaction_id, journal.phase
+            ))
+        }
+        Ok(_) => None,
+        Err(error) => Some(format!("the active TUN journal is unreadable: {error}")),
+    }
+}
+
 #[cfg(any(unix, windows))]
 fn runtime_data_dir_for_config(config_path: &std::path::Path) -> PathBuf {
     let system_dir = system_runtime_data_dir();
@@ -2715,61 +3863,59 @@ fn remove_stale_unix_endpoint(endpoint: &str) {
     }
 }
 
+/// Outcome of resolving the replay scope against the fixed-runtime mirror.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MirrorScopeResolution {
+    Match(String),
+    /// Mirror active points at a different subscription than the request
+    /// (A3' identity-mismatch signal).
+    IdentityMismatch {
+        request: String,
+        mirror_active: String,
+    },
+    /// No replayable scope (missing/invalid id, no mirror active).
+    Unavailable,
+}
+
 fn resolve_mirror_selection_scope_in(
     base: &std::path::Path,
     subscription_id: Option<&str>,
-) -> Option<String> {
+) -> MirrorScopeResolution {
     let subscription_id = match subscription_id {
         Some(id) if valid_mirror_subscription_id(id) => id,
         Some(id) => {
             eprintln!("[mihomo-daemon] selection replay skipped: invalid subscription id {id}");
-            return None;
+            return MirrorScopeResolution::Unavailable;
         }
         None => {
             eprintln!("[mihomo-daemon] selection replay skipped: selection replay requires subscription_id");
-            return None;
+            return MirrorScopeResolution::Unavailable;
         }
     };
     match read_mirror_active_id_in(base) {
-        Some(active) if active == subscription_id => Some(subscription_id.to_string()),
+        Some(active) if active == subscription_id => {
+            MirrorScopeResolution::Match(subscription_id.to_string())
+        }
         Some(active) => {
             eprintln!(
                 "[mihomo-daemon] selection replay skipped: selection subscription identity mismatch: mirror_active={active}, request={subscription_id}"
             );
-            None
+            MirrorScopeResolution::IdentityMismatch {
+                request: subscription_id.to_string(),
+                mirror_active: active,
+            }
         }
         None => {
             eprintln!(
                 "[mihomo-daemon] selection replay skipped: selection mirror has no active subscription"
             );
-            None
+            MirrorScopeResolution::Unavailable
         }
     }
 }
 
-fn resolve_mirror_selection_scope(subscription_id: Option<&str>) -> Option<String> {
+fn resolve_mirror_selection_scope(subscription_id: Option<&str>) -> MirrorScopeResolution {
     resolve_mirror_selection_scope_in(&daemon_config_dir(), subscription_id)
-}
-
-fn merge_tun_block_into_config_yaml(
-    config_content: &str,
-    tun_block: &serde_yaml::Value,
-) -> anyhow::Result<(String, String)> {
-    let mut doc: serde_yaml::Value = serde_yaml::from_str(config_content)
-        .map_err(|e| anyhow::anyhow!("system configuration YAML is invalid: {e}"))?;
-    if let serde_yaml::Value::Mapping(ref mut root_map) = doc {
-        root_map.insert(
-            serde_yaml::Value::String("tun".to_string()),
-            tun_block.clone(),
-        );
-    } else {
-        anyhow::bail!("system configuration root must be a YAML mapping");
-    }
-    let promoted = serde_yaml::to_string(&doc).map_err(|e| {
-        anyhow::anyhow!("failed to serialize promoted system configuration with TUN: {e}")
-    })?;
-    let revision = crate::tun_transaction::sha256_revision(promoted.as_bytes());
-    Ok((promoted, revision))
 }
 
 fn prepare_promoted_system_config_content(
@@ -2785,7 +3931,10 @@ fn prepare_promoted_system_config_content(
         });
 
         if let Some(existing_tun) = existing_tun_block {
-            return merge_tun_block_into_config_yaml(config_content, &existing_tun);
+            return crate::tun_transaction::merge_snapshot_tun_block_into_config_yaml(
+                config_content,
+                &existing_tun,
+            );
         } else {
             anyhow::bail!(
                 "active system TUN snapshot is missing or lacks a valid 'tun' block. Fix: mihomo-cli restart --system or mihomo-cli tun on --yes"
@@ -2795,24 +3944,65 @@ fn prepare_promoted_system_config_content(
     Ok((config_content.to_string(), config_revision.to_string()))
 }
 
+/// SPEC B3 / R3: rollback must observe the stop result. A Core that cannot
+/// be stopped is never restarted on top of, and the failure is reported.
 async fn restore_last_known_good(
     state: &Arc<Mutex<DaemonState>>,
     target_path: &Path,
     core_binary: &Path,
     old_content_backup: Option<&[u8]>,
-) {
-    if let Some(old_bytes) = old_content_backup {
-        let _ = std::fs::write(target_path, old_bytes);
-        let _ = stop_core(Arc::clone(state)).await;
-        let _ = start_core(
-            Arc::clone(state),
-            target_path.to_path_buf(),
-            core_binary.to_path_buf(),
-        )
-        .await;
-    } else {
+) -> Result<(), String> {
+    let Some(old_bytes) = old_content_backup else {
         let _ = std::fs::remove_file(target_path);
+        return Err(
+            "no previous configuration backup exists; the Core was not restarted during rollback. Fix: mihomo-cli restart --system"
+                .to_string(),
+        );
+    };
+    let _ = std::fs::write(target_path, old_bytes);
+    match stop_core(Arc::clone(state)).await {
+        DaemonResponse::Success { .. } => {}
+        DaemonResponse::Error { message } => {
+            return Err(format!(
+                "previous Core could not be stopped before rollback: {message}.                  Fix: mihomo-cli restart --system"
+            ));
+        }
+        other => {
+            return Err(format!(
+                "unexpected stop response before rollback: {other:?}"
+            ));
+        }
     }
+    match start_core(
+        Arc::clone(state),
+        target_path.to_path_buf(),
+        core_binary.to_path_buf(),
+    )
+    .await
+    {
+        DaemonResponse::Success { .. } => Ok(()),
+        DaemonResponse::Error { message } => Err(format!(
+            "last-known-good Core could not be restarted: {message}.              Fix: mihomo-cli restart --system"
+        )),
+        other => Err(format!("unexpected restart response: {other:?}")),
+    }
+}
+
+/// C / ：判定 promotion 目标是否为受管 TUN 快照。
+/// 持久快照（`tun_config_file` 的 `tun.enable`）是唯一判定依据；运行态
+/// `config_path` 不参与判定——失配/缺失态同样采信持久证据。
+#[cfg(any(unix, windows))]
+fn resolve_is_tun_snapshot(tun_config_file: &Path) -> bool {
+    snapshot_tun_enabled(tun_config_file)
+}
+
+/// apply 前后运行态 TUN 不变量的护栏判据。
+/// 不变量：若某次 apply（热重载或全量重启）之前运行态 `tun.enable == true`，
+/// 则 apply 之后它必须仍为 `true`——后态为 `Some(false)`（被禁用）或 `None`
+/// （不可观测）都视为破坏不变量并触发回滚；apply 前为 `None`（不可观测，
+/// 护栏降级为告警）或 `Some(false)`（用户经 `tun off` 显式关闭）都不触发。
+fn tun_apply_requires_rollback(tun_before: Option<bool>, tun_after: Option<bool>) -> bool {
+    tun_before == Some(true) && tun_after != Some(true)
 }
 
 async fn promote_system_config(
@@ -2822,6 +4012,10 @@ async fn promote_system_config(
     subscription_id: Option<String>,
     explicit_change_kind: Option<crate::config::ChangeKind>,
 ) -> DaemonResponse {
+    // B1: promotion is a managed mutation (mirror scope can
+    // change); bracket the whole operation so sampling straddling it is
+    // discarded.
+    let _drift_op = DriftOpGuard::open();
     if config_content.is_empty() || config_content.len() > 16 * 1024 * 1024 {
         return DaemonResponse::Error {
             message: "system configuration payload is empty or too large".to_string(),
@@ -2841,11 +4035,7 @@ async fn promote_system_config(
     // Check if active transaction exists
     match crate::tun_transaction::read_active_journal(&transaction_ctx) {
         Ok(Some(journal)) => {
-            if !matches!(
-                journal.phase,
-                crate::tun_transaction::JournalPhase::IntentCommitted
-                    | crate::tun_transaction::JournalPhase::RolledBack
-            ) {
+            if !transaction_gate_phase_allows_changes(journal.phase) {
                 return DaemonResponse::Error {
                     message: format!(
                         "A system TUN transaction ({}) is in progress (phase: {:?}).
@@ -2872,20 +4062,19 @@ async fn promote_system_config(
     let is_tun_snapshot = {
         let mut s = state.lock().await;
         reap_exited_core(&mut s);
-        // Issue #022 C：`is_tun_snapshot` 不能只依赖易失的运行态证据。daemon 刚重启、
+        // C：`is_tun_snapshot` 不能只依赖易失的运行态证据。daemon 刚重启、
         // Core 未运行或 pid 元数据不可恢复时 `config_path` 为空，若此时判定为非 TUN 快照，
         // restart 会 promote 到 `active-config.yaml`，把受管 TUN 快照永久晾在旧内容上，
         // 三方 revision（launched / active snapshot / intent）从此对不上 →
         // `TUN: unknown`、`Configuration: unknown`、`Health: degraded` 永不闭环。
-        // 运行态缺失时以持久证据（受管 TUN 快照 + tun.enable）为准。
-        let runtime_evidence_matches =
-            s.config_path.as_ref() == Some(&transaction_ctx.paths.tun_config_file);
-        let runtime_evidence_missing = s.config_path.is_none();
-        if runtime_evidence_matches || runtime_evidence_missing {
-            snapshot_tun_enabled(&transaction_ctx.paths.tun_config_file)
-        } else {
-            false
-        }
+        // 失配态（`config_path` 漂到 `active-config.yaml`）与缺失态同权，
+        // 一律采信持久证据——持久快照是 TUN 意图的权威来源，`config_path` 只是易失运行态，
+        // 失配时硬判 false 会把 promotion 降级为热重载，在跑的 TUN 被静默拆除。
+        // `tun off` 成功后快照必然写入 `enable: false`，故无条件采信持久快照
+        // 不会复活经 `tun off` 关闭的 TUN；经 Core API 直接 `PATCH /configs`
+        // 关闭的 TUN 不改写快照，下次 promotion 会按快照拉回 `enable: true`
+        // （out-of-band 关闭不被此判定尊重）。
+        resolve_is_tun_snapshot(&transaction_ctx.paths.tun_config_file)
     };
 
     let selection_scope = resolve_mirror_selection_scope(subscription_id.as_deref());
@@ -2949,14 +4138,21 @@ async fn promote_system_config(
 
     let core_binary = expected_system_core_binary_path();
     if let Err(message) = preflight_system_core_start_request(&target_path, &core_binary) {
-        restore_last_known_good(
-            &state,
-            &target_path,
-            &core_binary,
-            old_content_backup.as_deref(),
-        )
-        .await;
-        return DaemonResponse::Error { message };
+        // 终审 MAJOR：此臂位于停止 Core 之前——运行中的 Core 仍在跑旧配置、
+        // TUN 未被本次操作动过。这里若调用带 Core 停启的 `restore_last_known_good`，
+        // 会把一次无副作用的拒绝升级成"杀掉健康 Core"；而 preflight 失败的现实触发条件
+        // （core 二进制缺失）下重启必然失败，数据面全断。故只做纯文件级回滚，
+        // 与上方写失败臂对齐。
+        if let Some(old_bytes) = old_content_backup.as_ref() {
+            let _ = std::fs::write(&target_path, old_bytes);
+        } else {
+            let _ = std::fs::remove_file(&target_path);
+        }
+        return DaemonResponse::Error {
+            message: format!(
+                "{message}. The promoted file was rolled back on disk; no Core stop/start was performed, so a running Core (if any) stays untouched."
+            ),
+        };
     }
 
     let (core_running, current_endpoint) = {
@@ -2981,6 +4177,34 @@ async fn promote_system_config(
         }
     });
 
+    // 把运行态 TUN 观测前移为函数级前置证据——热重载与全量重启
+    // 共用同一判据（`tun_apply_requires_rollback`）：apply 前 `tun.enable == true`
+    // 时，apply 之后它必须仍为 `true`，否则回滚并显式报错；全量重启分支另并列
+    // 要求 payload 声明的 TUN（`is_tun_snapshot`）被 attested 为 true。
+    // Core 未运行、无可用 API endpoint、读取失败或超时记为 None，
+    // 护栏降级为告警/不触发。
+    let tun_before = if core_running {
+        match current_endpoint.as_deref().and_then(api_endpoint_transport) {
+            Some(ep) => {
+                let client = mihomo_api::EndpointMihomoApiClient::new(ep);
+                // review MINOR-1：这是护栏前置观测，只给 2s 预算，
+                // 避免无读超时的 GET 吃掉 CLI 的 20s 响应预算；超时同样记 None。
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    client.get("/configs"),
+                )
+                .await
+                {
+                    Ok(Ok(config)) => config["tun"]["enable"].as_bool(),
+                    Ok(Err(_)) | Err(_) => None,
+                }
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     if core_running && change_kind == crate::config::ChangeKind::HotReload {
         if let Some(ep) = current_endpoint.as_deref().and_then(api_endpoint_transport) {
             let client = mihomo_api::EndpointMihomoApiClient::new(ep);
@@ -2990,6 +4214,45 @@ async fn promote_system_config(
 
             match reload_result {
                 Ok(()) => {
+                    let tun_after = match client.get("/configs").await {
+                        Ok(config) => config["tun"]["enable"].as_bool(),
+                        Err(_) => None,
+                    };
+                    // apply 前 TUN 在跑（Some(true)）而 apply 后为
+                    // Some(false)（被禁用）或 None（GET /configs 读不到，不可观测）
+                    // 都意味着 TUN 存活无法证明 → 回滚并显式报错，两种情形文案区分；
+                    // apply 前为 None/Some(false) 不触发（降级为告警 / 用户显式关闭）。
+                    if tun_apply_requires_rollback(tun_before, tun_after) {
+                        // review MAJOR-1：护栏文案以共享标记起始，
+                        // CLI 侧 `is_tun_guard_error` 只认该常量。
+                        let detail = match tun_after {
+                            Some(false) => {
+                                format!("{TUN_GUARD_ERROR_MARKER}hot reload disabled the running TUN (runtime tun.enable changed from true to false)")
+                            }
+                            // None：apply 前已证明 TUN 在跑，apply 后却读不到——
+                            // 只声明不可观测，不谎称被改。
+                            _ => {
+                                format!("{TUN_GUARD_ERROR_MARKER}hot reload left the runtime TUN state unobservable (GET /configs no longer reports tun.enable after the reload)")
+                            }
+                        };
+                        let rollback = restore_last_known_good(
+                            &state,
+                            &target_path,
+                            &core_binary,
+                            old_content_backup.as_deref(),
+                        )
+                        .await;
+                        let mut message = match &rollback {
+                            Ok(()) => format!("{detail} and has been rolled back"),
+                            Err(_) => format!("{detail}; rollback did not complete"),
+                        };
+                        message.push_str(
+                            ". Fix: mihomo-cli tun on --yes to restore TUN, then mihomo-cli tun status to verify",
+                        );
+                        return DaemonResponse::Error {
+                            message: with_rollback_outcome(message, rollback),
+                        };
+                    }
                     let mut state_guard = state.lock().await;
                     reap_exited_core(&mut state_guard);
                     state_guard.launched_config_revision = Some(expected_revision.clone());
@@ -3010,11 +4273,34 @@ async fn promote_system_config(
 
                     let mut message =
                         "system configuration promoted and runtime applied".to_string();
-                    if let Some(subscription_id) = selection_scope {
-                        for line in replay_mirror_selection_intent(&state, &subscription_id).await {
-                            message.push('\n');
-                            message.push_str(&line);
+                    match &selection_scope {
+                        MirrorScopeResolution::Match(subscription_id) => {
+                            let _replay_guard = ReplayDriftGuard::open();
+                            for line in
+                                replay_mirror_selection_intent(&state, subscription_id).await
+                            {
+                                message.push('\n');
+                                message.push_str(&line);
+                            }
                         }
+                        MirrorScopeResolution::IdentityMismatch {
+                            request,
+                            mirror_active,
+                        } => {
+                            message.push('\n');
+                            message.push_str(&format!(
+                                "{} selection subscription identity mismatch: mirror_active={mirror_active}, request={request}",
+                                String::from_utf8_lossy(SELECTION_IDENTITY_MISMATCH_SIGNAL)
+                            ));
+                        }
+                        MirrorScopeResolution::Unavailable => {}
+                    }
+                    // reload 前未能读到 TUN 运行态，护栏未生效，不得静默报成功。
+                    if tun_before.is_none() {
+                        message.push('\n');
+                        message.push_str(
+                            "warning: TUN runtime state was not attested before hot reload; TUN survival after promotion is unverified",
+                        );
                     }
                     return DaemonResponse::Success { message };
                 }
@@ -3027,7 +4313,22 @@ async fn promote_system_config(
         }
     }
 
-    let _ = stop_core(Arc::clone(&state)).await;
+    // R3 / SPEC B3: the promotion stop must be observed; a Core that is
+    // still running is never replaced underneath itself.
+    match stop_core(Arc::clone(&state)).await {
+        DaemonResponse::Success { .. } => {}
+        response => {
+            let detail = match response {
+                DaemonResponse::Error { message } => message,
+                other => format!("unexpected stop response: {other:?}"),
+            };
+            return DaemonResponse::Error {
+                message: format!(
+                    "failed to stop the running Core before applying the system configuration: {detail}\n                       Fix: mihomo-cli restart --system"
+                ),
+            };
+        }
+    }
     match start_core(Arc::clone(&state), target_path.clone(), core_binary.clone()).await {
         DaemonResponse::Success { .. } => {
             let mut state_guard = state.lock().await;
@@ -3039,65 +4340,132 @@ async fn promote_system_config(
             let api_endpoint = state_guard.api_endpoint.clone();
             drop(state_guard);
             if runtime_revision != expected_revision {
-                restore_last_known_good(
+                let rollback = restore_last_known_good(
                     &state,
                     &target_path,
                     &core_binary,
                     old_content_backup.as_deref(),
                 )
                 .await;
-                return DaemonResponse::Error {
-                    message: "system configuration was loaded but its runtime revision could not be attested"
+                let message = with_rollback_outcome(
+                    "system configuration was loaded but its runtime revision could not be attested"
                         .to_string(),
+                    rollback,
+                );
+                // 收口：与 `start_core` 失败臂（下方）完全对称——此臂
+                // 同样发生在旧 Core 已被停掉、promoted 配置已接管之后，apply 前
+                // TUN 在跑时它不会自己回来；不带共享标记会被 CLI 折叠为 Pending，
+                // 用户看不到 TUN 已丢失。标记只作前缀，原文与 rollback 结果全保留。
+                let message = match tun_before {
+                    Some(true) => format!("{TUN_GUARD_ERROR_MARKER}{message}"),
+                    _ => message,
                 };
+                return DaemonResponse::Error { message };
             }
-            if is_tun_snapshot {
-                let tun_attested =
-                    if let Some(ep) = api_endpoint.as_deref().and_then(api_endpoint_transport) {
-                        let client = mihomo_api::EndpointMihomoApiClient::new(ep);
-                        match client.get("/configs").await {
-                            Ok(config) => config["tun"]["enable"].as_bool() == Some(true),
-                            Err(_) => false,
-                        }
-                    } else {
-                        false
-                    };
-                if !tun_attested {
-                    restore_last_known_good(
-                        &state,
-                        &target_path,
-                        &core_binary,
-                        old_content_backup.as_deref(),
-                    )
-                    .await;
-                    return DaemonResponse::Error {
-                        message: "promoted configuration was loaded but TUN runtime attestation failed: tun.enable is not true".to_string(),
-                    };
-                }
+            // 读取全量重启后的运行态 `tun.enable`，读不到记 None。
+            // 运行态不变量与热重载分支共用同一纯函数 `tun_apply_requires_rollback`：
+            // apply 前 TUN 在跑（Some(true)）而后态不为 true 就回滚——只凭
+            // is_tun_snapshot 会漏掉热重载失败 fail-open 到全量重启的降级分支：
+            // `!is_tun_snapshot` 但 TUN 实际在跑时，无 tun 块的 active-config
+            // 全量重启会静默拆除 TUN。payload 声明了 TUN（is_tun_snapshot）则
+            // 并列要求 attested 为 true。`tun off` 场景 tun_before 为 Some(false)，
+            // 不会进入本护栏。
+            let tun_after =
+                if let Some(ep) = api_endpoint.as_deref().and_then(api_endpoint_transport) {
+                    let client = mihomo_api::EndpointMihomoApiClient::new(ep);
+                    match client.get("/configs").await {
+                        Ok(config) => config["tun"]["enable"].as_bool(),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
+            if (is_tun_snapshot || tun_apply_requires_rollback(tun_before, tun_after))
+                && tun_after != Some(true)
+            {
+                let rollback = restore_last_known_good(
+                    &state,
+                    &target_path,
+                    &core_binary,
+                    old_content_backup.as_deref(),
+                )
+                .await;
+                // review MAJOR-1 + MINOR-2：共享标记让 CLI 侧识别为
+                // 护栏 Error；Fix 指引与热重载分支对称。
+                let mut message = format!(
+                    "{TUN_GUARD_ERROR_MARKER}promoted configuration was loaded but TUN runtime attestation failed: tun.enable is not true"
+                );
+                message.push_str(
+                    ". Fix: mihomo-cli tun on --yes to restore TUN, then mihomo-cli tun status to verify",
+                );
+                return DaemonResponse::Error {
+                    message: with_rollback_outcome(message, rollback),
+                };
             }
             let mut message = "system configuration promoted and runtime applied".to_string();
             // Replay the fixed-runtime selection mirror synchronously (≤5s
             // budget) so start/restart report restored selections in the same
             // response. The daemon never falls back to the user tree.
-            if let Some(subscription_id) = selection_scope {
-                for line in replay_mirror_selection_intent(&state, &subscription_id).await {
-                    message.push('\n');
-                    message.push_str(&line);
+            match &selection_scope {
+                MirrorScopeResolution::Match(subscription_id) => {
+                    let _replay_guard = ReplayDriftGuard::open();
+                    for line in replay_mirror_selection_intent(&state, subscription_id).await {
+                        message.push('\n');
+                        message.push_str(&line);
+                    }
                 }
+                MirrorScopeResolution::IdentityMismatch {
+                    request,
+                    mirror_active,
+                } => {
+                    message.push('\n');
+                    message.push_str(&format!(
+                        "{} selection subscription identity mismatch: mirror_active={mirror_active}, request={request}",
+                        String::from_utf8_lossy(SELECTION_IDENTITY_MISMATCH_SIGNAL)
+                    ));
+                }
+                MirrorScopeResolution::Unavailable => {}
+            }
+            // review BLOCKER：payload 未声明 TUN、Core 一直在跑，
+            // 却没读到 apply 前的 TUN 运行态（前置 GET 失败/超时）——护栏未生效，
+            // 全量重启可能已拆掉 TUN，不得静默报成功。措辞与热重载分支对称。
+            if !is_tun_snapshot && core_running && tun_before.is_none() {
+                message.push('\n');
+                message.push_str(
+                    "warning: TUN runtime state was not attested before the full restart; TUN survival after promotion is unverified",
+                );
             }
             DaemonResponse::Success { message }
         }
         DaemonResponse::Error { message } => {
-            restore_last_known_good(
+            let rollback = restore_last_known_good(
                 &state,
                 &target_path,
                 &core_binary,
                 old_content_backup.as_deref(),
             )
             .await;
+            // review MAJOR-2：TUN 在跑时旧 Core 已被停掉（TUN 设备
+            // 随之消失），新配置启动失败意味着 TUN 不会自己回来——该 Error 必须
+            // 带护栏标记走 Err 呈现，否则 CLI 折叠为 Pending，用户只看到
+            // "Run: mihomo-cli restart"，而 restart 仍从无 tun 块的配置启动。
+            // 标记只是前缀，`failed to start core` 的原始细节全部保留。
+            let message = with_rollback_outcome(message, rollback);
+            let message = match tun_before {
+                Some(true) => format!("{TUN_GUARD_ERROR_MARKER}{message}"),
+                _ => message,
+            };
             DaemonResponse::Error { message }
         }
         response => response,
+    }
+}
+
+/// R3: surface a rollback failure instead of swallowing it.
+fn with_rollback_outcome(message: String, rollback: Result<(), String>) -> String {
+    match rollback {
+        Ok(()) => message,
+        Err(rollback_error) => format!("{message}\n  {rollback_error}"),
     }
 }
 
@@ -3590,9 +4958,253 @@ async fn handle_apply_promoted_snapshot(
     }
 }
 
+/// 准入③: independent proof that the running runtime belongs to the
+/// *current* managed instance. The journal's own claims (`core_running`, the pid
+/// file, a binary path string, a matching revision, `legacy_source`) are
+/// explicitly not enough: the proof is either a live child handle created by the
+/// managed spawn path and still consistent with the instance launch record, or
+/// the existing four-part managed-Core attribution (which the stop then follows
+/// with a kernel-handle exit observation).
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurrentInstanceRuntime {
+    /// Spawned by this daemon; the pid still matches the launch record.
+    LiveChild(u32),
+    /// Not a child (daemon restart / adoption); proven through the Core API peer.
+    AttestedPeer(u32),
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+impl CurrentInstanceRuntime {
+    fn pid(self) -> u32 {
+        match self {
+            Self::LiveChild(pid) | Self::AttestedPeer(pid) => pid,
+        }
+    }
+}
+
+/// Strict launch-record agreement: the pid file is only the record, the live
+/// process is proven separately (child handle or API peer).
+#[cfg_attr(not(unix), allow(dead_code))]
+fn launch_record_matches_state(metadata: &CorePidMetadata, state: &DaemonState) -> bool {
+    state.core_pid == Some(metadata.pid)
+        && state
+            .core_binary
+            .as_ref()
+            .is_some_and(|binary| binary == &metadata.core_binary)
+        && state
+            .api_endpoint
+            .as_ref()
+            .is_some_and(|endpoint| metadata.api_endpoint.as_ref() == Some(endpoint))
+}
+
+#[cfg(unix)]
+async fn prove_current_instance_ownership(
+    state: &Arc<Mutex<DaemonState>>,
+) -> Result<CurrentInstanceRuntime, String> {
+    let (runtime, core_binary, api_endpoint) = {
+        let mut guard = state.lock().await;
+        let metadata = read_pid_file(&guard.pid_file)
+            .ok_or_else(|| format!("no instance launch record at {}", guard.pid_file.display()))?;
+        if !pid_metadata_is_trusted_system_core(&metadata) {
+            return Err(
+                "the instance launch record is not a trusted system Core record".to_string(),
+            );
+        }
+        if !launch_record_matches_state(&metadata, &guard)
+            || !pid_metadata_matches_state(&metadata, &guard)
+        {
+            return Err(
+                "the instance launch record does not match the daemon's recorded instance"
+                    .to_string(),
+            );
+        }
+        let runtime = match guard.core_child.as_mut() {
+            Some(child) => {
+                match child.try_wait() {
+                    Ok(None) => {}
+                    Ok(Some(_)) => return Err("the managed Core child already exited".to_string()),
+                    Err(error) => {
+                        return Err(format!(
+                            "cannot observe the managed Core child state: {error}"
+                        ))
+                    }
+                }
+                let child_pid = child
+                    .id()
+                    .ok_or_else(|| "the managed Core child carries no pid".to_string())?;
+                if guard.core_pid != Some(child_pid) {
+                    return Err(format!(
+                        "live Core child pid {child_pid} does not match the recorded pid {:?}",
+                        guard.core_pid
+                    ));
+                }
+                if metadata.pid != child_pid {
+                    return Err(format!(
+                        "instance launch record pid {} does not match the live Core child pid {child_pid}",
+                        metadata.pid
+                    ));
+                }
+                CurrentInstanceRuntime::LiveChild(child_pid)
+            }
+            None => {
+                if guard.core_pid.is_none() {
+                    return Err("the daemon records no current instance pid".to_string());
+                }
+                CurrentInstanceRuntime::AttestedPeer(metadata.pid)
+            }
+        };
+        (
+            runtime,
+            guard.core_binary.clone(),
+            guard.api_endpoint.clone(),
+        )
+    };
+
+    if let CurrentInstanceRuntime::AttestedPeer(recorded_pid) = runtime {
+        let (Some(core_binary), Some(api_endpoint)) = (core_binary, api_endpoint) else {
+            return Err(
+                "the daemon cannot name the managed Core binary/endpoint for the peer proof"
+                    .to_string(),
+            );
+        };
+        let state_dir = system_runtime_data_dir();
+        let endpoint = api_endpoint;
+        let service_uid = Some(unsafe { libc::geteuid() });
+        match crate::core_identity::prove_core_api_peer(
+            &endpoint,
+            &core_binary,
+            &state_dir,
+            service_uid,
+        ) {
+            crate::core_identity::CoreIdentityProof::Proven(identity) => {
+                if identity.pid != recorded_pid {
+                    return Err(format!(
+                        "the attested managed Core pid {} does not match the recorded instance pid {recorded_pid}",
+                        identity.pid
+                    ));
+                }
+            }
+            crate::core_identity::CoreIdentityProof::Absent => return Err(
+                "no process answers the managed Core API endpoint; the recorded runtime is stale"
+                    .to_string(),
+            ),
+            crate::core_identity::CoreIdentityProof::Unprovable(reason) => {
+                return Err(format!(
+                    "cannot prove the managed Core belongs to this instance: {reason}"
+                ))
+            }
+        }
+    }
+    Ok(runtime)
+}
+
+#[cfg(not(unix))]
+async fn prove_current_instance_ownership(
+    _state: &Arc<Mutex<DaemonState>>,
+) -> Result<CurrentInstanceRuntime, String> {
+    Err("managed Core ownership is not provable on this platform".to_string())
+}
+
+#[cfg(any(unix, windows))]
+fn core_api_endpoint_label(endpoint: &crate::instance::ApiEndpoint) -> String {
+    match endpoint {
+        crate::instance::ApiEndpoint::UnixSocket(path) => format!("unix://{}", path.display()),
+        crate::instance::ApiEndpoint::WindowsNamedPipe(pipe) => pipe.clone(),
+    }
+}
+
+/// 准入⑤: `core_running == false` is daemon bookkeeping, not a stop
+/// proof. Before a stopped-now proof is issued, the managed endpoint must be
+/// provably absent — a managed Core that still answers (or an unidentifiable
+/// listener) refuses and keeps every artifact.
+#[cfg(unix)]
+async fn assert_managed_runtime_absent(
+    ctx: &crate::instance::InstanceContext,
+) -> Result<(), String> {
+    let state_dir = ctx
+        .paths
+        .tun_config_file
+        .parent()
+        .ok_or_else(|| "the managed state directory is undefined".to_string())?;
+    let endpoint = core_api_endpoint_label(&ctx.paths.api_endpoint);
+    match crate::core_identity::prove_core_api_peer(
+        &endpoint,
+        &ctx.paths.core_binary,
+        state_dir,
+        Some(unsafe { libc::geteuid() }),
+    ) {
+        crate::core_identity::CoreIdentityProof::Absent => Ok(()),
+        crate::core_identity::CoreIdentityProof::Proven(identity) => Err(format!(
+            "managed Core process {} still answers the API endpoint; refusing a stopped-now proof",
+            identity.pid
+        )),
+        crate::core_identity::CoreIdentityProof::Unprovable(reason) => Err(format!(
+            "cannot prove the managed Core is stopped: {reason}"
+        )),
+    }
+}
+
+#[cfg(not(unix))]
+async fn assert_managed_runtime_absent(
+    ctx: &crate::instance::InstanceContext,
+) -> Result<(), String> {
+    let endpoint = core_api_endpoint_label(&ctx.paths.api_endpoint);
+    if endpoint_is_connectable(&endpoint) {
+        return Err(
+            "the Core API endpoint still accepts connections and its peer identity cannot be proven on this platform"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// admission (裁决 d = 严格化 b). Every condition below must hold;
+/// any failure keeps every artifact and leaves destructive cleanup at zero.
+struct LegacyResetRefusal {
+    stage: &'static str,
+    message: String,
+}
+
+async fn legacy_reset_admission(
+    ctx: &crate::instance::InstanceContext,
+    journal: &crate::tun_transaction::TunJournal,
+    observation: &crate::tun_transaction::RuntimeObservation,
+    state: &Arc<Mutex<DaemonState>>,
+) -> Result<(), LegacyResetRefusal> {
+    // ② transaction form + placeholder evidence: present, safely readable,
+    // digest-matching, and exactly the migration shape.
+    crate::tun_transaction::legacy_reset_evidence_admission(ctx, journal).map_err(|message| {
+        LegacyResetRefusal {
+            stage: "legacy_reset_evidence",
+            message,
+        }
+    })?;
+    // ③ current-instance ownership, independent of the journal.
+    let runtime = prove_current_instance_ownership(state)
+        .await
+        .map_err(|message| LegacyResetRefusal {
+            stage: "legacy_reset_ownership",
+            message,
+        })?;
+    if observation.core_pid != Some(runtime.pid()) {
+        return Err(LegacyResetRefusal {
+            stage: "legacy_reset_ownership",
+            message: format!(
+                "the proven instance pid {} does not match the observed runtime pid {:?}",
+                runtime.pid(),
+                observation.core_pid
+            ),
+        });
+    }
+    Ok(())
+}
+
 async fn handle_quiesce_candidate_runtime(
     state: Arc<Mutex<DaemonState>>,
     fence: crate::tun_transaction::TransactionFence,
+    allow_legacy_reset: bool,
+    allow_restored_old_quiesce: bool,
     peer: PeerAuth,
 ) -> DaemonResponse {
     if let Err(message) = validate_tun_peer_is_root(peer) {
@@ -3630,9 +5242,10 @@ async fn handle_quiesce_candidate_runtime(
         }
     };
 
+    // SPEC B3: fence.expected_phase must match journal.phase (unified check)
     if journal.transaction_id != fence.transaction_id
         || journal.generation != fence.generation
-        || journal.phase != crate::tun_transaction::JournalPhase::RollbackPending
+        || journal.phase != fence.expected_phase
         || journal.candidate_revision != fence.expected_candidate_revision
     {
         return DaemonResponse::Transaction {
@@ -3644,105 +5257,242 @@ async fn handle_quiesce_candidate_runtime(
         };
     }
 
-    let obs = get_runtime_observation(&state).await;
-    if !obs.core_running {
+    // SPEC B3: Only RollbackPending and RecoveryRequired phases are allowed
+    if !matches!(
+        journal.phase,
+        crate::tun_transaction::JournalPhase::RollbackPending
+            | crate::tun_transaction::JournalPhase::RecoveryRequired
+    ) {
         return DaemonResponse::Transaction {
-            response: crate::tun_transaction::TransactionResponse::AlreadySatisfied(
-                crate::tun_transaction::RuntimeProof {
-                    transaction_id: fence.transaction_id,
-                    generation: fence.generation,
-                    observed_phase: crate::tun_transaction::JournalPhase::RollbackPending,
-                    proof_kind: crate::tun_transaction::RuntimeProofKind::CandidateQuiesced,
-                    core_identity: obs.core_identity.unwrap_or_default(),
-                    core_pid: 0,
-                    launched_revision: String::new(),
-                    runtime_tun: false,
-                    api_ready: false,
-                },
-            ),
+            response: crate::tun_transaction::TransactionResponse::Stale {
+                observed_transaction_id: Some(journal.transaction_id),
+                observed_generation: Some(journal.generation),
+                observed_phase: Some(journal.phase),
+            },
         };
     }
 
-    let old_evidence = match crate::tun_transaction::read_and_validate_old_runtime(&ctx, &journal) {
-        Ok(evidence) => evidence,
-        Err(e) => {
+    let obs = get_runtime_observation(&state).await;
+
+    // SPEC B3 / 去脂裁决②: one stopped proof, no "attested but still running"
+    // third state. Nothing running is already a true stopped state; a running
+    // candidate or attested old runtime is stopped for both phases.
+    if !obs.core_running {
+        // `core_running` is bookkeeping. A managed Core that still
+        // answers at the endpoint is not stopped, even when the pid record is
+        // unreadable; issuing a stopped-now proof here would authorize cleanup
+        // under a live process.
+        if let Err(reason) = assert_managed_runtime_absent(&ctx).await {
             return DaemonResponse::Transaction {
                 response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
                     observation: obs,
                     error: crate::tun_transaction::StructuredError {
-                        code: crate::tun_transaction::TransactionErrorCode::UnsafeArtifact,
-                        stage: "validate_old_runtime_for_quiesce".to_string(),
+                        code: crate::tun_transaction::TransactionErrorCode::RuntimeRevisionMismatch,
+                        stage: "quiesce_stopped_verification".to_string(),
                         retryable: false,
-                        message: e.to_string(),
+                        message: reason,
                     },
                 },
             };
+        }
+        let proof = CoreStoppedProof::stopped_now(0);
+        return DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::Completed(quiesced_proof(
+                &fence,
+                journal.phase,
+                &obs,
+                &proof,
+            )),
+        };
+    }
+
+    // Identity is a disjunction: a candidate that matches the journal fingerprint is
+    // self-proving and must not depend on the old-runtime artifact. Only an
+    // unproven candidate needs `old-runtime.json`; its failure stays a rejection.
+    let matches_candidate = crate::tun_transaction::runtime_matches_candidate(&journal, &obs);
+    let old_evidence = if matches_candidate {
+        None
+    } else {
+        match crate::tun_transaction::read_and_validate_old_runtime(&ctx, &journal) {
+            Ok(evidence) => Some(evidence),
+            Err(e) => {
+                return DaemonResponse::Transaction {
+                    response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                        observation: obs,
+                        error: crate::tun_transaction::StructuredError {
+                            code: crate::tun_transaction::TransactionErrorCode::UnsafeArtifact,
+                            stage: "validate_old_runtime_for_quiesce".to_string(),
+                            retryable: false,
+                            message: e.to_string(),
+                        },
+                    },
+                };
+            }
         }
     };
+    let matches_old = old_evidence.as_ref().is_some_and(|evidence| {
+        crate::tun_transaction::runtime_matches_old_evidence(evidence, &obs)
+    });
+    let matches_restored_old = old_evidence.as_ref().is_some_and(|evidence| {
+        crate::tun_transaction::runtime_matches_restored_old_state(evidence, &obs)
+    });
 
-    // If core is running candidate, stop it
-    if crate::tun_transaction::runtime_matches_candidate(&journal, &obs) {
-        let stop_response = stop_core(Arc::clone(&state)).await;
-        let obs_after = get_runtime_observation(&state).await;
-        if !matches!(stop_response, DaemonResponse::Success { .. }) || obs_after.core_running {
+    let mut stage = if matches_candidate {
+        "quiesce_candidate"
+    } else {
+        "quiesce_old_runtime"
+    };
+    if !matches_candidate && !matches_old {
+        // a managed Core may still run the old revision/TUN with a new
+        // PID after a restart. Only an explicit runtime reset may stop it, and only
+        // after the daemon proves the live process belongs to this instance.
+        if allow_restored_old_quiesce && matches_restored_old {
+            let observed_pid = obs.core_pid;
+            match prove_current_instance_ownership(&state).await {
+                Ok(runtime) if Some(runtime.pid()) == observed_pid => {
+                    stage = "quiesce_restored_old_runtime";
+                }
+                Ok(runtime) => {
+                    return DaemonResponse::Transaction {
+                        response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                            observation: obs,
+                            error: crate::tun_transaction::StructuredError {
+                                code: crate::tun_transaction::TransactionErrorCode::RuntimeRevisionMismatch,
+                                stage: "quiesce_restored_old_ownership".to_string(),
+                                retryable: false,
+                                message: format!(
+                                    "managed ownership proof returned pid {} but the observed Core pid is {:?}",
+                                    runtime.pid(),
+                                    observed_pid
+                                ),
+                            },
+                        },
+                    };
+                }
+                Err(reason) => {
+                    return DaemonResponse::Transaction {
+                        response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                            observation: obs,
+                            error: crate::tun_transaction::StructuredError {
+                                code: crate::tun_transaction::TransactionErrorCode::RuntimeRevisionMismatch,
+                                stage: "quiesce_restored_old_ownership".to_string(),
+                                retryable: false,
+                                message: format!(
+                                    "cannot prove the current managed Core owns this instance: {reason}"
+                                ),
+                            },
+                        },
+                    };
+                }
+            }
+        } else if !allow_legacy_reset {
             return DaemonResponse::Transaction {
-                response: crate::tun_transaction::TransactionResponse::NotSatisfied {
-                    observation: obs_after,
+                response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                    observation: obs,
                     error: crate::tun_transaction::StructuredError {
-                        code: crate::tun_transaction::TransactionErrorCode::CoreStopFailed,
-                        stage: "quiesce_candidate".to_string(),
+                        code: crate::tun_transaction::TransactionErrorCode::RuntimeRevisionMismatch,
+                        stage: stage.to_string(),
                         retryable: false,
-                        message: "candidate core did not stop".to_string(),
+                        message:
+                            "running runtime is neither candidate nor fully attested old runtime"
+                                .to_string(),
                     },
                 },
             };
+        } else {
+            match legacy_reset_admission(&ctx, &journal, &obs, &state).await {
+                Ok(()) => stage = "quiesce_legacy_reset",
+                Err(refusal) => {
+                    return DaemonResponse::Transaction {
+                        response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                            observation: obs,
+                            error: crate::tun_transaction::StructuredError {
+                                code: crate::tun_transaction::TransactionErrorCode::RuntimeRevisionMismatch,
+                                stage: refusal.stage.to_string(),
+                                retryable: false,
+                                message: refusal.message,
+                            },
+                        },
+                    };
+                }
+            }
         }
-        DaemonResponse::Transaction {
-            response: crate::tun_transaction::TransactionResponse::Completed(
-                crate::tun_transaction::RuntimeProof {
-                    transaction_id: fence.transaction_id,
-                    generation: fence.generation,
-                    observed_phase: crate::tun_transaction::JournalPhase::RollbackPending,
-                    proof_kind: crate::tun_transaction::RuntimeProofKind::CandidateQuiesced,
-                    core_identity: obs_after.core_identity.unwrap_or_default(),
-                    core_pid: 0,
-                    launched_revision: String::new(),
-                    runtime_tun: false,
-                    api_ready: false,
-                },
-            ),
-        }
-    } else if crate::tun_transaction::runtime_matches_old_evidence(&old_evidence, &obs) {
-        // The old runtime is fully attested, so the candidate is already
-        // quiesced without stopping the old Core.
-        DaemonResponse::Transaction {
-            response: crate::tun_transaction::TransactionResponse::AlreadySatisfied(
-                crate::tun_transaction::RuntimeProof {
-                    transaction_id: fence.transaction_id,
-                    generation: fence.generation,
-                    observed_phase: crate::tun_transaction::JournalPhase::RollbackPending,
-                    proof_kind: crate::tun_transaction::RuntimeProofKind::CandidateQuiesced,
-                    core_identity: old_evidence.core_identity,
-                    core_pid: old_evidence.core_pid,
-                    launched_revision: old_evidence.launched_revision,
-                    runtime_tun: old_evidence.runtime_tun,
-                    api_ready: obs.api_ready,
-                },
-            ),
-        }
-    } else {
-        DaemonResponse::Transaction {
-            response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
-                observation: obs,
+    }
+
+    match quiesce_stop_runtime(Arc::clone(&state), stage).await {
+        Ok((proof, obs_after)) => DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::Completed(quiesced_proof(
+                &fence,
+                journal.phase,
+                &obs_after,
+                &proof,
+            )),
+        },
+        Err((obs_after, detail)) => DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::NotSatisfied {
+                observation: obs_after,
                 error: crate::tun_transaction::StructuredError {
-                    code: crate::tun_transaction::TransactionErrorCode::RuntimeRevisionMismatch,
-                    stage: "quiesce_candidate".to_string(),
+                    code: crate::tun_transaction::TransactionErrorCode::CoreStopFailed,
+                    stage: stage.to_string(),
                     retryable: false,
-                    message: "running runtime is neither candidate nor fully attested old runtime"
-                        .to_string(),
+                    message: detail,
                 },
             },
+        },
+    }
+}
+
+/// SPEC B3 / 去脂裁决②: stop the running managed runtime and return the
+/// single stopped proof. It does not care whether the running runtime is the
+/// candidate or the attested old Core — both phases must reach a true stop.
+async fn quiesce_stop_runtime(
+    state: Arc<Mutex<DaemonState>>,
+    stage: &str,
+) -> Result<
+    (CoreStoppedProof, crate::tun_transaction::RuntimeObservation),
+    (crate::tun_transaction::RuntimeObservation, String),
+> {
+    let (stop_response, stop_proof) = stop_core_with_proof(Arc::clone(&state)).await;
+    let obs_after = get_runtime_observation(&state).await;
+    match (stop_response, stop_proof) {
+        (DaemonResponse::Success { .. }, Some(proof)) if !obs_after.core_running => {
+            Ok((proof, obs_after))
         }
+        (response, _) => {
+            let detail = match response {
+                DaemonResponse::Error { message } => message,
+                other => format!("unexpected stop response: {other:?}"),
+            };
+            crate::log!("quiesce stop failed at {stage}: {detail}");
+            Err((obs_after, detail))
+        }
+    }
+}
+
+/// SPEC B3: build the quiesce runtime proof from the single stopped proof.
+fn quiesced_proof(
+    fence: &crate::tun_transaction::TransactionFence,
+    phase: crate::tun_transaction::JournalPhase,
+    obs_after: &crate::tun_transaction::RuntimeObservation,
+    stopped: &CoreStoppedProof,
+) -> crate::tun_transaction::RuntimeProof {
+    crate::log!(
+        "quiesce stopped proof: transaction={} gen={} stopped_pid={} stopped_at={}",
+        fence.transaction_id,
+        fence.generation,
+        stopped.pid,
+        stopped.stopped_at
+    );
+    crate::tun_transaction::RuntimeProof {
+        transaction_id: fence.transaction_id.clone(),
+        generation: fence.generation,
+        observed_phase: phase,
+        proof_kind: crate::tun_transaction::RuntimeProofKind::CandidateQuiesced,
+        core_identity: obs_after.core_identity.clone().unwrap_or_default(),
+        core_pid: 0,
+        launched_revision: String::new(),
+        runtime_tun: false,
+        api_ready: false,
     }
 }
 
@@ -3790,6 +5540,8 @@ async fn handle_restore_old_runtime(
 
     if journal.transaction_id != fence.transaction_id
         || journal.generation != fence.generation
+        || journal.phase != fence.expected_phase
+        || journal.candidate_revision != fence.expected_candidate_revision
         || journal.phase != crate::tun_transaction::JournalPhase::RollbackPending
     {
         return DaemonResponse::Transaction {
@@ -3820,27 +5572,28 @@ async fn handle_restore_old_runtime(
         }
     };
 
-    // Check if already restored (must match full old runtime evidence)
-    let obs = get_runtime_observation(&state).await;
-    if crate::tun_transaction::runtime_matches_old_evidence(&old_runtime, &obs) {
+    // the request may only ask for the target recorded in the durable
+    // evidence, not redefine it.
+    if expected_old_runtime_revision != old_runtime.launched_revision
+        || expected_old_runtime_tun != old_runtime.runtime_tun
+    {
+        let obs = get_runtime_observation(&state).await;
         return DaemonResponse::Transaction {
-            response: crate::tun_transaction::TransactionResponse::AlreadySatisfied(
-                crate::tun_transaction::RuntimeProof {
-                    transaction_id: fence.transaction_id,
-                    generation: fence.generation,
-                    observed_phase: crate::tun_transaction::JournalPhase::RollbackPending,
-                    proof_kind: crate::tun_transaction::RuntimeProofKind::OldRuntimeRestored,
-                    core_identity: old_runtime.core_identity,
-                    core_pid: old_runtime.core_pid,
-                    launched_revision: old_runtime.launched_revision,
-                    runtime_tun: old_runtime.runtime_tun,
-                    api_ready: true,
+            response: crate::tun_transaction::TransactionResponse::EvidenceMismatch {
+                observation: obs,
+                error: crate::tun_transaction::StructuredError {
+                    code: crate::tun_transaction::TransactionErrorCode::RuntimeRevisionMismatch,
+                    stage: "validate_restore_target".to_string(),
+                    retryable: false,
+                    message: "restore target does not match the durable old-runtime evidence"
+                        .to_string(),
                 },
-            ),
+            },
         };
     }
 
     // Determine launch source
+    let obs = get_runtime_observation(&state).await;
     let launch_source_path = match old_runtime.launch_source {
         crate::tun_transaction::LaunchSource::SystemActiveConfig => {
             crate::tun_transaction::active_config_path(&ctx)
@@ -3905,6 +5658,28 @@ async fn handle_restore_old_runtime(
     }
 
     // Stop candidate runtime if running and verified to belong to candidate
+    // already-restored uses the restored-state predicate (current PID
+    // allowed) and reports the current process, not the historical PID.
+    if crate::tun_transaction::runtime_matches_restored_old_state(&old_runtime, &obs)
+        && matches!(prove_current_instance_ownership(&state).await, Ok(runtime) if Some(runtime.pid()) == obs.core_pid)
+    {
+        return DaemonResponse::Transaction {
+            response: crate::tun_transaction::TransactionResponse::AlreadySatisfied(
+                crate::tun_transaction::RuntimeProof {
+                    transaction_id: fence.transaction_id,
+                    generation: fence.generation,
+                    observed_phase: crate::tun_transaction::JournalPhase::RollbackPending,
+                    proof_kind: crate::tun_transaction::RuntimeProofKind::OldRuntimeRestored,
+                    core_identity: obs.core_identity.unwrap_or_default(),
+                    core_pid: obs.core_pid.unwrap_or_default(),
+                    launched_revision: old_runtime.launched_revision,
+                    runtime_tun: old_runtime.runtime_tun,
+                    api_ready: obs.api_ready,
+                },
+            ),
+        };
+    }
+
     if obs.core_running {
         if crate::tun_transaction::runtime_matches_candidate(&journal, &obs) {
             let stop_res = stop_core(Arc::clone(&state)).await;
@@ -3962,9 +5737,10 @@ async fn handle_restore_old_runtime(
 
     match start_res {
         DaemonResponse::Success { .. } => {
-            if crate::tun_transaction::runtime_matches_old_evidence(&old_runtime, &obs_after)
+            if crate::tun_transaction::runtime_matches_restored_old_state(&old_runtime, &obs_after)
                 && obs_after.launched_revision.as_deref() == Some(&expected_old_runtime_revision)
                 && obs_after.runtime_tun == Some(expected_old_runtime_tun)
+                && matches!(prove_current_instance_ownership(&state).await, Ok(runtime) if Some(runtime.pid()) == obs_after.core_pid)
             {
                 DaemonResponse::Transaction {
                     response: crate::tun_transaction::TransactionResponse::Completed(
@@ -4455,20 +6231,52 @@ async fn handle_get_transaction_status(state: Arc<Mutex<DaemonState>>) -> Daemon
     transaction_status_response(obs, journal_result)
 }
 
+/// How a selection write is guarded for the drift sampler.
+#[derive(Clone, Copy, PartialEq)]
+enum SelectSegmentMode {
+    /// `SelectSystemProxy` IPC: bracket runtime PUT → intent persistence →
+    /// companion mirror record via an owner-matched select segment.
+    Explicit,
+    /// Core API passthrough (`CoreApiRequest` PUT /proxies/): replay, exit-IP
+    /// probes and raw API writes go through here with no companion record in
+    /// sight, so they guard via the replay suppression window instead of a
+    /// segment (a segment would wedge sampling until the next explicit select).
+    ApiPath,
+}
+
 async fn select_system_proxy(
     state: Arc<Mutex<DaemonState>>,
     group: String,
     node: String,
+    mode: SelectSegmentMode,
 ) -> DaemonResponse {
     if group.is_empty() || node.is_empty() || group.len() > 512 || node.len() > 512 {
         return DaemonResponse::Error {
             message: "proxy group and node must be non-empty and reasonably sized".to_string(),
         };
     }
+    // B1: bracket the managed selection write so the drift sampler
+    // never compares a half-applied runtime. Explicit selects open the segment
+    // that the companion mirror record closes; API-path writes arm the replay
+    // suppression window instead (covers the write plus the trailing gap).
+    let _drift_op = DriftOpGuard::open();
+    let segment = match mode {
+        SelectSegmentMode::Explicit => {
+            drift_open_select_segment();
+            true
+        }
+        SelectSegmentMode::ApiPath => {
+            drift_arm_suppression();
+            false
+        }
+    };
     let endpoint = {
         let mut state_guard = state.lock().await;
         reap_exited_core(&mut state_guard);
         if !state_guard.core_running {
+            if segment {
+                drift_close_select_segment();
+            }
             return DaemonResponse::Error {
                 message: "system Core is not running. Fix: mihomo-cli restart --system".to_string(),
             };
@@ -4476,12 +6284,18 @@ async fn select_system_proxy(
         state_guard.api_endpoint.clone()
     };
     let Some(core_endpoint) = endpoint.as_deref().and_then(api_endpoint_transport) else {
+        if segment {
+            drift_close_select_segment();
+        }
         return DaemonResponse::Error {
             message: "system Core has no usable API endpoint".to_string(),
         };
     };
     let client = mihomo_api::EndpointMihomoApiClient::new(core_endpoint);
     if let Err(error) = mihomo_api::select_proxy_with_client(&client, &group, &node).await {
+        if segment {
+            drift_close_select_segment();
+        }
         return DaemonResponse::Error {
             message: format!("failed to select proxy {group} → {node}: {error}"),
         };
@@ -4493,13 +6307,23 @@ async fn select_system_proxy(
         Ok(config) if config["now"].as_str() == Some(node.as_str()) => DaemonResponse::Success {
             message: format!("proxy selection applied: {group} → {node}"),
         },
-        Ok(_) => DaemonResponse::Error {
-            message: "proxy selection was accepted but runtime attestation did not match"
-                .to_string(),
-        },
-        Err(error) => DaemonResponse::Error {
-            message: format!("proxy selection runtime attestation failed: {error}"),
-        },
+        Ok(_) => {
+            if segment {
+                drift_close_select_segment();
+            }
+            DaemonResponse::Error {
+                message: "proxy selection was accepted but runtime attestation did not match"
+                    .to_string(),
+            }
+        }
+        Err(error) => {
+            if segment {
+                drift_close_select_segment();
+            }
+            DaemonResponse::Error {
+                message: format!("proxy selection runtime attestation failed: {error}"),
+            }
+        }
     }
 }
 
@@ -4514,11 +6338,96 @@ fn encode_proxy_path_segment(value: &str) -> String {
     })
 }
 
+#[cfg(any(unix, windows))]
+fn cache_db_service_user() -> Option<&'static str> {
+    // Tests run without the installed service account; the daemon/Core identity
+    // there is the current user, which `None` resolves to.
+    #[cfg(test)]
+    {
+        None
+    }
+    #[cfg(not(test))]
+    {
+        Some("mihomo")
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn cache_db_service_user() -> Option<&'static str> {
+    None
+}
+
+/// SPEC A2 / D2: the single cache.db evidence precondition shared by every
+/// Core spawn path (IPC start/restart/promote, daemon autostart, startup and
+/// failure retry). `start_core` is their only spawn primitive, and it runs under
+/// the lifecycle lock with the Core already proven stopped.
+///
+/// The daemon **only classifies**: permission drift is reported as
+/// `repair_required` and handed to the CLI's confirmation contract (single
+/// repair track). Content that cannot be handed over safely is quarantined here,
+/// because this is the only holder of the stop-write window.
+fn cache_db_gate_for_start(
+    state: &mut DaemonState,
+    data_dir: &std::path::Path,
+) -> Result<crate::utils::CacheDbState, String> {
+    if let Some(child) = state.core_child.as_mut() {
+        // A live Core still holds the old inode; never rename underneath it.
+        if matches!(child.try_wait(), Ok(None)) {
+            return Err(
+                "refusing to touch cache.db while the Core process is still running".to_string(),
+            );
+        }
+        state.core_child = None;
+        state.core_pid = None;
+        state.core_running = false;
+    }
+
+    let path = data_dir.join(crate::utils::CACHE_DB_FILE_NAME);
+    let classification = crate::utils::classify_cache_db_detailed(&path, cache_db_service_user());
+
+    if classification.state == crate::utils::CacheDbState::PermissionDrift {
+        // D2: repair is the CLI's single track (SPEC §12.3.1 confirmation contract).
+        return Err(format!(
+            "repair_required: {} ownership/permissions drifted from the mihomo service user;              the daemon does not self-heal permissions.\n               Fix: mihomo-cli restart --system",
+            path.display()
+        ));
+    }
+
+    if classification.needs_isolation() {
+        let reason = if classification.core_openable {
+            classification.state.as_str()
+        } else {
+            "not openable by the Core"
+        };
+        let quarantined = crate::utils::quarantine_cache_db(&path).map_err(|error| {
+            format!(
+                "cache.db is {} ({reason}) and could not be quarantined ({error}); refusing to start the Core.\n                   Fix: mihomo-cli restart --system",
+                classification.state.as_str()
+            )
+        })?;
+        crate::log!(
+            "quarantined cache.db {} as {}",
+            path.display(),
+            quarantined.display()
+        );
+        eprintln!(
+            "⚠ quarantine {} moved to {} ({reason}; the Core will rebuild it)",
+            path.display(),
+            quarantined.display()
+        );
+    }
+
+    Ok(classification.state)
+}
+
 async fn start_core(
     state: Arc<Mutex<DaemonState>>,
     config_path: PathBuf,
     core_binary: PathBuf,
 ) -> DaemonResponse {
+    // SPEC B3: shared budget - lifecycle operations ≤15s
+    let lifecycle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+
     let config_path = match system_runtime_config_path(&config_path) {
         Ok(path) => path,
         Err(error) => {
@@ -4550,9 +6459,18 @@ async fn start_core(
     };
     if endpoint_is_connectable(&api_endpoint) {
         return DaemonResponse::Error {
-            message: duplicate_core_endpoint_message(&api_endpoint),
+            message: unreusable_endpoint_message(&api_endpoint, &core_binary, &config_path),
         };
     }
+
+    // SPEC A2: cache.db evidence precondition — only reached with a proven
+    // stopped Core (no live child, no reachable endpoint), inside the lifecycle lock.
+    let cache_db_data_dir = runtime_data_dir_for_config(&config_path);
+    let cache_db_state = match cache_db_gate_for_start(&mut s, &cache_db_data_dir) {
+        Ok(state) => state,
+        Err(message) => return DaemonResponse::Error { message },
+    };
+
     let config_revision = match config_content_revision(&config_path) {
         Ok(revision) => revision,
         Err(error) => {
@@ -4608,7 +6526,7 @@ async fn start_core(
                     remove_pid_file(&s.pid_file);
                     // ADR-24: classify the failure and attempt geo auto-recovery.
                     let log_tail = read_log_tail(&s.core_log_file, 50);
-                    let failure = classify_core_startup_failure(&log_tail);
+                    let failure = classify_core_startup_failure(&log_tail, cache_db_state);
                     let error_msg = format_core_failure_message(&failure, &s.core_log_file);
                     drop(s);
                     return try_geo_recovery_and_retry(
@@ -4644,9 +6562,13 @@ async fn start_core(
                     // declaring success. This moves the readiness contract from the
                     // CLI client into the daemon (aligned with clash-verge-service:
                     // the client receives Success only once the core is actually ready).
+                    // SPEC B3: use shared lifecycle deadline, no independent timing.
                     let endpoint = api_endpoint_transport(&api_endpoint);
                     let ready = match &endpoint {
-                        Some(ep) => mihomo_api::wait_for_api_ready_at_endpoint(ep, 15).await,
+                        Some(ep) => {
+                            mihomo_api::wait_for_api_ready_with_deadline(ep, lifecycle_deadline)
+                                .await
+                        }
                         None => false,
                     };
                     if !ready {
@@ -4661,7 +6583,7 @@ async fn start_core(
                         remove_pid_file(&s.pid_file);
                         // ADR-24: classify the failure and attempt geo auto-recovery.
                         let log_tail = read_log_tail(&s.core_log_file, 50);
-                        let failure = classify_core_startup_failure(&log_tail);
+                        let failure = classify_core_startup_failure(&log_tail, cache_db_state);
                         let error_msg = format_core_failure_message(&failure, &s.core_log_file);
                         drop(s);
                         return try_geo_recovery_and_retry(
@@ -4701,11 +6623,58 @@ async fn start_core(
     }
 }
 
+/// SPEC B3: the single "Core is stopped" proof. Produced only by
+/// `stop_core_with_proof` and consumed by the quiesce proof and the reset path.
+/// `pid == 0` means "no managed Core process was running"; a non-zero pid means
+/// the process was killed and reaped (`wait`) successfully.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CoreStoppedProof {
+    pub pid: u32,
+    pub stopped_at: String,
+}
+
+impl CoreStoppedProof {
+    fn stopped_now(pid: u32) -> Self {
+        Self {
+            pid,
+            stopped_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    /// the privileged CLI compatibility executor produces the same
+    /// proof type after a kernel-handle exit observation, so consumers cannot
+    /// tell a "different" stopped state.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn observed(pid: u32) -> Self {
+        Self::stopped_now(pid)
+    }
+}
+
+/// Bound for reaping a killed Core; a process that ignores SIGKILL past this is
+/// treated as still running so no evidence may be touched.
+const STOP_CORE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn stop_core(state: Arc<Mutex<DaemonState>>) -> DaemonResponse {
+    stop_core_with_proof(state).await.0
+}
+
+async fn stop_core_with_proof(
+    state: Arc<Mutex<DaemonState>>,
+) -> (DaemonResponse, Option<CoreStoppedProof>) {
+    stop_core_with_proof_timeout(state, STOP_CORE_WAIT_TIMEOUT).await
+}
+
+/// SPEC B3: stop the managed Core and return the stopped proof on success.
+/// A failed kill or an unreaped child keeps `core_child` in state so liveness
+/// checks (including the cache.db gate) still see a running process.
+async fn stop_core_with_proof_timeout(
+    state: Arc<Mutex<DaemonState>>,
+    wait_timeout: std::time::Duration,
+) -> (DaemonResponse, Option<CoreStoppedProof>) {
     let mut s = state.lock().await;
     let Some(mut child) = s.core_child.take() else {
         // Orphan termination via pid-file identity probing is Unix-only for
-        // now (Issue #017); Windows has no process_cmdline equivalent yet.
+        // now; Windows has no process_cmdline equivalent yet.
         #[cfg(unix)]
         {
             if let Some(metadata) = read_pid_file(&s.pid_file)
@@ -4715,27 +6684,68 @@ async fn stop_core(state: Arc<Mutex<DaemonState>>) -> DaemonResponse {
                 if !pid_metadata_matches_state(&metadata, &s)
                     || !process_matches_core_metadata(&metadata)
                 {
-                    return DaemonResponse::Error {
-                        message: format!(
-                            "refusing to terminate orphan core process {} because pid metadata/process identity does not match daemon state",
-                            metadata.pid
-                        ),
-                    };
+                    return (
+                        DaemonResponse::Error {
+                            message: format!(
+                                "refusing to terminate orphan core process {} because pid metadata/process identity does not match daemon state",
+                                metadata.pid
+                            ),
+                        },
+                        None,
+                    );
                 }
                 let pid = metadata.pid;
-                let result = terminate_process(pid);
-                remove_pid_file(&s.pid_file);
-                s.core_running = false;
-                s.core_pid = None;
-                s.launched_config_revision = None;
-                s.api_endpoint = None;
-                return match result {
-                    Ok(()) => DaemonResponse::Success {
-                        message: format!("orphan core process {pid} terminated"),
-                    },
-                    Err(e) => DaemonResponse::Error {
-                        message: format!("failed to terminate orphan core process {pid}: {e}"),
-                    },
+                // SPEC 裁决 D-2: a successful signal is NOT a stopped proof.
+                // Only a stable kernel-handle observation of the exit counts.
+                if let Err(error) = terminate_process(pid) {
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        return (
+                            DaemonResponse::Error {
+                                message: format!(
+                                    "failed to signal orphan core process {pid}: {error}"
+                                ),
+                            },
+                            None,
+                        );
+                    }
+                }
+                match crate::core_identity::observe_process_exit(pid, STOP_CORE_WAIT_TIMEOUT) {
+                    crate::core_identity::ProcessExitProof::Exited => {
+                        remove_pid_file(&s.pid_file);
+                        s.core_running = false;
+                        s.core_pid = None;
+                        s.launched_config_revision = None;
+                        s.api_endpoint = None;
+                        let proof = CoreStoppedProof::stopped_now(pid);
+                        crate::log!(
+                            "core stopped proof: pid={} stopped_at={} (exit observed)",
+                            proof.pid,
+                            proof.stopped_at
+                        );
+                        (
+                            DaemonResponse::Success {
+                                message: format!("orphan core process {pid} exited"),
+                            },
+                            Some(proof),
+                        )
+                    }
+                    crate::core_identity::ProcessExitProof::StillRunning => (
+                        DaemonResponse::Error {
+                            message: format!(
+                                "orphan core process {pid} did not exit within {}s; no stopped proof (evidence retained, no further action taken)",
+                                STOP_CORE_WAIT_TIMEOUT.as_secs()
+                            ),
+                        },
+                        None,
+                    ),
+                    crate::core_identity::ProcessExitProof::Unprovable(reason) => (
+                        DaemonResponse::Error {
+                            message: format!(
+                                "cannot observe the exit of orphan core process {pid}: {reason}; no stopped proof (evidence retained)"
+                            ),
+                        },
+                        None,
+                    ),
                 };
             }
         }
@@ -4745,37 +6755,93 @@ async fn stop_core(state: Arc<Mutex<DaemonState>>) -> DaemonResponse {
             .filter(|endpoint| endpoint_is_connectable(endpoint))
             .cloned();
         if let Some(endpoint) = orphan_endpoint {
-            return DaemonResponse::Error {
-                message: format!(
-                    "core API endpoint is reachable at {endpoint}, but this daemon does not own the process and has no live pid file. Restart the system service or stop the orphan core manually."
-                ),
-            };
+            return (
+                DaemonResponse::Error {
+                    message: format!(
+                        "core API endpoint is reachable at {endpoint}, but this daemon cannot prove ownership of the process and has no live pid file. No termination was attempted; runtime evidence is retained."
+                    ),
+                },
+                None,
+            );
         }
         s.core_running = false;
         s.core_pid = None;
         s.launched_config_revision = None;
         s.api_endpoint = None;
         remove_pid_file(&s.pid_file);
-        return DaemonResponse::Success {
-            message: "core already stopped".to_string(),
-        };
+        let proof = CoreStoppedProof::stopped_now(0);
+        crate::log!(
+            "core stopped proof: pid=0 stopped_at={} (no managed core was running)",
+            proof.stopped_at
+        );
+        return (
+            DaemonResponse::Success {
+                message: "core already stopped".to_string(),
+            },
+            Some(proof),
+        );
     };
 
+    let pid = child.id().unwrap_or(0);
     let kill_result = child.kill().await;
-    let _ = child.wait().await;
+    let waited = tokio::time::timeout(wait_timeout, child.wait()).await;
+    settle_stop(&mut s, child, pid, kill_result, waited, wait_timeout)
+}
+
+/// SPEC B3: turn a kill/wait outcome into a response plus the single stopped
+/// proof. A failed or unreaped stop keeps the child in state so liveness proofs
+/// (including the cache.db gate) still see a running process.
+fn settle_stop(
+    s: &mut DaemonState,
+    child: tokio::process::Child,
+    pid: u32,
+    kill_result: std::io::Result<()>,
+    waited: Result<std::io::Result<std::process::ExitStatus>, tokio::time::error::Elapsed>,
+    wait_timeout: std::time::Duration,
+) -> (DaemonResponse, Option<CoreStoppedProof>) {
+    if !matches!(waited, Ok(Ok(_))) {
+        // Never clear the child on failure: liveness proofs must keep seeing it.
+        s.core_child = Some(child);
+        s.core_running = true;
+        let detail = match waited {
+            Ok(Err(error)) => error.to_string(),
+            Err(_) => format!(
+                "process {} did not exit within {}s",
+                pid,
+                wait_timeout.as_secs()
+            ),
+            Ok(Ok(_)) => unreachable!("wait success already handled"),
+        };
+        return (
+            DaemonResponse::Error {
+                message: format!("failed to stop core: {detail}"),
+            },
+            None,
+        );
+    }
+    if let Err(error) = kill_result {
+        // The process exited on its own between take and kill; the reaped child
+        // is still a valid stopped proof.
+        crate::log!("core kill reported {error} but the process was reaped");
+    }
+    s.core_child = None;
     s.core_running = false;
     s.core_pid = None;
+    s.launched_config_revision = None;
     s.api_endpoint = None;
     remove_pid_file(&s.pid_file);
-
-    match kill_result {
-        Ok(()) => DaemonResponse::Success {
+    let proof = CoreStoppedProof::stopped_now(pid);
+    crate::log!(
+        "core stopped proof: pid={} stopped_at={}",
+        proof.pid,
+        proof.stopped_at
+    );
+    (
+        DaemonResponse::Success {
             message: "core stopped".to_string(),
         },
-        Err(e) => DaemonResponse::Error {
-            message: format!("failed to stop core: {e}"),
-        },
-    }
+        Some(proof),
+    )
 }
 
 fn validate_core_api_request(
@@ -4932,7 +6998,14 @@ async fn process_core_api_request(
             .and_then(|b| b.get("name").and_then(|n| n.as_str().map(str::to_string)));
         if let (Some(group), Some(node)) = (decoded_group, node_name) {
             if !group.is_empty() && !node.is_empty() {
-                return match select_system_proxy(Arc::clone(&state), group, node).await {
+                return match select_system_proxy(
+                    Arc::clone(&state),
+                    group,
+                    node,
+                    SelectSegmentMode::ApiPath,
+                )
+                .await
+                {
                     DaemonResponse::Success { .. } => DaemonResponse::CoreApi {
                         data: serde_json::Value::Null,
                     },
@@ -5075,7 +7148,7 @@ fn set_tun_in_config_file(
         );
     }
     if let Some(dns_hijack) = dns_hijack {
-        // Issue #022: `--dns-hijack` 支持逗号分隔的多个目标（如 any:53,tcp://any:53）。
+        // `--dns-hijack` 支持逗号分隔的多个目标（如 any:53,tcp://any:53）。
         let entries = crate::config::dns_hijack_entries(dns_hijack);
         if !entries.is_empty() {
             tun.insert(
@@ -5121,7 +7194,7 @@ async fn toggle_tun_via_core_api(
         );
     }
     if let Some(dns_hijack) = dns_hijack {
-        // Issue #022: `--dns-hijack` 支持逗号分隔的多个目标（如 any:53,tcp://any:53）。
+        // `--dns-hijack` 支持逗号分隔的多个目标（如 any:53,tcp://any:53）。
         let entries: Vec<serde_json::Value> = crate::config::dns_hijack_entries(dns_hijack)
             .into_iter()
             .map(serde_json::Value::String)
@@ -5150,6 +7223,15 @@ async fn toggle_tun_via_core_api(
     }
 
     Ok(())
+}
+
+/// Tests that write an active journal into the shared isolated runtime dir must
+/// hold this lock for the whole window: the §12.4 gate in `process_command`
+/// reads that journal and would otherwise see a foreign in-flight transaction.
+#[cfg(all(test, unix))]
+fn runtime_journal_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 #[cfg(all(test, unix))]
@@ -5300,6 +7382,135 @@ tun:
     }
 
     #[test]
+    fn test_promote_applies_payload_noncontrolled_keys_over_snapshot() {
+        let old_yaml = r#"
+mixed-port: 7890
+tun:
+  enable: true
+  stack: mixed
+  route-exclude-address:
+    - 203.0.113.0/24
+"#;
+        let new_yaml = r#"
+mixed-port: 7891
+tun:
+  route-exclude-address:
+    - 192.0.2.0/24
+    - 198.51.100.0/24
+"#;
+        let new_revision = crate::tun_transaction::sha256_revision(new_yaml.as_bytes());
+        let (promoted, revision) = prepare_promoted_system_config_content(
+            new_yaml,
+            &new_revision,
+            true,
+            Some(old_yaml.as_bytes()),
+        )
+        .expect("promotion should preserve new non-controlled keys");
+
+        let doc: serde_yaml::Value = serde_yaml::from_str(&promoted).unwrap();
+        assert_eq!(doc["tun"]["enable"].as_bool(), Some(true));
+        assert_eq!(doc["tun"]["stack"].as_str(), Some("mixed"));
+        assert_eq!(
+            doc["tun"]["route-exclude-address"],
+            serde_yaml::from_str::<serde_yaml::Value>("- 192.0.2.0/24\n- 198.51.100.0/24\n")
+                .unwrap()
+        );
+        assert_eq!(
+            revision,
+            crate::tun_transaction::sha256_revision(promoted.as_bytes())
+        );
+    }
+
+    #[test]
+    fn test_promote_matches_cli_freeze_merge_bytes_and_revision() {
+        let old_yaml = r#"
+mixed-port: 7890
+tun:
+  enable: true
+  stack: mixed
+  mtu: 1400
+"#;
+        let new_yaml = r#"
+mixed-port: 7891
+tun:
+  route-exclude-address:
+    - 192.0.2.0/24
+"#;
+        let new_revision = crate::tun_transaction::sha256_revision(new_yaml.as_bytes());
+        let old_tun: serde_yaml::Value = serde_yaml::from_str(old_yaml).unwrap();
+        let (expected, expected_revision) =
+            crate::tun_transaction::merge_snapshot_tun_block_into_config_yaml(
+                new_yaml,
+                &old_tun["tun"],
+            )
+            .unwrap();
+        let (promoted, revision) = prepare_promoted_system_config_content(
+            new_yaml,
+            &new_revision,
+            true,
+            Some(old_yaml.as_bytes()),
+        )
+        .expect("promotion should succeed");
+
+        assert_eq!(promoted, expected);
+        assert_eq!(revision, expected_revision);
+        // payload-strict: snapshot-only mtu is not re-injected into the new intent.
+        let doc: serde_yaml::Value = serde_yaml::from_str(&promoted).unwrap();
+        assert!(doc["tun"].get("mtu").is_none(), "{doc:?}");
+    }
+
+    #[test]
+    fn test_cli_freeze_and_daemon_promotion_match_bytes_and_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let inputs = crate::instance::PathInputs::for_tests();
+        let mut ctx = crate::instance::InstanceContext::planned(
+            crate::instance::TargetOs::Linux,
+            crate::instance::InstanceMode::System,
+            &inputs,
+        );
+        ctx.paths.tun_config_file = temp.path().join("tun-config.yaml");
+        std::fs::create_dir_all(ctx.paths.tun_config_file.parent().unwrap()).unwrap();
+        let old_yaml = r#"
+mixed-port: 7890
+tun:
+  enable: true
+  stack: mixed
+  route-exclude-address:
+    - 203.0.113.0/24
+"#;
+        std::fs::write(&ctx.paths.tun_config_file, old_yaml).unwrap();
+        let new_yaml = r#"
+mixed-port: 7891
+tun:
+  route-exclude-address:
+    - 192.0.2.0/24
+"#;
+        let new_revision = crate::tun_transaction::sha256_revision(new_yaml.as_bytes());
+
+        let (cli_content, cli_revision) =
+            crate::tun_transaction::merge_system_tun_snapshot_into_payload(
+                &ctx,
+                new_yaml,
+                &new_revision,
+            )
+            .unwrap();
+        let (daemon_content, daemon_revision) = prepare_promoted_system_config_content(
+            new_yaml,
+            &new_revision,
+            true,
+            Some(old_yaml.as_bytes()),
+        )
+        .unwrap();
+
+        assert_eq!(cli_content, daemon_content);
+        assert_eq!(cli_revision, daemon_revision);
+        assert_eq!(
+            cli_revision,
+            crate::tun_transaction::sha256_revision(cli_content.as_bytes())
+        );
+    }
+
+    #[test]
     fn test_promote_does_not_inject_tun_when_inactive() {
         let old_yaml = r#"
 mixed-port: 7890
@@ -5352,6 +7563,167 @@ external-controller: 127.0.0.1:9090
         assert!(err2.to_string().contains("active system TUN snapshot"));
     }
 
+    #[test]
+    fn test_resolve_is_tun_snapshot_trusts_snapshot_on_runtime_path_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let tun_path = dir.path().join("tun-config.yaml");
+
+        std::fs::write(&tun_path, "mixed-port: 7890\ntun:\n  enable: true\n").unwrap();
+
+        // 回归：持久快照 `tun.enable: true` 时必须判定为 TUN 快照。
+        // 运行态 config_path 已从判定中移除（失配/缺失/匹配一律采信持久证据，
+        // 由函数签名本身保证）；旧实现失配态硬判 false，promotion 被降级为热
+        // 重载，在跑的 TUN 被静默拆除。
+        assert!(resolve_is_tun_snapshot(&tun_path));
+    }
+
+    #[test]
+    fn test_resolve_is_tun_snapshot_never_revives_disabled_tun() {
+        let dir = tempfile::tempdir().unwrap();
+        let tun_path = dir.path().join("tun-config.yaml");
+
+        // `tun off` 成功后快照写入 `enable: false`，无条件采信持久快照
+        // 不得复活经 `tun off` 关闭的 TUN。
+        std::fs::write(&tun_path, "mixed-port: 7890\ntun:\n  enable: false\n").unwrap();
+        assert!(!resolve_is_tun_snapshot(&tun_path));
+
+        // 快照缺失（文件不存在）同样判定为非 TUN 快照。
+        assert!(!resolve_is_tun_snapshot(&dir.path().join("missing.yaml")));
+    }
+
+    #[test]
+    fn test_tun_apply_requires_rollback_when_tun_was_enabled_then_disabled() {
+        assert!(tun_apply_requires_rollback(Some(true), Some(false)));
+    }
+
+    #[test]
+    fn test_tun_apply_requires_rollback_when_tun_was_enabled_then_unobservable() {
+        assert!(tun_apply_requires_rollback(Some(true), None));
+    }
+
+    #[test]
+    fn test_tun_apply_requires_rollback_never_triggers_when_before_unobservable() {
+        assert!(!tun_apply_requires_rollback(None, Some(true)));
+        assert!(!tun_apply_requires_rollback(None, Some(false)));
+        assert!(!tun_apply_requires_rollback(None, None));
+    }
+
+    #[test]
+    fn test_tun_apply_requires_rollback_never_triggers_when_tun_was_disabled() {
+        assert!(!tun_apply_requires_rollback(Some(false), Some(true)));
+        assert!(!tun_apply_requires_rollback(Some(false), Some(false)));
+        assert!(!tun_apply_requires_rollback(Some(false), None));
+    }
+
+    #[test]
+    fn tun_guard_errors_carry_the_shared_marker() {
+        // review MAJOR-1：CLI 侧 `is_tun_guard_error` 只认共享标记常量，
+        // daemon 侧护栏/attestation 文案必须以该常量起始。文案一旦改得丢掉标记，
+        // 这里先失败，而不是让护栏 Error 静默折叠回 Pending。
+        let source = include_str!("daemon.rs");
+        let guard_details = [
+            "hot reload disabled the running TUN (runtime tun.enable changed from true to false)",
+            "hot reload left the runtime TUN state unobservable (GET /configs no longer reports tun.enable after the reload)",
+            "promoted configuration was loaded but TUN runtime attestation failed: tun.enable is not true",
+        ];
+        for detail in guard_details {
+            let expected = format!("{{TUN_GUARD_ERROR_MARKER}}{detail}");
+            assert!(
+                source.contains(&expected),
+                "guard detail must start with TUN_GUARD_ERROR_MARKER: {detail}"
+            );
+        }
+        // start_core 失败臂与 runtime revision attestation 失败臂在 TUN 在跑时
+        // 都把整条原始错误套进标记，细节不被吞掉；两臂必须都在（收口）。
+        // （测试侧带转义反斜杠，不会自我匹配。）
+        let arm_marker = "format!(\"{TUN_GUARD_ERROR_MARKER}{message}\")";
+        assert_eq!(
+            source.matches(arm_marker).count(),
+            2,
+            "both the start_core failure arm and the runtime-revision failure arm must mark their Error when TUN was running"
+        );
+    }
+
+    #[test]
+    fn full_restart_tun_gate_reuses_the_shared_pure_invariant() {
+        // review MAJOR-3：热重载与全量重启共用 `tun_apply_requires_rollback`，
+        // 且全量重启分支不得内联重复实现判据——否则删掉 `tun_before == Some(true)`
+        // 这一触发条件后测试仍全绿，fail-open 降级分支会静默拆除 TUN。
+        let source = include_str!("daemon.rs");
+        let call = concat!("tun_apply_requires_rollback(tun_", "before, tun_after)");
+        assert_eq!(
+            source.matches(call).count(),
+            2,
+            "both the hot-reload and the full-restart branch must judge through the shared pure invariant"
+        );
+        let inline = concat!("is_tun_snapshot || tun_", "before == Some(true)");
+        assert!(
+            !source.contains(inline),
+            "the full-restart gate must not re-implement the invariant inline"
+        );
+    }
+
+    #[test]
+    fn full_restart_success_warns_when_tun_was_never_attested() {
+        // review BLOCKER：`tun_before` 不可观测时，全量重启分支
+        // 不得静默报成功，必须追加与热重载分支措辞对称的告警行。
+        let source = include_str!("daemon.rs");
+        assert!(
+            source.contains(concat!(
+                "warning: TUN runtime state was not attested before the full ",
+                "restart"
+            )),
+            "the full-restart Success must warn when the pre-restart TUN state was unobservable"
+        );
+        assert!(
+            source.contains(concat!(
+                "warning: TUN runtime state was not attested before hot ",
+                "reload"
+            )),
+            "the hot-reload Success must keep its symmetric warning"
+        );
+    }
+
+    #[test]
+    fn promote_preflight_failure_rolls_back_file_without_core_restart() {
+        // 终审 MAJOR：preflight 失败臂位于停止 Core 之前，Core 还在跑旧配置。
+        // 该臂必须只做文件级回滚（与写失败臂对齐），不得走带 Core 停启的回滚——否则
+        // 一次无副作用的拒绝会杀掉健康 Core，而此臂的现实触发条件（core 二进制缺失）
+        // 下重启必然失败，数据面全断。断言前先剥离注释行，避免注释里的标识符自我匹配。
+        let source = include_str!("daemon.rs");
+        let arm_start = source
+            .find("preflight_system_core_start_request(&target_path")
+            .expect("promote must preflight before applying");
+        let arm_end = source[arm_start..]
+            .find("let (core_running, current_endpoint)")
+            .expect("preflight arm must precede the running-state probe");
+        let arm: String = source[arm_start..arm_start + arm_end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !arm.contains("restore_last_known_good"),
+            "preflight failure arm must not restart the Core through restore_last_known_good"
+        );
+        assert!(
+            !arm.contains("stop_core") && !arm.contains("start_core"),
+            "preflight failure arm must neither stop nor start the Core"
+        );
+        assert!(
+            arm.contains("std::fs::write(&target_path, old_bytes)"),
+            "preflight failure arm must roll the promoted file back to the backup"
+        );
+        assert!(
+            arm.contains("std::fs::remove_file(&target_path)"),
+            "preflight failure arm must remove the promoted file when no backup exists"
+        );
+        assert!(
+            arm.contains("{message}."),
+            "preflight failure arm must keep the original message and append to it"
+        );
+    }
+
     #[tokio::test]
     async fn test_restore_last_known_good_restores_backup_file() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -5367,7 +7739,8 @@ external-controller: 127.0.0.1:9090
             ..DaemonState::default()
         }));
 
-        restore_last_known_good(&state, &target_path, &core_binary, Some(old_content)).await;
+        let _rollback =
+            restore_last_known_good(&state, &target_path, &core_binary, Some(old_content)).await;
 
         let restored = std::fs::read(&target_path).unwrap();
         assert_eq!(
@@ -5389,12 +7762,17 @@ external-controller: 127.0.0.1:9090
             ..DaemonState::default()
         }));
 
-        restore_last_known_good(&state, &target_path, &core_binary, None).await;
+        let rollback = restore_last_known_good(&state, &target_path, &core_binary, None).await;
 
         assert!(
             !target_path.exists(),
             "target config must be removed if no prior backup existed"
         );
+        // review MAJOR-2：无备份时 Core 未被重启，回滚并未完成，
+        // 不得返回 Ok 让 with_rollback_outcome 声称已回滚。
+        let err = rollback.expect_err("no-backup rollback must not claim success");
+        assert!(err.contains("no previous configuration backup"), "{err}");
+        assert!(err.contains("Core was not restarted"), "{err}");
     }
 
     #[tokio::test]
@@ -5507,33 +7885,758 @@ external-controller: 127.0.0.1:9090
 
     #[cfg(unix)]
     #[test]
+    fn daemon_replay_exit_matrix_renders_regular_outcome_remedies() {
+        use crate::selection::{ReplayGroupResult, ReplayOutcome, ReplayReport};
+
+        let result = |group: &str, node: &str, outcome: ReplayOutcome| ReplayGroupResult {
+            group: group.to_string(),
+            node: node.to_string(),
+            outcome,
+        };
+
+        // Every replay exit (startup / restart / promotion) renders through
+        // this helper, so the matrix is asserted once on the shared renderer.
+        let report = ReplayReport {
+            results: vec![result(
+                "Proxy",
+                "old-node",
+                ReplayOutcome::SkippedNodeMissing {
+                    current: Some("new-node".to_string()),
+                    members: vec!["new-node".to_string(), "other".to_string()],
+                },
+            )],
+            intent_error: None,
+            selectable_groups: None,
+        };
+        let lines = selection_replay_report_lines(&report).join("\n");
+        assert!(
+            lines.contains("node no longer in group (current: new-node)"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("Current members of Proxy: new-node, other"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("mihomo-cli select -g 'Proxy' --node='new-node'"),
+            "{lines}"
+        );
+
+        let report = ReplayReport {
+            results: vec![result("Gone", "n1", ReplayOutcome::SkippedGroupMissing)],
+            intent_error: None,
+            selectable_groups: Some(vec!["G1".to_string(), "G2".to_string()]),
+        };
+        let lines = selection_replay_report_lines(&report).join("\n");
+        assert!(lines.contains("Current groups: G1, G2"), "{lines}");
+        assert!(
+            !lines.contains("mihomo-cli select -g 'Gone'"),
+            "the vanished group is never a remedy: {lines}"
+        );
+
+        // Shared replay budget exhausted: no guessed group list, retry path.
+        let report = ReplayReport {
+            results: vec![result("Gone", "n1", ReplayOutcome::SkippedGroupMissing)],
+            intent_error: None,
+            selectable_groups: None,
+        };
+        let lines = selection_replay_report_lines(&report).join("\n");
+        assert!(
+            lines.contains("Group list unavailable (budget exhausted or query failed)"),
+            "{lines}"
+        );
+        assert!(!lines.contains("Current groups"), "{lines}");
+
+        let report = ReplayReport {
+            results: vec![
+                result(
+                    "A",
+                    "a",
+                    ReplayOutcome::Failed {
+                        error: "connection refused".to_string(),
+                    },
+                ),
+                result("B", "b", ReplayOutcome::BudgetExceeded),
+            ],
+            intent_error: None,
+            selectable_groups: None,
+        };
+        let lines = selection_replay_report_lines(&report).join("\n");
+        assert!(lines.contains("Intent kept; apply failed"), "{lines}");
+        assert!(
+            lines.contains("retry") || lines.contains("Retry"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("mihomo-cli select --replay or mihomo-cli restart --system"),
+            "{lines}"
+        );
+
+        // Applied-only reports carry no remedy noise.
+        let report = ReplayReport {
+            results: vec![result("A", "a", ReplayOutcome::Applied)],
+            intent_error: None,
+            selectable_groups: None,
+        };
+        assert_eq!(
+            selection_replay_report_lines(&report),
+            vec!["✓ Selections restored: A → a".to_string()]
+        );
+
+        // Exit matrix integrity (SPEC P5): the request-carrying exits —
+        // restart and the two promote paths — replay via
+        // `replay_mirror_selection_intent`; the daemon's own startup/autostart
+        // path has no request identity and must NOT replay at all (0 replays).
+        let source = include_str!("daemon.rs");
+        let replay_call = concat!("replay_mirror_selection_intent(&sta", "te");
+        assert_eq!(
+            source.matches(replay_call).count(),
+            2,
+            "request-carrying replay exits must go through the shared replay path"
+        );
+        // Both startup paths funnel through `startup_replay_lines`, which applies
+        // the §3.8.3 admission table before the same budget/degradation replay.
+        let startup_entry = concat!("startup_replay_lines(&sta", "te)");
+        assert_eq!(
+            source.matches(startup_entry).count(),
+            2,
+            "both daemon startup paths must go through the admitted replay entry"
+        );
+        assert_eq!(
+            source
+                .matches(concat!("fn startup_replay_admi", "ssion("))
+                .count(),
+            1,
+            "the suppression table has exactly one definition"
+        );
+        let report_render = concat!("format_lines", "()");
+        assert_eq!(
+            source.matches(report_render).count(),
+            1,
+            "daemon must render reports only through selection_replay_report_lines"
+        );
+    }
+
+    fn admission_inputs<'a>(
+        active: Option<&'a str>,
+        map_state: &'a str,
+        binding: Option<&'a MirrorBinding>,
+        launched: Option<&'a str>,
+        unsettled: bool,
+    ) -> StartupReplayInputs<'a> {
+        StartupReplayInputs {
+            mirror_active: active,
+            map_state,
+            binding,
+            launched_revision: launched,
+            transaction_unsettled: unsettled,
+        }
+    }
+
+    /// SPEC §3.8.3 抑制判定表：不是「没有请求」就抑制，而是「归属不可证」才抑制。
+    #[test]
+    fn startup_replay_admission_table() {
+        let id = "sub-abcdef12";
+        let bound = MirrorBinding {
+            subscription_id: id.to_string(),
+            config_revision: Some("rev-a".to_string()),
+        };
+        // Normal boot: no CLI request, but ownership is provable → replay.
+        assert!(startup_replay_admission(&admission_inputs(
+            Some(id),
+            "ready",
+            Some(&bound),
+            Some("rev-a"),
+            false
+        ))
+        .is_ok());
+
+        // Legitimate empty map = nothing to do, still admitted.
+        assert!(startup_replay_admission(&admission_inputs(
+            Some(id),
+            "ready",
+            Some(&bound),
+            Some("rev-a"),
+            false
+        ))
+        .is_ok());
+
+        // Identity unprovable / mismatched / unauthenticated → suppress.
+        let other = MirrorBinding {
+            subscription_id: "sub-11111111".to_string(),
+            config_revision: Some("rev-a".to_string()),
+        };
+        let legacy = MirrorBinding {
+            subscription_id: id.to_string(),
+            config_revision: None,
+        };
+        for (inputs, _identity) in [
+            (
+                admission_inputs(Some(id), "ready", None, Some("rev-a"), false),
+                true,
+            ),
+            (
+                admission_inputs(Some(id), "ready", Some(&other), Some("rev-a"), false),
+                true,
+            ),
+            (
+                admission_inputs(Some(id), "ready", Some(&bound), Some("rev-b"), false),
+                true,
+            ),
+            (
+                admission_inputs(Some(id), "ready", Some(&bound), None, false),
+                true,
+            ),
+            (
+                admission_inputs(Some(id), "ready", Some(&legacy), Some("rev-a"), false),
+                true,
+            ),
+        ] {
+            let skip = startup_replay_admission(&inputs).unwrap_err();
+            assert!(skip.identity, "{skip:?}");
+        }
+
+        // Fact-only suppression (no identity claim).
+        for inputs in [
+            admission_inputs(Some(id), "ready", Some(&bound), Some("rev-a"), true),
+            admission_inputs(None, "missing", Some(&bound), Some("rev-a"), false),
+            admission_inputs(Some(id), "missing", Some(&bound), Some("rev-a"), false),
+            admission_inputs(Some(id), "corrupt", Some(&bound), Some("rev-a"), false),
+        ] {
+            let skip = startup_replay_admission(&inputs).unwrap_err();
+            assert!(!skip.identity, "{skip:?}");
+        }
+    }
+
+    /// SPEC §3.8.3 dynamic counter: counts the actual selection PUTs the replay
+    /// path issues (no source counting).
+    #[cfg(unix)]
+    struct CountingSelectionClient {
+        puts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(unix)]
+    impl crate::mihomo_api::MihomoApiClient for CountingSelectionClient {
+        async fn get(&self, path: &str) -> anyhow::Result<serde_json::Value> {
+            if path.starts_with("/proxies/") {
+                return Ok(serde_json::json!({"all": ["N"], "now": "DIRECT"}));
+            }
+            Ok(serde_json::json!({}))
+        }
+
+        async fn get_bounded(
+            &self,
+            path: &str,
+            _byte_limit: usize,
+        ) -> anyhow::Result<serde_json::Value> {
+            self.get(path).await
+        }
+
+        async fn put(
+            &self,
+            _path: &str,
+            _body: serde_json::Value,
+        ) -> anyhow::Result<serde_json::Value> {
+            self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(serde_json::Value::Null)
+        }
+
+        async fn patch(
+            &self,
+            _path: &str,
+            _body: serde_json::Value,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::Value::Null)
+        }
+
+        async fn delete(&self, _path: &str) -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::Value::Null)
+        }
+    }
+
+    #[cfg(unix)]
+    fn counting_client() -> (
+        CountingSelectionClient,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let puts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (CountingSelectionClient { puts: puts.clone() }, puts)
+    }
+
+    /// Seeded mirror with one group/node and a binding to `revision`.
+    #[cfg(unix)]
+    fn seed_mirror(base: &std::path::Path, subscription_id: &str, revision: Option<&str>) {
+        record_active_subscription_mirror_in(base, subscription_id).unwrap();
+        record_selection_mirror_in(base, subscription_id, "selections:\n  G: N\n").unwrap();
+        record_mirror_binding_in(base, subscription_id, revision).unwrap();
+    }
+
+    /// ① Normal single-group boot recovery = exactly 1 PUT.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_replay_puts_once_when_ownership_is_provable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_mirror(tmp.path(), "sub-aaaaaaaa", Some("rev-a"));
+        let (client, puts) = counting_client();
+        let lines = replay_mirror_at_startup(tmp.path(), Some("rev-a"), false, &client).await;
+        assert_eq!(
+            puts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Selections restored")),
+            "{lines:?}"
+        );
+    }
+
+    /// ② Every degraded form suppresses all entries: 0 PUTs + explicit fact line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_replay_is_suppressed_in_every_degraded_form() {
+        use std::sync::atomic::Ordering;
+        let id = "sub-aaaaaaaa";
+
+        // (label, seed fn, launched revision, unsettled)
+        type DegradedCase<'a> = (
+            &'a str,
+            Box<dyn Fn(&std::path::Path)>,
+            Option<&'a str>,
+            bool,
+        );
+        let cases: Vec<DegradedCase> = vec![
+            (
+                "binding-missing",
+                Box::new(|base: &std::path::Path| {
+                    record_active_subscription_mirror_in(base, id).unwrap();
+                    record_selection_mirror_in(base, id, "selections:\n  G: N\n").unwrap();
+                }),
+                Some("rev-a"),
+                false,
+            ),
+            (
+                "binding-legacy-without-revision",
+                Box::new(|base: &std::path::Path| seed_mirror(base, id, None)),
+                Some("rev-a"),
+                false,
+            ),
+            (
+                "binding-identity-mismatch",
+                Box::new(|base: &std::path::Path| {
+                    record_active_subscription_mirror_in(base, id).unwrap();
+                    record_selection_mirror_in(base, id, "selections:\n  G: N\n").unwrap();
+                    record_mirror_binding_in(base, "sub-bbbbbbbb", Some("rev-a")).unwrap();
+                }),
+                Some("rev-a"),
+                false,
+            ),
+            (
+                "launched-revision-unknown",
+                Box::new(|base: &std::path::Path| seed_mirror(base, id, Some("rev-a"))),
+                None,
+                false,
+            ),
+            (
+                "map-source-unreadable",
+                Box::new(|base: &std::path::Path| {
+                    record_active_subscription_mirror_in(base, id).unwrap();
+                    record_mirror_binding_in(base, id, Some("rev-a")).unwrap();
+                }),
+                Some("rev-a"),
+                false,
+            ),
+            (
+                "map-corrupt",
+                Box::new(|base: &std::path::Path| {
+                    record_active_subscription_mirror_in(base, id).unwrap();
+                    record_mirror_binding_in(base, id, Some("rev-a")).unwrap();
+                    write_selection_mirror_file(
+                        &selection_mirror_file_path_in(base, id),
+                        b":::not-yaml",
+                    )
+                    .unwrap();
+                }),
+                Some("rev-a"),
+                false,
+            ),
+            (
+                "transaction-unsettled",
+                Box::new(|base: &std::path::Path| seed_mirror(base, id, Some("rev-a"))),
+                Some("rev-a"),
+                true,
+            ),
+        ];
+
+        for (label, seed, launched, unsettled) in cases {
+            let tmp = tempfile::TempDir::new().unwrap();
+            seed(tmp.path());
+            let (client, puts) = counting_client();
+            let lines = replay_mirror_at_startup(tmp.path(), launched, unsettled, &client).await;
+            assert_eq!(
+                puts.load(Ordering::SeqCst),
+                0,
+                "{label}: degraded state must never PUT ({lines:?})"
+            );
+            assert!(
+                lines.iter().any(|line| line.contains("0 replays")),
+                "{label}: suppression must be explicit ({lines:?})"
+            );
+        }
+    }
+
+    /// ③ Commit-gap: mirror pushed for B, config promotion crashed, boot loads A.
+    /// B must never be replayed into A (cross-subscription PUT).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_never_replays_b_after_a_crash_on_a() {
+        use std::sync::atomic::Ordering;
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Mirror/binding describe B, while the loaded configuration is A.
+        seed_mirror(tmp.path(), "sub-bbbbbbbb", Some("rev-b"));
+        let (client, puts) = counting_client();
+        let lines = replay_mirror_at_startup(tmp.path(), Some("rev-a"), false, &client).await;
+        assert_eq!(puts.load(Ordering::SeqCst), 0, "{lines:?}");
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("[selection-identity-mismatch]"),
+            "identity mismatch must be signalled: {joined}"
+        );
+        assert!(joined.contains("0 replays"), "{joined}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_resolve_mirror_selection_scope_skips_on_mismatch_or_missing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let base = tmp.path();
 
         // subscription_id 为 None / 非法 id 时跳过
-        assert_eq!(resolve_mirror_selection_scope_in(base, None), None);
-        assert_eq!(resolve_mirror_selection_scope_in(base, Some("sub1")), None);
+        assert_eq!(
+            resolve_mirror_selection_scope_in(base, None),
+            MirrorScopeResolution::Unavailable
+        );
+        assert_eq!(
+            resolve_mirror_selection_scope_in(base, Some("sub1")),
+            MirrorScopeResolution::Unavailable
+        );
 
         // 镜像缺失 active 时跳过
         assert_eq!(
             resolve_mirror_selection_scope_in(base, Some("sub-abcdef12")),
-            None
+            MirrorScopeResolution::Unavailable
         );
 
-        // active 不匹配时跳过
+        // active 不匹配时上报 identity-mismatch（A3'）
         record_active_subscription_mirror_in(base, "sub-abcdef99").unwrap();
         assert_eq!(
             resolve_mirror_selection_scope_in(base, Some("sub-abcdef12")),
-            None
+            MirrorScopeResolution::IdentityMismatch {
+                request: "sub-abcdef12".to_string(),
+                mirror_active: "sub-abcdef99".to_string(),
+            }
         );
 
         // active 匹配时返回作用域
         record_active_subscription_mirror_in(base, "sub-abcdef12").unwrap();
         assert_eq!(
             resolve_mirror_selection_scope_in(base, Some("sub-abcdef12")),
-            Some("sub-abcdef12".to_string())
+            MirrorScopeResolution::Match("sub-abcdef12".to_string())
         );
+    }
+
+    // ── B1: selection drift tracker ──
+
+    /// The drift tracker is process-global; serialize the tests that read or
+    /// mutate it so parallel test threads cannot interleave guards.
+    fn drift_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn drift_mirror(group: &str, node: &str) -> std::collections::BTreeMap<String, String> {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(group.to_string(), node.to_string());
+        map
+    }
+
+    fn proxies_json(entries: &[(&str, &str)]) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        for (group, now) in entries {
+            map.insert(
+                (*group).to_string(),
+                serde_json::json!({ "now": now, "type": "Selector" }),
+            );
+        }
+        serde_json::json!({ "proxies": map })
+    }
+
+    #[test]
+    fn compare_selection_drift_reports_only_mismatches() {
+        let mirror = drift_mirror("自动选择", "HK-01");
+        let drifts = compare_selection_drift(
+            &mirror,
+            &proxies_json(&[("自动选择", "HK-01")]),
+            1,
+            None,
+            None,
+        );
+        assert!(drifts.is_empty());
+
+        let drifts = compare_selection_drift(
+            &mirror,
+            &proxies_json(&[("自动选择", "SG-02")]),
+            42,
+            Some("sub-abcdef12"),
+            Some("abc123"),
+        );
+        assert_eq!(drifts.len(), 1);
+        assert_eq!(drifts[0].group, "自动选择");
+        assert_eq!(drifts[0].intent, "HK-01");
+        assert_eq!(drifts[0].runtime, "SG-02");
+        assert_eq!(drifts[0].at_unix, 42);
+        assert_eq!(drifts[0].subscription_id.as_deref(), Some("sub-abcdef12"));
+        assert_eq!(drifts[0].mirror_revision.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn compare_selection_drift_excludes_synthetic_and_absent_groups() {
+        // GLOBAL/COMPATIBLE are synthetic; absent groups have no intent to
+        // compare (mirror missing → no drift, B1).
+        let mut mirror = drift_mirror("GLOBAL", "REJECT");
+        mirror.insert("COMPATIBLE".to_string(), "DIRECT".to_string());
+        mirror.insert("幽灵组".to_string(), "HK-01".to_string());
+        let drifts = compare_selection_drift(
+            &mirror,
+            &proxies_json(&[("GLOBAL", "DIRECT"), ("COMPATIBLE", "DIRECT")]),
+            1,
+            None,
+            None,
+        );
+        assert!(drifts.is_empty(), "{drifts:?}");
+
+        // Malformed payload degrades to empty comparison, never panics.
+        assert!(
+            compare_selection_drift(&mirror, &serde_json::json!(null), 1, None, None).is_empty()
+        );
+        assert!(compare_selection_drift(&mirror, &serde_json::json!({}), 1, None, None).is_empty());
+    }
+
+    #[test]
+    fn drift_op_guard_brackets_both_edges() {
+        let _drift_test = drift_test_guard();
+        // A completed A→B→A operation must still bump the sequence twice so a
+        // sampler that straddled it discards the sample (three-round ABA fix).
+        let (seq_before, in_flight_before) = {
+            let tracker = drift_tracker().lock().unwrap();
+            (tracker.seq, tracker.in_flight)
+        };
+        {
+            let _op = DriftOpGuard::open();
+            {
+                let tracker = drift_tracker().lock().unwrap();
+                assert_eq!(tracker.in_flight, in_flight_before + 1);
+            }
+        }
+        let (seq_after, in_flight_after) = {
+            let tracker = drift_tracker().lock().unwrap();
+            (tracker.seq, tracker.in_flight)
+        };
+        assert_eq!(seq_after, seq_before.wrapping_add(2));
+        assert_eq!(in_flight_after, in_flight_before);
+    }
+
+    #[test]
+    fn replay_guard_arms_suppression_on_all_exits() {
+        let _drift_test = drift_test_guard();
+        {
+            let _guard = ReplayDriftGuard::open();
+        }
+        let suppress_until = drift_tracker().lock().unwrap().suppress_until;
+        let until = suppress_until.expect("replay end must arm suppression");
+        let remaining = until.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            remaining > DRIFT_REPLAY_SUPPRESSION / 2 && remaining <= DRIFT_REPLAY_SUPPRESSION,
+            "{remaining:?}"
+        );
+    }
+
+    #[test]
+    fn select_segment_brackets_and_closes_on_record() {
+        let _drift_test = drift_test_guard();
+        drift_open_select_segment();
+        {
+            let tracker = drift_tracker().lock().unwrap();
+            assert!(tracker.select_segment_open);
+        }
+        drift_close_select_segment();
+        assert!(!drift_tracker().lock().unwrap().select_segment_open);
+    }
+
+    #[test]
+    fn drift_ring_is_capped_and_group_entries_update_in_place() {
+        let _drift_test = drift_test_guard();
+        {
+            let mut tracker = drift_tracker().lock().unwrap();
+            tracker.observations.clear();
+            tracker.unknown_samples = 0;
+            tracker.last_warn_at.clear();
+        }
+        let mk = |group: &str, runtime: &str| crate::ipc::SelectionDriftObservation {
+            group: group.to_string(),
+            intent: "intent".to_string(),
+            runtime: runtime.to_string(),
+            at_unix: 0,
+            subscription_id: None,
+            mirror_revision: None,
+        };
+        let now = std::time::Instant::now();
+        for index in 0..(DRIFT_RING_CAPACITY + 10) {
+            let drift = mk(&format!("g{index:04}"), "a");
+            let mut tracker = drift_tracker().lock().unwrap();
+            apply_drift_observations(&mut tracker, vec![drift], now);
+        }
+        {
+            let mut tracker = drift_tracker().lock().unwrap();
+            assert_eq!(tracker.observations.len(), DRIFT_RING_CAPACITY);
+            // In-place update does not grow the ring.
+            apply_drift_observations(&mut tracker, vec![mk("g0005", "b")], now);
+            assert_eq!(tracker.observations.len(), DRIFT_RING_CAPACITY);
+            let updated = tracker
+                .observations
+                .iter()
+                .find(|obs| obs.group == "g0005")
+                .expect("existing group stays in the ring");
+            assert_eq!(updated.runtime, "b");
+            // Warning throttling: a second sample inside the window is silent
+            // (last_warn_at untouched → timestamp unchanged).
+            let warned_at = tracker.last_warn_at.get("g0005").copied();
+            apply_drift_observations(&mut tracker, vec![mk("g0005", "c")], now);
+            assert_eq!(tracker.last_warn_at.get("g0005").copied(), warned_at);
+            tracker.observations.clear();
+            tracker.last_warn_at.clear();
+        }
+    }
+
+    #[test]
+    fn drift_latest_observation_picks_max_at_unix() {
+        // N2: `.last()` is wrong because in-place updates keep the observation
+        // at its original index. The "Latest" display must pick the observation
+        // with the highest at_unix (ties broken by tail position).
+        let _drift_test = drift_test_guard();
+        {
+            let mut tracker = drift_tracker().lock().unwrap();
+            tracker.observations.clear();
+        }
+        let mk = |group: &str, runtime: &str, at: u64| crate::ipc::SelectionDriftObservation {
+            group: group.to_string(),
+            intent: "intent".to_string(),
+            runtime: runtime.to_string(),
+            at_unix: at,
+            subscription_id: None,
+            mirror_revision: None,
+        };
+        let now = std::time::Instant::now();
+        {
+            let mut tracker = drift_tracker().lock().unwrap();
+            // A@t1, B@t2 inserted → A at index 0, B at index 1
+            apply_drift_observations(&mut tracker, vec![mk("A", "r1", 100)], now);
+            apply_drift_observations(&mut tracker, vec![mk("B", "r2", 200)], now);
+            // t3: only A updated in-place (stays at index 0)
+            apply_drift_observations(&mut tracker, vec![mk("A", "r3", 300)], now);
+        }
+        // "Latest" must be A@t3 (at_unix=300), NOT B@t2 (which .last() would pick)
+        let (observations, _, _) = drift_snapshot();
+        let latest = latest_drift_observation(&observations).expect("at least one observation");
+        assert_eq!(latest.group, "A");
+        assert_eq!(latest.runtime, "r3");
+        assert_eq!(latest.at_unix, 300);
+        {
+            let mut tracker = drift_tracker().lock().unwrap();
+            tracker.observations.clear();
+        }
+    }
+
+    #[tokio::test]
+    async fn drift_unknown_samples_counts_real_failures_not_discarded_ticks() {
+        // N4: unknown_samples must count real failures (Core down, fetch
+        // timeout, mirror fault), NOT discarded ticks (suppressed/segment/
+        // in_flight).
+        {
+            let _drift_test = drift_test_guard();
+            let mut tracker = drift_tracker().lock().unwrap();
+            tracker.observations.clear();
+            tracker.unknown_samples = 0;
+            tracker.last_sample_status = String::new();
+            tracker.suppress_until = None;
+            tracker.select_segment_open = false;
+            tracker.in_flight = 0;
+            tracker.sampling = false;
+        }
+
+        // Simulate a discarded tick (suppressed) → unknown_samples must NOT increment
+        {
+            let mut tracker = drift_tracker().lock().unwrap();
+            tracker.suppress_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        }
+        let state = Arc::new(Mutex::new(DaemonState {
+            core_running: true,
+            core_child: None,
+            core_pid: None,
+            config_path: None,
+            launched_config_revision: None,
+            core_binary: None,
+            api_endpoint: Some("/var/run/mihomo/mihomo.sock".to_string()),
+            pid_file: std::path::PathBuf::new(),
+            core_log_file: std::path::PathBuf::new(),
+        }));
+        drift_sample_once(&state).await;
+        {
+            let tracker = drift_tracker().lock().unwrap();
+            assert_eq!(
+                tracker.unknown_samples, 0,
+                "suppressed tick must not increment unknown_samples"
+            );
+            assert_eq!(tracker.last_sample_status, "suppressed");
+        }
+
+        // Clear suppression, simulate Core not running → unknown_samples MUST increment
+        {
+            let mut tracker = drift_tracker().lock().unwrap();
+            tracker.suppress_until = None;
+            tracker.sampling = false;
+        }
+        let state_no_core = Arc::new(Mutex::new(DaemonState {
+            core_running: false,
+            core_child: None,
+            core_pid: None,
+            config_path: None,
+            launched_config_revision: None,
+            core_binary: None,
+            api_endpoint: Some("/var/run/mihomo/mihomo.sock".to_string()),
+            pid_file: std::path::PathBuf::new(),
+            core_log_file: std::path::PathBuf::new(),
+        }));
+        drift_sample_once(&state_no_core).await;
+        {
+            let tracker = drift_tracker().lock().unwrap();
+            assert_eq!(
+                tracker.unknown_samples, 1,
+                "Core down must increment unknown_samples"
+            );
+            assert_eq!(tracker.last_sample_status, "unknown");
+        }
+
+        // Cleanup
+        {
+            let mut tracker = drift_tracker().lock().unwrap();
+            tracker.unknown_samples = 0;
+            tracker.last_sample_status = String::new();
+        }
     }
 
     #[cfg(unix)]
@@ -5601,6 +8704,518 @@ external-controller: 127.0.0.1:9090
                 token: None,
             }
         ));
+    }
+
+    /// the SPEC §12.4 exemption matrix over every non-terminal phase.
+    /// Read-only commands pass, change commands are refused, and fenced transaction
+    /// commands pass only for their own transaction/generation/phase.
+    #[test]
+    fn gate_exemption_matrix_covers_every_non_terminal_phase() {
+        use crate::tun_transaction::{JournalPhase, TransactionFence, TunJournal};
+
+        fn journal_at(phase: JournalPhase) -> TunJournal {
+            TunJournal {
+                schema_version: 1,
+                transaction_id: "txn-gate".to_string(),
+                generation: 5,
+                phase,
+                original_uid: 1000,
+                target_runtime_tun: false,
+                base_intent_revision: None,
+                candidate_revision: "cand".to_string(),
+                candidate_core_identity: None,
+                candidate_core_pid: None,
+                old_snapshot_revision: None,
+                old_runtime_digest: "digest".to_string(),
+                recovery_target_revision: None,
+                legacy_source: false,
+                legacy_transaction_id: None,
+                legacy_base_revision: None,
+                rollback_evidence_complete: true,
+                last_error: None,
+                outcome: None,
+                recovery_core_identity: None,
+                recovery_core_pid: None,
+                updated_at: None,
+            }
+        }
+
+        fn fence(phase: JournalPhase) -> TransactionFence {
+            TransactionFence {
+                transaction_id: "txn-gate".to_string(),
+                generation: 5,
+                expected_phase: phase,
+                expected_candidate_revision: "cand".to_string(),
+            }
+        }
+
+        fn foreign_fence(phase: JournalPhase) -> TransactionFence {
+            TransactionFence {
+                transaction_id: "txn-other".to_string(),
+                generation: 6,
+                expected_phase: phase,
+                expected_candidate_revision: "other".to_string(),
+            }
+        }
+
+        let read_only = [
+            DaemonCommand::GetStatus { token: None },
+            DaemonCommand::GetTransactionStatus { token: None },
+            DaemonCommand::GetSelectionMirrorRevisions {
+                subscription_ids: Vec::new(),
+                token: None,
+            },
+            DaemonCommand::GetSelectionDrift { token: None },
+            DaemonCommand::CoreApiRequest {
+                method: CoreApiMethod::Get,
+                path: "/configs".to_string(),
+                body: None,
+                token: None,
+            },
+        ];
+        let change_commands = [
+            DaemonCommand::StartCore {
+                config_content: "tun:\n  enable: false\n".to_string(),
+                config_revision: "rev".to_string(),
+                subscription_id: None,
+                token: None,
+            },
+            DaemonCommand::StopCore { token: None },
+            DaemonCommand::RestartCore {
+                config_content: "tun:\n  enable: false\n".to_string(),
+                config_revision: "rev".to_string(),
+                subscription_id: None,
+                token: None,
+            },
+            DaemonCommand::ApplySystemTunSnapshot {
+                expected_revision: "rev".to_string(),
+                stack: None,
+                dns_hijack: None,
+                token: None,
+            },
+            DaemonCommand::PromoteSystemConfig {
+                config_content: "tun:\n  enable: false\n".to_string(),
+                config_revision: "rev".to_string(),
+                subscription_id: None,
+                change_kind: None,
+                token: None,
+            },
+            DaemonCommand::RecordSelectionIntent {
+                subscription_id: "sub-0123456789".to_string(),
+                content_yaml: "proxies: []\n".to_string(),
+                config_revision: Some("rev".to_string()),
+                token: None,
+            },
+            DaemonCommand::RecordActiveSubscription {
+                subscription_id: "sub-0123456789".to_string(),
+                config_revision: Some("rev".to_string()),
+                token: None,
+            },
+            DaemonCommand::SelectSystemProxy {
+                group: "G".to_string(),
+                node: "N".to_string(),
+                token: None,
+            },
+            DaemonCommand::DisableTun { token: None },
+            DaemonCommand::SetAutostart {
+                enabled: true,
+                token: None,
+            },
+            DaemonCommand::CoreApiRequest {
+                method: CoreApiMethod::Put,
+                path: "/configs".to_string(),
+                body: None,
+                token: None,
+            },
+            DaemonCommand::CoreApiRequest {
+                method: CoreApiMethod::Patch,
+                path: "/configs".to_string(),
+                body: None,
+                token: None,
+            },
+            DaemonCommand::CoreApiRequest {
+                method: CoreApiMethod::Delete,
+                path: "/connections".to_string(),
+                body: None,
+                token: None,
+            },
+        ];
+
+        for phase in [
+            JournalPhase::Prepared,
+            JournalPhase::PromotionPending,
+            JournalPhase::SnapshotPromoted,
+            JournalPhase::CoreApplied,
+            JournalPhase::RollbackPending,
+            JournalPhase::RecoveryRequired,
+        ] {
+            let journal = journal_at(phase);
+            // No active transaction at all: everything passes.
+            for cmd in read_only.iter().chain(change_commands.iter()) {
+                assert!(
+                    gate_admits(cmd, None),
+                    "{cmd:?} must pass with no active transaction"
+                );
+            }
+            // Read-only stays available during every non-terminal phase.
+            for cmd in &read_only {
+                assert!(
+                    gate_admits(cmd, Some(&journal)),
+                    "{cmd:?} must stay available in {phase:?}"
+                );
+            }
+            // Every change command is refused during every non-terminal phase.
+            for cmd in &change_commands {
+                assert!(
+                    !gate_admits(cmd, Some(&journal)),
+                    "{cmd:?} must be refused in {phase:?}"
+                );
+            }
+        }
+
+        // Fenced transaction commands: own fence + own phase only.
+        let cases = [
+            (
+                JournalPhase::Prepared,
+                DaemonCommand::ValidatePreparedRuntime {
+                    fence: fence(JournalPhase::Prepared),
+                    expected_old_runtime_revision: "old".to_string(),
+                    expected_old_runtime_tun: false,
+                    token: None,
+                },
+            ),
+            (
+                JournalPhase::SnapshotPromoted,
+                DaemonCommand::ApplyPromotedSnapshot {
+                    fence: fence(JournalPhase::SnapshotPromoted),
+                    target_runtime_tun: false,
+                    token: None,
+                },
+            ),
+            (
+                JournalPhase::RollbackPending,
+                DaemonCommand::QuiesceCandidateRuntime {
+                    fence: fence(JournalPhase::RollbackPending),
+                    allow_legacy_reset: false,
+                    allow_restored_old_quiesce: false,
+                    token: None,
+                },
+            ),
+            (
+                JournalPhase::RecoveryRequired,
+                DaemonCommand::QuiesceCandidateRuntime {
+                    fence: fence(JournalPhase::RecoveryRequired),
+                    allow_legacy_reset: false,
+                    allow_restored_old_quiesce: false,
+                    token: None,
+                },
+            ),
+            (
+                JournalPhase::RollbackPending,
+                DaemonCommand::RestoreOldRuntime {
+                    fence: fence(JournalPhase::RollbackPending),
+                    expected_old_runtime_revision: "old".to_string(),
+                    expected_old_runtime_tun: false,
+                    token: None,
+                },
+            ),
+            (
+                JournalPhase::CoreApplied,
+                DaemonCommand::AttestCurrentTransaction {
+                    fence: fence(JournalPhase::CoreApplied),
+                    expected_runtime_revision: "rev".to_string(),
+                    expected_runtime_tun: false,
+                    token: None,
+                },
+            ),
+            (
+                JournalPhase::RecoveryRequired,
+                DaemonCommand::ApplyLegacyRecoveryTarget {
+                    fence: fence(JournalPhase::RecoveryRequired),
+                    expected_recovery_target_revision: "rev".to_string(),
+                    token: None,
+                },
+            ),
+        ];
+        for (phase, cmd) in &cases {
+            let journal = journal_at(*phase);
+            assert!(
+                gate_admits(cmd, Some(&journal)),
+                "{cmd:?} must pass in its own phase {phase:?}"
+            );
+            // Same command in every other non-terminal phase is refused, except the
+            // quiesce channel which is deliberately open for both stop phases.
+            let quiesce = matches!(cmd, DaemonCommand::QuiesceCandidateRuntime { .. });
+            for other in [
+                JournalPhase::Prepared,
+                JournalPhase::PromotionPending,
+                JournalPhase::SnapshotPromoted,
+                JournalPhase::CoreApplied,
+                JournalPhase::RollbackPending,
+                JournalPhase::RecoveryRequired,
+            ] {
+                if other == *phase {
+                    continue;
+                }
+                let expected = quiesce
+                    && matches!(
+                        other,
+                        JournalPhase::RollbackPending | JournalPhase::RecoveryRequired
+                    );
+                assert_eq!(
+                    gate_admits(cmd, Some(&journal_at(other))),
+                    expected,
+                    "{cmd:?} admission in {other:?} must be {expected}"
+                );
+            }
+        }
+        // Fence mismatch on the transaction id / generation / candidate revision.
+        let rollback = journal_at(JournalPhase::RollbackPending);
+        assert!(!gate_admits(
+            &DaemonCommand::RestoreOldRuntime {
+                fence: foreign_fence(JournalPhase::RollbackPending),
+                expected_old_runtime_revision: "old".to_string(),
+                expected_old_runtime_tun: false,
+                token: None,
+            },
+            Some(&rollback)
+        ));
+        assert!(!gate_admits(
+            &DaemonCommand::QuiesceCandidateRuntime {
+                fence: foreign_fence(JournalPhase::RollbackPending),
+                allow_legacy_reset: false,
+                allow_restored_old_quiesce: false,
+                token: None,
+            },
+            Some(&rollback)
+        ));
+
+        // Terminal phases release the gate for every command.
+        for terminal in [JournalPhase::IntentCommitted, JournalPhase::RolledBack] {
+            let journal = journal_at(terminal);
+            for cmd in read_only.iter().chain(change_commands.iter()) {
+                assert!(
+                    gate_admits(cmd, Some(&journal)),
+                    "{cmd:?} must pass in terminal phase {terminal:?}"
+                );
+            }
+        }
+    }
+
+    /// the `process_command` path must use the same decision — the
+    /// matrix above cannot be bypassed by reaching the daemon through IPC.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gate_is_enforced_through_process_command() {
+        use crate::tun_transaction::{JournalPhase, TransactionFence, TunJournal};
+
+        isolate_daemon_runtime_for_tests();
+        let _serialized = runtime_journal_test_lock().lock().await;
+        let ctx = daemon_transaction_context().expect("system transaction context");
+        let active_dir = crate::tun_transaction::transactions_dir(&ctx).join("active");
+        let _ = std::fs::remove_dir_all(&active_dir);
+        std::fs::create_dir_all(&active_dir).unwrap();
+        let journal = TunJournal {
+            schema_version: 1,
+            transaction_id: "gate-process-command".to_string(),
+            generation: 12,
+            phase: JournalPhase::RollbackPending,
+            original_uid: 1000,
+            target_runtime_tun: false,
+            base_intent_revision: None,
+            candidate_revision: "cand".to_string(),
+            candidate_core_identity: None,
+            candidate_core_pid: None,
+            old_snapshot_revision: None,
+            old_runtime_digest: "digest".to_string(),
+            recovery_target_revision: None,
+            legacy_source: false,
+            legacy_transaction_id: None,
+            legacy_base_revision: None,
+            rollback_evidence_complete: true,
+            last_error: None,
+            outcome: None,
+            recovery_core_identity: None,
+            recovery_core_pid: None,
+            updated_at: Some(crate::tun_transaction::now_rfc3339()),
+        };
+        crate::tun_transaction::write_active_journal(&ctx, &journal).unwrap();
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        let gate_marker = "Change rejected: a system TUN transaction";
+
+        // Read-only query: not blocked by the gate.
+        let status = process_command(
+            DaemonCommand::GetStatus { token: None },
+            Arc::clone(&state),
+            peer_with_uid(Some(0)),
+        )
+        .await;
+        assert!(
+            matches!(status, DaemonResponse::Status { .. }),
+            "GetStatus must stay available: {status:?}"
+        );
+        let read_config = process_command(
+            DaemonCommand::CoreApiRequest {
+                method: CoreApiMethod::Get,
+                path: "/configs".to_string(),
+                body: None,
+                token: None,
+            },
+            Arc::clone(&state),
+            peer_with_uid(Some(0)),
+        )
+        .await;
+        match read_config {
+            DaemonResponse::Error { message } => assert!(
+                !message.contains(gate_marker),
+                "a read-only Core API request must not be gated: {message}"
+            ),
+            other => panic!("unexpected read-only response: {other:?}"),
+        }
+
+        // Change commands: refused with the change-specific message.
+        for cmd in [
+            DaemonCommand::SelectSystemProxy {
+                group: "G".to_string(),
+                node: "N".to_string(),
+                token: None,
+            },
+            DaemonCommand::CoreApiRequest {
+                method: CoreApiMethod::Put,
+                path: "/configs".to_string(),
+                body: Some(serde_json::json!({"tun": {"enable": true}})),
+                token: None,
+            },
+            DaemonCommand::PromoteSystemConfig {
+                config_content: "tun:\n  enable: false\n".to_string(),
+                config_revision: crate::tun_transaction::sha256_revision(
+                    b"tun:\n  enable: false\n",
+                ),
+                subscription_id: None,
+                change_kind: None,
+                token: None,
+            },
+            // Fenced command carrying a foreign fence: refused by the gate.
+            DaemonCommand::RestoreOldRuntime {
+                fence: TransactionFence {
+                    transaction_id: "some-other-transaction".to_string(),
+                    generation: 99,
+                    expected_phase: JournalPhase::RollbackPending,
+                    expected_candidate_revision: "other".to_string(),
+                },
+                expected_old_runtime_revision: "old".to_string(),
+                expected_old_runtime_tun: false,
+                token: None,
+            },
+        ] {
+            let response =
+                process_command(cmd.clone(), Arc::clone(&state), peer_with_uid(Some(0))).await;
+            match response {
+                DaemonResponse::Error { message } => {
+                    assert!(
+                        message.contains(gate_marker),
+                        "{cmd:?} must be refused by the gate: {message}"
+                    );
+                    assert!(
+                        message.contains("Read-only commands remain available")
+                            && message.contains("restart --system"),
+                        "the refusal must distinguish read-only and offer the Fix: {message}"
+                    );
+                }
+                other => panic!("{cmd:?} must be gated, got {other:?}"),
+            }
+        }
+
+        // The transaction's own fenced command still passes the gate.
+        let quiesce = process_command(
+            DaemonCommand::QuiesceCandidateRuntime {
+                fence: TransactionFence {
+                    transaction_id: journal.transaction_id.clone(),
+                    generation: journal.generation,
+                    expected_phase: JournalPhase::RollbackPending,
+                    expected_candidate_revision: journal.candidate_revision.clone(),
+                },
+                allow_legacy_reset: false,
+                allow_restored_old_quiesce: false,
+                token: None,
+            },
+            Arc::clone(&state),
+            peer_with_uid(Some(0)),
+        )
+        .await;
+        match quiesce {
+            DaemonResponse::Error { message } => assert!(
+                !message.contains(gate_marker),
+                "the transaction's own fenced command must not be gated: {message}"
+            ),
+            DaemonResponse::Transaction { .. } => {}
+            other => panic!("unexpected quiesce response: {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&active_dir);
+    }
+
+    /// D3: repeated probe noise collapses to one line per window per kind, and the
+    /// next emission reports how many identical events were swallowed.
+    #[test]
+    fn probe_noise_limiter_collapses_repeated_transport_errors() {
+        let mut limiter = ProbeNoiseLimiter::default();
+        // A CLI probe storm: 19 identical broken-pipe errors in one window.
+        let mut emitted = 0;
+        for offset in 0..19 {
+            if limiter.admit("broken-pipe", 1_000 + offset).is_some() {
+                emitted += 1;
+            }
+        }
+        assert_eq!(emitted, 1, "19 identical noise lines must collapse to one");
+
+        // Still inside the window: silent.
+        assert_eq!(limiter.admit("broken-pipe", 1_059), None);
+
+        // Next window re-emits once and reports the suppressed count (18 + 1).
+        assert_eq!(limiter.admit("broken-pipe", 1_060), Some(19));
+        assert_eq!(limiter.admit("broken-pipe", 1_061), None);
+
+        // Categories are limited independently, so a different transport error is
+        // still visible immediately.
+        assert_eq!(limiter.admit("connection-reset", 1_061), Some(0));
+    }
+
+    /// D3: only transport-close noise is rate limited; real connection errors keep
+    /// their unconditional log line.
+    #[test]
+    fn probe_noise_classification_keeps_real_failures_visible() {
+        let broken_pipe = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "Broken pipe",
+        ));
+        assert_eq!(probe_noise_kind(&broken_pipe), Some("broken-pipe"));
+        let context = broken_pipe.context("send response");
+        assert_eq!(probe_noise_kind(&context), Some("broken-pipe"));
+
+        let reset = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "Connection reset by peer",
+        ));
+        assert_eq!(probe_noise_kind(&reset), Some("connection-reset"));
+
+        for real in [
+            anyhow::anyhow!("invalid daemon command: missing field `type`"),
+            anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "socket gone",
+            )),
+            anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "token rejected",
+            )),
+        ] {
+            assert_eq!(
+                probe_noise_kind(&real),
+                None,
+                "a real failure must not be folded into probe noise: {real}"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -5731,10 +9346,10 @@ external-controller: 127.0.0.1:9090
     fn validate_client_token_for_peer_all_branches() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("owner");
-        let token = "my-secret-token";
+        let fixture_value = "my-secret-token";
         let record = OwnerRecord {
             uid: 1000,
-            token_sha256: crate::tun_transaction::sha256_revision(token.as_bytes()),
+            token_sha256: crate::tun_transaction::sha256_revision(fixture_value.as_bytes()),
         };
         let _guard = crate::utils::env_test_lock().lock().unwrap();
         let old = std::env::var_os("MIHOMO_CLI_OWNER_PATH");
@@ -5758,12 +9373,12 @@ external-controller: 127.0.0.1:9090
 
         // Branch 3: cannot determine peer UID
         assert_eq!(
-            validate_client_token_for_peer(Some(token), None),
+            validate_client_token_for_peer(Some(fixture_value), None),
             Err("cannot determine IPC peer uid".to_string())
         );
 
         // Branch 4: owner record missing / unreadable
-        let err = validate_client_token_for_peer(Some(token), Some(1000)).unwrap_err();
+        let err = validate_client_token_for_peer(Some(fixture_value), Some(1000)).unwrap_err();
         assert!(err.contains("cannot read owner record"), "{err}");
 
         // Now write the owner record
@@ -5771,7 +9386,7 @@ external-controller: 127.0.0.1:9090
 
         // Branch 5: peer UID mismatch
         assert_eq!(
-            validate_client_token_for_peer(Some(token), Some(1001)),
+            validate_client_token_for_peer(Some(fixture_value), Some(1001)),
             Err("auth token does not belong to IPC peer uid".to_string())
         );
 
@@ -5782,7 +9397,7 @@ external-controller: 127.0.0.1:9090
         );
 
         // Branch 7: valid token and matching peer UID
-        assert!(validate_client_token_for_peer(Some(token), Some(1000)).is_ok());
+        assert!(validate_client_token_for_peer(Some(fixture_value), Some(1000)).is_ok());
 
         if let Some(v) = old {
             unsafe {
@@ -5799,10 +9414,10 @@ external-controller: 127.0.0.1:9090
     fn validate_client_token_for_peer_rejects_whitespace_only_token() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("owner");
-        let token = "real-token";
+        let fixture_value = "real-token";
         let record = OwnerRecord {
             uid: 1000,
-            token_sha256: crate::tun_transaction::sha256_revision(token.as_bytes()),
+            token_sha256: crate::tun_transaction::sha256_revision(fixture_value.as_bytes()),
         };
         write_owner_record_to(&path, &record).unwrap();
         let _guard = crate::utils::env_test_lock().lock().unwrap();
@@ -5972,7 +9587,7 @@ external-controller: 127.0.0.1:9090
     fn daemon_command_parser_rejects_unknown_legacy_fields_with_clear_error() {
         let legacy = br#"{
             "type": "StartCore",
-            "config_path": "/home/alice/.config/mihomo/config.yaml",
+            "config_path": "/home/user/.config/mihomo/config.yaml",
             "core_binary": "/tmp/untrusted-mihomo"
         }"#;
 
@@ -6020,6 +9635,40 @@ external-controller: 127.0.0.1:9090
         assert_eq!(endpoint_windows_pipe_path("http://127.0.0.1:9090"), None);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn start_core_never_borrows_an_unprovable_endpoint_peer() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket = temp.path().join("api.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let endpoint = format!("unix://{}", socket.display());
+        let message = unreusable_endpoint_message(
+            &endpoint,
+            std::path::Path::new("/bin/sleep"),
+            &temp.path().join("config.yaml"),
+        );
+        assert!(message.contains("unprovable"), "{message}");
+        assert!(
+            message.contains("refusing to start a second Core"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("kill"),
+            "no manual kill guidance: {message}"
+        );
+        drop(listener);
+
+        let absent_endpoint = format!("unix://{}", temp.path().join("missing.sock").display());
+        assert_eq!(
+            unreusable_endpoint_message(
+                &absent_endpoint,
+                std::path::Path::new("/bin/sleep"),
+                &temp.path().join("config.yaml"),
+            ),
+            duplicate_core_endpoint_message(&absent_endpoint)
+        );
+    }
+
     #[test]
     fn duplicate_core_endpoint_message_is_shared_across_platforms() {
         let message = duplicate_core_endpoint_message(r"\\.\pipe\mihomo-core");
@@ -6037,7 +9686,7 @@ external-controller: 127.0.0.1:9090
         );
         #[cfg(not(target_os = "macos"))]
         let (config_path, core_binary) = (
-            PathBuf::from("/home/alice/.config/mihomo/config.yaml"),
+            PathBuf::from("/home/user/.config/mihomo/config.yaml"),
             PathBuf::from("/usr/local/lib/mihomo/mihomo"),
         );
         CorePidMetadata {
@@ -6258,7 +9907,7 @@ external-controller: 127.0.0.1:9090
             core_running: true,
             core_child: None,
             core_pid: Some(4242),
-            config_path: Some(PathBuf::from("/home/alice/.config/mihomo/config.yaml")),
+            config_path: Some(PathBuf::from("/home/user/.config/mihomo/config.yaml")),
             launched_config_revision: None,
             core_binary: Some(expected_system_core_binary_path()),
             api_endpoint: Some(api_endpoint.display().to_string()),
@@ -6279,7 +9928,7 @@ external-controller: 127.0.0.1:9090
         assert_eq!(s.core_pid, None);
         assert_eq!(
             s.config_path,
-            Some(PathBuf::from("/home/alice/.config/mihomo/config.yaml"))
+            Some(PathBuf::from("/home/user/.config/mihomo/config.yaml"))
         );
         assert_eq!(s.core_binary, Some(expected_system_core_binary_path()));
         assert_eq!(s.api_endpoint, None);
@@ -6288,11 +9937,13 @@ external-controller: 127.0.0.1:9090
     #[tokio::test]
     async fn restart_core_preflights_new_config_before_stopping_current_core() {
         isolate_daemon_runtime_for_tests();
+        // Another test may hold a journal in this shared runtime dir.
+        let _serialized = runtime_journal_test_lock().lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
         #[cfg(target_os = "macos")]
         let config_path = PathBuf::from("/Users/alice/.config/mihomo/config.yaml");
         #[cfg(not(target_os = "macos"))]
-        let config_path = PathBuf::from("/home/alice/.config/mihomo/config.yaml");
+        let config_path = PathBuf::from("/home/user/.config/mihomo/config.yaml");
         let state = Arc::new(Mutex::new(DaemonState {
             core_running: true,
             core_child: None,
@@ -6435,7 +10086,7 @@ external-controller: 127.0.0.1:9090
         #[cfg(target_os = "macos")]
         let valid = "/Users/alice/.config/mihomo/config.yaml";
         #[cfg(not(target_os = "macos"))]
-        let valid = "/home/alice/.config/mihomo/config.yaml";
+        let valid = "/home/user/.config/mihomo/config.yaml";
         assert!(validate_daemon_config_path_shape(std::path::Path::new(valid)).is_ok());
 
         // TUN config path (system-level) must also be accepted.
@@ -6450,7 +10101,7 @@ external-controller: 127.0.0.1:9090
 
         // The other platform's path shape must be rejected.
         let platform_other_home = if cfg!(target_os = "macos") {
-            "/home/alice/.config/mihomo/config.yaml"
+            "/home/user/.config/mihomo/config.yaml"
         } else {
             "/Users/alice/.config/mihomo/config.yaml"
         };
@@ -6462,12 +10113,12 @@ external-controller: 127.0.0.1:9090
             validate_daemon_config_path_shape(std::path::Path::new("/etc/shadow")).unwrap_err();
         assert!(err.contains("expected config.yaml or tun-config.yaml"));
         let err = validate_daemon_config_path_shape(std::path::Path::new(
-            "/home/alice/.config/other/config.yaml",
+            "/home/user/.config/other/config.yaml",
         ))
         .unwrap_err();
         assert!(err.contains("system daemon only accepts"));
         let err = validate_daemon_config_path_shape(std::path::Path::new(
-            "/home/alice/extra/.config/mihomo/config.yaml",
+            "/home/user/extra/.config/mihomo/config.yaml",
         ))
         .unwrap_err();
         assert!(err.contains("system daemon only accepts"));
@@ -6475,19 +10126,19 @@ external-controller: 127.0.0.1:9090
             .unwrap_err();
         assert!(err.contains("non-absolute"));
         let err = validate_daemon_config_path_shape(std::path::Path::new(
-            "/home/alice/../bob/.config/mihomo/config.yaml",
+            "/home/user/../bob/.config/mihomo/config.yaml",
         ))
         .unwrap_err();
         assert!(err.contains("must not contain . or .. components"));
         let err = validate_daemon_config_path_shape(std::path::Path::new(
-            "/home/alice/./.config/mihomo/config.yaml",
+            "/home/user/./.config/mihomo/config.yaml",
         ))
         .unwrap_err();
         assert!(err.contains("must not contain . or .. components"));
 
         // Invalid tun-config.yaml path should be rejected.
         let err = validate_daemon_config_path_shape(std::path::Path::new(
-            "/home/alice/.config/mihomo/tun-config.yaml",
+            "/home/user/.config/mihomo/tun-config.yaml",
         ))
         .unwrap_err();
         assert!(err.contains("system daemon only accepts"));
@@ -6655,7 +10306,7 @@ second
     #[test]
     fn reaping_crashed_core_preserves_recovery_intent() {
         let tmp = tempfile::tempdir().unwrap();
-        let config_path = PathBuf::from("/home/alice/.config/mihomo/config.yaml");
+        let config_path = PathBuf::from("/home/user/.config/mihomo/config.yaml");
         let core_binary = expected_system_core_binary_path();
         let mut state = DaemonState {
             core_running: true,
@@ -6815,7 +10466,7 @@ second
         let config_path = if cfg!(target_os = "macos") {
             PathBuf::from("/Users/alice/.config/mihomo/config.yaml")
         } else {
-            PathBuf::from("/home/alice/.config/mihomo/config.yaml")
+            PathBuf::from("/home/user/.config/mihomo/config.yaml")
         };
         let core_binary = if cfg!(target_os = "macos") {
             PathBuf::from("/Library/Application Support/mihomo/bin/mihomo")
@@ -6882,21 +10533,21 @@ second
 time="2026-08-12T14:52:09" level=error msg="can't download MMDB: context deadline exceeded"
 time="2026-08-12T14:52:09" level=fatal msg="Parse config error: rules[3848] [GEOIP,telegram,Telegram,no-resolve] error: can't download MMDB""#;
 
-        let failure = classify_core_startup_failure(log);
+        let failure = classify_core_startup_failure(log, crate::utils::CacheDbState::Healthy);
         assert_eq!(failure, CoreFailure::GeoipMissing);
     }
 
     #[test]
     fn classify_geosite_missing() {
         let log = r#"time="2026-08-12T14:50:39" level=info msg="Can't find GeoSite.dat""#;
-        let failure = classify_core_startup_failure(log);
+        let failure = classify_core_startup_failure(log, crate::utils::CacheDbState::Healthy);
         assert_eq!(failure, CoreFailure::GeositeMissing);
     }
 
     #[test]
     fn classify_config_parse_error() {
         let log = r#"time="2026-08-12T14:50:39" level=fatal msg="Parse config error: invalid key 'foo' at line 42""#;
-        let failure = classify_core_startup_failure(log);
+        let failure = classify_core_startup_failure(log, crate::utils::CacheDbState::Healthy);
         match failure {
             CoreFailure::ConfigError { ref detail } => {
                 assert!(detail.contains("Parse config error"));
@@ -6908,7 +10559,7 @@ time="2026-08-12T14:52:09" level=fatal msg="Parse config error: rules[3848] [GEO
     #[test]
     fn classify_system_geo_permission_before_config_error() {
         let log = r#"time="2026-08-13T14:50:39" level=fatal msg="Parse config error: rules[3848] error: can't remove invalid MMDB: remove /var/lib/mihomo-cli/geoip.metadb: permission denied""#;
-        let failure = classify_core_startup_failure(log);
+        let failure = classify_core_startup_failure(log, crate::utils::CacheDbState::Healthy);
         assert!(matches!(failure, CoreFailure::PermissionDenied { .. }));
         let message = format_core_failure_message(
             &failure,
@@ -6922,7 +10573,7 @@ time="2026-08-12T14:52:09" level=fatal msg="Parse config error: rules[3848] [GEO
     #[test]
     fn classify_port_conflict() {
         let log = r#"time="2026-08-12T14:50:39" level=error msg="listen tcp 0.0.0.0:9090: address already in use""#;
-        let failure = classify_core_startup_failure(log);
+        let failure = classify_core_startup_failure(log, crate::utils::CacheDbState::Healthy);
         match failure {
             CoreFailure::PortConflict { ref detail } => {
                 assert!(detail.contains("address already in use"));
@@ -6934,7 +10585,7 @@ time="2026-08-12T14:52:09" level=fatal msg="Parse config error: rules[3848] [GEO
     #[test]
     fn classify_permission_denied() {
         let log = r#"time="2026-08-12T14:50:39" level=fatal msg="open /etc/mihomo/config.yaml: permission denied""#;
-        let failure = classify_core_startup_failure(log);
+        let failure = classify_core_startup_failure(log, crate::utils::CacheDbState::Healthy);
         match failure {
             CoreFailure::PermissionDenied { ref detail } => {
                 assert!(detail.contains("permission denied"));
@@ -6946,14 +10597,40 @@ time="2026-08-12T14:52:09" level=fatal msg="Parse config error: rules[3848] [GEO
     #[test]
     fn classify_unknown_fallback() {
         let log = r#"time="2026-08-12T14:50:39" level=fatal msg="something completely unexpected happened""#;
-        let failure = classify_core_startup_failure(log);
+        let failure = classify_core_startup_failure(log, crate::utils::CacheDbState::Healthy);
         assert!(matches!(failure, CoreFailure::Unknown { .. }));
     }
 
     #[test]
     fn classify_empty_log_returns_unknown() {
-        let failure = classify_core_startup_failure("");
+        let failure = classify_core_startup_failure("", crate::utils::CacheDbState::Healthy);
         assert!(matches!(failure, CoreFailure::Unknown { .. }));
+    }
+
+    #[test]
+    fn classify_cache_db_invalid_when_content_invalid_and_core_failed() {
+        // SPEC A3: a bbolt failure plus a ContentInvalid verdict is attributable.
+        let log = r#"time="2026-10-20T18:00:00" level=error msg="cache.db: invalid database""#;
+        let failure =
+            classify_core_startup_failure(log, crate::utils::CacheDbState::ContentInvalid);
+        assert_eq!(failure, CoreFailure::CacheDbInvalid);
+        let message = format_core_failure_message(
+            &failure,
+            std::path::Path::new("/var/log/mihomo/mihomo.log"),
+        );
+        assert!(message.contains("Fix: mihomo-cli restart --system"));
+
+        // Without a cache.db verdict and without naming cache.db in the log, a
+        // generic bbolt error must not be attributed to the persistence file.
+        let anonymous_log = r#"time="2026-10-20T18:00:00" level=error msg="invalid database""#;
+        let failure =
+            classify_core_startup_failure(anonymous_log, crate::utils::CacheDbState::Healthy);
+        assert!(matches!(failure, CoreFailure::Unknown { .. }));
+        let failure = classify_core_startup_failure(
+            anonymous_log,
+            crate::utils::CacheDbState::ContentInvalid,
+        );
+        assert_eq!(failure, CoreFailure::CacheDbInvalid);
     }
 
     // ADR-24: format_core_failure_message tests.
@@ -7099,6 +10776,8 @@ mod windows_auth_model_tests {
         let _response = handle_quiesce_candidate_runtime(
             std::sync::Arc::clone(&state),
             fence.clone(),
+            false,
+            false,
             peer_with_uid(Some(0)),
         )
         .await;
@@ -7142,6 +10821,140 @@ mod windows_auth_model_tests {
             state_guard.core_running,
             "running unknown core must not be stopped by apply_promoted_snapshot"
         );
+    }
+
+    /// T2: the daemon's independent defense. A SnapshotPromoted
+    /// journal with a valid candidate and matching snapshot digest must still
+    /// be refused when the running Core identity does not match the attested
+    /// old runtime, and the running process must survive the rejection.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_promoted_snapshot_refuses_unattested_running_core() {
+        use super::*;
+        use crate::tun_transaction::{
+            JournalPhase, LaunchSource, OldRuntimeEvidence, TransactionFence, TransactionResponse,
+            TunJournal,
+        };
+
+        isolate_daemon_runtime_for_tests();
+        // The journal we write is also the §12.4 gate input of the shared test
+        // runtime dir; serialize with the tests that assert on that gate.
+        let _serialized = runtime_journal_test_lock().lock().await;
+        let ctx = daemon_transaction_context().expect("system transaction context");
+        let active_dir = crate::tun_transaction::transactions_dir(&ctx).join("active");
+
+        let candidate_bytes = b"tun:\n  enable: true\n";
+        let candidate_revision = crate::tun_transaction::sha256_revision(candidate_bytes);
+        std::fs::create_dir_all(&active_dir).unwrap();
+        std::fs::write(
+            crate::tun_transaction::active_candidate_path(&ctx),
+            candidate_bytes,
+        )
+        .unwrap();
+        std::fs::write(&ctx.paths.tun_config_file, candidate_bytes).unwrap();
+
+        let attested_identity = expected_system_core_binary_path()
+            .to_string_lossy()
+            .to_string();
+        let evidence = OldRuntimeEvidence {
+            core_running: true,
+            core_identity: attested_identity,
+            core_pid: 4242,
+            launched_revision: "old-revision".to_string(),
+            launch_source: LaunchSource::SystemTunSnapshot,
+            runtime_tun: true,
+            api_endpoint: "/var/run/mihomo/mihomo.sock".to_string(),
+            recorded_at_secs: None,
+        };
+        let evidence_bytes = serde_json::to_vec_pretty(&evidence).unwrap();
+        std::fs::write(
+            crate::tun_transaction::active_old_runtime_path(&ctx),
+            &evidence_bytes,
+        )
+        .unwrap();
+
+        let journal = TunJournal {
+            schema_version: 1,
+            transaction_id: "apply-unattested-test".to_string(),
+            generation: 13,
+            phase: JournalPhase::SnapshotPromoted,
+            original_uid: 1000,
+            target_runtime_tun: true,
+            base_intent_revision: None,
+            candidate_revision: candidate_revision.clone(),
+            candidate_core_identity: None,
+            candidate_core_pid: None,
+            old_snapshot_revision: None,
+            old_runtime_digest: crate::tun_transaction::sha256_revision(&evidence_bytes),
+            recovery_target_revision: None,
+            legacy_source: false,
+            legacy_transaction_id: None,
+            legacy_base_revision: None,
+            rollback_evidence_complete: true,
+            last_error: None,
+            outcome: None,
+            recovery_core_identity: None,
+            recovery_core_pid: None,
+            updated_at: Some(crate::tun_transaction::now_rfc3339()),
+        };
+        crate::tun_transaction::write_active_journal(&ctx, &journal).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn unknown runtime stand-in");
+        let pid = child.id().expect("runtime pid");
+        let state = Arc::new(Mutex::new(DaemonState {
+            core_running: true,
+            core_child: Some(child),
+            core_pid: Some(pid),
+            core_binary: Some(std::path::PathBuf::from("/usr/bin/unknown-core-identity")),
+            launched_config_revision: Some(candidate_revision.clone()),
+            api_endpoint: None,
+            pid_file: tmp.path().join("core.pid"),
+            core_log_file: tmp.path().join("core.log"),
+            ..DaemonState::default()
+        }));
+
+        let fence = TransactionFence {
+            transaction_id: journal.transaction_id.clone(),
+            generation: journal.generation,
+            expected_phase: journal.phase,
+            expected_candidate_revision: candidate_revision,
+        };
+        let response =
+            handle_apply_promoted_snapshot(Arc::clone(&state), fence, true, peer_with_uid(Some(0)))
+                .await;
+
+        match response {
+            DaemonResponse::Transaction {
+                response: TransactionResponse::EvidenceMismatch { error, .. },
+            } => {
+                assert_eq!(
+                    error.stage, "verify_running_core_before_apply",
+                    "the apply must be refused before stopping the unattested runtime"
+                );
+            }
+            other => panic!("an unattested running core must be refused: {other:?}"),
+        }
+
+        let mut guard = state.lock().await;
+        assert!(
+            guard.core_child.is_some(),
+            "a rejected apply must not stop the running Core"
+        );
+        if let Some(child) = guard.core_child.as_mut() {
+            let waited = child.try_wait().unwrap();
+            assert!(waited.is_none(), "the Core must still be alive");
+        }
+        if let Some(mut child) = guard.core_child.take() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        drop(guard);
+        std::fs::remove_dir_all(&active_dir).ok();
+        let _ = std::fs::remove_file(&ctx.paths.tun_config_file);
     }
 }
 
@@ -7244,5 +11057,804 @@ mod autostart_tests {
         // 遇到符号链接 tun-config.yaml，snapshot_tun_enabled 安全拒绝，回退到 active-config.yaml
         let resolved = resolve_autostart_target_config_path(runtime_dir);
         assert_eq!(resolved, Some(active_path));
+    }
+
+    // ---------------- cache.db spawn precondition (SPEC A2) ----------------
+
+    /// Every Core spawn path (IPC start/restart/promote, autostart, startup and
+    /// failure retry) funnels through `start_core`, which owns the only spawn site.
+    #[test]
+    fn every_core_spawn_path_shares_the_cache_db_precondition() {
+        let source = include_str!("daemon.rs");
+        let spawn_site = format!("cmd.{}", "spawn()");
+        assert_eq!(
+            source.matches(&spawn_site).count(),
+            1,
+            "the Core must have exactly one spawn site so the quarantine precondition cannot be bypassed"
+        );
+        let gate = source
+            .find("cache_db_gate_for_start(&mut s,")
+            .expect("start_core must call the cache.db gate");
+        let spawn = source.find(&spawn_site).expect("core spawn site");
+        assert!(
+            gate < spawn,
+            "the cache.db quarantine precondition must run before the Core is spawned"
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_daemon_cache_db_fixture(dir: &std::path::Path, bytes: &[u8]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join(crate::utils::CACHE_DB_FILE_NAME);
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn quarantine_names(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name().to_str().map(str::to_string)?;
+                name.starts_with(crate::utils::CACHE_DB_QUARANTINE_PREFIX)
+                    .then_some(name)
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_db_gate_quarantines_content_invalid_before_any_spawn() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut image = crate::utils::bolt_test_db_image(4096);
+        crate::utils::bolt_test_corrupt_meta(&mut image, 0);
+        crate::utils::bolt_test_corrupt_meta(&mut image, 4096);
+        let path = write_daemon_cache_db_fixture(temp.path(), &image);
+
+        let mut state = DaemonState {
+            pid_file: temp.path().join("core.pid"),
+            core_log_file: temp.path().join("core.log"),
+            ..DaemonState::default()
+        };
+        let observed = cache_db_gate_for_start(&mut state, temp.path()).unwrap();
+
+        assert_eq!(observed, crate::utils::CacheDbState::ContentInvalid);
+        assert!(!path.exists(), "the invalid cache.db must be moved away");
+        assert_eq!(quarantine_names(temp.path()).len(), 1);
+    }
+
+    /// D2 single track: the daemon never repairs cache.db permissions, it only
+    /// reports `repair_required` so the CLI's confirmation contract repairs them.
+    #[cfg(unix)]
+    #[test]
+    fn cache_db_gate_reports_repair_required_without_repairing() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let image = crate::utils::bolt_test_db_image(4096);
+        let path = write_daemon_cache_db_fixture(temp.path(), &image);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut state = DaemonState {
+            pid_file: temp.path().join("core.pid"),
+            core_log_file: temp.path().join("core.log"),
+            ..DaemonState::default()
+        };
+        let error = cache_db_gate_for_start(&mut state, temp.path()).unwrap_err();
+
+        assert!(error.contains("repair_required"), "{error}");
+        assert!(
+            error.contains("Fix: mihomo-cli restart --system"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().mode() & 0o777,
+            0o644,
+            "the daemon must not change permissions"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), image);
+        assert!(
+            quarantine_names(temp.path()).is_empty(),
+            "a permission-only anomaly must never quarantine"
+        );
+    }
+
+    /// A file that validates but cannot be opened by bbolt (truncated) must be
+    /// quarantined, not handed over and deleted by the Core.
+    #[cfg(unix)]
+    #[test]
+    fn cache_db_gate_isolates_truncated_file_that_cannot_be_opened() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = crate::utils::bolt_test_db_image(4096);
+        let path = write_daemon_cache_db_fixture(temp.path(), &image[..6000]);
+
+        let mut state = DaemonState {
+            pid_file: temp.path().join("core.pid"),
+            core_log_file: temp.path().join("core.log"),
+            ..DaemonState::default()
+        };
+        let observed = cache_db_gate_for_start(&mut state, temp.path()).unwrap();
+
+        assert_eq!(observed, crate::utils::CacheDbState::Degraded);
+        assert!(!path.exists(), "the unopenable file must be moved aside");
+        assert_eq!(quarantine_names(temp.path()).len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_db_gate_blocks_start_when_quarantine_impossible() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            // root bypasses directory write bits, so the failure cannot be provoked.
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = write_daemon_cache_db_fixture(temp.path(), &vec![0u8; 16 * 1024]);
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let mut state = DaemonState {
+            pid_file: temp.path().join("core.pid"),
+            core_log_file: temp.path().join("core.log"),
+            ..DaemonState::default()
+        };
+        let error = cache_db_gate_for_start(&mut state, temp.path()).unwrap_err();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            error.contains("Fix: mihomo-cli restart --system"),
+            "isolation failure must fail closed with a fix command: {error}"
+        );
+        assert!(
+            path.exists(),
+            "the original file must be preserved as evidence"
+        );
+    }
+
+    // ---------------- stop proof / quiesce true stop (SPEC B3) ----------------
+
+    #[cfg(unix)]
+    async fn running_sleep_core(dir: &std::path::Path) -> (Arc<Mutex<DaemonState>>, u32) {
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn live core stand-in");
+        let pid = child.id().expect("child pid");
+        let state = Arc::new(Mutex::new(DaemonState {
+            core_running: true,
+            core_child: Some(child),
+            core_pid: Some(pid),
+            pid_file: dir.join("core.pid"),
+            core_log_file: dir.join("core.log"),
+            ..DaemonState::default()
+        }));
+        (state, pid)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_core_timeout_keeps_child_visible_to_liveness_proofs() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, pid) = running_sleep_core(temp.path()).await;
+        let elapsed = tokio::time::timeout(std::time::Duration::ZERO, std::future::pending::<()>())
+            .await
+            .expect_err("zero budget must elapse");
+        let child = {
+            let mut guard = state.lock().await;
+            guard.core_child.take().expect("live child")
+        };
+
+        let mut guard = state.lock().await;
+        let (response, proof) = settle_stop(
+            &mut guard,
+            child,
+            pid,
+            Ok(()),
+            Err(elapsed),
+            STOP_CORE_WAIT_TIMEOUT,
+        );
+
+        assert!(
+            matches!(response, DaemonResponse::Error { .. }),
+            "a timed-out stop must be an error: {response:?}"
+        );
+        assert!(proof.is_none(), "no stopped proof may be produced");
+        assert!(
+            guard.core_child.is_some(),
+            "a failed stop must keep the child so liveness proofs still see pid {pid}"
+        );
+        assert!(guard.core_running, "state must not claim a stopped core");
+        if let Some(mut child) = guard.core_child.take() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_core_success_returns_the_single_stopped_proof() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, pid) = running_sleep_core(temp.path()).await;
+
+        let (response, proof) = stop_core_with_proof(Arc::clone(&state)).await;
+
+        assert!(matches!(response, DaemonResponse::Success { .. }));
+        let proof = proof.expect("a successful stop must produce a proof");
+        assert_eq!(proof.pid, pid);
+        assert!(!proof.stopped_at.is_empty());
+        let guard = state.lock().await;
+        assert!(guard.core_child.is_none());
+        assert!(!guard.core_running);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quiesce_true_stop_has_no_phase_carve_out() {
+        // 去脂裁决②: a running runtime (candidate or attested old Core) reaches the
+        // same true stop for both phases; there is no "attested but running" proof.
+        for phase in [
+            crate::tun_transaction::JournalPhase::RollbackPending,
+            crate::tun_transaction::JournalPhase::RecoveryRequired,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (state, pid) = running_sleep_core(temp.path()).await;
+
+            let (proof, obs_after) = quiesce_stop_runtime(Arc::clone(&state), "quiesce_test")
+                .await
+                .expect("a running runtime must be stopped");
+            assert_eq!(proof.pid, pid);
+            assert!(
+                !obs_after.core_running,
+                "runtime must be observably stopped for {phase:?}"
+            );
+
+            let fence = crate::tun_transaction::TransactionFence {
+                transaction_id: "txn".to_string(),
+                generation: 1,
+                expected_phase: phase,
+                expected_candidate_revision: "candidate".to_string(),
+            };
+            let runtime_proof = quiesced_proof(&fence, phase, &obs_after, &proof);
+            assert_eq!(runtime_proof.core_pid, 0, "0 proves the runtime is stopped");
+            assert!(runtime_proof.launched_revision.is_empty());
+            assert!(!runtime_proof.api_ready);
+            assert!(!runtime_proof.runtime_tun);
+            assert_eq!(runtime_proof.observed_phase, phase);
+        }
+    }
+
+    #[cfg(unix)]
+    fn quiesce_test_journal(
+        ctx: &crate::instance::InstanceContext,
+        candidate_pid: u32,
+        candidate_identity: &str,
+    ) -> crate::tun_transaction::TunJournal {
+        use crate::tun_transaction::{JournalPhase, TunJournal};
+
+        std::fs::create_dir_all(crate::tun_transaction::transactions_dir(ctx).join("active"))
+            .unwrap();
+        let journal = TunJournal {
+            schema_version: 1,
+            transaction_id: "quiesce-identity-test".to_string(),
+            generation: 11,
+            phase: JournalPhase::RecoveryRequired,
+            original_uid: 1000,
+            target_runtime_tun: false,
+            base_intent_revision: None,
+            candidate_revision: "rev-candidate".to_string(),
+            candidate_core_identity: Some(candidate_identity.to_string()),
+            candidate_core_pid: Some(candidate_pid),
+            old_snapshot_revision: None,
+            old_runtime_digest: "expected-digest".to_string(),
+            recovery_target_revision: None,
+            legacy_source: false,
+            legacy_transaction_id: None,
+            legacy_base_revision: None,
+            rollback_evidence_complete: true,
+            last_error: None,
+            outcome: None,
+            recovery_core_identity: None,
+            recovery_core_pid: None,
+            updated_at: Some(crate::tun_transaction::now_rfc3339()),
+        };
+        crate::tun_transaction::write_active_journal(ctx, &journal).unwrap();
+        journal
+    }
+
+    /// P1-4: identity is a disjunction. A candidate that matches the journal
+    /// fingerprint is self-proving and must be stopped even when the old-runtime
+    /// evidence is missing or drifted; an unproven candidate with broken evidence
+    /// must still be rejected without stopping anything.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quiesce_candidate_identity_does_not_depend_on_old_runtime_evidence() {
+        use crate::tun_transaction::{
+            JournalPhase, LaunchSource, OldRuntimeEvidence, TransactionFence, TransactionResponse,
+        };
+
+        isolate_daemon_runtime_for_tests();
+        // The journal we write is also the §12.4 gate input of the shared test
+        // runtime dir; serialize with the tests that assert on that gate.
+        let _serialized = runtime_journal_test_lock().lock().await;
+        let ctx = daemon_transaction_context().expect("system transaction context");
+        let core_identity = expected_system_core_binary_path();
+        let identity_text = core_identity.to_string_lossy().to_string();
+        let active_dir = crate::tun_transaction::transactions_dir(&ctx).join("active");
+        // Test hygiene: the "evidence missing" case must not depend on leftovers
+        // from earlier tests in this binary (review suggestion, narrow re-review).
+        let _ = std::fs::remove_file(active_dir.join("old-runtime.json"));
+
+        let fence_for = |journal: &crate::tun_transaction::TunJournal| TransactionFence {
+            transaction_id: journal.transaction_id.clone(),
+            generation: journal.generation,
+            expected_phase: journal.phase,
+            expected_candidate_revision: journal.candidate_revision.clone(),
+        };
+
+        let write_old_evidence = |pid: u32, revision: &str| {
+            let evidence = OldRuntimeEvidence {
+                core_running: true,
+                core_identity: identity_text.clone(),
+                core_pid: pid,
+                launched_revision: revision.to_string(),
+                launch_source: LaunchSource::SystemTunSnapshot,
+                runtime_tun: false,
+                api_endpoint: "/var/run/mihomo/mihomo.sock".to_string(),
+                recorded_at_secs: None,
+            };
+            std::fs::write(
+                active_dir.join("old-runtime.json"),
+                serde_json::to_vec(&evidence).unwrap(),
+            )
+            .unwrap();
+        };
+
+        // Case 1 (evidence missing) and case 2 (evidence digest drifted): the
+        // matched candidate must be quiesced with a stopped proof in both.
+        for drift in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let child = tokio::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn candidate stand-in");
+            let pid = child.id().expect("candidate pid");
+            let journal = quiesce_test_journal(&ctx, pid, &identity_text);
+            if drift {
+                // Digest in the journal stays "expected-digest" -> validation fails.
+                write_old_evidence(pid, "old-revision");
+            }
+            let state = Arc::new(Mutex::new(DaemonState {
+                core_running: true,
+                core_child: Some(child),
+                core_pid: Some(pid),
+                core_binary: Some(core_identity.clone()),
+                launched_config_revision: Some(journal.candidate_revision.clone()),
+                api_endpoint: None,
+                pid_file: tmp.path().join("core.pid"),
+                core_log_file: tmp.path().join("core.log"),
+                ..DaemonState::default()
+            }));
+
+            let response = handle_quiesce_candidate_runtime(
+                Arc::clone(&state),
+                fence_for(&journal),
+                false,
+                false,
+                peer_with_uid(Some(0)),
+            )
+            .await;
+
+            match response {
+                DaemonResponse::Transaction {
+                    response: TransactionResponse::Completed(proof),
+                } => {
+                    assert_eq!(proof.core_pid, 0, "stopped proof (drift={drift})");
+                    assert!(proof.launched_revision.is_empty());
+                    assert_eq!(proof.observed_phase, JournalPhase::RecoveryRequired);
+                    assert_eq!(proof.transaction_id, journal.transaction_id);
+                }
+                other => panic!(
+                    "a matched candidate must be quiesced regardless of old evidence (drift={drift}): {other:?}"
+                ),
+            }
+            let guard = state.lock().await;
+            assert!(
+                guard.core_child.is_none(),
+                "the candidate must actually be stopped (drift={drift})"
+            );
+            drop(guard);
+            std::fs::remove_dir_all(&active_dir).ok();
+        }
+
+        // Case 3: the running Core is not the candidate and the old evidence is
+        // broken -> rejection, and the Core keeps running (fail-closed).
+        let tmp = tempfile::tempdir().unwrap();
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn unknown runtime stand-in");
+        let pid = child.id().expect("runtime pid");
+        let journal = quiesce_test_journal(&ctx, pid + 1, &identity_text);
+        write_old_evidence(pid, "old-revision");
+        let state = Arc::new(Mutex::new(DaemonState {
+            core_running: true,
+            core_child: Some(child),
+            core_pid: Some(pid),
+            core_binary: Some(core_identity.clone()),
+            launched_config_revision: Some(journal.candidate_revision.clone()),
+            api_endpoint: None,
+            pid_file: tmp.path().join("core.pid"),
+            core_log_file: tmp.path().join("core.log"),
+            ..DaemonState::default()
+        }));
+
+        let response = handle_quiesce_candidate_runtime(
+            Arc::clone(&state),
+            fence_for(&journal),
+            false,
+            false,
+            peer_with_uid(Some(0)),
+        )
+        .await;
+
+        match response {
+            DaemonResponse::Transaction {
+                response: TransactionResponse::EvidenceMismatch { error, .. },
+            } => {
+                assert_eq!(
+                    error.stage, "validate_old_runtime_for_quiesce",
+                    "an unproven candidate must still fail on the broken evidence"
+                );
+            }
+            other => panic!("unknown identity with broken evidence must be rejected: {other:?}"),
+        }
+        let mut guard = state.lock().await;
+        assert!(
+            guard.core_child.is_some(),
+            "a rejected quiesce must not stop the running Core"
+        );
+        if let Some(child) = guard.core_child.as_mut() {
+            let waited = child.try_wait().unwrap();
+            assert!(waited.is_none(), "the Core must still be alive");
+        }
+        if let Some(mut child) = guard.core_child.take() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        drop(guard);
+        std::fs::remove_dir_all(&active_dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_core_liveness_only_trusts_the_recorded_core_process() {
+        use std::os::unix::process::CommandExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("core.pid");
+
+        // No pid file: proven stopped.
+        assert_eq!(managed_core_liveness_at(&pid_file), CoreLiveness::Stopped);
+
+        // A live process whose argv[0] is the recorded system core binary.
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg0(expected_system_core_binary_path())
+            .arg("30")
+            .spawn()
+            .expect("spawn fake core");
+        let metadata = CorePidMetadata {
+            pid: child.id(),
+            config_path: std::path::PathBuf::from("/var/lib/mihomo-cli/tun-config.yaml"),
+            core_binary: expected_system_core_binary_path(),
+            api_endpoint: Some(expected_system_core_api_endpoint().to_string()),
+            config_revision: None,
+        };
+        std::fs::write(&pid_file, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        // `spawn` returns before `execve`, so poll briefly for the new cmdline.
+        let mut observed = managed_core_liveness_at(&pid_file);
+        for _ in 0..100 {
+            if observed == CoreLiveness::Running(child.id()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            observed = managed_core_liveness_at(&pid_file);
+        }
+        assert_eq!(observed, CoreLiveness::Running(child.id()));
+
+        // A recycled pid belonging to a different binary is not a managed core.
+        let recycled = CorePidMetadata {
+            core_binary: PathBuf::from("/usr/local/lib/mihomo/other-core"),
+            ..metadata.clone()
+        };
+        std::fs::write(&pid_file, serde_json::to_vec(&recycled).unwrap()).unwrap();
+        assert_eq!(managed_core_liveness_at(&pid_file), CoreLiveness::Stopped);
+
+        // The recorded pid is dead: proven stopped.
+        let _ = child.kill();
+        let _ = child.wait();
+        std::fs::write(&pid_file, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        assert_eq!(managed_core_liveness_at(&pid_file), CoreLiveness::Stopped);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cache_db_gate_refuses_to_touch_a_running_core() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = write_daemon_cache_db_fixture(temp.path(), &vec![0u8; 16 * 1024]);
+
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn live core stand-in");
+        let mut state = DaemonState {
+            core_running: true,
+            core_child: Some(child),
+            pid_file: temp.path().join("core.pid"),
+            core_log_file: temp.path().join("core.log"),
+            ..DaemonState::default()
+        };
+
+        let error = cache_db_gate_for_start(&mut state, temp.path()).unwrap_err();
+        assert!(
+            error.contains("still running"),
+            "a Core that has not exited must block the stop-write window: {error}"
+        );
+        assert!(
+            path.exists(),
+            "no isolation may happen while the Core is alive"
+        );
+        assert!(quarantine_names(temp.path()).is_empty());
+
+        if let Some(mut child) = state.core_child.take() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod legacy_reset_admission_tests {
+    use super::*;
+
+    // ----------------: current-instance ownership ----------------
+
+    fn managed_launch_record(pid: u32) -> CorePidMetadata {
+        CorePidMetadata {
+            pid,
+            config_path: PathBuf::from("/var/lib/mihomo-cli/tun-config.yaml"),
+            core_binary: expected_system_core_binary_path(),
+            api_endpoint: Some(format!("unix://{}", expected_system_core_api_endpoint())),
+            config_revision: Some("launch-revision".to_string()),
+        }
+    }
+
+    fn state_with_launch_record(
+        pid_file: &std::path::Path,
+        record: &CorePidMetadata,
+    ) -> DaemonState {
+        DaemonState {
+            core_running: true,
+            core_pid: Some(record.pid),
+            core_binary: Some(record.core_binary.clone()),
+            api_endpoint: record.api_endpoint.clone(),
+            config_path: Some(record.config_path.clone()),
+            launched_config_revision: record.config_revision.clone(),
+            pid_file: pid_file.to_path_buf(),
+            core_log_file: pid_file.with_file_name("core.log"),
+            ..DaemonState::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn current_instance_ownership_accepts_a_live_child_with_matching_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn child stand-in");
+        let pid = child.id().expect("child pid");
+        let pid_file = temp.path().join("core.pid");
+        let record = managed_launch_record(pid);
+        write_pid_file(&pid_file, &record);
+        let mut state = state_with_launch_record(&pid_file, &record);
+        state.core_child = Some(child);
+        let state = Arc::new(Mutex::new(state));
+
+        assert_eq!(
+            prove_current_instance_ownership(&state).await.unwrap(),
+            CurrentInstanceRuntime::LiveChild(pid)
+        );
+
+        // A child whose pid no longer matches the recorded instance is refused.
+        {
+            let mut guard = state.lock().await;
+            guard.core_pid = Some(pid + 1);
+        }
+        assert!(prove_current_instance_ownership(&state).await.is_err());
+
+        let mut guard = state.lock().await;
+        if let Some(mut child) = guard.core_child.take() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn current_instance_ownership_refuses_a_missing_or_mismatched_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn child stand-in");
+        let pid = child.id().expect("child pid");
+        let pid_file = temp.path().join("core.pid");
+        let record = managed_launch_record(pid);
+
+        // No launch record at all.
+        let mut state = state_with_launch_record(&pid_file, &record);
+        state.core_child = Some(child);
+        let state = Arc::new(Mutex::new(state));
+        assert!(prove_current_instance_ownership(&state).await.is_err());
+
+        // Record pid does not match the live child.
+        let foreign = managed_launch_record(pid + 1);
+        write_pid_file(&pid_file, &foreign);
+        {
+            let mut guard = state.lock().await;
+            guard.core_pid = Some(pid);
+        }
+        assert!(prove_current_instance_ownership(&state).await.is_err());
+
+        // Untrusted binary / endpoint in the record is refused.
+        let mut untrusted = managed_launch_record(pid);
+        untrusted.core_binary = PathBuf::from("/tmp/foreign-core");
+        write_pid_file(&pid_file, &untrusted);
+        assert!(prove_current_instance_ownership(&state).await.is_err());
+
+        let mut untrusted_endpoint = managed_launch_record(pid);
+        untrusted_endpoint.api_endpoint = Some("unix:///tmp/foreign.sock".to_string());
+        write_pid_file(&pid_file, &untrusted_endpoint);
+        assert!(prove_current_instance_ownership(&state).await.is_err());
+
+        let mut guard = state.lock().await;
+        if let Some(mut child) = guard.core_child.take() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn current_instance_ownership_without_a_child_needs_a_proven_peer() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("core.pid");
+        let record = managed_launch_record(4242);
+        write_pid_file(&pid_file, &record);
+        let state = Arc::new(Mutex::new(state_with_launch_record(&pid_file, &record)));
+
+        // Nothing answers the recorded endpoint: the recorded runtime is stale and
+        // must not be treated as a proven peer.
+        let error = prove_current_instance_ownership(&state).await.unwrap_err();
+        assert!(
+            error.contains("no process answers") || error.contains("cannot prove"),
+            "{error}"
+        );
+
+        // Without any recorded pid the daemon cannot name the instance.
+        {
+            let mut guard = state.lock().await;
+            guard.core_pid = None;
+        }
+        assert!(prove_current_instance_ownership(&state).await.is_err());
+    }
+
+    #[test]
+    fn legacy_reset_gate_is_independent_of_the_admission_flag() {
+        // The new flag never widens the SPEC §12.4 matrix: a quiesce with the
+        // legacy admission requested is still gated outside its own phases.
+        let gate_journal = |phase| crate::tun_transaction::TunJournal {
+            schema_version: 1,
+            transaction_id: "txn-gate".to_string(),
+            generation: 5,
+            phase,
+            original_uid: 1000,
+            target_runtime_tun: false,
+            base_intent_revision: None,
+            candidate_revision: "cand".to_string(),
+            candidate_core_identity: None,
+            candidate_core_pid: None,
+            old_snapshot_revision: None,
+            old_runtime_digest: "digest".to_string(),
+            recovery_target_revision: None,
+            legacy_source: false,
+            legacy_transaction_id: None,
+            legacy_base_revision: None,
+            rollback_evidence_complete: true,
+            last_error: None,
+            outcome: None,
+            recovery_core_identity: None,
+            recovery_core_pid: None,
+            updated_at: None,
+        };
+        let gate_fence = |phase| crate::tun_transaction::TransactionFence {
+            transaction_id: "txn-gate".to_string(),
+            generation: 5,
+            expected_phase: phase,
+            expected_candidate_revision: "cand".to_string(),
+        };
+        assert!(!gate_admits(
+            &DaemonCommand::QuiesceCandidateRuntime {
+                fence: gate_fence(crate::tun_transaction::JournalPhase::Prepared),
+                allow_legacy_reset: true,
+                allow_restored_old_quiesce: false,
+                token: None,
+            },
+            Some(&gate_journal(
+                crate::tun_transaction::JournalPhase::Prepared
+            ))
+        ));
+        assert!(gate_admits(
+            &DaemonCommand::QuiesceCandidateRuntime {
+                fence: gate_fence(crate::tun_transaction::JournalPhase::RecoveryRequired),
+                allow_legacy_reset: true,
+                allow_restored_old_quiesce: false,
+                token: None,
+            },
+            Some(&gate_journal(
+                crate::tun_transaction::JournalPhase::RecoveryRequired
+            ))
+        ));
+    }
+
+    #[test]
+    fn autostart_is_blocked_by_any_non_terminal_transaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut ctx = daemon_transaction_context().expect("system instance context");
+        ctx.paths.config_dir = temp.path().join("config");
+        ctx.paths.intent_config_file = ctx.paths.config_dir.join("config.yaml");
+        ctx.paths.tun_config_file = temp.path().join("tun-config.yaml");
+        std::fs::create_dir_all(&ctx.paths.config_dir).unwrap();
+        std::fs::create_dir_all(crate::tun_transaction::active_dir(&ctx)).unwrap();
+
+        let journal = crate::tun_transaction::TunJournal {
+            schema_version: 1,
+            transaction_id: "autostart-gate".to_string(),
+            generation: 3,
+            phase: crate::tun_transaction::JournalPhase::RecoveryRequired,
+            original_uid: 1000,
+            target_runtime_tun: false,
+            base_intent_revision: None,
+            candidate_revision: "cand".to_string(),
+            candidate_core_identity: None,
+            candidate_core_pid: None,
+            old_snapshot_revision: None,
+            old_runtime_digest: "digest".to_string(),
+            recovery_target_revision: None,
+            legacy_source: true,
+            legacy_transaction_id: Some("legacy".to_string()),
+            legacy_base_revision: None,
+            rollback_evidence_complete: false,
+            last_error: None,
+            outcome: None,
+            recovery_core_identity: None,
+            recovery_core_pid: None,
+            updated_at: None,
+        };
+        crate::tun_transaction::write_active_journal(&ctx, &journal).unwrap();
+        assert!(autostart_transaction_blocker_for(&ctx).is_some());
+
+        let terminal = crate::tun_transaction::TunJournal {
+            phase: crate::tun_transaction::JournalPhase::IntentCommitted,
+            ..journal.clone()
+        };
+        crate::tun_transaction::write_active_journal(&ctx, &terminal).unwrap();
+        assert!(autostart_transaction_blocker_for(&ctx).is_none());
+
+        // An un-migrated legacy journal also owns the runtime.
+        std::fs::remove_file(crate::tun_transaction::active_journal_path(&ctx)).unwrap();
+        std::fs::write(crate::tun_transaction::legacy_journal_path(&ctx), b"{}").unwrap();
+        assert!(autostart_transaction_blocker_for(&ctx).is_some());
     }
 }

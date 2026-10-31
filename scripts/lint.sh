@@ -49,7 +49,7 @@ should_check_target() {
     local target="$1"
     local native
     native=$(rustc -vV | grep host | cut -d' ' -f2)
-    
+
     case "$SCOPE" in
         native)
             [ "$target" = "$native" ]
@@ -94,12 +94,12 @@ should_check_target() {
 # 判断 target 是否可编译（使用标准 cargo clippy --target）
 can_compile_target() {
     local target="$1"
-    
+
     # macOS targets 在 Linux 上需要 macOS SDK
     if $IS_LINUX && [[ "$target" == *"apple-darwin"* ]]; then
         return 1
     fi
-    
+
     # Linux ARM gnu 需要交叉编译器
     if [[ "$target" == "aarch64-unknown-linux-gnu" ]]; then
         if command -v aarch64-linux-gnu-gcc &>/dev/null; then
@@ -108,7 +108,7 @@ can_compile_target() {
             return 1
         fi
     fi
-    
+
     # musl targets：x86_64 需要 musl-gcc，或回退到 zig（wrapper 见 scripts/zig-musl-cc.sh，
     # 免 root 即可交叉编译 ring 的 C 代码）；aarch64 musl 暂无工具链。
     if [[ "$target" == *"musl"* ]]; then
@@ -118,7 +118,13 @@ can_compile_target() {
         fi
         return 1
     fi
-    
+
+    # wasm32-unknown-unknown: 本项目是带 tokio net 的 CLI，依赖树（getrandom/mio
+    # 无 js/net feature）在 wasm 目标下编不过，无构建目标，从 lint 中排除。
+    if [[ "$target" == "wasm32-"* ]]; then
+        return 1
+    fi
+
     # 其他 targets 应该可以编译
     return 0
 }
@@ -136,12 +142,12 @@ for target in $INSTALLED_TARGETS; do
     if ! should_check_target "$target"; then
         continue
     fi
-    
+
     if [ "$target" = "$NATIVE_TARGET" ]; then
         run_check "clippy ($target)" cargo clippy --all-targets -- -D warnings
         continue
     fi
-    
+
     # 检查是否能编译
     if ! can_compile_target "$target"; then
         if [ "$SCOPE" = "full" ]; then
@@ -153,7 +159,7 @@ for target in $INSTALLED_TARGETS; do
         fi
         continue
     fi
-    
+
     # musl 无 musl-gcc 时走 zig wrapper：cc-rs 会把 RUSTC_WRAPPER(sccache) 前缀到 C 编译器，
     # sccache 不识别 zig，故此处清空 RUSTC_WRAPPER（只影响本次 clippy 调用）。
     if [[ "$target" == "x86_64-unknown-linux-musl" ]] && ! command -v musl-gcc &>/dev/null; then
@@ -164,7 +170,7 @@ for target in $INSTALLED_TARGETS; do
                 cargo clippy --target "$target" --all-targets -- -D warnings
         continue
     fi
-    
+
     run_check "clippy ($target)" cargo clippy --target "$target" --all-targets -- -D warnings
 done
 

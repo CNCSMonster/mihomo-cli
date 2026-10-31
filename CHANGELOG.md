@@ -4,6 +4,25 @@
 
 ---
 
+## 2026-10-31
+
+### ✨ Features
+
+- **内置用户手册** — 新增 `mihomo-cli manual` 与 `doc` 别名，可按主题浏览安装、配置、订阅、节点、规则、DNS、TUN 与故障排查说明。
+- **代际升级与恢复** — 改进 system service 的代际升级、旧安装迁移、显式采纳与恢复诊断；无法证明的状态保持 unknown，不伪造成功。
+- **规则与内网诊断** — 新增规则容错降级、内网资产保护告警与 Split-DNS 识别，帮助发现危险拓扑。
+- **TUN 与配置** — 改进 TUN 快照合并、路由排除与配置重生成，减少自定义字段被旧快照覆盖的风险。
+
+### 🐛 Bug Fixes
+
+- 修复 Windows 用户模式启动、服务卸载与命名管道重试的若干可靠性问题。
+- 修复规则降级对复合规则的误改写，以及 TUN/DNS 诊断误判。
+- 修复 selection 清理与配置切换中的并发一致性问题。
+
+### 📚 Documentation
+
+- 用户手册按主题拆分并内嵌到二进制；公开文档仅保留 README、用户手册、CHANGELOG 与许可证。
+
 ## 2026-10-05
 
 ### 🐛 Bug Fixes
@@ -328,9 +347,7 @@ mihomo-cli install --system
 - **修复 controller 检查** — status verbose 只匹配 `external-controller-unix`，排除 TCP 模式误判
 
 ### 📚 Documentation
-- 建立 6 文档体系：README, USAGE, SPEC, ROADMAP, CONTEXT, CONTRIBUTING
-- SPEC 添加 ADR 节（6 条架构决策记录）
-- AGENTS.md / CLAUDE.md 作为 README 符号链接
+- 整理项目文档结构与说明入口。
 
 ---
 

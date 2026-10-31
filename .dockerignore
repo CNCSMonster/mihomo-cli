@@ -1,0 +1,12 @@
+**
+!Cargo.toml
+!Cargo.lock
+!build.rs
+!src/
+!src/**
+!target/
+!target/container-test/
+!target/container-test/**
+!tests/
+!tests/container/
+!tests/container/**

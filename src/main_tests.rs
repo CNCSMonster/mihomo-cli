@@ -29,7 +29,7 @@ mod cli_parse_tests {
         let paths = temp_paths_for("replay");
 
         // 1) 没有 active 订阅 → 只陈述事实
-        let out = translate_selection_replay_signal(msg, &paths);
+        let out = translate_selection_replay_signal(msg, None, &paths);
         assert!(
             out.contains("Selections not replayed: selection mirror unavailable"),
             "{out}"
@@ -38,26 +38,47 @@ mod cli_parse_tests {
 
         // 2) 有 active 订阅但没有持久化选点 → 整行删除（场景 B 的契约）
         config::set_active_id_at(&paths, "sub1").unwrap();
-        let out = translate_selection_replay_signal(msg, &paths);
+        let out = translate_selection_replay_signal(msg, Some("sub1"), &paths);
         assert!(out.trim().is_empty(), "必须删除该行: {out:?}");
 
-        // 3) 有持久化选点 + mirror 缺失 → 必须给出重建动作（真实的 mirror 丢失）
+        // 3) 有持久化选点 + mirror 缺失 → 必须给出逐条重建动作（真实的 mirror 丢失，
+        // A3' 补救矩阵：逐条 select 命令 + 目标存在性未验证声明）
         let sel_dir = paths.selections_dir();
         std::fs::create_dir_all(&sel_dir).unwrap();
         std::fs::write(
             paths.selection_state_path_for_subscription("sub1"),
-            "Test: DIRECT\n",
+            "selections:\n  Test: DIRECT\n",
         )
         .unwrap();
-        let out = translate_selection_replay_signal(msg, &paths);
+        let out = translate_selection_replay_signal(msg, Some("sub1"), &paths);
         assert!(
-            out.contains("run any selection command to rebuild it"),
-            "有持久化选点时必须要求重建: {out}"
+            out.contains("mihomo-cli select -g 'Test' --node='DIRECT'"),
+            "有持久化选点时必须逐条给出重建命令: {out}"
         );
+        assert!(
+            out.contains("If the target still exists"),
+            "镜像缺失时目标存在性未验证，必须声明: {out}"
+        );
+        assert!(
+            !out.contains("run any selection command"),
+            "笼统的重建提示已被 A3' 逐条矩阵取代: {out}"
+        );
+
+        // 3b) 持久化文件存在但解析不出选点 → 视同无意图，整行删除
+        std::fs::write(
+            paths.selection_state_path_for_subscription("sub1"),
+            "not: valid: selection: state\n",
+        )
+        .unwrap();
+        let out = translate_selection_replay_signal(msg, Some("sub1"), &paths);
+        assert!(out.trim().is_empty(), "解析失败不得误导: {out:?}");
 
         // 4) 非信号消息原样返回
         let plain = "system configuration promoted and runtime applied";
-        assert_eq!(translate_selection_replay_signal(plain, &paths), plain);
+        assert_eq!(
+            translate_selection_replay_signal(plain, None, &paths),
+            plain
+        );
 
         let _ = std::fs::remove_dir_all(paths.config_dir());
     }
@@ -595,7 +616,7 @@ eth0\t00000000\t01301FAC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n";
     #[test]
     fn doctor_owner_auth_output_is_diagnostic_and_never_contains_token_material() {
         let location = ipc::ClientTokenLocation {
-            token_path: std::path::PathBuf::from("/home/alice/.config/mihomo/service-token"),
+            token_path: std::path::PathBuf::from("/home/user/.config/mihomo/service-token"),
         };
         let check = format_doctor_owner_auth_check(
             instance::TargetOs::Linux,
@@ -609,7 +630,7 @@ eth0\t00000000\t01301FAC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n";
         assert!(check.detail.contains("token_file_readable=true"));
         assert!(check
             .detail
-            .contains("credential_path=/home/alice/.config/mihomo/service-token"));
+            .contains("credential_path=/home/user/.config/mihomo/service-token"));
         assert!(check
             .hint
             .as_deref()
@@ -640,7 +661,7 @@ eth0\t00000000\t01301FAC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n";
     #[test]
     fn format_doctor_owner_auth_check_covers_all_variants() {
         let location = ipc::ClientTokenLocation {
-            token_path: std::path::PathBuf::from("/home/alice/.config/mihomo/service-token"),
+            token_path: std::path::PathBuf::from("/home/user/.config/mihomo/service-token"),
         };
 
         // Authorized
@@ -879,7 +900,9 @@ eth0\t00000000\t01301FAC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n";
             .get_subcommands()
             .filter(|cmd| !cmd.is_hide_set())
             .map(|cmd| cmd.get_name().to_string())
-            .filter(|name| name != "help" && name != "dashboard" && name != "use")
+            .filter(|name| {
+                name != "help" && name != "dashboard" && name != "use" && name != "manual"
+            })
             .collect();
 
         for name in subcommands {
@@ -985,8 +1008,8 @@ eth0\t00000000\t01301FAC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n";
 RuntimeDirectory=mihomo"#;
         assert!(service_definition_user_home_references(
             v2,
-            "/home/kuku/.config/mihomo",
-            "/home/kuku",
+            "/home/user/.config/mihomo",
+            "/home/user",
         )
         .is_empty());
     }
@@ -1015,7 +1038,7 @@ RuntimeDirectory=mihomo"#;
             std::path::Path::new("/Users/kuku/.config/mihomo/start.sh")
         ));
         assert!(is_legacy_user_home_service_executable_ref(
-            std::path::Path::new("/home/kuku/.local/bin/mihomo")
+            std::path::Path::new("/home/user/.local/bin/mihomo")
         ));
         assert!(!is_legacy_user_home_service_executable_ref(
             std::path::Path::new("/Users/kuku/.config/mihomo")
@@ -1453,7 +1476,7 @@ RuntimeDirectory=mihomo"#;
         assert_eq!(err.kind(), clap::error::ErrorKind::WrongNumberOfValues);
     }
 
-    /// Issue #013: `config validate` must parse as a subcommand equivalent to
+    /// `config validate` must parse as a subcommand equivalent to
     /// `config --validate`.
     #[test]
     fn config_validate_subcommand_parses() {
@@ -2412,7 +2435,7 @@ vmess://example"
                 true,
                 true,
                 "/usr/local/bin/mihomo",
-                "/home/me/.config/mihomo"
+                "/home/user/.config/mihomo"
             ),
             vec![
                 "=== mihomo-cli uninstall ===".to_string(),
@@ -2421,7 +2444,7 @@ vmess://example"
                 "  - Stop running mihomo process".to_string(),
                 "  - Remove auto-start service".to_string(),
                 "  - Delete mihomo binary (/usr/local/bin/mihomo)".to_string(),
-                "  - Delete config dir (/home/me/.config/mihomo)".to_string(),
+                "  - Delete config dir (/home/user/.config/mihomo)".to_string(),
                 String::new(),
             ]
         );
@@ -2519,6 +2542,8 @@ vmess://example"
                 updated,
                 user_agent: None,
                 user_agent_mode: None,
+                retired: false,
+                retired_at: None,
             },
             config::SubscriptionMeta {
                 id: "sub-b".to_string(),
@@ -2526,6 +2551,8 @@ vmess://example"
                 updated,
                 user_agent: None,
                 user_agent_mode: None,
+                retired: false,
+                retired_at: None,
             },
         ];
         let menu_items = format_tui_subscription_menu_items(&subs, Some("sub-b"));
@@ -3026,6 +3053,8 @@ vmess://example"
                 updated,
                 user_agent: None,
                 user_agent_mode: None,
+                retired: false,
+                retired_at: None,
             },
             config::SubscriptionMeta {
                 id: "sub-b".to_string(),
@@ -3034,6 +3063,8 @@ vmess://example"
                 updated,
                 user_agent: None,
                 user_agent_mode: None,
+                retired: false,
+                retired_at: None,
             },
         ];
 
@@ -3076,6 +3107,8 @@ vmess://example"
             updated,
             user_agent: Some("clash-verge/v2.0.4".to_string()),
             user_agent_mode: Some(config::UserAgentMode::Fixed),
+            retired: false,
+            retired_at: None,
         };
 
         assert_eq!(
@@ -3785,7 +3818,10 @@ vmess://example"
             intent_config_exists: true,
             core_binary_exists: true,
         };
-        assert_eq!(status_health_label(&snapshot), "degraded");
+        assert_eq!(
+            status_health_label(&snapshot, service::ServiceRuntimeState::Running),
+            "degraded"
+        );
     }
 
     #[test]
@@ -3812,10 +3848,13 @@ vmess://example"
             intent_config_exists: false,
             core_binary_exists: true,
         };
-        assert_eq!(status_health_label(&snapshot), "ready");
+        assert_eq!(
+            status_health_label(&snapshot, service::ServiceRuntimeState::Running),
+            "ready"
+        );
         assert_eq!(status_core_label(&snapshot), "stopped");
         assert_eq!(status_api_label(&snapshot), "not configured");
-        assert_eq!(text_tun_status_label(&snapshot), "unknown");
+        assert_eq!(status_tun_label(&snapshot), "unknown");
         assert_eq!(status_configuration_label(&snapshot), "not configured");
     }
 
@@ -3843,14 +3882,20 @@ vmess://example"
             intent_config_exists: false,
             core_binary_exists: false,
         };
-        assert_eq!(status_health_label(&snapshot), "unknown");
+        assert_eq!(
+            status_health_label(&snapshot, service::ServiceRuntimeState::Running),
+            "unknown"
+        );
         assert_eq!(status_core_label(&snapshot), "unknown");
         assert_eq!(status_api_label(&snapshot), "unknown");
         assert_eq!(status_configuration_label(&snapshot), "unknown");
 
         snapshot.daemon_reachable = status::TriState::True;
         snapshot.intent_config_exists = true;
-        assert_eq!(status_health_label(&snapshot), "unknown");
+        assert_eq!(
+            status_health_label(&snapshot, service::ServiceRuntimeState::Running),
+            "unknown"
+        );
         assert_eq!(status_core_label(&snapshot), "unknown");
         assert_eq!(status_api_label(&snapshot), "unknown");
     }
@@ -3879,16 +3924,52 @@ vmess://example"
             intent_config_exists: true,
             core_binary_exists: true,
         };
-        assert_eq!(text_tun_status_label(&snapshot), "unknown");
+        assert_eq!(status_tun_label(&snapshot), "unknown");
 
         let mut uncertain = snapshot.clone();
         uncertain.configured_tun = status::TriState::True;
-        assert_eq!(text_tun_status_label(&uncertain), "unknown");
+        assert_eq!(status_tun_label(&uncertain), "unknown");
 
         let mut runtime = snapshot;
         runtime.runtime_tun = status::TriState::False;
         runtime.tun_verdict = status::TunVerdict::TunDisabled;
-        assert_eq!(text_tun_status_label(&runtime), "disabled");
+        assert_eq!(status_tun_label(&runtime), "disabled");
+    }
+
+    /// （P2-3）：dashboard 的 TUN 行与 `status` 共用 attested 判定；
+    /// 原始 runtime 观察为 true 但未 attested 时不得渲染成绿色。
+    #[test]
+    fn dashboard_tun_line_never_greens_unattested_tun() {
+        let mut snapshot = status::StatusSnapshot {
+            daemon_reachable: status::TriState::True,
+            configured_tun: status::TriState::True,
+            runtime_tun: status::TriState::True,
+            core_running: status::TriState::True,
+            api_reachable: true,
+            rule_mode: "rule".to_string(),
+            core_pid: Some(42),
+            active_config_path: None,
+            launched_snapshot_revision: Some("old".to_string()),
+            active_snapshot_revision: Some("new".to_string()),
+            active_intent_revision: Some("intent".to_string()),
+            configuration_verdict: status::ConfigurationVerdict::Unknown,
+            journal_state: status::JournalState::Unknown,
+            journal_error: None,
+            runtime_attested: false,
+            tun_verdict: status::TunVerdict::TunRunningUnattested,
+            system_proxy: crate::system_proxy::SystemProxyState::Unknown,
+            shell_proxy: crate::system_proxy::ShellProxyState::Unknown,
+            intent_config_exists: true,
+            core_binary_exists: true,
+        };
+        assert_eq!(dashboard_tun_label(&snapshot), "unknown");
+        snapshot.tun_verdict = status::TunVerdict::TunStateUnknown;
+        assert_eq!(dashboard_tun_label(&snapshot), "unknown");
+
+        snapshot.tun_verdict = status::TunVerdict::TunRunning;
+        assert_eq!(dashboard_tun_label(&snapshot), "✅ enabled");
+        snapshot.tun_verdict = status::TunVerdict::TunDisabled;
+        assert_eq!(dashboard_tun_label(&snapshot), "❌ disabled");
     }
 
     #[test]
@@ -3909,14 +3990,14 @@ vmess://example"
             rule_mode: "unknown".to_string(),
             core_pid: Some(4242),
             active_config_path: Some(active.clone()),
-            launched_snapshot_revision: None,
-            active_snapshot_revision: None,
-            active_intent_revision: None,
+            launched_snapshot_revision: Some("r1".to_string()),
+            active_snapshot_revision: Some("r1".to_string()),
+            active_intent_revision: Some("r1".to_string()),
             configuration_verdict: status::ConfigurationVerdict::Applied,
-            journal_state: status::JournalState::Unknown,
+            journal_state: status::JournalState::IntentCommitted,
             journal_error: None,
-            runtime_attested: false,
-            tun_verdict: status::TunVerdict::TunStateUnknown,
+            runtime_attested: true,
+            tun_verdict: status::TunVerdict::TunRunning,
             system_proxy: crate::system_proxy::SystemProxyState::Unsupported,
             shell_proxy: crate::system_proxy::ShellProxyState::Unknown,
             intent_config_exists: true,
@@ -3930,6 +4011,7 @@ vmess://example"
             &snapshot,
             // 运行时诊断不覆盖字段断言：Running 时不套用四态 overlay
             service::ServiceRuntimeState::Running,
+            &ctx,
         );
 
         assert_eq!(data["core"]["running"], true);
@@ -3940,6 +4022,12 @@ vmess://example"
         );
         assert_eq!(data["core"]["tun"], true);
         assert_eq!(data["tun"], "enabled");
+        assert_eq!(data["health"], "healthy");
+        assert_eq!(
+            data["health"],
+            status_health_label(&snapshot, service::ServiceRuntimeState::Running)
+        );
+        assert_eq!(data["tun"], status_tun_label(&snapshot));
         assert_eq!(data["configuration"], "applied");
         assert_eq!(status_configuration_label(&snapshot), "applied");
         assert_eq!(data["system_proxy"], "unsupported");
@@ -3974,7 +4062,7 @@ vmess://example"
             journal_state: status::JournalState::Unknown,
             journal_error: None,
             runtime_attested: false,
-            tun_verdict: status::TunVerdict::TunStateUnknown,
+            tun_verdict: status::TunVerdict::TunDisabled,
             system_proxy: crate::system_proxy::SystemProxyState::Disabled,
             shell_proxy: crate::system_proxy::ShellProxyState::NotConfigured,
             intent_config_exists: true,
@@ -3988,17 +4076,259 @@ vmess://example"
             &snapshot,
             // 运行时诊断不覆盖字段断言：Running 时不套用四态 overlay
             service::ServiceRuntimeState::Running,
+            &ctx,
         );
 
         assert_eq!(data["core"]["running"], serde_json::Value::Null);
         assert_eq!(data["core"]["tun"], false);
         assert_eq!(data["tun"], "disabled");
+        assert_eq!(data["tun"], status_tun_label(&snapshot));
         assert_eq!(data["system_proxy"], "disabled");
         assert_eq!(data["shell_proxy"], "not configured");
         assert_eq!(data["configured_tun"], "false");
         assert_eq!(data["daemon"]["running"], serde_json::Value::Null);
         assert_eq!(data["config"]["exists"], true);
         assert_eq!(data["binary"]["exists"], true);
+    }
+
+    /// / SPEC §0.6: `status --json` 顶层 `health`/`tun` 必须是文本摘要的
+    /// 机器可读等价物。每一个让 `runtime_tun == enabled` 处于 unattested 的形态都必须
+    /// 让两侧同时降级，原始观察只保留在 `core.tun`。
+    #[test]
+    fn status_json_health_and_tun_match_text_for_every_unattested_variant() {
+        struct UnattestedShape {
+            label: &'static str,
+            launched: Option<&'static str>,
+            active: Option<&'static str>,
+            intent: Option<&'static str>,
+            journal: status::JournalState,
+            runtime_attested: bool,
+        }
+        let variants = [
+            UnattestedShape {
+                label: "revision missing",
+                launched: Some("r1"),
+                active: Some("r1"),
+                intent: None,
+                journal: status::JournalState::IntentCommitted,
+                runtime_attested: true,
+            },
+            UnattestedShape {
+                label: "revision mismatch",
+                launched: Some("launched"),
+                active: Some("active"),
+                intent: Some("active"),
+                journal: status::JournalState::IntentCommitted,
+                runtime_attested: false,
+            },
+            UnattestedShape {
+                label: "journal not committed",
+                launched: Some("r1"),
+                active: Some("r1"),
+                intent: Some("r1"),
+                journal: status::JournalState::Prepared,
+                runtime_attested: true,
+            },
+        ];
+        let ctx = instance::InstanceContext::planned(
+            instance::TargetOs::Linux,
+            instance::InstanceMode::System,
+            &instance::PathInputs::for_tests(),
+        );
+        let plan = instance::planned_status_diagnostics(&ctx);
+
+        for shape in variants {
+            let UnattestedShape {
+                label,
+                launched,
+                active,
+                intent,
+                journal,
+                runtime_attested,
+            } = shape;
+            let verdict = status::tun_verdict(
+                status::TriState::True,
+                launched,
+                active,
+                intent,
+                journal,
+                runtime_attested,
+            );
+            assert_eq!(
+                verdict,
+                status::TunVerdict::TunRunningUnattested,
+                "{label}: fixture must be unattested"
+            );
+            let snapshot = status::StatusSnapshot {
+                daemon_reachable: status::TriState::True,
+                configured_tun: status::TriState::True,
+                runtime_tun: status::TriState::True,
+                core_running: status::TriState::True,
+                api_reachable: true,
+                rule_mode: "rule".to_string(),
+                core_pid: Some(4242),
+                active_config_path: None,
+                launched_snapshot_revision: launched.map(str::to_string),
+                active_snapshot_revision: active.map(str::to_string),
+                active_intent_revision: intent.map(str::to_string),
+                configuration_verdict: status::ConfigurationVerdict::Unknown,
+                journal_state: journal,
+                journal_error: None,
+                runtime_attested,
+                tun_verdict: verdict,
+                system_proxy: crate::system_proxy::SystemProxyState::Disabled,
+                shell_proxy: crate::system_proxy::ShellProxyState::NotConfigured,
+                intent_config_exists: true,
+                core_binary_exists: true,
+            };
+
+            let data = status_json_data(
+                &plan,
+                instance::ResolutionSource::ExplicitFlag,
+                &ctx.paths.intent_config_file,
+                &snapshot,
+                service::ServiceRuntimeState::Running,
+                &ctx,
+            );
+            let text_health = status_health_label(&snapshot, service::ServiceRuntimeState::Running);
+            let text_tun = status_tun_label(&snapshot);
+
+            assert_eq!(data["health"], text_health, "{label}: JSON != text health");
+            assert_eq!(data["tun"], text_tun, "{label}: JSON != text tun");
+            assert_ne!(
+                text_health, "healthy",
+                "{label}: unattested must not be healthy"
+            );
+            assert_ne!(
+                text_tun, "enabled",
+                "{label}: unattested must not be enabled"
+            );
+            assert_eq!(data["tun"], "unknown", "{label}");
+            assert_eq!(
+                data["core"]["tun"], true,
+                "{label}: raw runtime observation must survive in core.tun"
+            );
+            assert_eq!(data["configuration"], "unknown", "{label}");
+            assert_ne!(
+                (data["health"].as_str(), data["configuration"].as_str()),
+                (Some("healthy"), Some("unknown")),
+                "{label}: response must not claim healthy while configuration is unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn status_json_reports_healthy_and_enabled_only_when_tun_is_fully_attested() {
+        let verdict = status::tun_verdict(
+            status::TriState::True,
+            Some("r1"),
+            Some("r1"),
+            Some("r1"),
+            status::JournalState::IntentCommitted,
+            true,
+        );
+        assert_eq!(verdict, status::TunVerdict::TunRunning);
+        let ctx = instance::InstanceContext::planned(
+            instance::TargetOs::Linux,
+            instance::InstanceMode::System,
+            &instance::PathInputs::for_tests(),
+        );
+        let plan = instance::planned_status_diagnostics(&ctx);
+        let snapshot = status::StatusSnapshot {
+            daemon_reachable: status::TriState::True,
+            configured_tun: status::TriState::True,
+            runtime_tun: status::TriState::True,
+            core_running: status::TriState::True,
+            api_reachable: true,
+            rule_mode: "rule".to_string(),
+            core_pid: Some(4242),
+            active_config_path: None,
+            launched_snapshot_revision: Some("r1".to_string()),
+            active_snapshot_revision: Some("r1".to_string()),
+            active_intent_revision: Some("r1".to_string()),
+            configuration_verdict: status::ConfigurationVerdict::Applied,
+            journal_state: status::JournalState::IntentCommitted,
+            journal_error: None,
+            runtime_attested: true,
+            tun_verdict: verdict,
+            system_proxy: crate::system_proxy::SystemProxyState::Disabled,
+            shell_proxy: crate::system_proxy::ShellProxyState::NotConfigured,
+            intent_config_exists: true,
+            core_binary_exists: true,
+        };
+
+        let data = status_json_data(
+            &plan,
+            instance::ResolutionSource::ExplicitFlag,
+            &ctx.paths.intent_config_file,
+            &snapshot,
+            service::ServiceRuntimeState::Running,
+            &ctx,
+        );
+
+        assert_eq!(
+            data["health"],
+            status_health_label(&snapshot, service::ServiceRuntimeState::Running)
+        );
+        assert_eq!(data["health"], "healthy");
+        assert_eq!(data["tun"], status_tun_label(&snapshot));
+        assert_eq!(data["tun"], "enabled");
+        assert_eq!(data["core"]["tun"], true);
+        assert_eq!(data["configuration"], "applied");
+    }
+
+    #[test]
+    fn status_json_selections_field_present_with_local_derive_source() {
+        // SPEC §3.8.1: status JSON must carry `selections` with `subscription_id`
+        // and `source: local-derive`. No network, no runtime attestation.
+        let ctx = instance::InstanceContext::planned(
+            instance::TargetOs::Linux,
+            instance::InstanceMode::User,
+            &instance::PathInputs::for_tests(),
+        );
+        let plan = instance::planned_status_diagnostics(&ctx);
+        let snapshot = status::StatusSnapshot {
+            daemon_reachable: status::TriState::Unknown,
+            configured_tun: status::TriState::False,
+            runtime_tun: status::TriState::False,
+            core_running: status::TriState::Unknown,
+            api_reachable: false,
+            rule_mode: "rule".to_string(),
+            core_pid: None,
+            active_config_path: None,
+            launched_snapshot_revision: None,
+            active_snapshot_revision: None,
+            active_intent_revision: None,
+            configuration_verdict: status::ConfigurationVerdict::Unknown,
+            journal_state: status::JournalState::Unknown,
+            journal_error: None,
+            runtime_attested: false,
+            tun_verdict: status::TunVerdict::TunStateUnknown,
+            system_proxy: crate::system_proxy::SystemProxyState::Disabled,
+            shell_proxy: crate::system_proxy::ShellProxyState::NotConfigured,
+            intent_config_exists: true,
+            core_binary_exists: true,
+        };
+
+        let data = status_json_data(
+            &plan,
+            instance::ResolutionSource::ExplicitFlag,
+            &ctx.paths.intent_config_file,
+            &snapshot,
+            service::ServiceRuntimeState::Running,
+            &ctx,
+        );
+
+        // `selections` field must be present with `source: local-derive`.
+        assert!(
+            data.get("selections").is_some(),
+            "status JSON must carry `selections` field"
+        );
+        assert_eq!(data["selections"]["source"], "local-derive");
+        // `subscription_id` is present (may be null if no active subscription).
+        assert!(data["selections"].get("subscription_id").is_some());
+        // `count` is present.
+        assert!(data["selections"].get("count").is_some());
     }
 
     #[test]
@@ -4682,6 +5012,7 @@ mod g5_resolution_source_tests {
         assert!(utils::file_contents_equal(&cli_file, &same_file));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_prepare_and_apply_pending_generation_flow() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -4705,15 +5036,18 @@ mod g5_resolution_source_tests {
         ctx.paths.tun_config_file = temp.path().join("system-data/tun-config.yaml");
         ctx.paths.cli_binary = temp.path().join("bin/mihomo-cli");
         ctx.paths.core_binary = temp.path().join("bin/mihomo");
+        ctx.paths.generation_store_root = temp.path().join("system-data/generations");
 
         std::fs::create_dir_all(ctx.paths.cli_binary.parent().unwrap()).unwrap();
         std::fs::write(&ctx.paths.cli_binary, b"old-daemon").unwrap();
         std::fs::write(&ctx.paths.core_binary, b"old-core").unwrap();
 
-        let new_core = b"new-core-v2";
-        let new_cli = b"new-daemon-v2";
+        let new_core = b"new-core-v2".to_vec();
+        // P1 compares the pending daemon against the running executable, so the
+        // staged daemon must be the CLI that stages it.
+        let new_cli = std::fs::read(std::env::current_exe().unwrap()).unwrap();
 
-        let gen_id = prepare_system_generation(&ctx, new_core, new_cli, Vec::new()).unwrap();
+        let gen_id = prepare_system_generation(&ctx, &new_core, &new_cli, Vec::new()).unwrap();
         let store = system_generation_store(&ctx);
         let state = store.read_state().unwrap();
         assert_eq!(state.pending, Some(gen_id.clone()));
@@ -4727,23 +5061,67 @@ mod g5_resolution_source_tests {
         let manifest = store.validate_generation(&gen_id).unwrap();
         assert_eq!(manifest.generation_id, gen_id);
 
+        // SPEC A/P2: staging captured a baseline and bound it to the pending
+        // manifest; state.previous is that baseline (the rollback target).
+        let baseline_id = generation::GenerationId::new(
+            manifest
+                .metadata
+                .get("baseline")
+                .expect("pending manifest must record its baseline binding"),
+        )
+        .unwrap();
+        assert_eq!(
+            store.read_state().unwrap().previous,
+            Some(baseline_id.clone())
+        );
+        assert_eq!(
+            store.read_manifest(&baseline_id).unwrap().daemon.sha256,
+            generation::calculate_sha256_bytes(b"old-daemon")
+        );
+
         // Doctor detects pending generation
         let state = store.read_state().unwrap();
         assert!(state.pending.is_some());
 
-        // Commit active generation
-        let committed_state = commit_system_generation_active(&ctx, &store).unwrap();
+        // SPEC C-9: drive the REAL pipeline (child + fake daemon) instead of
+        // committing the slots by hand — the fake-apply shortcut is gone.
+        let output = super::gen036_pipeline_tests::run_pipeline_child_in(temp.path(), "happy");
+        assert!(
+            output.status.success(),
+            "real pipeline failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let committed_state = store.read_state().unwrap();
         assert_eq!(committed_state.active, Some(gen_id.clone()));
         assert_eq!(committed_state.pending, None);
+        assert_eq!(committed_state.previous, Some(baseline_id.clone()));
 
-        // Prepare another generation to test previous & cleanup
+        // Installed files now equal the active generation (the pipeline applied
+        // them), so restaging is admitted.
         let gen_id_2 = prepare_system_generation(&ctx, b"core-v3", b"cli-v3", Vec::new()).unwrap();
-        let committed_state_2 = commit_system_generation_active(&ctx, &store).unwrap();
-        assert_eq!(committed_state_2.active, Some(gen_id_2.clone()));
-        assert_eq!(committed_state_2.previous, Some(gen_id.clone()));
+        let baseline_2 = generation::GenerationId::new(
+            store
+                .read_manifest(&gen_id_2)
+                .unwrap()
+                .metadata
+                .get("baseline")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(baseline_2, baseline_id);
+        // The second staging bound its own baseline; the slots stay untouched
+        // until a pipeline run applies it.
+        assert_eq!(store.read_state().unwrap().pending, Some(gen_id_2.clone()));
+        assert_eq!(
+            store.read_state().unwrap().previous,
+            Some(baseline_2.clone())
+        );
 
         // Cleanup retains active and previous
-        let removed = cleanup_system_generation_old(&ctx, &store, 2).unwrap();
+        let lock = store.acquire_lock().unwrap();
+        let removed = cleanup_system_generation_old(&ctx, &store, &lock, 2).unwrap();
+        drop(lock);
         assert_eq!(removed.len(), 0);
     }
 
@@ -4775,6 +5153,7 @@ mod g5_resolution_source_tests {
             tun_transaction::RecoveryDirection::Resume,
             false,
             false,
+            false,
         )
         .await;
         assert!(res.is_ok());
@@ -4801,6 +5180,7 @@ mod g5_resolution_source_tests {
         ctx.paths.config_dir = temp.path().join("user-config");
         ctx.paths.intent_config_file = ctx.paths.config_dir.join("config.yaml");
         ctx.paths.tun_config_file = temp.path().join("system-data/tun-config.yaml");
+        ctx.paths.generation_store_root = temp.path().join("system-data/generations");
         ctx.permissions = instance::PermissionModel::DirectUser;
 
         // Base intent
@@ -4870,6 +5250,7 @@ tun:
             &journal,
             snap_cls.clone(),
             intent_cls.clone(),
+            tun_transaction::classify_old_runtime_evidence(&ctx, &journal),
             &obs,
             tun_transaction::RecoveryDirection::Resume,
         );
@@ -4883,6 +5264,7 @@ tun:
             &journal,
             snap_cls,
             intent_cls,
+            tun_transaction::classify_old_runtime_evidence(&ctx, &journal),
             &obs,
             tun_transaction::RecoveryDirection::Abort,
         );
@@ -4915,6 +5297,7 @@ tun:
         ctx.paths.tun_config_file = temp.path().join("system-data/tun-config.yaml");
         ctx.paths.cli_binary = temp.path().join("bin/mihomo-cli");
         ctx.paths.core_binary = temp.path().join("bin/mihomo");
+        ctx.paths.generation_store_root = temp.path().join("system-data/generations");
 
         std::fs::create_dir_all(ctx.paths.cli_binary.parent().unwrap()).unwrap();
         std::fs::create_dir_all(ctx.paths.tun_config_file.parent().unwrap()).unwrap();
@@ -4948,6 +5331,15 @@ tun:
         // 3. 当存在 skew 且没有 pending 时，成功创建 pending generation 并包含当前 CLI 内容
         let mut state_to_clear = store.read_state().unwrap();
         state_to_clear.pending = None;
+        store.write_state(&state_to_clear).unwrap();
+
+        // previous-only is explicit recovery, not an invitation to
+        // automatically re-certify the current installation.
+        assert!(maybe_prepare_cli_skew_generation(&ctx)
+            .unwrap_err()
+            .to_string()
+            .contains("显式"));
+        state_to_clear.active = state_to_clear.previous.take();
         store.write_state(&state_to_clear).unwrap();
 
         let prepared = maybe_prepare_cli_skew_generation(&ctx).unwrap();
@@ -5122,12 +5514,14 @@ mod r1_r2_testfirst_tests {
         println!("R1 suspects  (line list, to unlock site-by-site): {suspects:?}");
 
         // R1.1 complete: drop-aware scanner + function-boundary window.
-        // 27 acquire sites (22 original + 4 re-acquire around network awaits
-        // in cmd_config add/refresh/refresh-all/legacy-url + 1 short lock in
-        // update_group_overlay); 0 suspects — no ConfigLock held across await.
+        // 21 acquire sites after P1-1: the TUN base/candidate capture
+        // moved out of its own ConfigLock hold (main.rs) into the publish
+        // critical section of `prepare_and_publish_active_transaction_capturing_intent`
+        // (CoordinatorLock -> ConfigLock), so no config-lock site was added and
+        // the "no ConfigLock held across await" invariant stays intact; 0 suspects.
         assert_eq!(
             acquires.len(),
-            27,
+            21,
             "R1.1 acquire snapshot; update only when intentionally changing lock sites"
         );
         assert_eq!(
@@ -5142,6 +5536,14 @@ mod r1_r2_testfirst_tests {
 
     impl MihomoApiClient for ReloadFailingClient {
         async fn get(&self, _path: &str) -> anyhow::Result<serde_json::Value> {
+            anyhow::bail!("not used in this test")
+        }
+
+        async fn get_bounded(
+            &self,
+            _path: &str,
+            _byte_limit: usize,
+        ) -> anyhow::Result<serde_json::Value> {
             anyhow::bail!("not used in this test")
         }
 
@@ -5953,5 +6355,5040 @@ mod r3_runtime_writer_gate_tests {
                 .any(|d| d.path == home.join(".local/bin")),
             "cli_binary parent directory must be planned for creation"
         );
+    }
+}
+
+#[cfg(test)]
+mod selection_resilience_wave1_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // ── A3': outcome remediation matrix ──
+
+    #[test]
+    fn shell_single_quote_escapes_spaces_and_quotes() {
+        assert_eq!(crate::selection::shell_single_quote("plain"), "'plain'");
+        assert_eq!(
+            crate::selection::shell_single_quote("has space"),
+            "'has space'"
+        );
+        assert_eq!(crate::selection::shell_single_quote("it's"), "'it'\\''s'");
+        assert_eq!(
+            crate::selection::shell_single_quote("'quoted'"),
+            "''\\''quoted'\\'''"
+        );
+        assert_eq!(crate::selection::shell_single_quote(""), "''");
+    }
+
+    #[test]
+    fn select_fix_command_quotes_both_arguments() {
+        assert_eq!(
+            crate::selection::select_fix_command("自动 选择", "HK 01's"),
+            "mihomo-cli select -g '自动 选择' --node='HK 01'\\''s'"
+        );
+    }
+
+    #[test]
+    fn remedy_matrix_applied_is_quiet() {
+        let lines = crate::selection::selection_remedy_lines(
+            &selection::ReplayOutcome::Applied,
+            "Proxy",
+            None,
+            None,
+        );
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    #[test]
+    fn remedy_matrix_node_missing_lists_members_and_commands() {
+        let members = vec!["HK-01".to_string(), "SG 02".to_string()];
+        let lines = crate::selection::selection_remedy_lines(
+            &selection::ReplayOutcome::SkippedNodeMissing {
+                current: None,
+                members: Vec::new(),
+            },
+            "自动 选择",
+            Some(&members),
+            None,
+        );
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("Current members of 自动 选择: HK-01, SG 02"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("mihomo-cli select -g '自动 选择'  (interactive terminal only)"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("mihomo-cli select -g '自动 选择' --node='HK-01'"),
+            "{joined}"
+        );
+
+        // Unknown members: no member list, no fabricated non-interactive command.
+        let lines = crate::selection::selection_remedy_lines(
+            &selection::ReplayOutcome::SkippedNodeMissing {
+                current: None,
+                members: Vec::new(),
+            },
+            "自动选择",
+            None,
+            None,
+        );
+        let joined = lines.join("\n");
+        assert!(!joined.contains("Current members"), "{joined}");
+        assert!(!joined.contains("--node"), "{joined}");
+        assert!(joined.contains("Pick interactively"), "{joined}");
+    }
+
+    #[test]
+    fn remedy_matrix_group_missing_lists_current_groups_only() {
+        let groups = vec!["A组".to_string(), "B组".to_string()];
+        let lines = crate::selection::selection_remedy_lines(
+            &selection::ReplayOutcome::SkippedGroupMissing,
+            "已删除组",
+            None,
+            Some(&groups),
+        );
+        let joined = lines.join("\n");
+        assert!(joined.contains("Current groups: A组, B组"), "{joined}");
+        assert!(
+            joined.contains("mihomo-cli select  (interactive terminal only)"),
+            "{joined}"
+        );
+        // The vanished group must never appear in a fix command (it would
+        // fail-fast; the old group command is not a remedy).
+        assert!(!joined.contains("已删除组"), "{joined}");
+    }
+
+    #[test]
+    fn remedy_matrix_failed_and_budget_keep_intent_with_retry() {
+        let lines = crate::selection::selection_remedy_lines(
+            &selection::ReplayOutcome::Failed {
+                error: "connection refused".to_string(),
+            },
+            "Proxy",
+            None,
+            None,
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("Intent kept; apply failed: connection refused"),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("mihomo-cli select --replay"), "{lines:?}");
+
+        let lines = crate::selection::selection_remedy_lines(
+            &selection::ReplayOutcome::BudgetExceeded,
+            "Proxy",
+            None,
+            None,
+        );
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].contains("replay time budget exceeded"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].contains("mihomo-cli restart --system"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn remedy_matrix_group_missing_budget_exhausted_shows_retry_guidance() {
+        // (b′) 共享 deadline 超尽：groups=None 表示 /proxies 查询未在 budget 内返回，
+        // 不猜测成员，给显式重试指引。
+        let lines = crate::selection::selection_remedy_lines(
+            &selection::ReplayOutcome::SkippedGroupMissing,
+            "vanished-group",
+            None,
+            None, // groups=None: budget exhausted or the query failed
+        );
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("Group list unavailable (budget exhausted or query failed)"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("mihomo-cli select --replay or mihomo-cli restart --system"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("mihomo-cli select  (interactive terminal only)"),
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn signal_injection_sanitized_and_no_false_control_lines() {
+        // (b′) 伪信号名/换行注入被消毒：节点名包含信号标记或控制字符时，
+        // sanitize_for_display 过滤控制字符，不产生伪控制行。
+        let malicious_node = "[selection-mirror-missing]\r\nfake-control-line";
+        let cmd = crate::selection::select_fix_command("group", malicious_node);
+        // 控制字符被过滤，信号标记落在引号内成为普通文本
+        assert!(
+            cmd.contains("'[selection-mirror-missing]fake-control-line'"),
+            "{cmd}"
+        );
+        assert!(!cmd.contains('\r'), "{cmd}");
+        assert!(!cmd.contains('\n'), "{cmd}");
+
+        // 组名包含信号标记时同样被消毒
+        let malicious_group = "[selection-identity-mismatch]\tescaped";
+        let cmd = crate::selection::select_fix_command(malicious_group, "node");
+        assert!(
+            cmd.contains("'[selection-identity-mismatch]escaped'"),
+            "{cmd}"
+        );
+        assert!(!cmd.contains('\t'), "{cmd}");
+
+        // 回放报告同样不得把 CR/LF/ESC 变成额外控制行（daemon → CLI 输出路径）
+        let report = selection::ReplayReport {
+            results: vec![selection::ReplayGroupResult {
+                group: "[selection-identity-mismatch]g".to_string(),
+                node: "n\r\n[selection-mirror-missing]".to_string(),
+                outcome: selection::ReplayOutcome::Failed {
+                    error: "x\x1b[31m\ny".to_string(),
+                },
+            }],
+            intent_error: None,
+            selectable_groups: None,
+        };
+        for line in report
+            .format_lines()
+            .into_iter()
+            .chain(selection::selection_replay_remedy_lines(&report))
+        {
+            assert!(!line.contains('\r'), "{line:?}");
+            assert!(!line.contains('\n'), "{line:?}");
+            assert!(!line.contains('\x1b'), "{line:?}");
+            assert!(!is_mirror_missing_signal(&line), "{line:?}");
+            assert!(!is_identity_mismatch_signal(&line), "{line:?}");
+        }
+
+        // `contains` 会误判：信号识别必须是完整固定行前缀
+        let spoofed = "⚠ Selection A → node [selection-mirror-missing] not applied";
+        assert!(!is_mirror_missing_signal(spoofed));
+        assert!(!is_identity_mismatch_signal(
+            "⚠ Selection A → [selection-identity-mismatch] not applied"
+        ));
+        let tmp = TempDir::new().unwrap();
+        let paths = utils::AppPaths::for_test(tmp.path());
+        assert_eq!(
+            translate_selection_replay_signal(spoofed, None, &paths),
+            spoofed
+        );
+    }
+
+    #[test]
+    fn select_fix_command_binds_leading_dash_through_clap() {
+        // `--node=<quoted>` 显式绑定参数：前导 `-` 的节点名不会被当成 flag。
+        let cmd = crate::selection::select_fix_command("自动 选择", "-rf");
+        assert_eq!(cmd, "mihomo-cli select -g '自动 选择' --node='-rf'");
+
+        let cli = Cli::try_parse_from(["mihomo-cli", "select", "-g", "自动 选择", "--node=-rf"])
+            .expect("quoted remedy command must parse");
+        match cli.command.expect("select subcommand") {
+            Command::Select { group, node, .. } => {
+                assert_eq!(group.as_deref(), Some("自动 选择"));
+                assert_eq!(node.as_deref(), Some("-rf"));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn remedy_report_pure_failed_and_budget_keeps_intent() {
+        let report = selection::ReplayReport {
+            results: vec![
+                selection::ReplayGroupResult {
+                    group: "A".to_string(),
+                    node: "a".to_string(),
+                    outcome: selection::ReplayOutcome::Failed {
+                        error: "connection refused".to_string(),
+                    },
+                },
+                selection::ReplayGroupResult {
+                    group: "B".to_string(),
+                    node: "b".to_string(),
+                    outcome: selection::ReplayOutcome::BudgetExceeded,
+                },
+            ],
+            intent_error: None,
+            selectable_groups: None,
+        };
+        let joined = selection::selection_replay_remedy_lines(&report).join("\n");
+        assert!(
+            joined.contains("Intent kept; apply failed: connection refused"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("Intent kept; replay time budget exceeded."),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("mihomo-cli select --replay or mihomo-cli restart --system"),
+            "{joined}"
+        );
+        assert!(
+            !joined.contains("--node"),
+            "failed/budget must not fabricate a node binding: {joined}"
+        );
+    }
+
+    #[test]
+    fn promotion_success_message_not_swallowed() {
+        // (b′) promotion 不丢报告：main.rs 的 Success.message 消费路径是
+        // `selection_replay_message_lines`；报告行与补救行都必须被渲染。
+        let daemon_report = concat!(
+            "system configuration promoted and runtime applied\n",
+            "✓ Selections restored: A → B\n",
+            "[selection-mirror-missing] selection mirror unavailable\n",
+            "  Pick interactively: mihomo-cli select -g 'A'  (interactive terminal only)"
+        );
+        let tmp = TempDir::new().unwrap();
+        let paths = utils::AppPaths::for_test(tmp.path());
+        config::set_active_id_at(&paths, "sub1").unwrap();
+        std::fs::create_dir_all(paths.selections_dir()).unwrap();
+        std::fs::write(
+            paths.selection_state_path_for_subscription("sub1"),
+            "selections:\n  A: B\n",
+        )
+        .unwrap();
+
+        let lines = selection_replay_message_lines(daemon_report, Some("sub1"), &paths);
+        let out = lines.join("\n");
+        assert!(
+            out.contains("system configuration promoted and runtime applied"),
+            "{out}"
+        );
+        assert!(out.contains("✓ Selections restored: A → B"), "{out}");
+        assert!(
+            out.contains("Selections not replayed: selection mirror unavailable"),
+            "{out}"
+        );
+        assert!(out.contains("mihomo-cli select -g 'A' --node='B'"), "{out}");
+        assert!(out.contains("Pick interactively"), "{out}");
+
+        // 空消息不产生任何输出行
+        assert!(selection_replay_message_lines("", Some("sub1"), &paths).is_empty());
+    }
+
+    #[test]
+    fn promotion_remedy_binds_request_subscription_not_current_active() {
+        // N4：请求在途时 active 已切到另一订阅，补救仍绑定请求时刻的 ID。
+        let tmp = TempDir::new().unwrap();
+        let paths = utils::AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.selections_dir()).unwrap();
+        std::fs::write(
+            paths.selection_state_path_for_subscription("sub-request"),
+            "selections:\n  RequestGroup: R-Node\n",
+        )
+        .unwrap();
+        std::fs::write(
+            paths.selection_state_path_for_subscription("sub-other"),
+            "selections:\n  OtherGroup: O-Node\n",
+        )
+        .unwrap();
+        config::set_active_id_at(&paths, "sub-other").unwrap();
+
+        let out = selection_replay_message_lines(
+            "[selection-mirror-missing] selection mirror unavailable",
+            Some("sub-request"),
+            &paths,
+        )
+        .join("\n");
+        assert!(
+            out.contains("mihomo-cli select -g 'RequestGroup' --node='R-Node'"),
+            "{out}"
+        );
+        assert!(!out.contains("OtherGroup"), "{out}");
+    }
+
+    #[test]
+    fn lifecycle_remedy_binds_request_subscription_not_current_active() {
+        // P1-1：lifecycle（StartCore/RestartCore）Success 消费必须绑定 send 前的
+        // subscription ID。若误绑消费时的 active（Y 槽无意图/解析失败），
+        // mirror-missing 信号会被 translate 静默删除 —— 正是本用例的回归形态。
+        let tmp = TempDir::new().unwrap();
+        let paths = utils::AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.selections_dir()).unwrap();
+        std::fs::write(
+            paths.selection_state_path_for_subscription("sub-request"),
+            "selections:\n  RequestGroup: R-Node\n",
+        )
+        .unwrap();
+        // Y 槽：消费时 active 已切到它，但它没有意图文件。
+        config::set_active_id_at(&paths, "sub-current").unwrap();
+
+        let message = concat!(
+            "system configuration promoted and runtime applied\n",
+            "[selection-mirror-missing] selection mirror unavailable"
+        );
+        let bound_to_request =
+            translate_selection_replay_signal(message, Some("sub-request"), &paths);
+        assert!(
+            bound_to_request.contains("Selections not replayed"),
+            "{bound_to_request}"
+        );
+        assert!(
+            bound_to_request.contains("mihomo-cli select -g 'RequestGroup' --node='R-Node'"),
+            "{bound_to_request}"
+        );
+
+        // 误绑当前 active（无意图）→ 降级信号被静默吞掉，证明绑定口径必须是请求 ID。
+        let bound_to_current =
+            translate_selection_replay_signal(message, Some("sub-current"), &paths);
+        assert!(
+            !bound_to_current.contains("Selections not replayed"),
+            "{bound_to_current}"
+        );
+
+        // Y 槽解析失败同样是静默降级面；请求 ID 的补救不受影响。
+        std::fs::write(
+            paths.selection_state_path_for_subscription("sub-current"),
+            "not: valid: selection: state\n",
+        )
+        .unwrap();
+        let bound_to_current =
+            translate_selection_replay_signal(message, Some("sub-current"), &paths);
+        assert!(
+            !bound_to_current.contains("Selections not replayed"),
+            "{bound_to_current}"
+        );
+        assert!(
+            translate_selection_replay_signal(message, Some("sub-request"), &paths)
+                .contains("RequestGroup")
+        );
+
+        // 生产口回归锁：ID 在 IPC send 前捕获，Success 分支只读该副本。
+        let source = include_str!("main.rs");
+        let send_at = source
+            .find("let resp = ipc::send_command(&cmd).await?;")
+            .expect("lifecycle send site");
+        let capture_at = source
+            .find("subscription_id_at_request = subscription_id.clone()")
+            .expect("lifecycle request-time id capture");
+        assert!(
+            capture_at < send_at,
+            "lifecycle must capture the subscription id before the IPC send"
+        );
+        let success_arm = &source[send_at..];
+        let arm_end = success_arm
+            .find("ipc::DaemonResponse::Error { message }")
+            .expect("lifecycle success arm boundary");
+        let success_arm = &success_arm[..arm_end];
+        assert!(
+            success_arm.contains("subscription_id_at_request.as_deref()"),
+            "lifecycle success arm must bind the request-time subscription id"
+        );
+        assert!(
+            !success_arm.contains("get_active_id_at"),
+            "lifecycle success arm must not read the consuming-time active pointer"
+        );
+    }
+
+    // ── A1': commit-kind user feedback ──
+
+    #[test]
+    fn commit_messages_cover_new_reuse_revive() {
+        use chrono::TimeZone;
+
+        let new = config::SubscriptionCommit {
+            id: "sub-11111111".to_string(),
+            kind: config::SubscriptionCommitKind::New,
+        };
+        assert!(subscription_commit_messages(&new).is_empty(), "{new:?}");
+
+        let reuse = config::SubscriptionCommit {
+            id: "sub-22222222".to_string(),
+            kind: config::SubscriptionCommitKind::Reuse,
+        };
+        let msgs = subscription_commit_messages(&reuse);
+        assert_eq!(msgs.len(), 1);
+        assert!(
+            msgs[0].contains("Existing subscription sub-22222222 reused (same URL)"),
+            "{msgs:?}"
+        );
+
+        let revive = config::SubscriptionCommit {
+            id: "sub-33333333".to_string(),
+            kind: config::SubscriptionCommitKind::Revive {
+                retired_at: chrono::Utc.with_ymd_and_hms(2026, 3, 4, 5, 6, 7).single(),
+                other_retired: vec!["sub-44444444".to_string()],
+            },
+        };
+        let msgs = subscription_commit_messages(&revive);
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        assert!(
+            msgs[0].contains("revived (was retired 2026-03-04 05:06:07 UTC)"),
+            "{msgs:?}"
+        );
+        assert!(msgs[1].contains("stay retired: sub-44444444"), "{msgs:?}");
+
+        let revive_alone = config::SubscriptionCommit {
+            id: "sub-55555555".to_string(),
+            kind: config::SubscriptionCommitKind::Revive {
+                retired_at: None,
+                other_retired: Vec::new(),
+            },
+        };
+        let msgs = subscription_commit_messages(&revive_alone);
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].contains("unknown date"), "{msgs:?}");
+    }
+
+    // ── A2': quiet status observation line ──
+
+    fn meta(id: &str, url: &str, retired: bool) -> config::SubscriptionMeta {
+        config::SubscriptionMeta {
+            id: id.to_string(),
+            url: url.to_string(),
+            updated: chrono::Utc::now(),
+            user_agent: None,
+            user_agent_mode: None,
+            retired,
+            retired_at: None,
+        }
+    }
+
+    #[test]
+    fn fixed_selection_slot_count_matrix() {
+        let tmp = TempDir::new().unwrap();
+        let paths = utils::AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.subscriptions_dir()).unwrap();
+        std::fs::create_dir_all(paths.selections_dir()).unwrap();
+
+        // slot-a: alive + selections + cache file → counted
+        let slot_a = "sub-aaaaaaaa";
+        std::fs::write(paths.subscription_file_path(slot_a), "proxies: []").unwrap();
+        std::fs::write(
+            paths.selection_state_path_for_subscription(slot_a),
+            "selections:\n  Test: DIRECT\n",
+        )
+        .unwrap();
+        // slot-b: retired with selections → not counted (A1' revive path)
+        let slot_b = "sub-bbbbbbbb";
+        std::fs::write(paths.subscription_file_path(slot_b), "proxies: []").unwrap();
+        std::fs::write(
+            paths.selection_state_path_for_subscription(slot_b),
+            "selections:\n  Test: DIRECT\n",
+        )
+        .unwrap();
+        // slot-c: active subscription → not counted (already the live intent)
+        let slot_c = "sub-cccccccc";
+        std::fs::write(paths.subscription_file_path(slot_c), "proxies: []").unwrap();
+        std::fs::write(
+            paths.selection_state_path_for_subscription(slot_c),
+            "selections:\n  Test: DIRECT\n",
+        )
+        .unwrap();
+        // slot-d: alive but no selection state file → not counted
+        let slot_d = "sub-dddddddd";
+        std::fs::write(paths.subscription_file_path(slot_d), "proxies: []").unwrap();
+        // slot-e: selections exist but cache file is gone → not counted
+        let slot_e = "sub-eeeeeeee";
+        std::fs::write(
+            paths.selection_state_path_for_subscription(slot_e),
+            "selections:\n  Test: DIRECT\n",
+        )
+        .unwrap();
+
+        let subs = vec![
+            meta(slot_a, "https://a.example", false),
+            meta(slot_b, "https://b.example", true),
+            meta(slot_c, "https://c.example", false),
+            meta(slot_d, "https://d.example", false),
+            meta(slot_e, "https://e.example", false),
+        ];
+
+        // No active subscription: both alive cache-valid slots with
+        // selections count (slot-a + slot-c).
+        assert_eq!(count_fixed_selection_slots(&paths, &subs, None), 2);
+        // Active = slot-a: it is excluded as the live intent.
+        assert_eq!(count_fixed_selection_slots(&paths, &subs, Some(slot_a)), 1);
+        // Active = slot-c: symmetric exclusion.
+        assert_eq!(count_fixed_selection_slots(&paths, &subs, Some(slot_c)), 1);
+        // Active = an unrelated id: both eligible slots count.
+        assert_eq!(
+            count_fixed_selection_slots(&paths, &subs, Some("sub-ffffffff")),
+            2
+        );
+
+        // Empty selections never count.
+        std::fs::write(
+            paths.selection_state_path_for_subscription(slot_a),
+            "selections: {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            paths.selection_state_path_for_subscription(slot_c),
+            "selections: {}\n",
+        )
+        .unwrap();
+        assert_eq!(count_fixed_selection_slots(&paths, &subs, None), 0);
+    }
+}
+
+/// SPEC C1 (A2 repair path): shared repair prerequisites and the
+/// confirmation contract that guards privileged cache.db permission repair.
+mod state_hygiene_phase0_tests {
+    use super::*;
+
+    #[test]
+    fn start_and_restart_share_the_repair_prerequisites() {
+        assert!(lifecycle_shares_repair_prerequisites(
+            instance::InstanceMode::System,
+            instance::ServiceAction::Start
+        ));
+        assert!(lifecycle_shares_repair_prerequisites(
+            instance::InstanceMode::System,
+            instance::ServiceAction::Restart
+        ));
+        assert!(!lifecycle_shares_repair_prerequisites(
+            instance::InstanceMode::System,
+            instance::ServiceAction::Stop
+        ));
+        assert!(!lifecycle_shares_repair_prerequisites(
+            instance::InstanceMode::User,
+            instance::ServiceAction::Start
+        ));
+        assert_eq!(
+            lifecycle_repair_fix_command(instance::ServiceAction::Start),
+            "mihomo-cli start --system --yes"
+        );
+        assert_eq!(
+            lifecycle_repair_fix_command(instance::ServiceAction::Restart),
+            "mihomo-cli restart --system --yes"
+        );
+    }
+
+    #[test]
+    fn no_tty_without_yes_reports_repair_required() {
+        // No TTY and no `--yes`: never self-heal, only report the contract.
+        assert_eq!(
+            cache_db_permission_repair_decision(false, false),
+            CacheDbRepairDecision::RefuseRepairRequired
+        );
+        let message = cache_db_repair_required_message(lifecycle_repair_fix_command(
+            instance::ServiceAction::Restart,
+        ));
+        assert!(message.contains("repair_required"), "{message}");
+        assert!(
+            message.contains("mihomo-cli restart --system --yes"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("sudo") && !message.contains("chown"),
+            "the contract must not ask the user to run privileged commands directly: {message}"
+        );
+
+        // `--yes` applies the repair directly; a TTY asks first.
+        assert_eq!(
+            cache_db_permission_repair_decision(true, false),
+            CacheDbRepairDecision::Apply
+        );
+        assert_eq!(
+            cache_db_permission_repair_decision(false, true),
+            CacheDbRepairDecision::Prompt
+        );
+        assert_eq!(
+            cache_db_permission_repair_decision(true, true),
+            CacheDbRepairDecision::Apply
+        );
+    }
+}
+
+/// SPEC §12.3:8 controlled reset (P0-1): cleanup happens only behind the single
+/// stopped proof; a refusal or failed stop must keep every artifact.
+mod controlled_reset_proof_tests {
+    use super::*;
+    use tun_transaction::{JournalPhase, TunJournal};
+
+    fn reset_test_context() -> (tempfile::TempDir, instance::InstanceContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let inputs = instance::PathInputs {
+            home: tmp.path().join("home"),
+            uid: Some(1000),
+            gid: Some(1000),
+            xdg_runtime_dir: Some(tmp.path().join("run/user/1000")),
+            program_data: tmp.path().join("ProgramData"),
+            app_data: tmp.path().join("AppData/Roaming"),
+            local_app_data: tmp.path().join("AppData/Local"),
+            username_or_sid: "alice".to_string(),
+        };
+        let mut ctx = instance::InstanceContext::planned(
+            instance::TargetOs::Linux,
+            instance::InstanceMode::System,
+            &inputs,
+        );
+        ctx.paths.config_dir = tmp.path().join("user-config");
+        ctx.paths.intent_config_file = ctx.paths.config_dir.join("config.yaml");
+        ctx.paths.tun_config_file = tmp.path().join("system-data/tun-config.yaml");
+        ctx.paths.generation_store_root = tmp.path().join("system-data/generations");
+        ctx.permissions = instance::PermissionModel::DirectUser;
+        std::fs::create_dir_all(&ctx.paths.config_dir).unwrap();
+        std::fs::create_dir_all(ctx.paths.tun_config_file.parent().unwrap()).unwrap();
+        (tmp, ctx)
+    }
+
+    fn seeded_reset_journal(ctx: &instance::InstanceContext) -> TunJournal {
+        let active = tun_transaction::transactions_dir(ctx).join("active");
+        std::fs::create_dir_all(&active).unwrap();
+        let journal = TunJournal {
+            schema_version: 1,
+            transaction_id: "reset-proof-test".to_string(),
+            generation: 9,
+            phase: JournalPhase::RecoveryRequired,
+            original_uid: 1000,
+            target_runtime_tun: false,
+            base_intent_revision: None,
+            candidate_revision: "candidate".to_string(),
+            candidate_core_identity: None,
+            candidate_core_pid: None,
+            old_snapshot_revision: None,
+            old_runtime_digest: "digest".to_string(),
+            recovery_target_revision: None,
+            legacy_source: false,
+            legacy_transaction_id: None,
+            legacy_base_revision: None,
+            rollback_evidence_complete: true,
+            last_error: None,
+            outcome: None,
+            recovery_core_identity: None,
+            recovery_core_pid: None,
+            updated_at: Some(tun_transaction::now_rfc3339()),
+        };
+        tun_transaction::write_active_journal(ctx, &journal).unwrap();
+        std::fs::write(&ctx.paths.tun_config_file, b"mixed-port: 7890\n").unwrap();
+        let gate = tun_transaction::SystemTransactionGate {
+            schema_version: 1,
+            transaction_id: journal.transaction_id.clone(),
+            generation: journal.generation,
+            original_uid: 1000,
+            base_intent_revision: None,
+            candidate_revision: journal.candidate_revision.clone(),
+        };
+        tun_transaction::write_user_gate(&ctx.paths.config_dir, &gate, 1000).unwrap();
+        journal
+    }
+
+    fn evidence_paths(ctx: &instance::InstanceContext) -> [std::path::PathBuf; 3] {
+        [
+            tun_transaction::active_journal_path(ctx),
+            ctx.paths.tun_config_file.clone(),
+            tun_transaction::user_gate_path(&ctx.paths.config_dir),
+        ]
+    }
+
+    #[tokio::test]
+    async fn reset_keeps_every_artifact_when_the_stop_proof_fails() {
+        let (_tmp, ctx) = reset_test_context();
+        let journal = seeded_reset_journal(&ctx);
+
+        let error = reset_managed_system_runtime_with_proof(&ctx, |_fence| async {
+            Err(anyhow::anyhow!("daemon rejected QuiesceCandidateRuntime"))
+        })
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Fix: mihomo-cli restart --system"),
+            "{error}"
+        );
+        for path in evidence_paths(&ctx) {
+            assert!(
+                path.exists(),
+                "cleanup count must be 0, but {} was removed",
+                path.display()
+            );
+        }
+        let gc = tun_transaction::transactions_dir(&ctx).join("gc");
+        let reset_entries = std::fs::read_dir(&gc)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(&format!("reset-{}-", journal.generation))
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(reset_entries, 0, "no journal quarantine may happen");
+        // The gate keeps blocking: nothing converged without a stopped proof.
+        let still_active = tun_transaction::read_active_journal(&ctx).unwrap();
+        assert_eq!(
+            still_active.map(|j| j.phase),
+            Some(JournalPhase::RecoveryRequired)
+        );
+        assert!(tun_transaction::read_user_gate(&ctx.paths.config_dir)
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn reset_cleans_artifacts_only_after_the_stopped_proof() {
+        let (_tmp, ctx) = reset_test_context();
+        let journal = seeded_reset_journal(&ctx);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen_in_closure = seen.clone();
+
+        let message = reset_managed_system_runtime_with_proof(&ctx, move |fence| {
+            *seen_in_closure.lock().unwrap() = Some(fence);
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+
+        assert!(message.contains("重新建立运行状态"));
+        let fence = seen.lock().unwrap().clone().expect("proof fence");
+        assert_eq!(
+            fence.expected_phase, journal.phase,
+            "the reset must fence the journal's own phase"
+        );
+        assert_eq!(fence.transaction_id, journal.transaction_id);
+        for path in evidence_paths(&ctx) {
+            assert!(!path.exists(), "{} should be cleaned", path.display());
+        }
+        let gc = tun_transaction::transactions_dir(&ctx).join("gc");
+        assert!(
+            std::fs::read_dir(&gc)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|e| e
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("reset-{}-", journal.generation))),
+            "the journal must be quarantined as evidence, not deleted"
+        );
+        // Convergence precondition: after the reset the §12.4 gate has neither an
+        // active journal nor a user gate left to block the restart.
+        assert!(tun_transaction::read_active_journal(&ctx)
+            .unwrap()
+            .is_none());
+        assert!(tun_transaction::read_user_gate(&ctx.paths.config_dir)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn reset_isolates_a_broken_cache_db_only_after_the_proof() {
+        // With an installed service account the fixture would be PermissionDrift
+        // (owner mismatch) and the reset must not isolate it before a permission
+        // repair; that combination needs root to build, so skip it here.
+        #[cfg(unix)]
+        {
+            let name = std::ffi::CString::new("mihomo").unwrap();
+            if !unsafe { libc::getpwnam(name.as_ptr()) }.is_null() {
+                return;
+            }
+        }
+        let (_tmp, ctx) = reset_test_context();
+        seeded_reset_journal(&ctx);
+        let cache_db = ctx
+            .paths
+            .tun_config_file
+            .parent()
+            .unwrap()
+            .join(utils::CACHE_DB_FILE_NAME);
+        std::fs::write(&cache_db, vec![0u8; 16 * 1024]).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cache_db, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        // Failed proof: the broken cache is left untouched as evidence.
+        let _ = reset_managed_system_runtime_with_proof(&ctx, |_fence| async {
+            Err(anyhow::anyhow!("stop failed"))
+        })
+        .await
+        .unwrap_err();
+        assert!(cache_db.exists(), "no isolation without a stopped proof");
+
+        // Proven stop: the same no-replace primitive quarantines it.
+        reset_managed_system_runtime_with_proof(&ctx, |_fence| async { Ok(()) })
+            .await
+            .unwrap();
+        assert!(!cache_db.exists());
+        let quarantined = std::fs::read_dir(cache_db.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(utils::CACHE_DB_QUARANTINE_PREFIX)
+            })
+            .count();
+        assert_eq!(quarantined, 1);
+    }
+
+    fn quiesce_fence() -> tun_transaction::TransactionFence {
+        tun_transaction::TransactionFence {
+            transaction_id: "txn".to_string(),
+            generation: 3,
+            expected_phase: JournalPhase::RecoveryRequired,
+            expected_candidate_revision: "candidate".to_string(),
+        }
+    }
+
+    fn stopped_proof(fence: &tun_transaction::TransactionFence) -> tun_transaction::RuntimeProof {
+        tun_transaction::RuntimeProof {
+            transaction_id: fence.transaction_id.clone(),
+            generation: fence.generation,
+            observed_phase: fence.expected_phase,
+            proof_kind: tun_transaction::RuntimeProofKind::CandidateQuiesced,
+            core_identity: String::new(),
+            core_pid: 0,
+            launched_revision: String::new(),
+            runtime_tun: false,
+            api_ready: false,
+        }
+    }
+
+    #[test]
+    fn quiesce_proof_must_show_a_stopped_runtime() {
+        let fence = quiesce_fence();
+
+        // Accepted: a completed proof with a stopped runtime.
+        let accepted = ipc::DaemonResponse::Transaction {
+            response: tun_transaction::TransactionResponse::Completed(stopped_proof(&fence)),
+        };
+        validate_quiesced_response(&accepted, &fence).unwrap();
+
+        // Rejected: gate refusal / unreadable journal.
+        let rejection = ipc::DaemonResponse::Error {
+            message: "A system TUN transaction is in progress".to_string(),
+        };
+        assert!(validate_quiesced_response(&rejection, &fence).is_err());
+
+        // Rejected: the daemon could not stop the runtime.
+        let not_satisfied = ipc::DaemonResponse::Transaction {
+            response: tun_transaction::TransactionResponse::NotSatisfied {
+                observation: tun_transaction::RuntimeObservation {
+                    core_running: true,
+                    core_identity: Some("core".to_string()),
+                    core_pid: Some(42),
+                    launched_revision: Some("candidate".to_string()),
+                    runtime_tun: Some(false),
+                    api_ready: true,
+                },
+                error: tun_transaction::StructuredError {
+                    code: tun_transaction::TransactionErrorCode::CoreStopFailed,
+                    stage: "quiesce_old_runtime".to_string(),
+                    retryable: false,
+                    message: "still running".to_string(),
+                },
+            },
+        };
+        assert!(validate_quiesced_response(&not_satisfied, &fence).is_err());
+
+        // Rejected: the removed "attested but still running" third state.
+        let mut running = stopped_proof(&fence);
+        running.core_pid = 42;
+        running.launched_revision = "old-revision".to_string();
+        running.api_ready = true;
+        running.runtime_tun = true;
+        let attested_running = ipc::DaemonResponse::Transaction {
+            response: tun_transaction::TransactionResponse::AlreadySatisfied(running),
+        };
+        assert!(validate_quiesced_response(&attested_running, &fence).is_err());
+    }
+
+    #[test]
+    fn quiesce_proof_failure_reports_whether_a_stop_was_attempted() {
+        let fence = quiesce_fence();
+
+        let not_attempted = ipc::DaemonResponse::Transaction {
+            response: tun_transaction::TransactionResponse::EvidenceMismatch {
+                observation: tun_transaction::RuntimeObservation {
+                    core_running: true,
+                    core_identity: Some("core".to_string()),
+                    core_pid: Some(42),
+                    launched_revision: Some("candidate".to_string()),
+                    runtime_tun: Some(false),
+                    api_ready: true,
+                },
+                error: tun_transaction::StructuredError {
+                    code: tun_transaction::TransactionErrorCode::RuntimeRevisionMismatch,
+                    stage: "quiesce_candidate".to_string(),
+                    retryable: false,
+                    message: "running runtime is neither candidate nor fully attested".to_string(),
+                },
+            },
+        };
+        let error = validate_quiesced_response(&not_attempted, &fence).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<ManagedStopError>()
+                .map(|stop| stop.phase),
+            Some(StopAttemptPhase::NotAttempted)
+        );
+
+        let not_satisfied = ipc::DaemonResponse::Transaction {
+            response: tun_transaction::TransactionResponse::NotSatisfied {
+                observation: tun_transaction::RuntimeObservation {
+                    core_running: true,
+                    core_identity: Some("core".to_string()),
+                    core_pid: Some(42),
+                    launched_revision: Some("candidate".to_string()),
+                    runtime_tun: Some(false),
+                    api_ready: true,
+                },
+                error: tun_transaction::StructuredError {
+                    code: tun_transaction::TransactionErrorCode::CoreStopFailed,
+                    stage: "quiesce_legacy_reset".to_string(),
+                    retryable: false,
+                    message: "process 42 did not exit within 5s".to_string(),
+                },
+            },
+        };
+        let error = validate_quiesced_response(&not_satisfied, &fence).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<ManagedStopError>()
+                .map(|stop| stop.phase),
+            Some(StopAttemptPhase::AttemptedButUnconfirmed)
+        );
+    }
+
+    #[test]
+    fn pre_admission_refusal_only_unlocks_the_legacy_quiesce_shapes() {
+        let (_tmp, ctx) = reset_test_context();
+        let fence = quiesce_fence();
+        let mismatch = |stage: &str| ipc::DaemonResponse::Transaction {
+            response: tun_transaction::TransactionResponse::EvidenceMismatch {
+                observation: tun_transaction::RuntimeObservation {
+                    core_running: true,
+                    core_identity: Some("core".to_string()),
+                    core_pid: Some(42),
+                    launched_revision: Some("candidate".to_string()),
+                    runtime_tun: Some(false),
+                    api_ready: true,
+                },
+                error: tun_transaction::StructuredError {
+                    code: tun_transaction::TransactionErrorCode::RuntimeRevisionMismatch,
+                    stage: stage.to_string(),
+                    retryable: false,
+                    message: "refused".to_string(),
+                },
+            },
+        };
+        assert!(is_pre_admission_quiesce_refusal(
+            &ctx,
+            &mismatch("quiesce_candidate")
+        ));
+        assert!(is_pre_admission_quiesce_refusal(
+            &ctx,
+            &mismatch("quiesce_legacy_reset")
+        ));
+        assert!(!is_pre_admission_quiesce_refusal(
+            &ctx,
+            &mismatch("validate_old_runtime_for_quiesce")
+        ));
+
+        let stale = ipc::DaemonResponse::Transaction {
+            response: tun_transaction::TransactionResponse::Stale {
+                observed_transaction_id: None,
+                observed_generation: None,
+                observed_phase: None,
+            },
+        };
+        assert!(!is_pre_admission_quiesce_refusal(&ctx, &stale));
+
+        // A generic daemon error is only a capability signal when the CLI/daemon
+        // binary skew is observable; an unreadable install path stays closed.
+        let error = ipc::DaemonResponse::Error {
+            message: "failed to parse daemon command".to_string(),
+        };
+        assert!(!is_pre_admission_quiesce_refusal(&ctx, &error));
+        let _ = fence;
+    }
+
+    #[tokio::test]
+    async fn reset_failure_distinguishes_not_attempted_from_unconfirmed_exit() {
+        let (_tmp, ctx) = reset_test_context();
+        let _journal = seeded_reset_journal(&ctx);
+
+        let not_attempted = reset_managed_system_runtime_with_proof(&ctx, |_fence| async {
+            Err(anyhow::Error::new(ManagedStopError::not_attempted(
+                "managed Core ownership is unprovable",
+            )))
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            not_attempted.contains("未尝试停止 Core"),
+            "the refusal must say no stop was attempted: {not_attempted}"
+        );
+        assert!(not_attempted.contains("Fix: mihomo-cli restart --system"));
+        assert!(ctx.paths.tun_config_file.exists());
+
+        let attempted = reset_managed_system_runtime_with_proof(&ctx, |_fence| async {
+            Err(anyhow::Error::new(
+                ManagedStopError::attempted_but_unconfirmed("pid 42 did not exit within 5s"),
+            ))
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            attempted.contains("已尝试停止 Core，但退出未被确认"),
+            "the refusal must say the exit is unconfirmed: {attempted}"
+        );
+        assert!(ctx.paths.tun_config_file.exists());
+    }
+
+    #[tokio::test]
+    async fn reset_keeps_the_active_journal_until_every_other_artifact_is_gone() {
+        let (_tmp, ctx) = reset_test_context();
+        let mut journal = seeded_reset_journal(&ctx);
+        journal.legacy_source = true;
+        std::fs::write(tun_transaction::legacy_journal_path(&ctx), b"legacy").unwrap();
+
+        // Break the final step so the ordering is observable: the active
+        // directory of the journal is the lifecycle gate that refuses new Core
+        // starts, so it must be released last.
+        std::fs::remove_dir_all(tun_transaction::active_dir(&ctx)).unwrap();
+        let error = reset_managed_runtime_artifacts(&ctx, &journal).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("transaction directory is unavailable"),
+            "{error}"
+        );
+
+        assert!(
+            !ctx.paths.tun_config_file.exists(),
+            "the managed snapshot must be gone before the journal is quarantined"
+        );
+        assert!(
+            !tun_transaction::legacy_journal_path(&ctx).exists(),
+            "legacy artifacts must be gone before the journal is quarantined"
+        );
+        assert!(
+            tun_transaction::read_user_gate(&ctx.paths.config_dir)
+                .unwrap()
+                .is_none(),
+            "the user gate must be gone before the journal is quarantined"
+        );
+    }
+
+    #[test]
+    fn only_restart_grants_the_legacy_reset_admission() {
+        let source = include_str!("main.rs");
+
+        let tun_start = source
+            .find("async fn execute_system_tun_transaction(")
+            .expect("tun entry must exist");
+        let tun_call = source[tun_start..]
+            .find("maybe_auto_recover_active_transaction(")
+            .map(|offset| offset + tun_start)
+            .expect("tun entry must run recovery");
+        let tun_window = &source[tun_call..tun_call + 400];
+        assert!(
+            tun_window.contains("false,\n        false,\n        false,"),
+            "tun on/off --yes must not unlock the legacy reset admission: {tun_window}"
+        );
+
+        let restart_start = source
+            .find("async fn cmd_lifecycle_instance_mode(")
+            .expect("restart entry must exist");
+        let restart_call = source[restart_start..]
+            .find("maybe_auto_recover_active_transaction(")
+            .map(|offset| offset + restart_start)
+            .expect("restart entry must run recovery");
+        let restart_window = &source[restart_call..restart_call + 500];
+        assert!(
+            restart_window.contains("true,"),
+            "restart must pass the legacy reset admission: {restart_window}"
+        );
+        assert!(
+            restart_window.contains("only the explicit `restart --system` origin"),
+            "the admission origin must stay documented at its single grant site"
+        );
+
+        let reset_start = source
+            .find("async fn prove_managed_runtime_stopped(")
+            .expect("reset stop must exist");
+        let reset_body_end =
+            source[reset_start..].find("\nasync fn ").unwrap_or(4000) + reset_start;
+        let reset_body = &source[reset_start..reset_body_end];
+        assert!(
+            reset_body.contains("allow_legacy_reset && is_pre_admission_quiesce_refusal"),
+            "the CLI compatibility executor must stay behind both gates"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rollback_pending_evidence_tests {
+    use super::*;
+    use tun_transaction::{JournalPhase, OldRuntimeEvidenceState, RecoveryAction, TunJournal};
+
+    fn rollback_test_context() -> (tempfile::TempDir, instance::InstanceContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let inputs = instance::PathInputs {
+            home: tmp.path().join("home"),
+            uid: Some(1000),
+            gid: Some(1000),
+            xdg_runtime_dir: Some(tmp.path().join("run/user/1000")),
+            program_data: tmp.path().join("ProgramData"),
+            app_data: tmp.path().join("AppData/Roaming"),
+            local_app_data: tmp.path().join("AppData/Local"),
+            username_or_sid: "alice".to_string(),
+        };
+        let mut ctx = instance::InstanceContext::planned(
+            instance::TargetOs::Linux,
+            instance::InstanceMode::System,
+            &inputs,
+        );
+        ctx.paths.config_dir = tmp.path().join("user-config");
+        ctx.paths.intent_config_file = ctx.paths.config_dir.join("config.yaml");
+        ctx.paths.tun_config_file = tmp.path().join("system-data/tun-config.yaml");
+        ctx.permissions = instance::PermissionModel::DirectUser;
+        std::fs::create_dir_all(&ctx.paths.config_dir).unwrap();
+        std::fs::create_dir_all(ctx.paths.tun_config_file.parent().unwrap()).unwrap();
+        (tmp, ctx)
+    }
+
+    /// Journal present, durable old-runtime evidence absent.
+    fn journal_without_evidence(ctx: &instance::InstanceContext) -> TunJournal {
+        let active = tun_transaction::transactions_dir(ctx).join("active");
+        std::fs::create_dir_all(&active).unwrap();
+        assert!(!tun_transaction::active_old_runtime_path(ctx).exists());
+        let journal = TunJournal {
+            schema_version: 1,
+            transaction_id: "rollback-evidence-test".to_string(),
+            generation: 4,
+            phase: JournalPhase::RollbackPending,
+            original_uid: 1000,
+            target_runtime_tun: false,
+            base_intent_revision: None,
+            candidate_revision: "candidate".to_string(),
+            candidate_core_identity: None,
+            candidate_core_pid: None,
+            old_snapshot_revision: Some("old".to_string()),
+            old_runtime_digest: "digest-of-a-deleted-file".to_string(),
+            recovery_target_revision: None,
+            legacy_source: false,
+            legacy_transaction_id: None,
+            legacy_base_revision: None,
+            rollback_evidence_complete: true,
+            last_error: None,
+            outcome: None,
+            recovery_core_identity: None,
+            recovery_core_pid: None,
+            updated_at: Some(tun_transaction::now_rfc3339()),
+        };
+        tun_transaction::write_active_journal(ctx, &journal).unwrap();
+        journal
+    }
+
+    /// The planner turns the missing evidence into a refusal, and that refusal is
+    /// exactly what authorizes the controlled reset — the change-command lock-out
+    /// therefore has a reachable one-shot exit.
+    #[test]
+    fn missing_rollback_evidence_refusal_routes_into_the_controlled_reset() {
+        let (_tmp, ctx) = rollback_test_context();
+        let journal = journal_without_evidence(&ctx);
+        let obs = tun_transaction::RuntimeObservation {
+            core_running: false,
+            core_identity: None,
+            core_pid: None,
+            launched_revision: None,
+            runtime_tun: None,
+            api_ready: false,
+        };
+        let evidence = tun_transaction::classify_old_runtime_evidence(&ctx, &journal);
+        assert_eq!(evidence, OldRuntimeEvidenceState::Missing);
+        let action = tun_transaction::plan_recovery(
+            &journal,
+            tun_transaction::SnapshotClassification::Old,
+            tun_transaction::classify_intent(&ctx.paths.intent_config_file, &journal),
+            evidence,
+            &obs,
+            tun_transaction::RecoveryDirection::Resume,
+        );
+        let message = match &action {
+            RecoveryAction::RefuseNeedsEvidence(message) => message.clone(),
+            other => panic!("a dangling RollbackPending must refuse, got {other:?}"),
+        };
+        assert!(
+            message.contains("mihomo-cli restart --system"),
+            "the refusal must carry the one-shot Fix: {message}"
+        );
+
+        // `restart --system --yes` (allow) and the interactive prompt both land on
+        // the controlled reset; the bare path surfaces the Fix instead of exiting
+        // with an unattributed ENOENT.
+        assert_eq!(
+            route_recovery_action(action.clone(), true, false),
+            RecoveryRoute::ControlledReset
+        );
+        assert_eq!(
+            route_recovery_action(action.clone(), false, true),
+            RecoveryRoute::ControlledReset
+        );
+        match route_recovery_action(action, false, false) {
+            RecoveryRoute::Refuse(shown) => {
+                assert!(shown.contains("mihomo-cli restart --system"), "{shown}");
+            }
+            other => panic!("without authorization the refusal must be surfaced: {other:?}"),
+        }
+    }
+
+    /// The reset channel itself converges this exact state: journal quarantined,
+    /// no active journal left, so the next lifecycle command is unblocked.
+    #[tokio::test]
+    async fn controlled_reset_converges_a_rollback_pending_journal_without_evidence() {
+        let (_tmp, ctx) = rollback_test_context();
+        let journal = journal_without_evidence(&ctx);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen_in_closure = seen.clone();
+
+        let message = reset_managed_system_runtime_with_proof(&ctx, move |fence| {
+            *seen_in_closure.lock().unwrap() = Some(fence);
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+
+        assert!(message.contains("重新建立运行状态"), "{message}");
+        let fence = seen.lock().unwrap().clone().expect("proof fence");
+        assert_eq!(fence.expected_phase, JournalPhase::RollbackPending);
+        assert_eq!(fence.transaction_id, journal.transaction_id);
+        assert!(tun_transaction::read_active_journal(&ctx)
+            .unwrap()
+            .is_none());
+        let gc = tun_transaction::transactions_dir(&ctx).join("gc");
+        assert!(
+            std::fs::read_dir(&gc)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("reset-{}-", journal.generation))),
+            "the journal must be kept as evidence, not deleted"
+        );
+    }
+
+    /// Defence in depth: even if the evidence disappears between planning and the
+    /// copy, the surfaced error carries the Fix and is never a bare ENOENT.
+    #[test]
+    fn rollback_copy_error_is_attributed_and_never_bare_enoent() {
+        let (_tmp, ctx) = rollback_test_context();
+        let journal = journal_without_evidence(&ctx);
+
+        let error = read_old_runtime_for_rollback(&ctx, &journal).unwrap_err();
+        let text = error.to_string();
+        assert!(
+            text.contains("Fix: mihomo-cli restart --system"),
+            "the copy failure must carry the Fix: {text}"
+        );
+        assert!(
+            text.contains("old-runtime evidence is missing"),
+            "the copy failure must name the missing artifact: {text}"
+        );
+        assert_ne!(text.trim(), "No such file or directory (os error 2)");
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod cache_db_evidence_hook_tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    /// the repair gate copies an unjudged (permission-drift) `cache.db`
+    /// aside before repairing; the original is untouched and repair still runs.
+    #[test]
+    fn unjudged_cache_db_is_preserved_and_repair_stays_unblocked() {
+        // The fixture uses `None`, i.e. the current user's uid/gid/file mode, so
+        // it runs identically whether or not a `mihomo` service account exists
+        // on the host (the former getpwnam precondition was obsolete).
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(utils::CACHE_DB_FILE_NAME);
+        let corrupt = utils::bolt_test_db_image_with_version(4096, 9);
+        std::fs::write(&path, &corrupt).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(
+            utils::classify_cache_db(&path, None),
+            utils::CacheDbState::PermissionDrift
+        );
+        let preserved = preserve_unjudged_cache_db_evidence(&path, None)
+            .expect("an unjudged cache.db must leave a copy");
+        assert_eq!(std::fs::read(&preserved).unwrap(), corrupt);
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o644);
+        assert_eq!(
+            utils::classify_cache_db(&path, None),
+            utils::CacheDbState::PermissionDrift
+        );
+
+        assert!(utils::repair_cache_db_permissions(&path, None).unwrap());
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        // Once the content verdict is reachable the hook stops copying.
+        assert_eq!(
+            utils::classify_cache_db(&path, None),
+            utils::CacheDbState::ContentInvalid
+        );
+        assert!(preserve_unjudged_cache_db_evidence(&path, None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod tun_guard_error_tests {
+    use super::*;
+    use crate::ipc::TUN_GUARD_ERROR_MARKER;
+
+    /// review MAJOR-1：护栏判据锚定共享标记常量，不再匹配自由文案。
+    /// 场景下 `tun_active` 为 false，这条判据是护栏 Error 不被折叠成
+    /// Pending 的唯一防线；带标记的必须 Err 呈现，不带标记的保持 Pending 语义。
+    #[test]
+    fn is_tun_guard_error_matches_only_the_shared_marker() {
+        assert!(is_tun_guard_error(&format!(
+            "{TUN_GUARD_ERROR_MARKER}promoted configuration was loaded but TUN runtime attestation failed: tun.enable is not true"
+        )));
+        assert!(is_tun_guard_error(&format!(
+            "{TUN_GUARD_ERROR_MARKER}failed to start core: listen tcp 7890: address already in use"
+        )));
+        // 收口：runtime revision attestation 失败臂同样带标记，必须 Err 呈现。
+        assert!(is_tun_guard_error(&format!(
+            "{TUN_GUARD_ERROR_MARKER}system configuration was loaded but its runtime revision could not be attested"
+        )));
+
+        // 用户可控的 YAML 错误文案里出现 tun.enable，不得被误判为护栏 Error。
+        assert!(!is_tun_guard_error(
+            "system configuration YAML is invalid: tun.enable is not allowed here"
+        ));
+        // 未带标记的 Core 启动失败沿用既有 Pending 折叠语义。
+        assert!(!is_tun_guard_error(
+            "failed to start core: listen tcp 7890: address already in use"
+        ));
+        assert!(!is_tun_guard_error(
+            "system configuration promoted and runtime applied"
+        ));
+    }
+}
+
+// ── SPEC Phase 2: 代际升级应用健壮性管线 ─────────────────────────
+
+#[cfg(test)]
+mod gen036_pipeline_tests {
+    use super::*;
+
+    fn system_ctx(temp: &std::path::Path) -> instance::InstanceContext {
+        let inputs = instance::PathInputs {
+            home: temp.join("home"),
+            uid: Some(1000),
+            gid: Some(1000),
+            xdg_runtime_dir: Some(temp.join("run/user/1000")),
+            program_data: temp.join("ProgramData"),
+            app_data: temp.join("AppData/Roaming"),
+            local_app_data: temp.join("AppData/Local"),
+            username_or_sid: "alice".to_string(),
+        };
+        let mut ctx = instance::InstanceContext::planned(
+            instance::TargetOs::Linux,
+            instance::InstanceMode::System,
+            &inputs,
+        );
+        ctx.paths.config_dir = temp.join("user-config");
+        ctx.paths.intent_config_file = ctx.paths.config_dir.join("config.yaml");
+        ctx.paths.tun_config_file = temp.join("system-data/tun-config.yaml");
+        ctx.paths.cli_binary = temp.join("bin/mihomo-cli");
+        ctx.paths.core_binary = temp.join("bin/mihomo");
+        ctx.paths.generation_store_root = temp.join("system-data/generations");
+        std::fs::create_dir_all(ctx.paths.cli_binary.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(ctx.paths.tun_config_file.parent().unwrap()).unwrap();
+        ctx
+    }
+
+    fn binding_of(
+        store: &generation::GenerationStore,
+        id: &generation::GenerationId,
+    ) -> generation::GenerationId {
+        let manifest = store.read_manifest(id).unwrap();
+        generation::GenerationId::new(manifest.metadata.get("baseline").unwrap()).unwrap()
+    }
+
+    /// SPEC P2（deviation 4）：legacy/hand-crafted pending 无绑定 = 事实不明，
+    /// 必须严格拒绝且零替换（不得以受限模式继续）。
+    #[tokio::test]
+    async fn legacy_pending_without_binding_is_rejected_with_zero_replacement() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        std::fs::write(&ctx.paths.cli_binary, b"daemon-v1").unwrap();
+        std::fs::write(&ctx.paths.core_binary, b"core-v1").unwrap();
+
+        // P1 passes (pending daemon bytes == the running executable); only the core
+        // changes, so P1 cannot be the rejection reason.
+        let current_cli = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let gen_id = prepare_system_generation(&ctx, b"core-v2", &current_cli, Vec::new()).unwrap();
+        let store = system_generation_store(&ctx);
+
+        // Drop the binding: this is what a legacy pending looks like.
+        let mut manifest = store.read_manifest(&gen_id).unwrap();
+        manifest.metadata.remove("baseline");
+        store.write_manifest(&manifest).unwrap();
+        let mut state = store.read_state().unwrap();
+        state.previous = None;
+        store.write_state(&state).unwrap();
+
+        let error = apply_pending_generation(&ctx).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("无基线绑定"),
+            "must reject as fact-unknown: {error:#}"
+        );
+        // Zero replacement: the installed core is untouched and pending survives.
+        assert_eq!(std::fs::read(&ctx.paths.core_binary).unwrap(), b"core-v1");
+        assert_eq!(store.read_state().unwrap().pending, Some(gen_id));
+    }
+
+    /// SPEC C：墓碑已发布但槽位未消费 → 重入只续做槽位消费。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tombstone_published_pending_is_consumed_on_reentry() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        std::fs::write(&ctx.paths.cli_binary, b"daemon-v1").unwrap();
+        std::fs::write(&ctx.paths.core_binary, b"core-v1").unwrap();
+
+        let gen_id = prepare_system_generation(&ctx, b"core-v2", b"daemon-v1", Vec::new()).unwrap();
+        let store = system_generation_store(&ctx);
+        let baseline_id = binding_of(&store, &gen_id);
+
+        // Crash window: tombstone published, slots not yet consumed. Production
+        // publishes the native-withdrawal association before the rename; tests
+        // must reproduce that evidence, not a bare tombstone.
+        record_native_withdrawal(&store, &gen_id, &baseline_id).unwrap();
+        store.withdraw_generation(&gen_id).unwrap();
+        drop(store);
+
+        // The re-entry runs in a child process against a fake daemon so the
+        // baseline identity re-verification (P2-8) has a real daemon to attest.
+        let output = run_pipeline_child_in(temp.path(), "reentry");
+        assert!(
+            output.status.success(),
+            "child re-entry failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let store = system_generation_store(&ctx);
+        let state = store.read_state().unwrap();
+        // Discard-style tombstone (no rollback proof) → revoked terminal.
+        assert_eq!(state.active, None);
+        assert_eq!(state.pending, None);
+        assert_eq!(state.previous, Some(baseline_id));
+        assert!(store.has_withdrawn(&gen_id), "tombstone is never deleted");
+    }
+
+    /// SPEC N5：混合态拒绝重暂存；干净态（与基线一致）允许。
+    #[test]
+    fn mixed_state_is_refused_by_restage_admission() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        std::fs::write(&ctx.paths.cli_binary, b"daemon-v1").unwrap();
+        std::fs::write(&ctx.paths.core_binary, b"core-v1").unwrap();
+
+        let gen_id = prepare_system_generation(&ctx, b"core-v2", b"daemon-v1", Vec::new()).unwrap();
+        let store = system_generation_store(&ctx);
+        let baseline_id = binding_of(&store, &gen_id);
+        let lock = store.acquire_lock().unwrap();
+        store
+            .commit_active_cas(&lock, &gen_id, Some(&baseline_id))
+            .unwrap();
+        drop(lock);
+
+        // Partial replacement: core matches neither the active nor the baseline.
+        std::fs::write(&ctx.paths.core_binary, b"core-partial").unwrap();
+        let error =
+            prepare_system_generation(&ctx, b"core-v3", b"daemon-v1", Vec::new()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("混合态"),
+            "mixed state must be refused: {error:#}"
+        );
+
+        // Clean state (installed == baseline) is admitted again.
+        std::fs::write(&ctx.paths.core_binary, b"core-v1").unwrap();
+        assert!(prepare_system_generation(&ctx, b"core-v3", b"daemon-v1", Vec::new()).is_ok());
+    }
+
+    /// SPEC D/P6：双 writer CAS —— 过期期望 ID 与被抢占的 pending 都被拒绝。
+    #[test]
+    fn cas_commit_rejects_stale_and_preempted_writers() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        std::fs::write(&ctx.paths.cli_binary, b"daemon-v1").unwrap();
+        std::fs::write(&ctx.paths.core_binary, b"core-v1").unwrap();
+
+        let gen_id = prepare_system_generation(&ctx, b"core-v2", b"daemon-v1", Vec::new()).unwrap();
+        let store = system_generation_store(&ctx);
+        let baseline_id = binding_of(&store, &gen_id);
+        let stale = generation::GenerationId::new("gen-stale-snapshot").unwrap();
+
+        let lock = store.acquire_lock().unwrap();
+        match store.commit_active_cas(&lock, &stale, Some(&baseline_id)) {
+            Err(generation::GenerationError::GenerationMismatch { .. }) => {}
+            other => panic!("stale writer must be rejected, got {other:?}"),
+        }
+        let committed = store
+            .commit_active_cas(&lock, &gen_id, Some(&baseline_id))
+            .unwrap();
+        assert_eq!(committed.active, Some(gen_id.clone()));
+        // A second writer holding the same (now stale) expectation is refused.
+        match store.commit_active_cas(&lock, &gen_id, Some(&baseline_id)) {
+            Err(generation::GenerationError::NoPendingGeneration) => {}
+            other => panic!("preempted writer must be rejected, got {other:?}"),
+        }
+    }
+
+    /// SPEC P4：daemon-only 升级时 core 内容相等 → 不换 core inode。
+    #[cfg(unix)]
+    #[test]
+    fn daemon_only_upgrade_keeps_the_core_inode() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        std::fs::write(&ctx.paths.cli_binary, b"daemon-v1").unwrap();
+        std::fs::write(&ctx.paths.core_binary, b"core-v1").unwrap();
+        let core_inode_before = std::fs::metadata(&ctx.paths.core_binary).unwrap().ino();
+
+        let gen_id = prepare_system_generation(&ctx, b"core-v1", b"daemon-v2", Vec::new()).unwrap();
+        let store = system_generation_store(&ctx);
+        let baseline_id = binding_of(&store, &gen_id);
+        let manifest = store.validate_generation(&gen_id).unwrap();
+        let baseline_manifest = store.validate_generation(&baseline_id).unwrap();
+        let targets = build_artifact_targets(&ctx, &store, &gen_id, &manifest).unwrap();
+        let plan = ApplyPlan {
+            pending_id: gen_id,
+            manifest,
+            baseline_id,
+            baseline_manifest,
+            targets,
+        };
+
+        let change = change_set(&plan).unwrap();
+        assert!(change.daemon, "daemon bytes changed");
+        assert!(!change.core, "equal core bytes must not be rewritten");
+        assert!(change.extras.is_empty());
+
+        let replaced = replace_artifacts(&plan, &change).unwrap();
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(replaced[0].relative_path, "mihomo-cli");
+        assert!(replaced[0].had_pre_image);
+        assert_eq!(std::fs::read(&ctx.paths.cli_binary).unwrap(), b"daemon-v2");
+        assert_eq!(
+            std::fs::metadata(&ctx.paths.core_binary).unwrap().ino(),
+            core_inode_before,
+            "core inode must be preserved on a daemon-only upgrade"
+        );
+    }
+
+    /// SPEC C：补偿逐 artifact 从基线换回，基线声明为缺失的 artifact 以
+    /// no-replace 改名移出（不删除），覆盖「升级新增 artifact」的缺失态恢复。
+    #[cfg(unix)]
+    #[test]
+    fn compensation_restores_baseline_and_moves_aside_artifacts_that_never_existed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        std::fs::write(&ctx.paths.cli_binary, b"daemon-v1").unwrap();
+        // No core and no geo data installed before the upgrade.
+        let state_dir = ctx.paths.tun_config_file.parent().unwrap().to_path_buf();
+
+        let extras = vec![(
+            "GeoSite.dat".to_string(),
+            b"geo-v2".to_vec(),
+            Some(0o644u32),
+        )];
+        let gen_id = prepare_system_generation(&ctx, b"core-v2", b"daemon-v1", extras).unwrap();
+        let store = system_generation_store(&ctx);
+        let baseline_id = binding_of(&store, &gen_id);
+        let manifest = store.validate_generation(&gen_id).unwrap();
+        let baseline_manifest = store.validate_generation(&baseline_id).unwrap();
+        assert!(manifest_missing_set(&baseline_manifest).contains("mihomo"));
+        assert!(manifest_missing_set(&baseline_manifest).contains("GeoSite.dat"));
+
+        let targets = build_artifact_targets(&ctx, &store, &gen_id, &manifest).unwrap();
+        let plan = ApplyPlan {
+            pending_id: gen_id.clone(),
+            manifest,
+            baseline_id: baseline_id.clone(),
+            baseline_manifest: baseline_manifest.clone(),
+            targets,
+        };
+
+        // Apply (P4) then compensate the artifacts.
+        replace_artifacts(&plan, &change_set(&plan).unwrap()).unwrap();
+        assert!(ctx.paths.core_binary.exists());
+        assert!(state_dir.join("GeoSite.dat").exists());
+
+        let baseline_targets =
+            build_artifact_targets(&ctx, &store, &baseline_id, &baseline_manifest).unwrap();
+        let missing = manifest_missing_set(&baseline_manifest);
+        restore_baseline_artifacts(&baseline_targets, &missing).unwrap();
+
+        assert_eq!(std::fs::read(&ctx.paths.cli_binary).unwrap(), b"daemon-v1");
+        assert!(!ctx.paths.core_binary.exists(), "core did not exist before");
+        assert!(ctx
+            .paths
+            .core_binary
+            .with_file_name("mihomo.rollback-removed-00")
+            .exists());
+        assert!(!state_dir.join("GeoSite.dat").exists());
+        assert!(state_dir.join("GeoSite.dat.rollback-removed-00").exists());
+    }
+
+    /// SPEC P1-1/P2：迁移来的 pending/绑定未经认证 → 事实不明 → 零替换。
+    #[tokio::test]
+    async fn migrated_pending_is_not_trusted_by_binding_verification() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        std::fs::write(&ctx.paths.cli_binary, b"daemon-v1").unwrap();
+        std::fs::write(&ctx.paths.core_binary, b"core-v1").unwrap();
+
+        let current_cli = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let gen_id = prepare_system_generation(&ctx, b"core-v2", &current_cli, Vec::new()).unwrap();
+        let store = system_generation_store(&ctx);
+        let baseline_id = binding_of(&store, &gen_id);
+        // Simulate the legacy migration marker: migrated bytes confer no trust.
+        store.mark_generation_untrusted(&gen_id).unwrap();
+
+        let error = apply_pending_generation(&ctx).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("未经认证"),
+            "migrated pending must be rejected: {error:#}"
+        );
+        assert_eq!(std::fs::read(&ctx.paths.core_binary).unwrap(), b"core-v1");
+        assert_eq!(store.read_state().unwrap().pending, Some(gen_id));
+        assert!(!store.is_generation_untrusted(&baseline_id));
+    }
+
+    /// SPEC P6：提交后崩溃（pending 已清空）→ 重入走普通 restart，重跑管线
+    /// 不改槽位、不报成功。
+    #[tokio::test]
+    async fn post_commit_crash_reentry_is_a_no_op() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        std::fs::write(&ctx.paths.cli_binary, b"daemon-v1").unwrap();
+        std::fs::write(&ctx.paths.core_binary, b"core-v1").unwrap();
+
+        let gen_id = prepare_system_generation(&ctx, b"core-v2", b"daemon-v1", Vec::new()).unwrap();
+        let store = system_generation_store(&ctx);
+        let baseline_id = binding_of(&store, &gen_id);
+        let lock = store.acquire_lock().unwrap();
+        store
+            .commit_active_cas(&lock, &gen_id, Some(&baseline_id))
+            .unwrap();
+        drop(lock);
+
+        // New process re-enters the pipeline after the commit crashed.
+        assert!(!apply_pending_generation(&ctx).await.unwrap());
+        let state = store.read_state().unwrap();
+        assert_eq!(state.active, Some(gen_id));
+        assert_eq!(state.pending, None);
+        assert_eq!(state.previous, Some(baseline_id));
+    }
+
+    /// SPEC N3/C：同 sha 的墓碑机械阻断 skew helper 自动重暂存（不靠文案）。
+    #[test]
+    fn tombstone_gate_blocks_skew_helper_auto_restage() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        let current_cli = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        // Installed service binary is skewed relative to the running CLI.
+        std::fs::write(&ctx.paths.cli_binary, b"older-daemon").unwrap();
+        std::fs::write(&ctx.paths.core_binary, b"core-v1").unwrap();
+        assert!(is_system_cli_skewed(&ctx));
+
+        // A withdrawn generation shipped the very daemon revision we run now.
+        let gen_id = prepare_system_generation(&ctx, b"core-v1", &current_cli, Vec::new()).unwrap();
+        let store = system_generation_store(&ctx);
+        store.withdraw_generation(&gen_id).unwrap();
+        let mut state = store.read_state().unwrap();
+        state.pending = None;
+        state.previous = None;
+        store.write_state(&state).unwrap();
+
+        let error = maybe_prepare_cli_skew_generation(&ctx).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("墓碑"),
+            "tombstone must mechanically block auto re-staging: {error:#}"
+        );
+        assert!(store.read_state().unwrap().pending.is_none());
+        // The tombstone manifest stays readable after the rename.
+        assert_eq!(
+            store
+                .read_withdrawn_manifest(&gen_id)
+                .unwrap()
+                .daemon
+                .sha256,
+            generation::calculate_sha256_bytes(&current_cli)
+        );
+    }
+
+    /// SPEC N3：显式重试成功（提交同一 daemon 版本）后退休对应墓碑。
+    #[test]
+    fn successful_retry_retires_matching_tombstone() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        std::fs::write(&ctx.paths.cli_binary, b"daemon-v1").unwrap();
+        std::fs::write(&ctx.paths.core_binary, b"core-v1").unwrap();
+
+        let withdrawn_id =
+            prepare_system_generation(&ctx, b"core-v2", b"daemon-v1", Vec::new()).unwrap();
+        let store = system_generation_store(&ctx);
+        store.withdraw_generation(&withdrawn_id).unwrap();
+        // A withdrawn pending is consumed by the discard/compensation terminal.
+        store.clear_pending().unwrap();
+
+        // A different daemon revision is a different upgrade source: the
+        // tombstone must survive (核心字节属于失败候选，不参与同源判定).
+        let other_id =
+            prepare_system_generation(&ctx, b"core-v2", b"daemon-v2", Vec::new()).unwrap();
+        let other_baseline = binding_of(&store, &other_id);
+        let other_manifest = store.validate_generation(&other_id).unwrap();
+        let other_baseline_manifest = store.validate_generation(&other_baseline).unwrap();
+        let other_targets =
+            build_artifact_targets(&ctx, &store, &other_id, &other_manifest).unwrap();
+        retire_successful_tombstones(
+            &store,
+            &ApplyPlan {
+                pending_id: other_id,
+                manifest: other_manifest,
+                baseline_id: other_baseline,
+                baseline_manifest: other_baseline_manifest,
+                targets: other_targets,
+            },
+        );
+        assert!(store.has_withdrawn(&withdrawn_id));
+        // A pending generation is never silently overwritten (裁决 A1): clear the
+        // intermediate candidate before staging the retry.
+        store.clear_pending().unwrap();
+
+        // Same daemon revision as the withdrawn generation → the retry retires it.
+        let retry_id =
+            prepare_system_generation(&ctx, b"core-v2", b"daemon-v1", Vec::new()).unwrap();
+        let baseline_id = binding_of(&store, &retry_id);
+        let manifest = store.validate_generation(&retry_id).unwrap();
+        let baseline_manifest = store.validate_generation(&baseline_id).unwrap();
+        let targets = build_artifact_targets(&ctx, &store, &retry_id, &manifest).unwrap();
+        let plan = ApplyPlan {
+            pending_id: retry_id,
+            manifest,
+            baseline_id,
+            baseline_manifest,
+            targets,
+        };
+
+        assert!(store.has_withdrawn(&withdrawn_id));
+        retire_successful_tombstones(&store, &plan);
+        assert!(!store.has_withdrawn(&withdrawn_id));
+    }
+
+    /// SPEC P5/P0-1：启动因果必须是三态判定——「receipt 缺失」属不可证，
+    /// 必须补一次重启再验，绝不允许当作满足（daemon reattach 旧 core 反例）。
+    #[test]
+    fn unknown_start_receipt_is_never_satisfied() {
+        let frozen = FrozenConfig {
+            content: "config-bytes".to_string(),
+            revision: "rev-frozen".to_string(),
+            subscription_id: None,
+            ownership_proven: true,
+        };
+        let status = |running: bool, launched: Option<&str>| DaemonStatusView {
+            running,
+            launched_config_revision: launched.map(str::to_string),
+        };
+
+        assert_eq!(
+            start_causality(Some(&frozen), &status(false, None)),
+            StartCausality::NeedsStart
+        );
+        // 旧 core 被 daemon reattach：running=true 但没有任何 receipt。
+        match start_causality(Some(&frozen), &status(true, None)) {
+            StartCausality::NeedsRestart(reason) => {
+                assert!(reason.contains("receipt"), "{reason}")
+            }
+            other => panic!("unknown receipt must force a restart, got {other:?}"),
+        }
+        match start_causality(Some(&frozen), &status(true, Some("rev-other"))) {
+            StartCausality::NeedsRestart(_) => {}
+            other => panic!("stale snapshot must force a restart, got {other:?}"),
+        }
+        assert_eq!(
+            start_causality(Some(&frozen), &status(true, Some("rev-frozen"))),
+            StartCausality::Satisfied
+        );
+        // No managed config ⇒ no start causality to bind (documented degrade path).
+        assert_eq!(
+            start_causality(None, &status(true, None)),
+            StartCausality::Satisfied
+        );
+    }
+
+    /// SPEC P1（冻结判据）：pending daemon 只认「= sha256(current_exe)」，
+    /// 已安装 daemon 相同不再放行（否则可应用一个不是当前进程的 daemon）。
+    #[tokio::test]
+    async fn pending_daemon_must_match_the_running_executable() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        std::fs::write(&ctx.paths.cli_binary, b"daemon-installed").unwrap();
+        std::fs::write(&ctx.paths.core_binary, b"core-v1").unwrap();
+        // Pending daemon == installed daemon, but NOT the running executable.
+        let gen_id =
+            prepare_system_generation(&ctx, b"core-v2", b"daemon-installed", Vec::new()).unwrap();
+        let store = system_generation_store(&ctx);
+
+        let error = apply_pending_generation(&ctx).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("当前运行的可执行文件"),
+            "P1 must compare against current_exe only: {error:#}"
+        );
+        assert_eq!(std::fs::read(&ctx.paths.core_binary).unwrap(), b"core-v1");
+        assert_eq!(store.read_state().unwrap().pending, Some(gen_id));
+    }
+
+    /// SPEC A/P2-1：完全缺失的安装也能捕获基线（全 missing 基线），
+    /// 从而不会产生「无绑定 pending 永不可应用 + 指引死循环」。
+    #[test]
+    fn all_missing_install_still_yields_a_bound_baseline() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        // Deliberately no installed daemon/core on disk.
+        let gen_id = prepare_system_generation(&ctx, b"core-v2", b"daemon-v2", Vec::new()).unwrap();
+        let store = system_generation_store(&ctx);
+        let state = store.read_state().unwrap();
+        let manifest = store.validate_generation(&gen_id).unwrap();
+        let baseline_id = generation::GenerationId::new(
+            manifest
+                .metadata
+                .get("baseline")
+                .expect("staging always records a baseline binding"),
+        )
+        .unwrap();
+        assert_eq!(state.previous, Some(baseline_id.clone()));
+
+        let baseline = store.validate_generation(&baseline_id).unwrap();
+        assert!(baseline.is_baseline());
+        let missing = manifest_missing_set(&baseline);
+        assert!(missing.contains(&baseline.daemon.relative_path));
+        assert!(missing.contains(&baseline.core.relative_path));
+        // The binding is accepted by P2 — no deadlock for a first install.
+        assert!(verify_baseline_binding(&store, &manifest, &state, &gen_id).is_ok());
+    }
+
+    // ── 子进程假 daemon 夹具：驱动**真实**管线（非纯函数矩阵） ──────────
+    #[cfg(unix)]
+    const FAKE_DAEMON_ROOT_ENV: &str = "MIHOMO036_FAKE_DAEMON_ROOT";
+    #[cfg(unix)]
+    const FAKE_DAEMON_SCENARIO_ENV: &str = "MIHOMO036_FAKE_DAEMON_SCENARIO";
+
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct FakeDaemonCounters {
+        restarts: std::sync::atomic::AtomicUsize,
+        starts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(unix)]
+    async fn serve_fake_daemon(
+        listener: tokio::net::UnixListener,
+        daemon_sha: String,
+        launched_revision: Option<String>,
+        counters: std::sync::Arc<FakeDaemonCounters>,
+    ) {
+        serve_fake_daemon_logged(
+            listener,
+            daemon_sha,
+            launched_revision,
+            counters,
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            false,
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    async fn serve_fake_daemon_logged(
+        listener: tokio::net::UnixListener,
+        daemon_sha: String,
+        launched_revision: Option<String>,
+        counters: std::sync::Arc<FakeDaemonCounters>,
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        fail_records: bool,
+    ) {
+        use std::sync::atomic::Ordering;
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let sha = daemon_sha.clone();
+            let launched = launched_revision.clone();
+            let counters = counters.clone();
+            let log = std::sync::Arc::clone(&log);
+            tokio::spawn(async move {
+                let mut reader = tokio::io::BufReader::new(stream);
+                let Ok(command) =
+                    ipc::read_json_message::<_, ipc::DaemonCommand>(&mut reader, "daemon command")
+                        .await
+                else {
+                    return;
+                };
+                let label = match &command {
+                    ipc::DaemonCommand::GetStatus { .. } => "GetStatus".to_string(),
+                    ipc::DaemonCommand::RestartCore { .. } => "RestartCore".to_string(),
+                    ipc::DaemonCommand::StartCore {
+                        subscription_id,
+                        config_revision,
+                        ..
+                    } => format!(
+                        "StartCore subscription={subscription_id:?} revision={}",
+                        config_revision.chars().take(16).collect::<String>()
+                    ),
+                    ipc::DaemonCommand::RecordActiveSubscription {
+                        subscription_id,
+                        config_revision,
+                        ..
+                    } => format!(
+                        "RecordActiveSubscription subscription={subscription_id} revision={:?}",
+                        config_revision
+                            .as_deref()
+                            .map(|rev| rev.chars().take(16).collect::<String>())
+                    ),
+                    ipc::DaemonCommand::RecordSelectionIntent {
+                        subscription_id,
+                        config_revision,
+                        ..
+                    } => format!(
+                        "RecordSelectionIntent subscription={subscription_id} revision={:?}",
+                        config_revision
+                            .as_deref()
+                            .map(|rev| rev.chars().take(16).collect::<String>())
+                    ),
+                    ipc::DaemonCommand::StopCore { .. } => "StopCore".to_string(),
+                    ipc::DaemonCommand::CoreApiRequest { .. } => "CoreApiRequest".to_string(),
+                    other => format!("{other:?}"),
+                };
+                log.lock().unwrap().push(label);
+                let response = match command {
+                    ipc::DaemonCommand::GetStatus { .. } => ipc::DaemonResponse::Status {
+                        running: true,
+                        core_pid: Some(std::process::id()),
+                        config_path: None,
+                        tun_snapshot_revision: None,
+                        launched_config_revision: launched,
+                        autostart_enabled: false,
+                        daemon_executable_revision: Some(sha),
+                        tun_journal_state: None,
+                        tun_journal_error: None,
+                    },
+                    ipc::DaemonCommand::RestartCore { .. } => {
+                        counters.restarts.fetch_add(1, Ordering::SeqCst);
+                        ipc::DaemonResponse::Success {
+                            message: String::new(),
+                        }
+                    }
+                    ipc::DaemonCommand::StartCore { .. } => {
+                        counters.starts.fetch_add(1, Ordering::SeqCst);
+                        ipc::DaemonResponse::Success {
+                            message: String::new(),
+                        }
+                    }
+                    ipc::DaemonCommand::RecordActiveSubscription { .. }
+                    | ipc::DaemonCommand::RecordSelectionIntent { .. }
+                        if fail_records =>
+                    {
+                        ipc::DaemonResponse::Error {
+                            message: "mirror channel rejected the record".to_string(),
+                        }
+                    }
+                    ipc::DaemonCommand::StopCore { .. }
+                    | ipc::DaemonCommand::RecordActiveSubscription { .. }
+                    | ipc::DaemonCommand::RecordSelectionIntent { .. } => {
+                        ipc::DaemonResponse::Success {
+                            message: String::new(),
+                        }
+                    }
+                    ipc::DaemonCommand::CoreApiRequest { .. } => ipc::DaemonResponse::CoreApi {
+                        data: serde_json::json!({}),
+                    },
+                    other => ipc::DaemonResponse::Error {
+                        message: format!("fake daemon does not support {other:?}"),
+                    },
+                };
+                let mut writer = reader.into_inner();
+                let _ = ipc::write_json_message(&mut writer, &response).await;
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    fn pipeline_plan(
+        ctx: &instance::InstanceContext,
+        store: &generation::GenerationStore,
+        id: &generation::GenerationId,
+    ) -> ApplyPlan {
+        let manifest = store.validate_generation(id).unwrap();
+        let baseline_id =
+            generation::GenerationId::new(manifest.metadata.get("baseline").unwrap()).unwrap();
+        let baseline_manifest = store.validate_generation(&baseline_id).unwrap();
+        let targets = build_artifact_targets(ctx, store, id, &manifest).unwrap();
+        ApplyPlan {
+            pending_id: id.clone(),
+            manifest,
+            baseline_id,
+            baseline_manifest,
+            targets,
+        }
+    }
+
+    /// 子进程内运行：真实 `start_and_prove` / `apply_pending_generation` 对假 daemon。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_drives_the_apply_pipeline_against_a_fake_daemon() {
+        let Ok(root) = std::env::var(FAKE_DAEMON_ROOT_ENV) else {
+            return;
+        };
+        let scenario = std::env::var(FAKE_DAEMON_SCENARIO_ENV).unwrap_or_default();
+        let socket_path: std::path::PathBuf = std::env::var_os(ipc::TEST_DAEMON_SOCKET_ENV)
+            .map(std::path::PathBuf::from)
+            .expect("parent must pass the fake daemon socket path");
+        let ctx = system_ctx(std::path::Path::new(&root));
+
+        if scenario == "reentry" {
+            // The parent left durable state: pending P + tombstone P.withdrawn.
+            let store = system_generation_store(&ctx);
+            let state = store.read_state().unwrap();
+            let pending = state
+                .pending
+                .clone()
+                .expect("parent staged a pending generation");
+            assert!(
+                store.has_withdrawn(&pending),
+                "parent published the tombstone"
+            );
+            let baseline_id = state.previous.clone().expect("baseline recorded");
+            let baseline_manifest = store.validate_generation(&baseline_id).unwrap();
+            let socket_path_parent = socket_path.clone();
+            let listener = tokio::net::UnixListener::bind(&socket_path_parent).unwrap();
+            let counters = std::sync::Arc::new(FakeDaemonCounters::default());
+            tokio::spawn(serve_fake_daemon(
+                listener,
+                baseline_manifest.daemon.sha256.clone(),
+                None,
+                counters.clone(),
+            ));
+            assert!(apply_pending_generation(&ctx).await.unwrap());
+            let state = store.read_state().unwrap();
+            // SPEC 裁决 A1: a tombstone without the rollback-proof marker is
+            // an explicit discard → metadata-only revoked terminal state.
+            assert_eq!(state.active, None, "revoked state must not claim a runtime");
+            assert_eq!(state.pending, None);
+            assert_eq!(state.previous, Some(baseline_id));
+            assert!(store.has_withdrawn(&pending), "tombstone is never deleted");
+            return;
+        }
+
+        std::fs::create_dir_all(&ctx.paths.config_dir).unwrap();
+        std::fs::write(
+            &ctx.paths.intent_config_file,
+            format!(
+                "mixed-port: 7890\n{}\n",
+                ctx.paths.api_endpoint.controller_line()
+            ),
+        )
+        .unwrap();
+
+        let store = system_generation_store(&ctx);
+        let prepared = store.read_state().ok().and_then(|state| state.pending);
+        let gen_id = match prepared {
+            // A parent test already staged this generation: materialise the
+            // artifacts so P4 has nothing to replace (no downtime in the child).
+            Some(existing) => {
+                let manifest = store.validate_generation(&existing).unwrap();
+                for target in build_artifact_targets(&ctx, &store, &existing, &manifest).unwrap() {
+                    if let Ok(bytes) = std::fs::read(&target.source) {
+                        std::fs::write(&target.dest, bytes).unwrap();
+                    }
+                }
+                existing
+            }
+            None => {
+                let cli_bytes = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+                let core_bytes = b"core-v1".to_vec();
+                std::fs::write(&ctx.paths.cli_binary, &cli_bytes).unwrap();
+                std::fs::write(&ctx.paths.core_binary, &core_bytes).unwrap();
+                prepare_system_generation(&ctx, &core_bytes, &cli_bytes, Vec::new()).unwrap()
+            }
+        };
+        let manifest = store.validate_generation(&gen_id).unwrap();
+        let frozen = freeze_config_triple(&ctx).unwrap().expect("config exists");
+
+        if scenario == "mirror_push_error" {
+            let paths = utils::AppPaths::new(ctx.paths.config_dir.clone());
+            config::set_active_id_at(&paths, "sub-aaaaaaaa").unwrap();
+            let selection = paths.selection_state_path_for_subscription("sub-aaaaaaaa");
+            if let Some(parent) = selection.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&selection, "selections:\n  G: N\n").unwrap();
+            let frozen = freeze_config_triple(&ctx).unwrap().expect("config exists");
+            let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+            tokio::spawn(serve_fake_daemon_logged(
+                listener,
+                "sha".to_string(),
+                None,
+                std::sync::Arc::new(FakeDaemonCounters::default()),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                true,
+            ));
+            // Business Error from the mirror channel = channel unavailable.
+            let error = push_mirror_strict(&ctx, &frozen).await.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("被拒绝"),
+                "record Error must be treated as an unavailable channel: {error:#}"
+            );
+            return;
+        }
+
+        if scenario == "cas_child" {
+            // Cross-process CAS: commit first, then let the parent lose.
+            let baseline =
+                generation::GenerationId::new(manifest.metadata.get("baseline").unwrap()).unwrap();
+            let lock = store.acquire_lock().unwrap();
+            store
+                .commit_active_cas(&lock, &gen_id, Some(&baseline))
+                .expect("child must win the commit race");
+            return;
+        }
+
+        if scenario == "mirror_order" || scenario == "request_binding" {
+            let paths = utils::AppPaths::new(ctx.paths.config_dir.clone());
+            config::set_active_id_at(&paths, "sub-aaaaaaaa").unwrap();
+            let selection = paths.selection_state_path_for_subscription("sub-aaaaaaaa");
+            if let Some(parent) = selection.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&selection, "selections:\n  G: N\n").unwrap();
+            let frozen = freeze_config_triple(&ctx).unwrap().expect("config exists");
+            let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+            // Receipt missing → the pipeline must push the mirror first and only
+            // then restart the managed Core.
+            tokio::spawn(serve_fake_daemon_logged(
+                listener,
+                manifest.daemon.sha256.clone(),
+                None,
+                std::sync::Arc::new(FakeDaemonCounters::default()),
+                std::sync::Arc::clone(&log),
+                false,
+            ));
+            if scenario == "request_binding" {
+                // The active pointer moves to B after the triple was frozen: the
+                // request must stay bound to the frozen identity A.
+                config::set_active_id_at(&paths, "sub-bbbbbbbb").unwrap();
+                let _ = request_core_start(&ctx, "binding", Some(&frozen)).await;
+                let entries = log.lock().unwrap().clone();
+                let start = entries
+                    .iter()
+                    .find(|entry| entry.starts_with("StartCore "))
+                    .unwrap_or_else(|| panic!("no StartCore request: {entries:?}"));
+                assert!(
+                    start.contains("subscription=Some(\"sub-aaaaaaaa\")"),
+                    "request must bind the frozen subscription: {start}"
+                );
+                assert!(
+                    start.contains(&frozen.revision.chars().take(16).collect::<String>()),
+                    "request must carry the frozen revision: {start}"
+                );
+                return;
+            }
+            let plan = pipeline_plan(&ctx, &store, &gen_id);
+            let _ = run_apply_pipeline(&ctx, &plan, Some(&frozen)).await;
+            let entries = log.lock().unwrap().clone();
+            let position = |prefix: &str| {
+                entries
+                    .iter()
+                    .position(|entry| entry.starts_with(prefix))
+                    .unwrap_or_else(|| panic!("{prefix} missing: {entries:?}"))
+            };
+            let active = position("RecordActiveSubscription ");
+            let intent = position("RecordSelectionIntent ");
+            let restart = position("RestartCore");
+            assert!(
+                active < restart && intent < restart,
+                "mirror push must precede the Core start: {entries:?}"
+            );
+            return;
+        }
+
+        let launched = if scenario == "receipt_missing" {
+            None
+        } else {
+            Some(frozen.revision.clone())
+        };
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let counters = std::sync::Arc::new(FakeDaemonCounters::default());
+        tokio::spawn(serve_fake_daemon(
+            listener,
+            manifest.daemon.sha256.clone(),
+            launched,
+            counters.clone(),
+        ));
+
+        if scenario == "receipt_missing" {
+            // D6-①: receipt missing → one restart → still missing → never success.
+            let plan = pipeline_plan(&ctx, &store, &gen_id);
+            let mut degraded = Vec::new();
+            let error = start_and_prove(&ctx, &plan, Some(&frozen), true, None, &mut degraded)
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("启动因果不可证"),
+                "unknown receipt must never be reported as success: {error:#}"
+            );
+            assert_eq!(
+                counters.restarts.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "exactly one managed restart before re-verification"
+            );
+            assert_eq!(
+                counters.starts.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "a running core must be restarted, not started"
+            );
+            return;
+        }
+
+        // C-9: the real apply pipeline end-to-end (no downtime) commits the slots.
+        assert!(apply_pending_generation(&ctx).await.unwrap());
+        let state = store.read_state().unwrap();
+        assert_eq!(state.active, Some(gen_id.clone()));
+        assert_eq!(state.pending, None);
+        assert_eq!(
+            state.previous.as_ref().map(|id| id.as_str().to_string()),
+            Some(frozen.revision.clone()).map(|_| {
+                generation::GenerationId::new(
+                    store
+                        .read_manifest(&gen_id)
+                        .unwrap()
+                        .metadata
+                        .get("baseline")
+                        .unwrap(),
+                )
+                .unwrap()
+                .as_str()
+                .to_string()
+            })
+        );
+        assert_eq!(
+            counters.restarts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a proven receipt must not restart the managed core"
+        );
+    }
+
+    #[cfg(unix)]
+    pub(super) fn run_pipeline_child_in(
+        root: &std::path::Path,
+        scenario: &str,
+    ) -> std::process::Output {
+        let socket_path = root.join("fake-daemon.sock");
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::gen036_pipeline_tests::child_drives_the_apply_pipeline_against_a_fake_daemon",
+                "--nocapture",
+            ])
+            .env(FAKE_DAEMON_ROOT_ENV, root)
+            .env(FAKE_DAEMON_SCENARIO_ENV, scenario)
+            .env(ipc::TEST_DAEMON_SOCKET_ENV, &socket_path)
+            .output()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn run_pipeline_child(scenario: &str) -> std::process::Output {
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket_path = temp.path().join("fake-daemon.sock");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::gen036_pipeline_tests::child_drives_the_apply_pipeline_against_a_fake_daemon",
+                "--nocapture",
+            ])
+            .env(FAKE_DAEMON_ROOT_ENV, temp.path())
+            .env(FAKE_DAEMON_SCENARIO_ENV, scenario)
+            .env(ipc::TEST_DAEMON_SOCKET_ENV, &socket_path)
+            .output()
+            .unwrap();
+        // Keep the temp root alive until the child exits, then drop it.
+        drop(socket_path);
+        drop(temp);
+        output
+    }
+
+    /// D6-①：子进程真实驱动 `start_and_prove`——receipt 恒缺 → 单次重启 → 不得报成功。
+    #[cfg(unix)]
+    #[test]
+    fn pipeline_never_reports_success_on_an_unprovable_start_receipt() {
+        let output = run_pipeline_child("receipt_missing");
+        assert!(
+            output.status.success(),
+            "child assertions failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// C-9：子进程真实驱动 `apply_pending_generation`（非直调 CAS）完成提交。
+    #[cfg(unix)]
+    #[test]
+    fn apply_pipeline_end_to_end_commits_the_generation() {
+        let output = run_pipeline_child("happy");
+        assert!(
+            output.status.success(),
+            "child assertions failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// 镜像桩①：Record* 返回业务 Error = 通道不可用（不得当成推送成功）。
+    #[cfg(unix)]
+    #[test]
+    fn mirror_push_treats_business_error_as_unavailable_channel() {
+        let output = run_pipeline_child("mirror_push_error");
+        assert!(
+            output.status.success(),
+            "child assertions failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// 镜像桩②：旧 daemon 先推时序——镜像推送严格早于 Core 启动/重启请求。
+    #[cfg(unix)]
+    #[test]
+    fn mirror_push_precedes_core_start() {
+        let output = run_pipeline_child("mirror_order");
+        assert!(
+            output.status.success(),
+            "child assertions failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// 镜像桩③：请求 ID 绑定——冻结后 active 指针切到 B，请求仍绑定冻结身份 A。
+    #[cfg(unix)]
+    #[test]
+    fn request_identity_is_frozen_across_active_pointer_changes() {
+        let output = run_pipeline_child("request_binding");
+        assert!(
+            output.status.success(),
+            "child assertions failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// C-11：跨进程真双 writer CAS——先提交者胜，后者的期望 ID 已被消费。
+    #[cfg(unix)]
+    #[test]
+    fn cross_process_cas_rejects_the_loser() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket_path = temp.path().join("fake-daemon.sock");
+        let root = temp.path().to_path_buf();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::gen036_pipeline_tests::child_drives_the_apply_pipeline_against_a_fake_daemon",
+                "--nocapture",
+            ])
+            .env(FAKE_DAEMON_ROOT_ENV, &root)
+            .env(FAKE_DAEMON_SCENARIO_ENV, "cas_child")
+            .env(ipc::TEST_DAEMON_SOCKET_ENV, &socket_path)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "child (winner) failed:\n{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+
+        let ctx = system_ctx(&root);
+        let store = system_generation_store(&ctx);
+        let state = store.read_state().unwrap();
+        let active = state.active.expect("child committed");
+        let lock = store.acquire_lock().unwrap();
+        match store.commit_active_cas(&lock, &active, state.previous.as_ref()) {
+            Err(generation::GenerationError::NoPendingGeneration) => {}
+            other => panic!("the losing writer must be rejected, got {other:?}"),
+        }
+    }
+
+    /// C-10：信任根/state/manifest 的权限合同——服务账号不可写（无账户也能验证模式）。
+    #[cfg(unix)]
+    #[test]
+    fn generation_state_is_not_writable_by_the_service_identity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        std::fs::write(&ctx.paths.cli_binary, b"daemon-v1").unwrap();
+        std::fs::write(&ctx.paths.core_binary, b"core-v1").unwrap();
+        let gen_id = prepare_system_generation(&ctx, b"core-v2", b"daemon-v1", Vec::new()).unwrap();
+        let store = system_generation_store(&ctx);
+        let baseline = binding_of(&store, &gen_id);
+
+        let mut paths = vec![
+            store.root_dir().to_path_buf(),
+            store.generations_dir(),
+            store.state_file_path(),
+            store.manifest_path(&gen_id),
+            store.manifest_path(&baseline),
+        ];
+        paths.push(store.generation_dir(&gen_id).join("mihomo-cli"));
+        for path in paths {
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            let mode = metadata.permissions().mode() & 0o777;
+            assert_eq!(
+                mode & 0o022,
+                0,
+                "{} must not be group/other writable (mode {mode:#o})",
+                path.display()
+            );
+        }
+        // The trust root itself is owner-traversable only.
+        let root_mode = std::fs::metadata(store.root_dir())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(root_mode, 0o750, "trust root must be 0750");
+    }
+
+    /// C-12：锁序契约——generation 锁先于 config 锁，且无反向持锁路径。
+    #[test]
+    fn generation_lock_precedes_config_lock_and_never_reverses() {
+        let source = include_str!("main.rs");
+
+        // Within the pipeline, the generation lock precedes the frozen config
+        // snapshot (the only place that takes the config lock).
+        let start = source
+            .find("pub(crate) async fn apply_pending_generation(")
+            .unwrap();
+        let body_end = source[start..].find("\n}\n").unwrap() + start;
+        let body = &source[start..body_end];
+        let gen_lock = body.find("acquire_lock()").unwrap();
+        let config_snapshot = body.find("freeze_config_triple(").unwrap();
+        assert!(
+            gen_lock < config_snapshot,
+            "generation lock must be taken before the config snapshot"
+        );
+
+        // No function may hold the config lock while staging/applying generations.
+        for function in split_functions(source) {
+            if function.contains("ConfigLock::acquire") {
+                assert!(
+                    !function.contains("prepare_system_generation(")
+                        && !function.contains("apply_pending_generation(")
+                        && !function.contains("acquire_lock()"),
+                    "config-lock holder must not enter the generation pipeline (reverse lock order)"
+                );
+            }
+        }
+    }
+
+    /// Splits `main.rs` source into top-level function bodies (brace depth 0).
+    fn split_functions(source: &str) -> Vec<String> {
+        let mut functions = Vec::new();
+        let mut current: Option<String> = None;
+        let mut depth = 0i32;
+        for line in source.lines() {
+            if current.is_none()
+                && (line.starts_with("fn ")
+                    || line.starts_with("async fn ")
+                    || line.starts_with("pub fn ")
+                    || line.starts_with("pub(crate) fn ")
+                    || line.starts_with("pub(crate) async fn ")
+                    || line.starts_with("pub async fn ")
+                    || line.starts_with("async fn "))
+            {
+                current = Some(String::new());
+            }
+            if let Some(buffer) = current.as_mut() {
+                buffer.push_str(line);
+                buffer.push('\n');
+                depth += line.matches('{').count() as i32;
+                depth -= line.matches('}').count() as i32;
+                if depth == 0 && buffer.contains('{') {
+                    functions.push(buffer.clone());
+                    current = None;
+                }
+            }
+        }
+        functions
+    }
+
+    /// 裁决 A1：显式撤销只动元数据——active=∅、pending=∅、previous=B（保留基线），
+    /// 墓碑保留候选字节，安装文件一字未改、无停启。
+    #[test]
+    fn discard_pending_revokes_metadata_and_keeps_the_baseline() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        std::fs::write(&ctx.paths.cli_binary, b"daemon-v1").unwrap();
+        std::fs::write(&ctx.paths.core_binary, b"core-v1").unwrap();
+        let gen_id = prepare_system_generation(&ctx, b"core-v2", b"daemon-v1", Vec::new()).unwrap();
+        let store = system_generation_store(&ctx);
+        let baseline_id = binding_of(&store, &gen_id);
+
+        let installed_before = (
+            std::fs::read(&ctx.paths.cli_binary).unwrap(),
+            std::fs::read(&ctx.paths.core_binary).unwrap(),
+        );
+        discard_pending_generation(&ctx, &gen_id).unwrap();
+
+        let state = store.read_state().unwrap();
+        assert_eq!(state.active, None);
+        assert_eq!(state.pending, None);
+        assert_eq!(state.previous, Some(baseline_id.clone()));
+        assert!(
+            store.has_withdrawn(&gen_id),
+            "candidate bytes kept as evidence"
+        );
+        assert!(
+            store.validate_generation(&baseline_id).is_ok(),
+            "baseline intact"
+        );
+        assert!(
+            !store.has_rollback_proof(&gen_id),
+            "discard is not a rollback"
+        );
+        assert_eq!(
+            installed_before,
+            (
+                std::fs::read(&ctx.paths.cli_binary).unwrap(),
+                std::fs::read(&ctx.paths.core_binary).unwrap()
+            ),
+            "discard must not touch installed artifacts"
+        );
+    }
+
+    /// 裁决 A1：撤销准入 fail-closed——目标身份不符、无绑定、绑定与 previous 不一致。
+    #[test]
+    fn discard_pending_is_fail_closed_on_insufficient_evidence() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        std::fs::write(&ctx.paths.cli_binary, b"daemon-v1").unwrap();
+        std::fs::write(&ctx.paths.core_binary, b"core-v1").unwrap();
+        let gen_id = prepare_system_generation(&ctx, b"core-v2", b"daemon-v1", Vec::new()).unwrap();
+        let store = system_generation_store(&ctx);
+
+        // Unknown target identity.
+        let unknown = generation::GenerationId::new("gen-not-the-pending").unwrap();
+        assert!(discard_pending_generation(&ctx, &unknown).is_err());
+
+        // Binding mismatch: pending manifest no longer binds state.previous.
+        let mut manifest = store.read_manifest(&gen_id).unwrap();
+        manifest
+            .metadata
+            .insert("baseline".to_string(), "gen-other".to_string());
+        store.write_manifest(&manifest).unwrap();
+        assert!(discard_pending_generation(&ctx, &gen_id).is_err());
+        // Nothing was revoked by the rejected attempts.
+        let state = store.read_state().unwrap();
+        assert_eq!(state.pending, Some(gen_id.clone()));
+        assert!(!store.has_withdrawn(&gen_id));
+    }
+
+    /// 裁决 A1：普通 install（暂存）不得隐式丢弃 pending。
+    #[test]
+    fn staging_never_silently_discards_a_pending_generation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        std::fs::write(&ctx.paths.cli_binary, b"daemon-v1").unwrap();
+        std::fs::write(&ctx.paths.core_binary, b"core-v1").unwrap();
+        let gen_id = prepare_system_generation(&ctx, b"core-v2", b"daemon-v1", Vec::new()).unwrap();
+        let store = system_generation_store(&ctx);
+
+        let error =
+            prepare_system_generation(&ctx, b"core-v3", b"daemon-v1", Vec::new()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("--discard-pending"), "{message}");
+        assert_eq!(store.read_state().unwrap().pending, Some(gen_id));
+    }
+
+    /// 裁决 A1 恢复态：撤销后新候选 C 继续绑定已认证基线 B，不捕获混合安装态，
+    /// 且暂存准入把「安装态 = 已撤销候选」视为已知现场（不是混合态）。
+    #[test]
+    fn restaging_after_discard_binds_the_authenticated_baseline() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        std::fs::write(&ctx.paths.cli_binary, b"daemon-v1").unwrap();
+        std::fs::write(&ctx.paths.core_binary, b"core-v1").unwrap();
+        let first = prepare_system_generation(&ctx, b"core-v2", b"daemon-v1", Vec::new()).unwrap();
+        let store = system_generation_store(&ctx);
+        let baseline = binding_of(&store, &first);
+        discard_pending_generation(&ctx, &first).unwrap();
+
+        // The install tree still carries the revoked candidate's bytes (candidate
+        // == installed for daemon, so the mixed-scene guard must not fire).
+        let candidate =
+            prepare_system_generation(&ctx, b"core-v3", b"daemon-v1", Vec::new()).unwrap();
+        let manifest = store.read_manifest(&candidate).unwrap();
+        assert_eq!(
+            manifest.metadata.get("baseline").map(String::as_str),
+            Some(baseline.as_str()),
+            "candidate C must bind the authenticated baseline B, not the mixed scene"
+        );
+        let state = store.read_state().unwrap();
+        assert_eq!(state.previous, Some(baseline), "previous stays B");
+        assert_eq!(state.pending, Some(candidate));
+    }
+
+    const CRASH_CHILD_ENV: &str = "MIHOMO036_CRASH_CHILD_ROOT";
+
+    /// 只在崩溃子进程中真正运行：准备好 pending、发布墓碑后**真实退出进程**
+    /// （abort，不走任何清理路径），模拟「墓碑已发布 / 槽位未消费」断点。
+    #[test]
+    fn crash_child_publishes_tombstone_then_aborts() {
+        let Ok(root) = std::env::var(CRASH_CHILD_ENV) else {
+            return;
+        };
+        let ctx = system_ctx(std::path::Path::new(&root));
+        std::fs::write(&ctx.paths.cli_binary, b"daemon-v1").unwrap();
+        std::fs::write(&ctx.paths.core_binary, b"core-v1").unwrap();
+        let gen_id = prepare_system_generation(&ctx, b"core-v2", b"daemon-v1", Vec::new()).unwrap();
+        let store = system_generation_store(&ctx);
+        let baseline = store.read_state().unwrap().previous.unwrap();
+        record_native_withdrawal(&store, &gen_id, &baseline).unwrap();
+        store.withdraw_generation(&gen_id).unwrap();
+        std::process::abort();
+    }
+
+    /// SPEC C/P6：真崩溃测试——子进程持锁期间真实退出，新进程重入后只做
+    /// 槽位消费并收敛（不依赖任何进程内信号）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn crashed_process_state_converges_in_a_new_process() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().to_path_buf();
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "tests::gen036_pipeline_tests::crash_child_publishes_tombstone_then_aborts",
+                "--nocapture",
+            ])
+            .env(CRASH_CHILD_ENV, &root)
+            .status()
+            .unwrap();
+        assert!(
+            !status.success(),
+            "the child process must die mid-pipeline: {status:?}"
+        );
+
+        // Durable state written by the dead process.
+        let ctx = system_ctx(&root);
+        let store = system_generation_store(&ctx);
+        let state = store.read_state().unwrap();
+        let pending = state
+            .pending
+            .clone()
+            .expect("crash child staged a pending generation");
+        let baseline = state.previous.clone().expect("baseline binding recorded");
+        assert!(store.has_withdrawn(&pending));
+
+        // A new process re-enters and converges without any in-process signal.
+        drop(store);
+        let output = run_pipeline_child_in(&root, "reentry");
+        assert!(
+            output.status.success(),
+            "re-entry child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let store = system_generation_store(&ctx);
+        let state = store.read_state().unwrap();
+        assert_eq!(state.active, None);
+        assert_eq!(state.pending, None);
+        assert_eq!(state.previous, Some(baseline));
+        assert!(store.has_withdrawn(&pending));
+    }
+
+    /// SPEC P1-1：信任根必须是显式 root:root 0750（非 umask 继承），
+    /// 模式或祖先可写性漂移即拒绝。
+    #[cfg(unix)]
+    #[test]
+    fn generation_trust_root_drift_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("generations");
+        utils::ensure_generation_trust_root(&root).unwrap();
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o750,
+            "trust root must not inherit the process umask"
+        );
+        assert!(utils::verify_generation_trust_root(&root).is_ok());
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(utils::verify_generation_trust_root(&root).is_err());
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(utils::verify_generation_trust_root(&root).is_ok());
+
+        // A world-writable ancestor without the sticky bit invalidates the root.
+        let loose_parent = temp.path().join("loose");
+        std::fs::create_dir_all(&loose_parent).unwrap();
+        std::fs::set_permissions(&loose_parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let nested = loose_parent.join("generations");
+        utils::ensure_dir_all_no_follow(&nested).unwrap();
+        utils::set_directory_mode_no_follow(&nested, 0o750).unwrap();
+        assert!(utils::verify_generation_trust_root(&nested).is_err());
+        // Creating it through the contract refuses the loose ancestor outright.
+        assert!(utils::ensure_generation_trust_root(&nested).is_err());
+    }
+
+    /// SPEC P0/P1-3：恢复入口**单点**留证——证据在任何恢复动作之前落盘，
+    /// 且恢复本身失败也不影响证据与原文件。
+    #[tokio::test]
+    async fn evidence_is_preserved_before_any_recovery_action() {
+        // With an installed service account the fixture would be PermissionDrift
+        // (owner mismatch) and `needs_isolation()` is false, so nothing would be
+        // preserved; that combination needs root to build, so skip it here.
+        #[cfg(unix)]
+        {
+            let name = std::ffi::CString::new("mihomo").unwrap();
+            if !unsafe { libc::getpwnam(name.as_ptr()) }.is_null() {
+                return;
+            }
+        }
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        let state_dir = ctx.paths.tun_config_file.parent().unwrap().to_path_buf();
+        let cache_db = state_dir.join(utils::CACHE_DB_FILE_NAME);
+        std::fs::write(&cache_db, b"not-a-bbolt-database").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cache_db, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        // A legacy journal forces the recovery path past its "no journal" return.
+        let legacy_journal = tun_transaction::legacy_journal_path(&ctx);
+        if let Some(parent) = legacy_journal.parent() {
+            utils::ensure_dir_all_no_follow(parent).unwrap();
+        }
+        std::fs::write(&legacy_journal, b"{not-a-journal").unwrap();
+
+        let result = maybe_auto_recover_active_transaction(
+            &ctx,
+            tun_transaction::RecoveryDirection::Abort,
+            false,
+            false,
+            false,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "an unreadable legacy journal must fail the recovery: {result:?}"
+        );
+
+        // Evidence exists even though the recovery aborted before taking any action.
+        let evidence: Vec<_> = std::fs::read_dir(&state_dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(utils::is_quarantine_artifact_name)
+            })
+            .collect();
+        assert_eq!(
+            evidence.len(),
+            1,
+            "exactly one evidence copy, written before any recovery action"
+        );
+        assert_eq!(
+            std::fs::read(evidence[0].path()).unwrap(),
+            b"not-a-bbolt-database"
+        );
+        // Copy, not move; the journal evidence is untouched as well.
+        assert_eq!(
+            std::fs::read(state_dir.join(utils::CACHE_DB_FILE_NAME)).unwrap(),
+            b"not-a-bbolt-database"
+        );
+        assert_eq!(std::fs::read(&legacy_journal).unwrap(), b"{not-a-journal");
+
+        // The stop/uninstall direction funnels through the same single point:
+        // a second recovery entry (Abort) must not create a second evidence copy.
+        let again = maybe_auto_recover_active_transaction(
+            &ctx,
+            tun_transaction::RecoveryDirection::Resume,
+            false,
+            false,
+            false,
+        )
+        .await;
+        assert!(again.is_err());
+        let evidence_after: Vec<_> = std::fs::read_dir(&state_dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(utils::is_quarantine_artifact_name)
+            })
+            .collect();
+        assert_eq!(
+            evidence_after.len(),
+            1,
+            "every recovery entry shares one idempotent preservation point"
+        );
+    }
+
+    /// SPEC P0/P1-3：结构性断言——恢复入口里留证只出现一次，且必须先于
+    /// recovery marker 与任何恢复动作（所有恢复入口共享该单点）。
+    #[test]
+    fn recovery_entry_preserves_evidence_before_marker_and_actions() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("pub(crate) async fn maybe_auto_recover_active_transaction(")
+            .expect("recovery entry must exist");
+        let body_end = source[start..].find("\n}\n").expect("entry must end") + start;
+        let body = &source[start..body_end];
+
+        assert_eq!(
+            body.matches("preserve_upgrade_evidence(").count(),
+            1,
+            "the recovery entry must contain exactly one preservation point"
+        );
+        let preserve = body.find("preserve_upgrade_evidence(").unwrap();
+        let marker = body
+            .find("try_acquire_recovery_marker")
+            .expect("entry must acquire the recovery marker");
+        let first_action = body.find("execute_recovery_action").unwrap_or(usize::MAX);
+        assert!(
+            preserve < marker,
+            "preservation must precede the recovery marker"
+        );
+        assert!(
+            preserve < first_action,
+            "preservation must precede every recovery action"
+        );
+    }
+
+    /// SPEC P0：cache.db 证据保全 = 复制留证（不移动原件）、no-replace 命名、
+    /// K=3 保留、未完成副本不用最终命名。
+    #[cfg(unix)]
+    #[test]
+    fn cache_db_evidence_is_copied_aside_without_moving_and_retained_three() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_db = temp.path().join(utils::CACHE_DB_FILE_NAME);
+        std::fs::write(&cache_db, b"broken-bbolt-bytes").unwrap();
+
+        let mut preserved = Vec::new();
+        for round in 0..5u8 {
+            // Distinct content per round: identical bytes are de-duplicated (see
+            // the idempotence assertion below) and would not exercise K=3.
+            std::fs::write(&cache_db, [b"broken-bbolt".as_slice(), &[round]].concat()).unwrap();
+            preserved.push(utils::preserve_cache_db_evidence(&cache_db).unwrap());
+        }
+        // The live file is untouched (copy, not move).
+        assert_eq!(
+            std::fs::read(&cache_db).unwrap(),
+            [b"broken-bbolt".as_slice(), &[4u8]].concat()
+        );
+
+        for path in &preserved {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            assert!(utils::is_quarantine_artifact_name(name), "{name}");
+            assert!(!name.contains(".partial"), "{name}");
+        }
+        // Retention evicts the oldest artifacts only (K=3 survives).
+        for (offset, path) in preserved
+            .iter()
+            .rev()
+            .take(utils::CACHE_DB_QUARANTINE_RETENTION)
+            .enumerate()
+        {
+            assert!(path.exists(), "{} must survive retention", path.display());
+            let round = 4 - offset as u8;
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                [b"broken-bbolt".as_slice(), &[round]].concat()
+            );
+        }
+        // Idempotent: re-preserving identical bytes reuses the existing artifact
+        // instead of burning the K=3 budget on a duplicate.
+        let reused = utils::preserve_cache_db_evidence(&cache_db).unwrap();
+        assert_eq!(reused, *preserved.last().unwrap());
+        // K=3 retention, and no staged `.partial` leftovers.
+        let quarantined = std::fs::read_dir(temp.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(utils::is_quarantine_artifact_name)
+            })
+            .count();
+        assert_eq!(quarantined, utils::CACHE_DB_QUARANTINE_RETENTION);
+        let partials = std::fs::read_dir(temp.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".partial"))
+            })
+            .count();
+        assert_eq!(partials, 0);
+        // The newest copy survives eviction.
+        assert!(preserved.last().unwrap().exists());
+    }
+}
+
+/// wave 1：缺陷 1/2/3 的 CLI 侧验收（candidate 捕获、控制键告警、正常顺序对照）。
+#[cfg(test)]
+mod issue041_wave1_tests {
+    use super::*;
+
+    const INTENT_WITH_TUN: &str = "\
+mode: rule
+mixed-port: 7897
+proxies: []
+rules:
+- MATCH,DIRECT
+tun:
+  enable: true
+  stack: mixed
+  auto-route: true
+  strict-route: true
+  dns-hijack:
+  - any:53
+  - tcp://any:53
+  route-exclude-address:
+  - 224.0.0.0/4
+";
+
+    fn system_ctx(temp: &std::path::Path) -> instance::InstanceContext {
+        let inputs = instance::PathInputs {
+            home: temp.join("home"),
+            uid: Some(1000),
+            gid: Some(1000),
+            xdg_runtime_dir: Some(temp.join("run/user/1000")),
+            program_data: temp.join("ProgramData"),
+            app_data: temp.join("AppData/Roaming"),
+            local_app_data: temp.join("AppData/Local"),
+            username_or_sid: "alice".to_string(),
+        };
+        let mut ctx = instance::InstanceContext::planned(
+            instance::TargetOs::Linux,
+            instance::InstanceMode::System,
+            &inputs,
+        );
+        ctx.paths.config_dir = temp.join("user-config");
+        ctx.paths.intent_config_file = ctx.paths.config_dir.join("config.yaml");
+        ctx.paths.tun_config_file = temp.join("system-data/tun-config.yaml");
+        ctx.permissions = instance::PermissionModel::DirectUser;
+        std::fs::create_dir_all(&ctx.paths.config_dir).unwrap();
+        std::fs::create_dir_all(ctx.paths.tun_config_file.parent().unwrap()).unwrap();
+        ctx
+    }
+
+    #[cfg(unix)]
+    const TUN_PREPARE_ROOT_ENV: &str = "MIHOMO_TEST_TUN_PREPARE_ROOT";
+
+    /// 在给定 root 上完整跑一次 `tun on` 的 prepare（捕获 + 发布同一临界区）。
+    #[cfg(unix)]
+    fn prepare_tun_transaction_in(root: &std::path::Path) -> anyhow::Result<()> {
+        let ctx = system_ctx(root);
+        std::fs::write(&ctx.paths.intent_config_file, INTENT_WITH_TUN)?;
+        tun_transaction::prepare_and_publish_active_transaction_capturing_intent(
+            &ctx,
+            1000,
+            true,
+            &evidence(),
+            |intent_bytes| build_tun_candidate(&ctx, intent_bytes, true, None, None),
+        )?;
+        Ok(())
+    }
+
+    fn evidence() -> tun_transaction::OldRuntimeEvidence {
+        tun_transaction::OldRuntimeEvidence {
+            core_running: true,
+            core_identity: "core-1".to_string(),
+            core_pid: 1234,
+            launched_revision: "old-rev".to_string(),
+            launch_source: tun_transaction::LaunchSource::SystemTunSnapshot,
+            runtime_tun: true,
+            api_endpoint: "unix".to_string(),
+            recorded_at_secs: Some(100),
+        }
+    }
+
+    /// `tun on` 的 prepare 必须先 reconcile override，再捕获 intent；
+    /// 否则只写在 override 的非控制键不会进入 candidate/snapshot。
+    #[test]
+    fn issue060_tun_on_reconciles_override_before_candidate_capture() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        std::fs::write(&ctx.paths.intent_config_file, INTENT_WITH_TUN).unwrap();
+        let paths = utils::AppPaths::new(ctx.paths.config_dir.clone());
+        std::fs::write(
+            paths.override_path(),
+            "tun:\n  route-exclude-address:\n  - 192.0.2.0/24\n  - 198.51.100.0/24\n",
+        )
+        .unwrap();
+
+        let journal =
+            tun_transaction::prepare_and_publish_active_transaction_capturing_intent_with_prepare(
+                &ctx,
+                1000,
+                true,
+                &evidence(),
+                || {
+                    let reconciled = config::reconcile_override_into_intent_checked(&paths, None)?;
+                    assert!(reconciled.changed, "override must be reconciled");
+                    Ok(())
+                },
+                |intent_bytes| build_tun_candidate(&ctx, intent_bytes, true, None, None),
+            )
+            .expect("tun on prepare must succeed");
+
+        let candidate = std::fs::read_to_string(tun_transaction::active_candidate_path(&ctx))
+            .expect("candidate must exist");
+        let candidate: serde_yaml::Value = serde_yaml::from_str(&candidate).unwrap();
+        assert_eq!(
+            candidate["tun"]["route-exclude-address"],
+            serde_yaml::from_str::<serde_yaml::Value>("- 192.0.2.0/24\n- 198.51.100.0/24\n")
+                .unwrap()
+        );
+        let intent_revision = tun_transaction::sha256_revision(
+            std::fs::read(&ctx.paths.intent_config_file)
+                .unwrap()
+                .as_slice(),
+        );
+        assert_eq!(
+            journal.base_intent_revision.as_deref(),
+            Some(intent_revision.as_str())
+        );
+    }
+
+    /// 缺陷 2（裁决定稿）：override 里的 TUN 控制键必须**明确告警**（不能静默丢弃），
+    /// 非控制键（route-exclude-address）不得误报。
+    #[test]
+    fn issue041_override_control_key_warning_is_explicit() {
+        let control: serde_yaml::Value = serde_yaml::from_str(
+            "tun:\n  enable: false\n  stack: system\n  dns-hijack:\n  - any:53\n",
+        )
+        .unwrap();
+        let warning = tun_owned_override_keys_warning(&control).expect("control keys must warn");
+        assert!(warning.contains("tun.enable"), "{warning}");
+        assert!(warning.contains("tun.stack"), "{warning}");
+        assert!(warning.contains("tun.dns-hijack"), "{warning}");
+        assert!(warning.contains("tun on"), "{warning}");
+
+        let non_control: serde_yaml::Value =
+            serde_yaml::from_str("tun:\n  route-exclude-address:\n  - 224.0.0.0/4\n").unwrap();
+        assert!(
+            tun_owned_override_keys_warning(&non_control).is_none(),
+            "non-control keys are not transaction-owned"
+        );
+    }
+
+    /// 缺陷 1（裁决点 3）：candidate 必须由**调用方捕获的** intent 字节构建，
+    /// 不得自行重新读盘（否则 base 与 candidate 可能来自不同快照）。
+    #[test]
+    fn issue041_tun_candidate_is_built_from_captured_bytes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        std::fs::write(
+            &ctx.paths.intent_config_file,
+            "mode: rule\nrules:\n- MATCH,DIRECT\n",
+        )
+        .unwrap();
+
+        let captured = INTENT_WITH_TUN.as_bytes();
+        let candidate = build_tun_candidate(&ctx, captured, true, None, None).unwrap();
+        let doc: serde_yaml::Value = serde_yaml::from_slice(&candidate).unwrap();
+        let tun = &doc["tun"];
+        assert_eq!(tun["enable"], serde_yaml::Value::Bool(true));
+        assert_eq!(
+            tun["route-exclude-address"],
+            serde_yaml::from_str::<serde_yaml::Value>("- 224.0.0.0/4").unwrap(),
+            "candidate must derive from the captured bytes, not the on-disk intent"
+        );
+    }
+
+    /// （P2-3）：`tun off` 正向用例——intent 带完整 `tun` 块时，candidate
+    /// 只翻转 `enable: false`；提交不得被“丢 tun 块”防线误拒，且整张 map 逐键保留。
+    #[test]
+    fn issue050_tun_off_candidate_commits_with_the_whole_tun_map_preserved() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        std::fs::create_dir_all(&ctx.paths.config_dir).unwrap();
+        std::fs::write(&ctx.paths.intent_config_file, INTENT_WITH_TUN).unwrap();
+
+        let journal = tun_transaction::prepare_and_publish_active_transaction_capturing_intent(
+            &ctx,
+            1000,
+            false,
+            &evidence(),
+            |intent_bytes| build_tun_candidate(&ctx, intent_bytes, false, None, None),
+        )
+        .expect("tun off prepare must succeed against a complete tun intent");
+
+        let result = tun_transaction::compare_and_commit_user_intent(&ctx, &journal)
+            .expect("tun off commit must not be rejected as a tun-dropping candidate");
+        assert_eq!(result, tun_transaction::IntentCommitResult::Committed);
+
+        let committed: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&ctx.paths.intent_config_file).unwrap())
+                .unwrap();
+        assert_eq!(committed["tun"]["enable"], serde_yaml::Value::Bool(false));
+        let expected_tun: serde_yaml::Value = serde_yaml::from_str(
+            "\
+enable: false
+stack: mixed
+auto-route: true
+strict-route: true
+dns-hijack:
+- any:53
+- tcp://any:53
+route-exclude-address:
+- 224.0.0.0/4
+",
+        )
+        .unwrap();
+        assert_eq!(
+            committed["tun"], expected_tun,
+            "tun off must only flip enable and keep the whole TUN map"
+        );
+        assert_eq!(
+            committed["mixed-port"],
+            serde_yaml::Value::Number(7897.into())
+        );
+        assert_eq!(
+            committed["rules"],
+            serde_yaml::from_str::<serde_yaml::Value>("- MATCH,DIRECT").unwrap()
+        );
+    }
+
+    /// 取 `main.rs` 中某个函数的函数体（到第一个顶格 `}` 为止，与既有静态扫描同构）。
+    fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("signature not found: {signature}"));
+        let body_end = source[start..]
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("function end not found for {signature}"))
+            + start;
+        &source[start..body_end]
+    }
+
+    /// 缺陷 3 P1-1：owner 闸门必须与首次写入同处 ConfigLock 临界区
+    /// （acquire → 闸门 → 首次写入），否则「闸门通过 → 并发 prepare 发布 journal →
+    /// 写入」的 TOCTOU 窗口仍然存在。
+    #[test]
+    fn issue041_override_guard_runs_inside_config_lock_before_first_write() {
+        let body = function_body(include_str!("main.rs"), "async fn apply_override_change(");
+        let acquire = body
+            .find("ConfigLock::acquire")
+            .expect("apply_override_change must take the config lock");
+        let guard = body
+            .find("ensure_no_transaction_owner_before_config_write")
+            .expect("apply_override_change must run the transaction-owner gate");
+        let first_write = body
+            .find("atomic_write_file_for_original_user")
+            .or_else(|| body.find("remove_file_if_exists"))
+            .expect("apply_override_change must write the override file");
+        assert!(
+            acquire < guard,
+            "the owner gate must run under the config lock (acquire then gate)"
+        );
+        assert!(
+            guard < first_write,
+            "the owner gate must run before the first write of the override file"
+        );
+    }
+
+    /// 缺陷 3 P1-1/P1-2：捕获→发布、以及提交重验，都必须处在 CoordinatorLock →
+    /// ConfigLock 的同一临界区内（锁序与 CAS/journal 写方一致）。
+    #[test]
+    fn issue041_capture_commit_take_coordinator_before_config_lock() {
+        let source = include_str!("tun_transaction.rs");
+        let capture = function_body(
+            source,
+            "pub fn prepare_and_publish_active_transaction_capturing_intent_with_prepare<F, P>(",
+        );
+        let coordinator = capture
+            .find("CoordinatorLock::acquire")
+            .expect("capturing prepare must take the coordinator lock");
+        let config = capture
+            .find("ConfigLock::acquire")
+            .expect("capturing prepare must take the config lock");
+        let capture_read = capture
+            .find("intent_config_file")
+            .expect("capturing prepare must read the intent");
+        let publish = capture
+            .find("prepare_and_publish_active_locked(")
+            .expect("capturing prepare must publish under the same span");
+        assert!(
+            coordinator < config,
+            "lock order must be coordinator -> config"
+        );
+        assert!(
+            config < capture_read && capture_read < publish,
+            "intent capture and publish must share one critical section"
+        );
+
+        let commit = function_body(source, "pub fn compare_and_commit_user_intent(");
+        let commit_coordinator = commit
+            .find("CoordinatorLock::acquire")
+            .expect("commit must take the coordinator lock");
+        let commit_config = commit
+            .find("ConfigLock::acquire")
+            .expect("commit must take the config lock");
+        let recheck = commit
+            .find("read_active_journal")
+            .expect("commit must re-verify the canonical journal");
+        assert!(
+            commit_coordinator < commit_config,
+            "commit lock order must be coordinator -> config"
+        );
+        assert!(
+            commit_config < recheck,
+            "the canonical journal re-verification must run under both locks"
+        );
+    }
+
+    /// 缺陷 3 P1-2：提交必须与 journal 写方（CoordinatorLock 持有者）串行——等待而不是
+    /// 并发重验，且不引入死锁。
+    #[test]
+    fn issue041_commit_waits_for_the_journal_writer() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        std::fs::write(&ctx.paths.intent_config_file, INTENT_WITH_TUN).unwrap();
+        let mut journal = tun_transaction::prepare_and_publish_active_transaction_capturing_intent(
+            &ctx,
+            1000,
+            true,
+            &evidence(),
+            |intent_bytes| build_tun_candidate(&ctx, intent_bytes, true, None, None),
+        )
+        .unwrap();
+        for next in [
+            tun_transaction::JournalPhase::PromotionPending,
+            tun_transaction::JournalPhase::SnapshotPromoted,
+            tun_transaction::JournalPhase::CoreApplied,
+        ] {
+            let fence = tun_transaction::TransactionFence {
+                transaction_id: journal.transaction_id.clone(),
+                generation: journal.generation,
+                expected_phase: journal.phase,
+                expected_candidate_revision: journal.candidate_revision.clone(),
+            };
+            journal = tun_transaction::cas_update_phase(&ctx, &fence, next, None, None).unwrap();
+        }
+
+        let held = Arc::new(AtomicBool::new(false));
+        let writer_ctx = ctx.clone();
+        let writer_held = Arc::clone(&held);
+        let writer = std::thread::spawn(move || {
+            let _coordinator = tun_transaction::CoordinatorLock::acquire(&writer_ctx).unwrap();
+            writer_held.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(150));
+        });
+        while !held.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let started = Instant::now();
+        let result = tun_transaction::compare_and_commit_user_intent(&ctx, &journal).unwrap();
+        let waited = started.elapsed();
+        writer.join().unwrap();
+
+        assert_eq!(result, tun_transaction::IntentCommitResult::Committed);
+        assert!(
+            waited >= Duration::from_millis(120),
+            "commit must serialize with the journal writer, waited only {waited:?}"
+        );
+    }
+
+    /// 缺陷 3 P2-2：`base_intent_revision` 缺失时一律 Conflict——不得凭 legacy 身份
+    /// 绕过「当前 intent 是否本事务前置」的证明。
+    #[test]
+    fn issue041_legacy_without_base_is_never_committed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        let candidate = "mode: rule\ntun:\n  enable: true\nrules:\n- MATCH,DIRECT\n";
+        std::fs::create_dir_all(tun_transaction::active_dir(&ctx)).unwrap();
+        std::fs::write(&ctx.paths.intent_config_file, INTENT_WITH_TUN).unwrap();
+        std::fs::write(
+            tun_transaction::active_candidate_path(&ctx),
+            candidate.as_bytes(),
+        )
+        .unwrap();
+
+        let mut journal = tun_transaction::TunJournal {
+            schema_version: 1,
+            transaction_id: "legacy-no-base".to_string(),
+            generation: 2,
+            phase: tun_transaction::JournalPhase::CoreApplied,
+            original_uid: 1000,
+            target_runtime_tun: true,
+            base_intent_revision: None,
+            candidate_revision: tun_transaction::sha256_revision(candidate.as_bytes()),
+            candidate_core_identity: None,
+            candidate_core_pid: None,
+            old_snapshot_revision: None,
+            old_runtime_digest: "digest".to_string(),
+            recovery_target_revision: None,
+            legacy_source: true,
+            legacy_transaction_id: Some("legacy".to_string()),
+            legacy_base_revision: None,
+            rollback_evidence_complete: false,
+            last_error: None,
+            outcome: None,
+            recovery_core_identity: None,
+            recovery_core_pid: None,
+            updated_at: None,
+        };
+        tun_transaction::write_active_journal(&ctx, &journal).unwrap();
+
+        let result = tun_transaction::compare_and_commit_user_intent(&ctx, &journal).unwrap();
+        assert_eq!(result, tun_transaction::IntentCommitResult::Conflict);
+        assert_eq!(
+            std::fs::read_to_string(&ctx.paths.intent_config_file).unwrap(),
+            INTENT_WITH_TUN,
+            "a journal without a base must never overwrite the intent"
+        );
+
+        // With a base recorded, the same journal is no longer blocked by this rule.
+        journal.base_intent_revision =
+            Some(tun_transaction::sha256_revision(INTENT_WITH_TUN.as_bytes()));
+        tun_transaction::write_active_journal(&ctx, &journal).unwrap();
+        assert_eq!(
+            tun_transaction::compare_and_commit_user_intent(&ctx, &journal).unwrap(),
+            tun_transaction::IntentCommitResult::Committed
+        );
+    }
+
+    /// 缺陷 3（并发封口）：两个**真实进程**经 barrier 同时抢同一实例的事务 owner，
+    /// 只能有一个成为 owner（第二个被 journal/user-gate 拒绝）。
+    #[cfg(unix)]
+    #[test]
+    fn issue041_single_owner_survives_two_process_barrier() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().to_path_buf();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::issue041_wave1_tests::issue041_child_races_tun_prepare",
+                "--nocapture",
+            ])
+            .env(TUN_PREPARE_ROOT_ENV, &root)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        // Release both sides at (nearly) the same instant.
+        std::fs::write(root.join("go"), b"").unwrap();
+        let parent = prepare_tun_transaction_in(&root);
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            output.status.success(),
+            "child failed to run:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("CHILD_OK") || stdout.contains("CHILD_ERR"),
+            "child must have raced the prepare, got: {stdout}"
+        );
+        let child_ok = stdout.contains("CHILD_OK");
+        let parent_ok = parent.is_ok();
+
+        assert!(
+            parent_ok ^ child_ok,
+            "exactly one process may own the transaction; parent_ok={parent_ok} child_ok={child_ok} child_out={stdout}"
+        );
+        let loser_message = if parent_ok {
+            stdout.clone()
+        } else {
+            parent
+                .as_ref()
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        };
+        assert!(
+            loser_message.contains("already in progress")
+                || loser_message.contains("gate already exists"),
+            "loser must be refused by the durable owner check: {loser_message}"
+        );
+    }
+
+    /// 上面 barrier 用例的失败方/成功方子进程入口（仅由父进程以 `--exact` 拉起）。
+    #[cfg(unix)]
+    #[test]
+    fn issue041_child_races_tun_prepare() {
+        let Ok(root) = std::env::var(TUN_PREPARE_ROOT_ENV) else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let go = root.join("go");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !go.exists() {
+            if std::time::Instant::now() >= deadline {
+                println!("CHILD_ERR: barrier timeout");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        match prepare_tun_transaction_in(&root) {
+            Ok(()) => println!("CHILD_OK"),
+            Err(error) => println!("CHILD_ERR: {error}"),
+        }
+    }
+
+    /// 正常顺序对照（无残留事务）：`override import`（带 route-exclude）→ `tun on`，
+    /// candidate 提交后 intent 的 tun 块逐键完整，且 route-exclude 保留。
+    #[test]
+    fn issue041_normal_order_import_then_tun_on_keeps_tun_block() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ctx = system_ctx(temp.path());
+        std::fs::write(&ctx.paths.intent_config_file, INTENT_WITH_TUN).unwrap();
+
+        let journal = tun_transaction::prepare_and_publish_active_transaction_capturing_intent(
+            &ctx,
+            1000,
+            true,
+            &evidence(),
+            |intent_bytes| build_tun_candidate(&ctx, intent_bytes, true, None, None),
+        )
+        .unwrap();
+        assert_eq!(
+            journal.base_intent_revision.as_deref(),
+            Some(tun_transaction::sha256_revision(INTENT_WITH_TUN.as_bytes()).as_str()),
+            "the journal base must describe the intent captured in the same critical section"
+        );
+        // Walk the journal to CoreApplied, then commit as the CLI does.
+        let mut journal = journal;
+        for next in [
+            tun_transaction::JournalPhase::PromotionPending,
+            tun_transaction::JournalPhase::SnapshotPromoted,
+            tun_transaction::JournalPhase::CoreApplied,
+        ] {
+            let fence = tun_transaction::TransactionFence {
+                transaction_id: journal.transaction_id.clone(),
+                generation: journal.generation,
+                expected_phase: journal.phase,
+                expected_candidate_revision: journal.candidate_revision.clone(),
+            };
+            journal = tun_transaction::cas_update_phase(&ctx, &fence, next, None, None).unwrap();
+        }
+        assert_eq!(
+            tun_transaction::compare_and_commit_user_intent(&ctx, &journal).unwrap(),
+            tun_transaction::IntentCommitResult::Committed
+        );
+
+        let committed: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&ctx.paths.intent_config_file).unwrap())
+                .unwrap();
+        // 裁决验收口径：整块 TUN map 比对（不是只看 tun:/enable 存在）。
+        let expected_tun: serde_yaml::Value = serde_yaml::from_str(
+            "\
+enable: true
+stack: mixed
+auto-route: true
+strict-route: true
+dns-hijack:
+- any:53
+- tcp://any:53
+route-exclude-address:
+- 224.0.0.0/4
+",
+        )
+        .unwrap();
+        assert_eq!(
+            committed["tun"], expected_tun,
+            "the whole TUN map must survive import -> tun on"
+        );
+    }
+}
+// ──: 删除 proxy group 后孤儿 selection（机械子集） ──
+
+#[cfg(test)]
+mod issue_034_orphan_selection_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn paths_in(tmp: &TempDir) -> utils::AppPaths {
+        utils::AppPaths::new(tmp.path().join(".config/mihomo"))
+    }
+
+    fn scope_for(paths: &utils::AppPaths, subscription_id: &str) -> selection::SelectionScope {
+        std::fs::create_dir_all(paths.selections_dir()).unwrap();
+        selection::SelectionScope {
+            subscription_id: subscription_id.to_string(),
+            path: paths.selection_state_path_for_subscription(subscription_id),
+        }
+    }
+
+    fn body_of(source: &'static str, start: &str, end: &str) -> &'static str {
+        let start_at = source.find(start).expect("锚点缺失");
+        let end_at = source[start_at..].find(end).expect("结束锚点缺失") + start_at;
+        &source[start_at..end_at]
+    }
+
+    /// 删组只清理本组在本订阅的条目：不跨组、不跨订阅、不 GC 其他槽的用户树
+    /// （明确砍掉统一孤儿 GC 器——派生镜像不得回写用户树）。
+    #[test]
+    fn delete_cleanup_removes_only_the_deleted_group_in_its_own_scope() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        let scope = scope_for(&paths, "sub-aaaaaaaa");
+        let other = scope_for(&paths, "sub-bbbbbbbb");
+        selection::remember_selection_for_scope(&scope, "Antigravity", "韩国KR-HY2").unwrap();
+        selection::remember_selection_for_scope(&scope, "Proxy", "NodeA").unwrap();
+        selection::remember_selection_for_scope(&other, "Antigravity", "NodeB").unwrap();
+
+        let outcome = cleanup_deleted_group_selection(&scope, "Antigravity");
+        assert!(
+            matches!(outcome, DeletedGroupSelection::Unpinned),
+            "{outcome:?}"
+        );
+        assert!(deleted_group_selection_notice("Antigravity", &outcome).is_none());
+
+        let left = selection::load_selection_state_for_scope(&scope).unwrap();
+        assert_eq!(left.get("Antigravity"), None);
+        assert_eq!(left.get("Proxy"), Some(&"NodeA".to_string()));
+        assert_eq!(
+            selection::load_selection_state_for_scope(&other)
+                .unwrap()
+                .get("Antigravity"),
+            Some(&"NodeB".to_string()),
+            "其他订阅槽的用户树不得被触碰"
+        );
+
+        // 没有该组记录时既无清理也无提示（Absent 不推送、不报告）。
+        let outcome = cleanup_deleted_group_selection(&scope, "Antigravity");
+        assert!(
+            matches!(outcome, DeletedGroupSelection::Absent),
+            "{outcome:?}"
+        );
+        assert!(deleted_group_selection_notice("Antigravity", &outcome).is_none());
+    }
+
+    /// unpin 失败（EACCES/锁超时/解析错误同一面）不得静默：非致命但可见，
+    /// 且必须给出 `select --unpin` 修复路径。
+    #[test]
+    fn delete_cleanup_failure_is_visible_with_a_repair_path() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        let scope = scope_for(&paths, "sub-cccccccc");
+        std::fs::write(&scope.path, "not: valid: selection: state\n").unwrap();
+
+        let outcome = cleanup_deleted_group_selection(&scope, "Antigravity");
+        assert!(
+            matches!(outcome, DeletedGroupSelection::Failed(_)),
+            "{outcome:?}"
+        );
+        let notice = deleted_group_selection_notice("Antigravity", &outcome)
+            .expect("清理失败必须可见，不得 `let _ =` 吞掉");
+        assert!(notice.starts_with('⚠'), "{notice}");
+        assert!(notice.contains("was not cleaned up"), "{notice}");
+        assert!(
+            notice.contains("mihomo-cli select --unpin --group 'Antigravity'"),
+            "{notice}"
+        );
+    }
+
+    /// 顺序断言：清理只在 overlay merge 提交成功之后执行，且失败回滚路径不带
+    /// 任何 selection 副作用（merge 前 unpin 会留下"意图已删、组仍在"的反向不一致）。
+    ///
+    /// （P3-1）文本代理边界：运行时验证需要真实的 `config` merge 管线
+    /// （Core 二进制等价校验、`ConfigLock`、endpoint 解析）。这些依赖没有测试注入缝，
+    /// 本仓既有做法只能锁源码结构；因此这里断言的是「调用点位于 save → merge →
+    /// rollback 之后的相对次序」，而不是一次真实 merge 失败注入。语义边界与
+    /// `delete_cleanup_pushes_the_runtime_selection_mirror` 相同。
+    #[test]
+    fn delete_cleanup_runs_after_the_overlay_merge_commits() {
+        let source = include_str!("main.rs");
+        let body = body_of(
+            source,
+            "async fn update_group_overlay(",
+            "async fn cmd_rule(",
+        );
+
+        let save_at = body
+            .find("overlay.save(&overlay_path)?")
+            .expect("overlay save");
+        let merge_at = body
+            .find("config::merge_user_config_checked_at_endpoint(")
+            .expect("merge 站点");
+        let rollback_at = body
+            .find("restore_file_snapshot(&overlay_path, previous.clone())")
+            .expect("merge 失败回滚站点");
+        let cleanup_at = body
+            .find("cleanup_deleted_group_selection(scope, &name)")
+            .expect("delete 清理站点");
+        assert!(save_at < merge_at, "merge 必须在 overlay.save 之后");
+        assert!(rollback_at < cleanup_at, "回滚路径必须先于清理");
+        assert!(
+            merge_at < cleanup_at,
+            "清理必须在 merge 成功之后（否则 merge 失败不可回滚 selection）"
+        );
+
+        // 吞错形态全仓清零。
+        assert!(
+            !source.contains("let _ = crate::selection::unpin_selection_for_scope"),
+            "unpin 结果不得再被 `let _ =` 吞掉"
+        );
+    }
+
+    /// 镜像推送接线：清理掉记录后必须推镜像，且只在 system 模式推、只在真的
+    /// 移除记录时推。IPC 无注入缝（socket 是固定绝对路径，测试内不得触碰真实
+    /// 运行态），故沿用本仓既有做法——生产口结构锁（同 main_tests 中
+    /// lifecycle 成功臂的断言）。
+    ///
+    /// （P3-2）：极性判据已抽成纯函数
+    /// [`should_push_selection_mirror_after_delete`]，其真值表由下一项测试在运行时
+    /// 覆盖；本测试只锁「调用点存在且以环境探测结果为参数」这一接线事实。
+    #[test]
+    fn delete_cleanup_pushes_the_runtime_selection_mirror() {
+        let source = include_str!("main.rs");
+        let body = body_of(
+            source,
+            "async fn update_group_overlay(",
+            "async fn cmd_rule(",
+        );
+        let cleanup_at = body
+            .find("let outcome = cleanup_deleted_group_selection(scope, &name)")
+            .expect("delete 清理站点");
+        let tail = &body[cleanup_at..];
+
+        assert!(
+            tail.contains("push_selection_mirror_update(paths, &scope.subscription_id, json)"),
+            "清理后必须推镜像，否则 daemon 独立重启继续重放孤儿（§2.3）"
+        );
+        assert!(
+            tail.contains("selection_mirror_target_is_system(system, user)"),
+            "镜像只存在于 system 模式，user 模式推送只会产生无意义告警"
+        );
+        assert!(
+            tail.contains("should_push_selection_mirror_after_delete("),
+            "polarity must go through the extracted predicate"
+        );
+    }
+
+    /// （P3-3）：`--json` 报告字段 `selection_cleanup` 是纯追加面：
+    /// 三种清理结果各有稳定词，非 delete 动作由调用方填 `null`。
+    #[test]
+    fn delete_cleanup_json_labels_are_stable() {
+        assert_eq!(
+            selection_cleanup_label(&DeletedGroupSelection::Absent),
+            "absent"
+        );
+        assert_eq!(
+            selection_cleanup_label(&DeletedGroupSelection::Unpinned),
+            "unpinned"
+        );
+        assert_eq!(
+            selection_cleanup_label(&DeletedGroupSelection::Failed(anyhow::anyhow!("boom"))),
+            "failed"
+        );
+    }
+
+    /// （P3-2）：推送极性的运行时真值表——只有「system 模式的镜像
+    /// 目标」且「真的移除了记录」才推送；Absent/Failed/user 模式一律不推。
+    #[test]
+    fn delete_cleanup_mirror_push_polarity_is_runtime_checkable() {
+        use DeletedGroupSelection::{Absent, Failed, Unpinned};
+
+        assert!(should_push_selection_mirror_after_delete(&Unpinned, true));
+        assert!(!should_push_selection_mirror_after_delete(&Unpinned, false));
+        assert!(!should_push_selection_mirror_after_delete(&Absent, true));
+        assert!(!should_push_selection_mirror_after_delete(
+            &Failed(anyhow::anyhow!("unpin failed")),
+            true
+        ));
+    }
+
+    /// 渲染：干净报告保留成功图标。
+    #[test]
+    fn lifecycle_success_lines_keep_the_glyph_for_clean_reports() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+
+        assert_eq!(
+            lifecycle_success_lines(
+                "system configuration promoted and runtime applied",
+                None,
+                &paths
+            ),
+            vec!["  ✅ system configuration promoted and runtime applied".to_string()]
+        );
+        assert_eq!(
+            lifecycle_success_lines("", None, &paths),
+            vec!["  ✅".to_string()]
+        );
+    }
+
+    /// 渲染：混合结果（基线成功行 + replay 的 ⚠ 行）不得被成功图标包裹。
+    #[test]
+    fn lifecycle_success_lines_never_wrap_warnings_in_the_success_glyph() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+
+        let mixed = "system configuration promoted and runtime applied\n\
+                     ✓ Selections restored: Proxy → NodeA\n\
+                     ⚠ Selection Antigravity → 韩国KR-HY2 not applied: group no longer exists";
+        let lines = lifecycle_success_lines(mixed, None, &paths);
+        assert!(
+            lines.iter().all(|line| !line.contains('✅')),
+            "混合结果不得带成功图标: {lines:?}"
+        );
+        assert_eq!(
+            lines[0],
+            "system configuration promoted and runtime applied"
+        );
+        assert_eq!(
+            lines[2],
+            "⚠ Selection Antigravity → 韩国KR-HY2 not applied: group no longer exists"
+        );
+
+        // 只有告警行（无基线行）同样原样呈现。
+        let only_warning =
+            "⚠ Selection Antigravity → 韩国KR-HY2 not applied: group no longer exists";
+        assert_eq!(
+            lifecycle_success_lines(only_warning, None, &paths),
+            vec![only_warning.to_string()]
+        );
+    }
+
+    /// 生产口回归锁：lifecycle 成功臂走共享格式化器，不再硬编码成功图标前缀。
+    #[test]
+    fn lifecycle_success_site_uses_the_shared_formatter() {
+        let source = include_str!("main.rs");
+        let site = source
+            .find("let resp = ipc::send_command(&cmd).await?;")
+            .expect("lifecycle send site");
+        let arm = &source[site..];
+        let arm_end = arm
+            .find("ipc::DaemonResponse::Error { message }")
+            .expect("lifecycle success arm boundary");
+        let success_arm = &arm[..arm_end];
+        assert!(
+            success_arm.contains("lifecycle_success_lines("),
+            "lifecycle 成功臂必须复用共享格式化器"
+        );
+        assert!(
+            !success_arm.contains('✅'),
+            "成功图标不得直接包裹 daemon message"
+        );
+    }
+}
+
+#[cfg(test)]
+mod issue_044_json_mode_stdout_pollution_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn paths_in(tmp: &TempDir) -> utils::AppPaths {
+        utils::AppPaths::new(tmp.path().to_path_buf())
+    }
+
+    fn body_of(source: &'static str, start: &str, end: &str) -> &'static str {
+        let start_at = source.find(start).expect("锚点缺失");
+        let end_at = source[start_at..].find(end).expect("结束锚点缺失") + start_at;
+        &source[start_at..end_at]
+    }
+
+    /// push_selection_mirror_update 必须包含 json 通道参数并在 json 模式路由至 eprintln。
+    #[test]
+    fn push_selection_mirror_update_routes_to_eprintln_when_json_is_true() {
+        let source = include_str!("main.rs");
+        assert!(
+            source.contains("async fn push_selection_mirror_update(paths: &utils::AppPaths, subscription_id: &str, json: bool)"),
+            "push_selection_mirror_update 必须包含 json 参数"
+        );
+        let fn_start = source
+            .find("async fn push_selection_mirror_update(")
+            .expect("push_selection_mirror_update 签名");
+        let fn_body = &source[fn_start..fn_start + 1500];
+        assert!(
+            fn_body.contains("if json {\n                    eprintln!("),
+            "json 模式下 mirror push 诊断输出必须走 eprintln! 避免污染 stdout"
+        );
+        assert!(
+            fn_body.contains("println!("),
+            "非 json 模式下必须保留原 println! 输出"
+        );
+    }
+
+    /// update_group_overlay 原生组隐藏与 reset no-op 必须在 json 模式下避免污染 stdout。
+    #[test]
+    fn update_group_overlay_routes_notices_to_eprintln_in_json_mode() {
+        let source = include_str!("main.rs");
+        let body = body_of(
+            source,
+            "async fn update_group_overlay(",
+            "async fn cmd_rule(",
+        );
+        assert!(
+            body.contains("if json {\n                    eprintln!(\"proxy group `{name}` is already at upstream state (no-op)\");"),
+            "reset no-op 提示在 json 模式下必须输出至 stderr"
+        );
+        assert!(
+            body.contains("if json {\n                    eprintln!(\"原生组 `{name}` 已标记隐藏（将在配置合成时被过滤）\");"),
+            "原生组隐藏提示在 json 模式下必须输出至 stderr"
+        );
+    }
+
+    /// apply_selected_proxy 在 json 模式下输出结构化 JSON envelope，非 json 模式输出 Switched。
+    #[test]
+    fn apply_selected_proxy_emits_json_envelope_when_json_is_true() {
+        let source = include_str!("main.rs");
+        let body = body_of(
+            source,
+            "async fn apply_selected_proxy(",
+            "async fn print_selection_replay_after_ready(",
+        );
+        assert!(
+            body.contains("if json {\n        print_json_envelope("),
+            "apply_selected_proxy 在 json 模式下必须输出 json envelope"
+        );
+        assert!(
+            body.contains("println!(\"Switched {group_name} → {node_name}\");"),
+            "apply_selected_proxy 在非 json 模式下必须保留 Switched 文本输出"
+        );
+    }
+
+    /// main 错误退出时，在 json 模式下向 stdout 打印结构化错误 envelope。
+    #[test]
+    fn main_error_exit_emits_error_envelope_on_stdout_when_json_is_true() {
+        let source = include_str!("main.rs");
+        let body = body_of(source, "async fn main() {", "async fn run(cli: Cli)");
+        assert!(
+            body.contains(
+                "let error_envelope = json_error_envelope(cmd_name, &format!(\"{e:#}\"));"
+            ),
+            "main 错误退出在 json 模式下必须向 stdout 打印错误 envelope"
+        );
+        assert!(
+            body.contains("println!(\"{json_str}\");"),
+            "错误 envelope 必须写到 stdout"
+        );
+        let envelope = body_of(
+            source,
+            "fn json_error_envelope(",
+            "fn validate_config_at_paths_with_binary_json(",
+        );
+        assert!(
+            envelope.contains("\"ok\": false"),
+            "错误 envelope 必须标记 ok: false"
+        );
+        assert!(
+            body.contains("eprintln!(\"\\n  Error: {e}\");"),
+            "错误细节必须同时保留在 stderr"
+        );
+    }
+
+    /// push_selection_mirror_update 缺失文件时静默返回，不 panic。
+    #[tokio::test]
+    async fn push_selection_mirror_update_missing_file_is_silent() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        // 无 selection 文件，不应有任何输出或 panic
+        push_selection_mirror_update(&paths, "non-existent-sub", true).await;
+        push_selection_mirror_update(&paths, "non-existent-sub", false).await;
+    }
+}
+
+/// 把「我读不到」与「它不对」分开——身份不足只能落到 `Undeterminable`，
+/// 既不得索要提权，也不得把自由文案里出现的 permission 字样当作判据。
+#[cfg(test)]
+mod eacces_classification_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn undeterminable_state_dir_never_escalates_privileges() {
+        use utils::SystemStateDirVerdict;
+
+        for is_root in [false, true] {
+            assert_eq!(
+                system_state_repair_action(SystemStateDirVerdict::Healthy, is_root),
+                SystemStateRepairAction::None
+            );
+        }
+
+        // 无 sudo 调用计划：三态里只有确证漂移才产生提权动作。
+        for is_root in [false, true] {
+            let action = system_state_repair_action(SystemStateDirVerdict::Undeterminable, is_root);
+            assert_eq!(action, SystemStateRepairAction::ReportUndeterminable);
+            assert_ne!(
+                action,
+                SystemStateRepairAction::ReexecAsRoot,
+                "an identity that cannot judge must never trigger sudo (root={is_root})"
+            );
+            assert_ne!(action, SystemStateRepairAction::RepairInPlace);
+        }
+
+        assert_eq!(
+            system_state_repair_action(SystemStateDirVerdict::NeedsRepair, false),
+            SystemStateRepairAction::ReexecAsRoot
+        );
+        assert_eq!(
+            system_state_repair_action(SystemStateDirVerdict::NeedsRepair, true),
+            SystemStateRepairAction::RepairInPlace
+        );
+    }
+
+    #[test]
+    fn generation_read_classification_is_structural_not_textual() {
+        let denied = generation::GenerationError::Io(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        ));
+        assert!(generation_read_is_identity_limited(&denied));
+
+        // 文案里出现 permission denied 但错误种类不是 EACCES：不得触发提权。
+        let textual = generation::GenerationError::Serialization(
+            "Permission denied while decoding state.json".to_string(),
+        );
+        assert!(!generation_read_is_identity_limited(&textual));
+
+        let other_io =
+            generation::GenerationError::Io(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        assert!(!generation_read_is_identity_limited(&other_io));
+    }
+
+    /// 裁决 B 拆分之一：**观测语境零提权**。generation state 读不动（EACCES）时，
+    /// 「是否已有 pending」这一观测只提示后继续，绝不触发 sudo 重入。
+    /// 业务阶段（暂存/应用）的受控授权由
+    /// `protected_domain_authorization_tests::unreadable_generation_root_requires_business_authorization`
+    /// 单独覆盖——两者是不同决策，不得互相顶替。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreadable_system_generation_state_does_not_request_sudo() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            // root 绕过模式位，构造不出不可观测的 state 目录。
+            return;
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("mihomo-035-generation-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let generation_root = dir.join("generations");
+        std::fs::create_dir_all(&generation_root).unwrap();
+        std::fs::set_permissions(&generation_root, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut ctx = instance::InstanceContext::planned(
+            instance::TargetOs::Linux,
+            instance::InstanceMode::System,
+            &instance::PathInputs::from_current_env(),
+        );
+        ctx.paths.tun_config_file = dir.join("tun-config.yaml");
+        ctx.paths.cli_binary = dir.join("mihomo-cli");
+        // 独立注入 trust root：只改 tun_config_file 从未真的构造出 EACCES。
+        ctx.paths.generation_store_root = generation_root.clone();
+
+        // 若判据仍走字符串/误判，这里会进入 sudo 重入并 exit，断言必然失败。
+        assert!(maybe_sudo_reexec_for_system_generation(&ctx).is_ok());
+
+        std::fs::set_permissions(&generation_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// SPEC §12.3.1（裁决 B）：root 专属域的**业务操作授权**边界。
+/// 与三态权限判定分离：授权只看「当前显式操作是否必须由特权执行者完成」，
+/// 既不是漂移判定，也不产生任何修复动作。
+#[cfg(test)]
+mod protected_domain_authorization_tests {
+    use super::*;
+
+    fn planned_system_ctx(root: &std::path::Path) -> instance::InstanceContext {
+        let mut ctx = instance::InstanceContext::planned(
+            instance::TargetOs::Linux,
+            instance::InstanceMode::System,
+            &instance::PathInputs::from_current_env(),
+        );
+        ctx.paths.tun_config_file = root.join("system-data/tun-config.yaml");
+        ctx.paths.generation_store_root = root.join("system-data/generations");
+        std::fs::create_dir_all(ctx.paths.tun_config_file.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&ctx.paths.generation_store_root).unwrap();
+        ctx
+    }
+
+    #[test]
+    fn healthy_installation_requests_no_authorization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = planned_system_ctx(tmp.path());
+        assert_eq!(
+            protected_domains_requiring_authorization(&ctx),
+            Vec::new(),
+            "可观测的健康安装态不得产生任何授权请求"
+        );
+        // 观测得到时授权边界是纯 no-op：既不询问也不 exit。
+        assert!(authorize_protected_domain_operations(&ctx, "restart --system", "重启").is_ok());
+    }
+
+    #[test]
+    fn user_mode_never_requests_system_authorization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = planned_system_ctx(tmp.path());
+        ctx.mode = instance::InstanceMode::User;
+        assert!(authorize_protected_domain_operations(&ctx, "restart", "重启").is_ok());
+    }
+
+    /// 拆分之二：**必要业务阶段受控授权**。generation 信任根不可读时，业务阶段
+    /// （暂存/应用）必须识别出「需要授权」，而不是把它折叠成「无需处理」。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreadable_generation_root_requires_business_authorization() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            // root 绕过模式位，构造不出不可观测的 trust root。
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = planned_system_ctx(tmp.path());
+        std::fs::set_permissions(
+            &ctx.paths.generation_store_root,
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+
+        assert_eq!(
+            protected_domains_requiring_authorization(&ctx),
+            vec![ProtectedDomain::GenerationTrustRoot]
+        );
+    }
+
+    /// runtime 事务域与代际域是两个独立域：一个不可读不得把另一个也算进去。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreadable_transaction_journal_requires_authorization_independently() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = planned_system_ctx(tmp.path());
+        let transactions = tun_transaction::transactions_dir(&ctx);
+        std::fs::create_dir_all(&transactions).unwrap();
+        std::fs::set_permissions(&transactions, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        assert_eq!(
+            protected_domains_requiring_authorization(&ctx),
+            vec![ProtectedDomain::RuntimeTransactions],
+            "generation 域仍可观测，不得被一并判为需要授权"
+        );
+    }
+
+    /// 裁决原文措辞：不宣称检测到权限异常，也不给任何修复/递归 chown 建议。
+    #[test]
+    fn authorization_notice_never_claims_a_permission_problem() {
+        let notice = protected_domain_authorization_notice("restart --system", "重启");
+        assert!(notice.contains("为执行你请求的 restart --system"));
+        assert!(notice.contains("需要管理员授权检查受保护的运行状态"));
+        assert!(notice.contains("并按原命令范围恢复事务或应用更新"));
+        assert!(notice.contains("当前尚未判定权限异常"));
+        assert!(notice.contains("重启可能暂时中断连接"));
+        for forbidden in [
+            "检测到",
+            "正在修复",
+            "chown",
+            "chmod",
+            "权限问题",
+            "异常修复",
+        ] {
+            assert!(
+                !notice.contains(forbidden),
+                "授权提示不得出现 {forbidden}: {notice}"
+            );
+        }
+    }
+
+    /// 「已授权但仍不可读」必须是结构化失败：不递归 sudo、不假装运行态被改动。
+    #[test]
+    fn authorized_but_still_unobservable_is_structured() {
+        let message = protected_domain_still_unobservable_message(&[
+            ProtectedDomain::RuntimeTransactions,
+            ProtectedDomain::GenerationTrustRoot,
+        ]);
+        assert!(message.contains("已取得管理员授权"));
+        assert!(message.contains("受保护的运行事务状态与受保护的代际信任根"));
+        assert!(message.contains("未判定权限漂移"));
+        assert!(message.contains("运行态未改动"));
+        assert!(message.contains("mihomo-cli doctor --system"));
+        for forbidden in ["chown", "chmod", "sudo "] {
+            assert!(
+                !message.contains(forbidden),
+                "结构化失败不得含 {forbidden}: {message}"
+            );
+        }
+    }
+
+    /// 代际信任根的两种拒绝必须分开报：授权不足 ≠ 确证违约。
+    #[test]
+    fn generation_trust_root_refusals_are_classified_separately() {
+        let denied = anyhow::anyhow!(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let unavailable = generation_trust_root_refusal("暂存代际", &denied).to_string();
+        assert!(unavailable.contains("授权不足"));
+        assert!(unavailable.contains("未判定权限漂移"));
+        assert!(unavailable.contains("在可取得管理员授权的会话重试原 mihomo-cli 命令"));
+        assert!(!unavailable.contains("chown"));
+
+        let drifted = anyhow::anyhow!("generation trust root /x drifted from root:root 0750");
+        let violation = generation_trust_root_refusal("暂存代际", &drifted).to_string();
+        assert!(violation.contains("代际信任根安全条件不满足"));
+        assert!(violation.contains("证据保留"));
+        assert!(violation.contains("mihomo-cli doctor --system"));
+        assert!(!violation.contains("chown"));
+        assert!(!violation.contains("授权不足"));
+    }
+
+    /// 身份不足判据必须结构化：文案里出现 permission denied 不算。
+    #[test]
+    fn identity_limited_detection_is_structural() {
+        let denied = anyhow::anyhow!(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(identity_limited_io(&denied));
+
+        let not_found = anyhow::anyhow!(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(!identity_limited_io(&not_found));
+
+        let textual = anyhow::anyhow!("Permission denied while decoding state.json");
+        assert!(!identity_limited_io(&textual));
+
+        let wrapped = anyhow::anyhow!(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            .context("代际状态不可读");
+        assert!(identity_limited_io(&wrapped), "错误链包裹后仍须识别");
+    }
+
+    /// 无 TTY 时不等待交互输入：sudo 以 `--non-interactive` 启动，认证不成立即非零；
+    /// 业务参数原样保留（授权不扩大业务范围，`--yes` 也不替代 OS 认证）。
+    #[test]
+    fn non_interactive_authorization_keeps_the_business_arguments() {
+        let exe = std::path::Path::new("/usr/local/bin/mihomo-cli");
+        let args = vec!["restart".to_string(), "--system".to_string()];
+        let command = sudo_reexec_command_with(exe, &args, true);
+        let rendered: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(command.get_program(), "sudo");
+        assert!(rendered.iter().any(|arg| arg == "--non-interactive"));
+        assert!(rendered
+            .windows(2)
+            .any(|pair| pair == ["restart", "--system"]));
+        assert!(!rendered.iter().any(|arg| arg == "--yes"));
+    }
+
+    fn offset_after(source: &'static str, start: &str, needle: &str) -> usize {
+        let base = source.find(start).expect("缺少起点锚点");
+        source[base..]
+            .find(needle)
+            .map(|offset| offset + base)
+            .unwrap_or_else(|| panic!("缺少锚点: {needle}"))
+    }
+
+    /// 授权必须发生在首次特权读取/留证/写入之前，且至多一次重入（root 不再 sudo）。
+    #[test]
+    fn authorization_precedes_privileged_work_and_never_recurses() {
+        let source = include_str!("main.rs");
+
+        let gate = offset_after(
+            source,
+            "async fn cmd_lifecycle_instance_mode(",
+            "authorize_protected_domain_operations(",
+        );
+        for later in [
+            "shared_repair_prerequisites(",
+            "preserve_upgrade_evidence(&ctx)",
+            "maybe_auto_recover_active_transaction(",
+            "ensure_instance_controller_endpoint(&ctx)",
+            "apply_pending_generation(&ctx)",
+        ] {
+            assert!(
+                gate < offset_after(source, "async fn cmd_lifecycle_instance_mode(", later),
+                "生命周期入口的授权必须早于 {later}"
+            );
+        }
+
+        let apply_gate = offset_after(
+            source,
+            "pub(crate) async fn apply_pending_generation(",
+            "authorize_protected_domain_operations(",
+        );
+        assert!(
+            apply_gate
+                < offset_after(
+                    source,
+                    "pub(crate) async fn apply_pending_generation(",
+                    "verify_generation_trust_root("
+                ),
+            "应用代际的授权必须早于信任根读取"
+        );
+
+        for entry in [
+            "pub(crate) fn prepare_system_generation(",
+            "fn discard_pending_generation(",
+        ] {
+            assert!(
+                offset_after(source, entry, "authorize_protected_domain_operations(")
+                    < offset_after(source, entry, "verify_generation_trust_root("),
+                "{entry} 的授权必须早于信任根读取"
+            );
+        }
+
+        let gate_body = offset_after(source, "fn authorize_protected_domain_operations(", "");
+        let recursion_guard = source[gate_body..]
+            .find("if is_current_process_root()")
+            .expect("授权边界必须先判特权");
+        let reexec = source[gate_body..]
+            .find("sudo_reexec_command_with(")
+            .expect("授权边界必须使用非交互提权重入");
+        assert!(
+            recursion_guard < reexec,
+            "特权执行者不得再次 sudo（至多一次协调提权重入）"
+        );
+    }
+
+    /// 只读观测面（status/doctor/tun status）零提权：授权边界只能出现在四个业务入口。
+    #[test]
+    fn authorization_gate_has_no_read_only_call_sites() {
+        let source = include_str!("main.rs");
+        assert_eq!(
+            source
+                .matches("authorize_protected_domain_operations(")
+                .count(),
+            5,
+            "授权边界只允许：定义 + 生命周期/应用/暂存/撤销 四个业务入口"
+        );
+        for call in [
+            "authorize_protected_domain_operations(&ctx, operation, impact)",
+            "authorize_protected_domain_operations(ctx, \"restart --system\", \"重启\")",
+            "authorize_protected_domain_operations(ctx, \"install --system\", \"安装\")",
+            "authorize_protected_domain_operations(ctx, \"install --discard-pending\", \"安装\")",
+        ] {
+            assert_eq!(
+                source.matches(call).count(),
+                1,
+                "缺少或重复的业务入口: {call}"
+            );
+        }
+    }
+}
+
+/// 配置树修复探测同样把「我读不到」与「它不对」分开——
+/// 判据必须 stat 化，身份不足落到 `Undeterminable`，零自动提权。
+#[cfg(all(test, unix))]
+mod config_assets_eacces_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn undeterminable_config_assets_never_escalates_privileges() {
+        for is_root in [false, true] {
+            assert_eq!(
+                config_assets_repair_action(ConfigAssetsVerdict::Healthy, is_root),
+                ConfigOwnershipRepair::NotNeeded
+            );
+        }
+
+        // 无 sudo 调用计划：三态里只有确证漂移才产生提权动作。
+        for is_root in [false, true] {
+            let action = config_assets_repair_action(ConfigAssetsVerdict::Undeterminable, is_root);
+            assert_eq!(action, ConfigOwnershipRepair::ReportUndeterminable);
+            assert_ne!(
+                action,
+                ConfigOwnershipRepair::ReexecAsRoot,
+                "an identity that cannot judge config assets must never trigger sudo (root={is_root})"
+            );
+            assert_ne!(action, ConfigOwnershipRepair::RepairAsRoot);
+        }
+
+        assert_eq!(
+            config_assets_repair_action(ConfigAssetsVerdict::NeedsRepair, false),
+            ConfigOwnershipRepair::ReexecAsRoot
+        );
+        assert_eq!(
+            config_assets_repair_action(ConfigAssetsVerdict::NeedsRepair, true),
+            ConfigOwnershipRepair::RepairAsRoot
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_assets_verdict_merge_and_rank() {
+        assert!(ConfigAssetsVerdict::Healthy.rank() < ConfigAssetsVerdict::Undeterminable.rank());
+        assert!(
+            ConfigAssetsVerdict::Undeterminable.rank() < ConfigAssetsVerdict::NeedsRepair.rank()
+        );
+
+        assert_eq!(
+            ConfigAssetsVerdict::Healthy.merge(Some(ConfigAssetsVerdict::Undeterminable)),
+            ConfigAssetsVerdict::Undeterminable
+        );
+        assert_eq!(
+            ConfigAssetsVerdict::Healthy.merge(Some(ConfigAssetsVerdict::NeedsRepair)),
+            ConfigAssetsVerdict::NeedsRepair
+        );
+        assert_eq!(
+            ConfigAssetsVerdict::Undeterminable.merge(Some(ConfigAssetsVerdict::NeedsRepair)),
+            ConfigAssetsVerdict::NeedsRepair
+        );
+        assert_eq!(
+            ConfigAssetsVerdict::NeedsRepair.merge(Some(ConfigAssetsVerdict::Healthy)),
+            ConfigAssetsVerdict::NeedsRepair
+        );
+        assert_eq!(
+            ConfigAssetsVerdict::NeedsRepair.merge(Some(ConfigAssetsVerdict::Undeterminable)),
+            ConfigAssetsVerdict::NeedsRepair
+        );
+        assert_eq!(
+            ConfigAssetsVerdict::Undeterminable.merge(Some(ConfigAssetsVerdict::Healthy)),
+            ConfigAssetsVerdict::Undeterminable
+        );
+        assert_eq!(
+            ConfigAssetsVerdict::Healthy.merge(None),
+            ConfigAssetsVerdict::Healthy
+        );
+    }
+
+    /// 0770 / unopenable EACCES 夹具：文件不可 open 读（EACCES），但 stat 观测属主相符时判 Healthy，零提权。
+    #[cfg(unix)]
+    #[test]
+    fn unopenable_eacces_config_file_maps_to_healthy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.yaml");
+        std::fs::write(&config_path, "mixed-port: 7890\n").unwrap();
+
+        let my_uid = unsafe { libc::geteuid() };
+
+        // 设置为 0o000，当前用户无法 open(O_RDONLY)，但 lstat 仍可观测属主
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // 验证 open 确实失败（EACCES）
+        if my_uid != 0 {
+            let open_res = std::fs::File::open(&config_path);
+            assert!(
+                open_res.is_err(),
+                "file with mode 0000 must not be openable by non-root"
+            );
+            assert_eq!(
+                open_res.unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
+
+        // stat-based 探测只读 lstat，不应因为打不开而误判漂移
+        let verdict = check_config_assets_verdict(&config_dir, &config_path, my_uid).unwrap();
+        assert_eq!(verdict, ConfigAssetsVerdict::Healthy);
+
+        let repair = detect_config_assets_repair(&config_dir, &config_path, my_uid, false).unwrap();
+        assert_eq!(repair, ConfigOwnershipRepair::NotNeeded);
+
+        // 恢复权限以便清理
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// 0770 / unopenable 订阅条目：条目无法 open 但 stat 属主相符时判 Healthy，零提权。
+    #[cfg(unix)]
+    #[test]
+    fn unopenable_eacces_subscription_entry_maps_to_healthy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        let sub_dir = config_dir.join("subscriptions");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        let config_path = config_dir.join("config.yaml");
+        std::fs::write(&config_path, "mixed-port: 7890\n").unwrap();
+
+        let sub_file = sub_dir.join("default.yaml");
+        std::fs::write(&sub_file, "proxies: []\n").unwrap();
+
+        let my_uid = unsafe { libc::geteuid() };
+
+        // 设置订阅条目为 0o000
+        std::fs::set_permissions(&sub_file, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        if my_uid != 0 {
+            assert_eq!(
+                std::fs::File::open(&sub_file).unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
+
+        let verdict = check_config_assets_verdict(&config_dir, &config_path, my_uid).unwrap();
+        assert_eq!(verdict, ConfigAssetsVerdict::Healthy);
+
+        let repair = detect_config_assets_repair(&config_dir, &config_path, my_uid, false).unwrap();
+        assert_eq!(repair, ConfigOwnershipRepair::NotNeeded);
+
+        std::fs::set_permissions(&sub_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// 确证 root 漂移：当配置属于 root（uid 0）而 expected_uid != 0 时，必须判 NeedsRepair。
+    #[cfg(unix)]
+    #[test]
+    fn confirmed_root_drift_maps_to_needs_repair() {
+        let my_uid = unsafe { libc::geteuid() };
+        if my_uid == 0 {
+            let temp = tempfile::tempdir().unwrap();
+            let config_dir = temp.path().join("config");
+            std::fs::create_dir_all(&config_dir).unwrap();
+            let config_path = config_dir.join("config.yaml");
+            std::fs::write(&config_path, "mixed-port: 7890\n").unwrap();
+
+            let verdict = check_config_assets_verdict(&config_dir, &config_path, 1000).unwrap();
+            assert_eq!(verdict, ConfigAssetsVerdict::NeedsRepair);
+
+            let repair =
+                detect_config_assets_repair(&config_dir, &config_path, 1000, true).unwrap();
+            assert_eq!(repair, ConfigOwnershipRepair::RepairAsRoot);
+        } else {
+            let verdict = probe_config_file_verdict(1000, 0, true, 1).unwrap();
+            assert_eq!(verdict, ConfigAssetsVerdict::NeedsRepair);
+
+            let action_non_root = config_assets_repair_action(verdict, false);
+            assert_eq!(action_non_root, ConfigOwnershipRepair::ReexecAsRoot);
+
+            let action_root = config_assets_repair_action(verdict, true);
+            assert_eq!(action_root, ConfigOwnershipRepair::RepairAsRoot);
+        }
+    }
+
+    /// 不可观测路径：父目录权限为 0o000 时，stat 失败（EACCES）必须落入 Undeterminable，零提权。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unobservable_path_maps_to_undeterminable() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("unsearchable");
+        std::fs::create_dir_all(&parent).unwrap();
+        let config_dir = parent.join("mihomo");
+        let config_path = config_dir.join("config.yaml");
+
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let my_uid = unsafe { libc::geteuid() };
+        let verdict = check_config_assets_verdict(&config_dir, &config_path, my_uid).unwrap();
+        assert_eq!(verdict, ConfigAssetsVerdict::Undeterminable);
+
+        let repair = detect_config_assets_repair(&config_dir, &config_path, my_uid, false).unwrap();
+        assert_eq!(repair, ConfigOwnershipRepair::ReportUndeterminable);
+
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// subscriptions 目录不可读时（mode 0o000），read_dir 失败落入 Undeterminable，零提权。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreadable_subscription_dir_maps_to_undeterminable() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        let sub_dir = config_dir.join("subscriptions");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        let config_path = config_dir.join("config.yaml");
+        std::fs::write(&config_path, "mixed-port: 7890\n").unwrap();
+
+        std::fs::set_permissions(&sub_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let my_uid = unsafe { libc::geteuid() };
+        let verdict = check_config_assets_verdict(&config_dir, &config_path, my_uid).unwrap();
+        assert_eq!(verdict, ConfigAssetsVerdict::Undeterminable);
+
+        let repair = detect_config_assets_repair(&config_dir, &config_path, my_uid, false).unwrap();
+        assert_eq!(repair, ConfigOwnershipRepair::ReportUndeterminable);
+
+        std::fs::set_permissions(&sub_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// 调用点回归：`ensure_system_config_ownership_for_lifecycle` 遇到 Undeterminable 时
+    /// 只提示后以 Ok(()) 放行，不得执行 sudo 重入或 exit。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ensure_system_config_ownership_undeterminable_does_not_request_sudo() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("unsearchable_lifecycle");
+        std::fs::create_dir_all(&parent).unwrap();
+        let config_dir = parent.join("mihomo");
+
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut ctx = instance::InstanceContext::planned(
+            instance::TargetOs::Linux,
+            instance::InstanceMode::System,
+            &instance::PathInputs::from_current_env(),
+        );
+        ctx.paths.config_dir = config_dir.clone();
+        ctx.paths.intent_config_file = config_dir.join("config.yaml");
+
+        // 若 Undeterminable 误走 ReexecAsRoot，这里会执行 sudo 重入并终止进程导致测试失败；
+        // 预期必须是 Ok(())。
+        assert!(ensure_system_config_ownership_for_lifecycle(&ctx).is_ok());
+
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
+/// 非特权 `doctor`/`status` 的 pending generation 三态可见性——
+/// 代际信任根 EACCES 不得等同「无 pending」、不得静默、不得提权；可读时行为不变。
+#[cfg(all(test, unix))]
+mod issue_048_pending_visibility_tests {
+    use super::*;
+
+    fn planned_system_ctx(root: &std::path::Path) -> instance::InstanceContext {
+        let mut ctx = instance::InstanceContext::planned(
+            instance::TargetOs::Linux,
+            instance::InstanceMode::System,
+            &instance::PathInputs::for_tests(),
+        );
+        ctx.paths.generation_store_root = root.join("generations");
+        ctx
+    }
+
+    fn generation_id(label: &str) -> generation::GenerationId {
+        generation::GenerationId::new(label).unwrap()
+    }
+
+    /// 按花括号配平提取函数源码（含内联 format 花括号，天然配平）。
+    fn function_source<'a>(source: &'a str, entry: &str) -> &'a str {
+        let start = source.find(entry).expect("缺少函数入口锚点");
+        let body_start = start + source[start..].find('{').expect("缺少函数体");
+        let bytes = source.as_bytes();
+        let mut depth = 1usize;
+        let mut idx = body_start + 1;
+        while depth > 0 {
+            match bytes[idx] {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            idx += 1;
+        }
+        &source[start..idx]
+    }
+
+    /// 三态分类：可读无 pending → Applied；可读有 pending → HasPending；读不动 → Undeterminable。
+    #[test]
+    fn observe_pending_distinguishes_read_failure_from_no_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = planned_system_ctx(temp.path());
+        let store = system_generation_store(&ctx);
+
+        assert!(matches!(
+            store.observe_pending(),
+            generation::PendingObservation::Applied
+        ));
+
+        let mut state = generation::GenerationState::default();
+        let id = generation_id("gen-048-pending");
+        state.pending = Some(id.clone());
+        store.write_state(&state).unwrap();
+        match store.observe_pending() {
+            generation::PendingObservation::HasPending(observed) => assert_eq!(observed, id),
+            other => panic!("可读且有 pending 须报 HasPending: {other:?}"),
+        }
+    }
+
+    /// 非 root + 0o000 信任根：EACCES 必须映射为 Undeterminable，而不是 Applied。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreadable_trust_root_maps_to_undeterminable() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            // root 绕过模式位，构造不出不可观测的 trust root。
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = planned_system_ctx(temp.path());
+        std::fs::create_dir_all(&ctx.paths.generation_store_root).unwrap();
+        std::fs::set_permissions(
+            &ctx.paths.generation_store_root,
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            system_generation_store(&ctx).observe_pending(),
+            generation::PendingObservation::Undeterminable(_)
+        ));
+
+        std::fs::set_permissions(
+            &ctx.paths.generation_store_root,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
+
+    /// doctor 三态消费：可读无 pending → 静默；可读有 pending → 既有 fail 告警不变。
+    #[test]
+    fn doctor_pending_check_keeps_silence_and_existing_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = planned_system_ctx(temp.path());
+        let store = system_generation_store(&ctx);
+
+        assert!(doctor_pending_generation_check(&store).is_none());
+
+        let mut state = generation::GenerationState::default();
+        let id = generation_id("gen-048-doctor");
+        state.pending = Some(id.clone());
+        store.write_state(&state).unwrap();
+        let warned = doctor_pending_generation_check(&store).unwrap();
+        assert!(!warned.passed);
+        assert!(warned
+            .detail
+            .contains(&format!("发现 pending generation ({id})")));
+    }
+
+    /// doctor + status 对不可读信任根：❓「无法判定」、诚实且可执行、零 sudo 计划。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreadable_root_reports_undeterminable_without_escalation() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            // root 绕过模式位，构造不出不可观测的 trust root。
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = planned_system_ctx(temp.path());
+        std::fs::create_dir_all(&ctx.paths.generation_store_root).unwrap();
+        std::fs::set_permissions(
+            &ctx.paths.generation_store_root,
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+
+        let check = doctor_pending_generation_check(&system_generation_store(&ctx)).unwrap();
+        assert!(
+            check.passed && check.neutral,
+            "不可读是「无法判定」（❓），不是问题（❌）"
+        );
+        assert!(check.hint.is_none(), "无法判定不携带修复型 hint（不提权）");
+        assert!(check.detail.contains("无法判定"));
+        assert!(check.detail.contains("可能存在未应用更新"));
+        assert!(check
+            .detail
+            .contains("mihomo-cli doctor --system --privileged"));
+        assert!(!check.detail.contains("mihomo-cli restart --system"));
+        for forbidden in [
+            "检测到",
+            "正在修复",
+            "chown",
+            "chmod",
+            "权限问题",
+            "无待应用更新",
+        ] {
+            assert!(
+                !check.detail.contains(forbidden),
+                "无法判定提示不得出现 {forbidden}: {}",
+                check.detail
+            );
+        }
+
+        // 只读面零 sudo 计划：三个消费点不得触碰提权/授权边界。
+        let source = include_str!("main.rs");
+        for entry in [
+            "fn doctor_pending_generation_check(",
+            "fn pending_generation_unknown_notice(",
+            "pub(crate) fn check_and_warn_daemon_binary_skew(",
+            "fn status_json_pending_generation(",
+        ] {
+            let body = function_source(source, entry);
+            for forbidden in [
+                "maybe_sudo_reexec_for_system_generation(",
+                "sudo_reexec_command",
+                "authorize_protected_domain_operations(",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "{entry} 不得包含 {forbidden}（只读观测零提权）"
+                );
+            }
+        }
+
+        std::fs::set_permissions(
+            &ctx.paths.generation_store_root,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
+
+    /// 「无法判定」文案：身份不足带授权检查指引；非身份类失败只报事实。
+    #[test]
+    fn unknown_notice_is_honest_and_actionable() {
+        let limited = pending_generation_unknown_notice(&generation::GenerationError::Io(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        ));
+        assert!(limited.contains("无法判定"));
+        assert!(limited.contains("可能存在未应用更新"));
+        assert!(limited.contains("mihomo-cli doctor --system --privileged"));
+        assert!(!limited.contains("mihomo-cli restart --system"));
+        for forbidden in [
+            "检测到",
+            "正在修复",
+            "chown",
+            "chmod",
+            "无待应用更新",
+            "没有待应用更新",
+        ] {
+            assert!(
+                !limited.contains(forbidden),
+                "文案不得出现 {forbidden}: {limited}"
+            );
+        }
+
+        let broken = pending_generation_unknown_notice(
+            &generation::GenerationError::Serialization("corrupt".to_string()),
+        );
+        assert!(broken.contains("无法判定"));
+        assert!(
+            !broken.contains("restart --system"),
+            "非身份类读取失败不给管理员授权指引"
+        );
+    }
+
+    /// status --json：system 实例三态结构化为 none / pending+id / unknown；user 实例为 null。
+    #[test]
+    fn status_json_pending_generation_is_structured() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = planned_system_ctx(temp.path());
+
+        assert_eq!(
+            status_json_pending_generation(ctx.mode, &ctx)["state"],
+            "none"
+        );
+
+        let mut state = generation::GenerationState::default();
+        let id = generation_id("gen-048-json");
+        state.pending = Some(id.clone());
+        system_generation_store(&ctx).write_state(&state).unwrap();
+        let value = status_json_pending_generation(ctx.mode, &ctx);
+        assert_eq!(value["state"], "pending");
+        assert_eq!(value["id"], id.as_str());
+
+        let user_ctx = instance::InstanceContext::planned(
+            instance::TargetOs::Linux,
+            instance::InstanceMode::User,
+            &instance::PathInputs::for_tests(),
+        );
+        assert!(status_json_pending_generation(user_ctx.mode, &user_ctx).is_null());
+    }
+
+    /// status --json 不可读 → `{"state":"unknown"}`：不是 none，也不伪造 pending。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn status_json_pending_generation_reports_unknown_for_unreadable_root() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = planned_system_ctx(temp.path());
+        std::fs::create_dir_all(&ctx.paths.generation_store_root).unwrap();
+        std::fs::set_permissions(
+            &ctx.paths.generation_store_root,
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+
+        assert_eq!(
+            status_json_pending_generation(ctx.mode, &ctx)["state"],
+            "unknown"
+        );
+
+        std::fs::set_permissions(
+            &ctx.paths.generation_store_root,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
+
+    /// 接线回归：status 文本与 JSON 均消费同一三态观测点。
+    #[test]
+    fn status_paths_consume_the_shared_three_state_observation() {
+        let source = include_str!("main.rs");
+        let text_body = function_source(source, "pub(crate) fn check_and_warn_daemon_binary_skew(");
+        assert!(text_body.contains("observe_pending()"));
+        assert!(text_body.contains("存在待应用的系统更新"));
+        assert!(text_body.contains("pending_generation_unknown_notice("));
+
+        let json_body = function_source(source, "fn status_json_data(");
+        assert!(json_body
+            .contains("\"pending_generation\": status_json_pending_generation(plan.mode, ctx),"));
+    }
+
+    #[test]
+    fn doctor_daemon_binary_skew_hint_includes_system_flag() {
+        assert_eq!(
+            doctor_daemon_binary_skew_hint(),
+            "应用更新: mihomo-cli restart --system"
+        );
+    }
+
+    #[test]
+    fn doctor_split_dns_intent_detection() {
+        let split_dns_config = r#"
+dns:
+  enable: true
+  nameserver-policy:
+    '+.corp.example': 10.10.1.1
+"#;
+        assert!(has_split_dns_intent(split_dns_config));
+
+        let route_exclude_config = r#"
+tun:
+  enable: true
+  route-exclude-address:
+    - 10.0.0.0/8
+"#;
+        assert!(has_split_dns_intent(route_exclude_config));
+
+        let normal_config = r#"
+dns:
+  enable: true
+tun:
+  enable: true
+"#;
+        assert!(!has_split_dns_intent(normal_config));
+    }
+
+    #[test]
+    fn format_rule_list_annotated_marks_active_and_fallback_rules() {
+        let rules = vec![
+            "DOMAIN-SUFFIX,corp.example,DIRECT".to_string(),
+            "DOMAIN-KEYWORD,openai,OpenRouter".to_string(),
+        ];
+        let policies = vec!["DIRECT".to_string(), "Proxy".to_string()];
+        let lines =
+            format_rule_list_annotated(&rules, crate::rules::RulePosition::Front, Some(&policies));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("DOMAIN-SUFFIX,corp.example,DIRECT") && l.contains("[Active]")),
+            "Expected active annotation for valid rule, got: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("DOMAIN-KEYWORD,openai,OpenRouter") && l.contains("Fallback")),
+            "Expected fallback annotation for missing policy rule, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn doctor_intranet_guard_checks_identifies_risk_topology() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_file = temp.path().join("config.yaml");
+        std::fs::write(
+            &config_file,
+            r#"
+sniffer:
+  enable: true
+  override-destination: true
+tun:
+  enable: true
+rules:
+  - DOMAIN-SUFFIX,google.com,Proxy
+  - MATCH,Proxy
+"#,
+        )
+        .unwrap();
+
+        let checks = doctor_intranet_guard_checks(&config_file);
+        assert_eq!(checks.len(), 1);
+        assert!(checks[0].warning);
+        assert!(checks[0].label.contains("Intranet Guard"));
+        assert!(checks[0].detail.contains("Sniffer"));
+        assert!(checks[0]
+            .hint
+            .as_ref()
+            .unwrap()
+            .contains("route-exclude-address"));
+    }
+
+    #[test]
+    fn doctor_intranet_guard_checks_clean_on_safe_topology() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_file = temp.path().join("config.yaml");
+        std::fs::write(
+            &config_file,
+            r#"
+sniffer:
+  enable: true
+  override-destination: true
+tun:
+  enable: true
+  route-exclude-address:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+rules:
+  - DOMAIN-SUFFIX,google.com,Proxy
+  - MATCH,Proxy
+"#,
+        )
+        .unwrap();
+
+        let checks = doctor_intranet_guard_checks(&config_file);
+        assert!(checks.is_empty());
     }
 }

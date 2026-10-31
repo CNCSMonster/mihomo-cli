@@ -1,5 +1,5 @@
 # Real-Core select/promotion 终审镜像。target/container-test/mihomo-real 必须预先准备。
-# 覆盖 #007 按订阅选择持久化与 #004 TUN-active promotion dispatcher，
+# 覆盖 按订阅选择持久化与 TUN-active promotion dispatcher，
 # 分别以普通用户 testuser 与 root 两种身份运行。
 FROM ubuntu:24.04
 

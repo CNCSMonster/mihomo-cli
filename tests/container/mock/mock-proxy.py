@@ -11,10 +11,10 @@ import threading
 
 class MockProxyHandler(http.server.BaseHTTPRequestHandler):
     """Mock 代理处理器"""
-    
+
     # 类变量用于记录请求
     request_log = []
-    
+
     def log_request(self, code='-', size='-'):
         """记录请求"""
         MockProxyHandler.request_log.append({
@@ -23,7 +23,7 @@ class MockProxyHandler(http.server.BaseHTTPRequestHandler):
             'code': code
         })
         super().log_request(code, size)
-    
+
     def do_GET(self):
         """处理 GET 请求"""
         if '/test-success' in self.path:
@@ -47,12 +47,12 @@ class MockProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-type', 'text/plain')
             self.end_headers()
             self.wfile.write(b'Mock proxy response')
-    
+
     def do_CONNECT(self):
         """处理 HTTPS CONNECT 请求"""
         self.send_response(200)
         self.end_headers()
-    
+
     def do_POST(self):
         """处理 POST 请求"""
         self.send_response(200)

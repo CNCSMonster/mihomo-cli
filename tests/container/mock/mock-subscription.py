@@ -18,7 +18,7 @@ proxies:
     server: 127.0.0.1
     port: 8388
     cipher: aes-256-gcm
-    password: "password"
+    password: "x"
   - name: "Mock Proxy 2"
     type: vmess
     server: 127.0.0.1
@@ -51,7 +51,7 @@ class MockSubHandler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
-    
+
     def log_message(self, format, *args):
         # 静默日志
         pass

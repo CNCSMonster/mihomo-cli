@@ -10,6 +10,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// review MAJOR-1：TUN 护栏 / attestation Error 的共享标记前缀。
+/// daemon 侧所有宣告"运行态 TUN 已被拆除或无法观测"的 Error 文案必须以它起始，
+/// CLI 侧 `is_tun_guard_error` 只认这个常量：判据锚定常量而非自由文案，
+/// 文案措辞改动不会让护栏 Error 静默折叠回 Pending。
+pub(crate) const TUN_GUARD_ERROR_MARKER: &str = "tun-guard: ";
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CoreApiMethod {
     Get,
@@ -79,6 +85,11 @@ pub enum DaemonCommand {
     RecordSelectionIntent {
         subscription_id: String,
         content_yaml: String,
+        /// SPEC §3.8.3: the request-side config revision this mirror is bound to.
+        /// The daemon records it in the mirror binding sidecar so a later startup
+        /// can prove the mirror belongs to the config it actually loaded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config_revision: Option<String>,
         /// Windows-only auth token (None on unix — peer uid validation).
         #[serde(default)]
         token: Option<String>,
@@ -86,6 +97,9 @@ pub enum DaemonCommand {
     /// Record the active subscription identity mirror in the fixed system runtime.
     RecordActiveSubscription {
         subscription_id: String,
+        /// SPEC §3.8.3: request-side config revision (see `RecordSelectionIntent`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config_revision: Option<String>,
         /// Windows-only auth token (None on unix — peer uid validation).
         #[serde(default)]
         token: Option<String>,
@@ -144,6 +158,18 @@ pub enum DaemonCommand {
     },
     QuiesceCandidateRuntime {
         fence: crate::tun_transaction::TransactionFence,
+        /// set only by the authorized controlled-reset stop
+        /// (`restart --system` after the runtime-reset confirmation). It unlocks
+        /// the migrated-legacy-placeholder admission and nothing else; omitted on
+        /// the wire when false so non-reset callers keep the original request.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        allow_legacy_reset: bool,
+        /// explicit `restart --system --yes` authorization to stop a
+        /// managed Core that still runs the old revision/TUN with a new PID. Kept
+        /// separate from the legacy-placeholder admission; omitted when false so
+        /// older daemons see the original request.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        allow_restored_old_quiesce: bool,
         #[serde(default)]
         token: Option<String>,
     },
@@ -177,6 +203,15 @@ pub enum DaemonCommand {
     /// a `None` revision in the response means the mirror file is absent.
     GetSelectionMirrorRevisions {
         subscription_ids: Vec<String>,
+        /// Windows-only auth token (None on unix — peer uid validation).
+        #[serde(default)]
+        token: Option<String>,
+    },
+    /// Read-only query of the daemon-cached selection drift observations
+    /// (B2). Never triggers a core request, a fix, or a path
+    /// access; authorization is fully inherited from the existing read-only
+    /// command contract (peer UID + owner record + token).
+    GetSelectionDrift {
         /// Windows-only auth token (None on unix — peer uid validation).
         #[serde(default)]
         token: Option<String>,
@@ -227,6 +262,39 @@ pub enum DaemonResponse {
     SelectionMirrorRevisions {
         revisions: BTreeMap<String, Option<String>>,
     },
+    /// Cached selection drift observation snapshot (B2).
+    SelectionDrift {
+        observations: Vec<SelectionDriftObservation>,
+        /// Samples discarded because the daemon was mutating/suppressed/
+        /// inconsistent. No finite visibility bound is promised for these.
+        unknown_samples: u64,
+        /// Health of the sampler: `ok` (last sample healthy),
+        /// `unknown`, or `suppressed` (replay suppression window).
+        sample_status: String,
+        /// Set when the active TUN journal is in-flight/corrupt: the cache is
+        /// still returned, but the CLI must annotate the fault state.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        journal: Option<String>,
+    },
+}
+
+/// One drift observation: runtime `now` differs from the daemon-owned
+/// mirror intent for the group (B1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectionDriftObservation {
+    pub group: String,
+    /// Intent node recorded in the fixed-runtime selection mirror.
+    pub intent: String,
+    /// Runtime `now` reported by the Core at sample time.
+    pub runtime: String,
+    /// Unix timestamp (seconds) of the observation.
+    pub at_unix: u64,
+    /// Subscription the mirror intent belongs to (Wave 1 §3.8.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_id: Option<String>,
+    /// SHA-256 revision of the mirror file at sample time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror_revision: Option<String>,
 }
 
 pub(crate) fn managed_snapshot_revision(path: &Path) -> anyhow::Result<String> {
@@ -265,8 +333,18 @@ pub(crate) fn current_client_token() -> Option<String> {
     read_client_token(&client_token_location().token_path)
 }
 
+/// Test-only override so an isolated child process can drive the real pipeline
+/// against a fake daemon socket instead of the machine-wide one. Compiled only
+/// under `cfg(test)`; the production binary never reads any env for this path.
+#[cfg(test)]
+pub(crate) const TEST_DAEMON_SOCKET_ENV: &str = "MIHOMO_TEST_DAEMON_SOCKET";
+
 /// IPC socket path for the system service.
 pub fn system_service_socket_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = std::env::var_os(TEST_DAEMON_SOCKET_ENV) {
+        return PathBuf::from(path);
+    }
     if cfg!(unix) {
         PathBuf::from("/var/run/mihomo/service.sock")
     } else {
@@ -493,16 +571,21 @@ fn with_ipc_token(cmd: DaemonCommand, token: Option<String>) -> DaemonCommand {
         RecordSelectionIntent {
             subscription_id,
             content_yaml,
+            config_revision,
             ..
         } => RecordSelectionIntent {
             subscription_id,
             content_yaml,
+            config_revision,
             token,
         },
         RecordActiveSubscription {
-            subscription_id, ..
+            subscription_id,
+            config_revision,
+            ..
         } => RecordActiveSubscription {
             subscription_id,
+            config_revision,
             token,
         },
         SelectSystemProxy { group, node, .. } => SelectSystemProxy { group, node, token },
@@ -537,7 +620,17 @@ fn with_ipc_token(cmd: DaemonCommand, token: Option<String>) -> DaemonCommand {
             target_runtime_tun,
             token,
         },
-        QuiesceCandidateRuntime { fence, .. } => QuiesceCandidateRuntime { fence, token },
+        QuiesceCandidateRuntime {
+            fence,
+            allow_legacy_reset,
+            allow_restored_old_quiesce,
+            ..
+        } => QuiesceCandidateRuntime {
+            fence,
+            allow_legacy_reset,
+            allow_restored_old_quiesce,
+            token,
+        },
         RestoreOldRuntime {
             fence,
             expected_old_runtime_revision,
@@ -576,6 +669,7 @@ fn with_ipc_token(cmd: DaemonCommand, token: Option<String>) -> DaemonCommand {
             subscription_ids,
             token,
         },
+        GetSelectionDrift { .. } => GetSelectionDrift { token },
     }
 }
 
@@ -691,10 +785,12 @@ mod tests {
             DaemonCommand::RecordSelectionIntent {
                 subscription_id: "sub-abcdef12".to_string(),
                 content_yaml: "selections:\n  G: N\n".to_string(),
+                config_revision: Some("rev-1".to_string()),
                 token: None,
             },
             DaemonCommand::RecordActiveSubscription {
                 subscription_id: "sub-abcdef12".to_string(),
+                config_revision: Some("rev-1".to_string()),
                 token: None,
             },
         ] {
@@ -748,6 +844,76 @@ mod tests {
             DaemonResponse::SelectionMirrorRevisions { revisions: got } => {
                 assert_eq!(got, revisions)
             }
+            other => panic!("unexpected response variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn selection_drift_query_roundtrips_and_injects_token() {
+        // B2: read-only cache query; no path or fix payload.
+        let cmd = DaemonCommand::GetSelectionDrift { token: None };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"GetSelectionDrift\""));
+        assert!(!json.contains("selection_intent_dir"));
+        assert!(!json.contains("/var/lib"));
+        let parsed = serde_json::from_str::<DaemonCommand>(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            DaemonCommand::GetSelectionDrift { token: None }
+        ));
+
+        // Token injection keeps authorization explicit (Windows path).
+        let with_token = with_ipc_token(
+            DaemonCommand::GetSelectionDrift { token: None },
+            Some("t0".into()),
+        );
+        match with_token {
+            DaemonCommand::GetSelectionDrift { token } => assert_eq!(token.as_deref(), Some("t0")),
+            other => panic!("unexpected command variant: {other:?}"),
+        }
+
+        let resp = DaemonResponse::SelectionDrift {
+            observations: vec![SelectionDriftObservation {
+                group: "自动选择".to_string(),
+                intent: "HK-01".to_string(),
+                runtime: "SG-02".to_string(),
+                at_unix: 1_700_000_000,
+                subscription_id: Some("sub-abcdef12".to_string()),
+                mirror_revision: Some("abc123".to_string()),
+            }],
+            unknown_samples: 3,
+            sample_status: "ok".to_string(),
+            journal: Some("in-flight (Prepared)".to_string()),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        match serde_json::from_str::<DaemonResponse>(&json).unwrap() {
+            DaemonResponse::SelectionDrift {
+                observations,
+                unknown_samples,
+                sample_status,
+                journal,
+            } => {
+                assert_eq!(observations.len(), 1);
+                assert_eq!(observations[0].group, "自动选择");
+                assert_eq!(observations[0].runtime, "SG-02");
+                assert_eq!(unknown_samples, 3);
+                assert_eq!(sample_status, "ok");
+                assert_eq!(journal.as_deref(), Some("in-flight (Prepared)"));
+            }
+            other => panic!("unexpected response variant: {other:?}"),
+        }
+
+        // Healthy daemon: journal annotation is omitted entirely (back-compat).
+        let resp = DaemonResponse::SelectionDrift {
+            observations: Vec::new(),
+            unknown_samples: 0,
+            sample_status: "suppressed".to_string(),
+            journal: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("journal"));
+        match serde_json::from_str::<DaemonResponse>(&json).unwrap() {
+            DaemonResponse::SelectionDrift { journal: None, .. } => {}
             other => panic!("unexpected response variant: {other:?}"),
         }
     }

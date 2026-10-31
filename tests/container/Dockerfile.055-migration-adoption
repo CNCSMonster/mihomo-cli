@@ -1,0 +1,34 @@
+# legacy generation-store migration + explicit adoption contract.
+# Runtime-only image: target/container-test/{mihomo-cli,mihomo-real-055} must be
+# prepared by generation-migration-adoption-test.sh before build.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV MIHOMO_CLI_MIHOMO_PATH=/usr/local/lib/mihomo/mihomo
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    sudo \
+    systemd \
+    iproute2 \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY target/container-test/mihomo-cli /usr/local/bin/mihomo-cli
+COPY target/container-test/mihomo-cli /tests/mihomo-cli-source
+COPY target/container-test/mihomo-real-055 /usr/local/lib/mihomo/mihomo
+COPY target/container-test/mihomo-real-055 /tests/real-mihomo
+COPY tests/container/scripts/ /tests/scripts/
+
+RUN chmod 755 /usr/local/bin/mihomo-cli /tests/mihomo-cli-source \
+    /usr/local/lib/mihomo/mihomo /tests/real-mihomo /tests/scripts/*.sh && \
+    mkdir -p /var/lib/mihomo-cli /var/run/mihomo /var/log/mihomo \
+    /home/testuser/.config/mihomo && \
+    useradd -m -s /bin/bash testuser && \
+    useradd --system --no-create-home --shell /usr/sbin/nologin mihomo && \
+    printf 'testuser ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/testuser && \
+    chmod 440 /etc/sudoers.d/testuser && \
+    chown -R testuser:testuser /home/testuser/.config
+
+WORKDIR /tests

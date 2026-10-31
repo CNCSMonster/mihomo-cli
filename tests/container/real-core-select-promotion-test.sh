@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 真实 Mihomo Core 终审：#007 按订阅选择持久化 + #004 TUN-active promotion。
+# 真实 Mihomo Core 终审： 按订阅选择持久化 + TUN-active promotion。
 # 分别以普通用户（testuser）与 root 两种身份在隔离 privileged systemd 容器中运行；
 # 缺少真实 Core 或 docker 时失败。真实 TUN 需要 /dev/net/tun。
 set -euo pipefail
@@ -66,4 +66,4 @@ trap cleanup EXIT
 # root 情况的"被拒"是合同行为，不是测试场景。
 run_identity testuser
 
-echo "PASS: real-Core #007 and #004 journeys verified with selection runtime mirror"
+echo "PASS: real-Core  and  journeys verified with selection runtime mirror"

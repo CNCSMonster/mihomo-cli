@@ -14,6 +14,7 @@ COPY target/container-test/mihomo-cli /usr/local/bin/mihomo-cli
 COPY target/container-test/mihomo-cli /tests/mihomo-cli-source
 COPY target/container-test/mihomo /usr/local/lib/mihomo/mihomo
 COPY target/container-test/mihomo /tests/fake-mihomo
+COPY target/container-test/legacy/ /tests/legacy/
 COPY tests/container/mock/gsettings /usr/local/bin/gsettings
 COPY tests/container/scripts/ /tests/scripts/
 COPY tests/container/scripts/test-tun-config-contract.sh /tests/test-tun-config-contract.sh

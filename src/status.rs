@@ -70,7 +70,9 @@ pub enum TunVerdict {
     TunStateUnknown,
 }
 
-fn tun_verdict(
+/// SPEC §0.6 attestation aggregation. `pub(crate)` so render-layer tests can
+/// prove both `status` formatters consume the derived verdict.
+pub(crate) fn tun_verdict(
     runtime_tun: TriState,
     launched_snapshot_revision: Option<&str>,
     active_snapshot_revision: Option<&str>,

@@ -10,6 +10,11 @@ use serde::{Deserialize, Serialize};
 // ── Multi-subscription data structures ──
 
 /// Subscription metadata stored in subscriptions.yaml
+///
+/// (SPEC-selection-mirror-resilience A1'): `config --remove` marks
+/// the entry `retired` instead of deleting it, so a byte-identical URL re-add
+/// revives the same subscription id and keeps its selection/overlay slots
+/// reachable. Entries without the field (older files) read as alive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscriptionMeta {
     pub id: String,
@@ -19,7 +24,25 @@ pub struct SubscriptionMeta {
     pub user_agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_agent_mode: Option<UserAgentMode>,
+    #[serde(default, skip_serializing_if = "retired_flag_is_false")]
+    pub retired: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<DateTime<Utc>>,
 }
+
+fn retired_flag_is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl SubscriptionMeta {
+    pub fn is_alive(&self) -> bool {
+        !self.retired
+    }
+}
+
+/// Tombstone FIFO cap: at most this many retired entries are kept in
+/// subscriptions.yaml; older ones are evicted with a single log line.
+pub const RETIRED_TOMBSTONE_LIMIT: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -129,9 +152,252 @@ pub fn find_subscription<'a>(
 
 // ── Phase 4: Subscription CRUD ──
 
+/// Downloaded, converted and validated subscription content awaiting commit.
+#[derive(Debug, Clone)]
+pub struct PreparedSubscription {
+    pub yaml_content: String,
+}
+
+/// Download + convert + validate a subscription **without touching disk**.
+///
+/// (A1' concurrency contract): the network fetch stays outside the
+/// config write lock; the URL identity match and the commit happen together
+/// inside one critical section (`commit_subscription_matched_at`).
+pub async fn prepare_subscription_with_user_agent(
+    url: &str,
+    user_agent: Option<String>,
+) -> anyhow::Result<PreparedSubscription> {
+    let result = download_sub_with_user_agent(url, user_agent.as_deref())
+        .await
+        .map_err(|e| anyhow::anyhow!("Cannot reach subscription URL.\n  {e}"))?;
+    let content = result.content;
+    let is_yaml = result.is_clash_yaml;
+
+    let yaml_content = if is_yaml {
+        content
+    } else {
+        warn_raw_subscription_conversion();
+        crate::log!("Converting subscription format (vmess/base64 → Clash YAML)...");
+        convert_vmess_to_clash(&content)?
+    };
+
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str(&yaml_content).context("Subscription content is not valid YAML")?;
+    validate_subscription_yaml(&yaml)?;
+    Ok(PreparedSubscription { yaml_content })
+}
+
+/// Outcome of a URL-matched subscription commit (A1').
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubscriptionCommitKind {
+    /// No entry holds this URL: the usual new-identity flow.
+    New,
+    /// A living entry already holds this byte-identical URL: reuse its id
+    /// (equivalent to refresh — snapshot/rollback semantics, never the
+    /// delete-style new-subscription rollback).
+    Reuse,
+    /// The most recent retired entry held this URL: revive it with its id,
+    /// selections and overlay intact.
+    Revive {
+        retired_at: Option<DateTime<Utc>>,
+        /// Same-URL tombstones that stay retired (single-line hint).
+        other_retired: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct SubscriptionCommit {
+    pub id: String,
+    pub kind: SubscriptionCommitKind,
+}
+
+/// True pre-images of one commit transaction, captured inside the config
+/// write lock immediately before the commit writes (A1' defect 1/2):
+/// rollback restores exactly what THIS transaction overwrote — never a
+/// pre-download snapshot that could clobber a concurrent successful commit.
+#[derive(Debug)]
+pub(crate) struct SubscriptionPreImages {
+    cache: Option<String>,
+    metadata: Option<String>,
+    active: Option<String>,
+    /// Whether this transaction modified the active pointer at all; the
+    /// active pre-image is only restored when it did. Set to `true` by a
+    /// caller critical section that activates outside `commit` (e.g. the
+    /// interactive activate prompt) so its rollback also restores `active`.
+    pub(crate) activated: bool,
+}
+
+impl SubscriptionPreImages {
+    /// Restore cache + metadata to this transaction's old state; restore the
+    /// active pointer only if this transaction changed it.
+    pub(crate) fn restore(self, paths: &AppPaths, id: &str) -> anyhow::Result<()> {
+        let mut errors = Vec::new();
+        if let Err(error) = restore_optional_file(&paths.subscription_file_path(id), self.cache) {
+            errors.push(format!("subscription cache: {error}"));
+        }
+        if let Err(error) = restore_optional_file(&paths.subscriptions_meta_path(), self.metadata) {
+            errors.push(format!("subscriptions metadata: {error}"));
+        }
+        if self.activated {
+            if let Err(error) = restore_optional_file(&paths.active_file_path(), self.active) {
+                errors.push(format!("active subscription: {error}"));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(errors.join("; "))
+        }
+    }
+}
+
+/// URL-matched commit: reload metadata inside the config write lock, resolve
+/// the identity (living > newest retired > new), then commit cache + metadata
+/// + active pointer as one rollback-protected transaction.
+pub fn commit_subscription_matched_at(
+    paths: &AppPaths,
+    url: &str,
+    yaml_content: &str,
+    user_agent: Option<String>,
+    activate: Option<bool>,
+) -> anyhow::Result<SubscriptionCommit> {
+    let _lock = crate::lock::ConfigLock::acquire(paths.config_dir())?;
+    let mut subs = load_subscriptions_at(paths)?;
+    let (kind, id) = resolve_subscription_identity(&subs, url)?;
+    commit_subscription_entry_at(
+        paths,
+        &id,
+        kind,
+        yaml_content,
+        &mut subs,
+        url,
+        user_agent,
+        activate,
+    )
+    .map(|(commit, _pre_images)| commit)
+}
+
+/// Lock-internal commit transaction with a caller-supplied critical section
+/// (A1' defect 1): identity match, pre-images, commit, `after_commit`
+/// (e.g. activate prompt + config merge validation) and failure rollback all
+/// happen inside ONE config write lock hold. `after_commit` failures roll the
+/// commit back to this transaction's true pre-images, so a command that fails
+/// after downloading can never overwrite another command's successful commit.
+pub(crate) fn commit_subscription_matched_checked_at(
+    paths: &AppPaths,
+    url: &str,
+    yaml_content: &str,
+    user_agent: Option<String>,
+    activate: Option<bool>,
+    after_commit: impl FnOnce(&SubscriptionCommit, &mut SubscriptionPreImages) -> anyhow::Result<()>,
+) -> anyhow::Result<SubscriptionCommit> {
+    let _lock = crate::lock::ConfigLock::acquire(paths.config_dir())?;
+    let mut subs = load_subscriptions_at(paths)?;
+    let (kind, id) = resolve_subscription_identity(&subs, url)?;
+    let (commit, mut pre_images) = commit_subscription_entry_at(
+        paths,
+        &id,
+        kind,
+        yaml_content,
+        &mut subs,
+        url,
+        user_agent,
+        activate,
+    )?;
+    if let Err(error) = after_commit(&commit, &mut pre_images) {
+        if let Err(rollback_error) = pre_images.restore(paths, &commit.id) {
+            anyhow::bail!(
+                "Subscription change failed and rollback incomplete: {rollback_error}.\n  Original error: {error}"
+            );
+        }
+        anyhow::bail!("Subscription change failed; last-known-good state restored.\n  {error}");
+    }
+    Ok(commit)
+}
+
+/// Resolve the byte-exact URL identity inside the caller's critical section:
+/// living match (fail-fast when ambiguous) > newest tombstone > brand new.
+fn resolve_subscription_identity(
+    subs: &[SubscriptionMeta],
+    url: &str,
+) -> anyhow::Result<(SubscriptionCommitKind, String)> {
+    let alive_matches: Vec<usize> = subs
+        .iter()
+        .enumerate()
+        .filter(|(_, sub)| sub.is_alive() && sub.url == url)
+        .map(|(index, _)| index)
+        .collect();
+    if alive_matches.len() > 1 {
+        anyhow::bail!(ambiguous_alive_subscription_message(subs, &alive_matches));
+    }
+
+    let retired_matches: Vec<usize> = if alive_matches.is_empty() {
+        subs.iter()
+            .enumerate()
+            .filter(|(_, sub)| !sub.is_alive() && sub.url == url)
+            .map(|(index, _)| index)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Newest tombstone wins; entries without retired_at sort oldest.
+    let newest_retired = retired_matches.iter().copied().max_by_key(|index| {
+        subs[*index]
+            .retired_at
+            .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+    });
+
+    if let Some(&index) = alive_matches.first() {
+        Ok((SubscriptionCommitKind::Reuse, subs[index].id.clone()))
+    } else if let Some(index) = newest_retired {
+        let other_retired = retired_matches
+            .iter()
+            .filter(|candidate| **candidate != index)
+            .map(|candidate| subs[*candidate].id.clone())
+            .collect();
+        let kind = SubscriptionCommitKind::Revive {
+            retired_at: subs[index].retired_at,
+            other_retired,
+        };
+        Ok((kind, subs[index].id.clone()))
+    } else {
+        Ok((SubscriptionCommitKind::New, generate_subscription_id()))
+    }
+}
+
+fn ambiguous_alive_subscription_message(subs: &[SubscriptionMeta], alive: &[usize]) -> String {
+    let mut message = String::from(
+        "Subscription URL is already registered under multiple living subscriptions; converge to one identity first:",
+    );
+    for index in alive {
+        message.push_str(&format!(
+            "\n  {} (updated {})",
+            subs[*index].id,
+            subs[*index].updated.format("%Y-%m-%d %H:%M:%S UTC")
+        ));
+    }
+    let keeper = &subs[alive[0]].id;
+    message.push_str(&format!(
+        "\n  Keep {keeper}: mihomo-cli config --switch {keeper}"
+    ));
+    for index in alive.iter().skip(1) {
+        message.push_str(&format!(
+            "\n  Then remove the other: mihomo-cli config --remove {}",
+            subs[*index].id
+        ));
+    }
+    message.push_str(&format!(
+        "\n  (one switch + {} remove(s); removing does not delete its identity, no re-add required)",
+        alive.len().saturating_sub(1)
+    ));
+    message
+}
+
 /// Add a new subscription: download → save → update metadata → set active if first
 pub async fn add_subscription_at(paths: &AppPaths, url: &str) -> anyhow::Result<String> {
-    add_subscription_at_with_user_agent(paths, url, None, None).await
+    Ok(add_subscription_at_with_user_agent(paths, url, None, None)
+        .await?
+        .id)
 }
 
 /// Add a subscription with optional user-agent and explicit activate control.
@@ -141,47 +407,17 @@ pub async fn add_subscription_at_with_user_agent(
     url: &str,
     user_agent: Option<String>,
     activate: Option<bool>,
-) -> anyhow::Result<String> {
-    // Download subscription content. Auto mode tries a small Clash-UA set and stops at first YAML.
-    let result = download_sub_with_user_agent(url, user_agent.as_deref())
-        .await
-        .map_err(|e| anyhow::anyhow!("Cannot reach subscription URL.\n  {e}"))?;
-    let content = result.content;
-    let is_yaml = result.is_clash_yaml;
-
-    // Convert if needed
-    let yaml_content = if is_yaml {
-        content
-    } else {
-        warn_raw_subscription_conversion();
-        crate::log!("Converting subscription format (vmess/base64 → Clash YAML)...");
-        convert_vmess_to_clash(&content)?
-    };
-
-    // Validate
-    let yaml: serde_yaml::Value =
-        serde_yaml::from_str(&yaml_content).context("Subscription content is not valid YAML")?;
-    validate_subscription_yaml(&yaml)?;
-
-    // Generate ID and commit cache, metadata, and active pointer as one local transaction.
-    let id = generate_subscription_id();
-    let mut subs = load_subscriptions_at(paths)?;
-    commit_new_subscription_at(
-        paths,
-        &id,
-        &yaml_content,
-        &mut subs,
-        url,
-        user_agent,
-        activate,
-    )?;
+) -> anyhow::Result<SubscriptionCommit> {
+    let prepared = prepare_subscription_with_user_agent(url, user_agent.clone()).await?;
+    let commit =
+        commit_subscription_matched_at(paths, url, &prepared.yaml_content, user_agent, activate)?;
 
     crate::log!(
         "Added subscription {} with {} lines",
-        id,
-        yaml_content.lines().count()
+        commit.id,
+        prepared.yaml_content.lines().count()
     );
-    Ok(id)
+    Ok(commit)
 }
 
 fn snapshot_optional_file(path: &std::path::Path) -> anyhow::Result<Option<String>> {
@@ -202,25 +438,7 @@ fn restore_optional_file(path: &std::path::Path, snapshot: Option<String>) -> an
     Ok(())
 }
 
-pub(crate) fn commit_imported_subscription_at(
-    paths: &AppPaths,
-    id: &str,
-    yaml_content: &str,
-    url: &str,
-    activate: bool,
-) -> anyhow::Result<()> {
-    let mut subs = load_subscriptions_at(paths)?;
-    commit_new_subscription_at(
-        paths,
-        id,
-        yaml_content,
-        &mut subs,
-        url,
-        None,
-        Some(activate),
-    )
-}
-
+#[cfg(test)]
 fn commit_new_subscription_at(
     paths: &AppPaths,
     id: &str,
@@ -230,6 +448,36 @@ fn commit_new_subscription_at(
     user_agent: Option<String>,
     activate: Option<bool>,
 ) -> anyhow::Result<()> {
+    commit_subscription_entry_at(
+        paths,
+        id,
+        SubscriptionCommitKind::New,
+        yaml_content,
+        subs,
+        url,
+        user_agent,
+        activate,
+    )?;
+    Ok(())
+}
+
+/// Commit cache + metadata + active pointer for one resolved identity.
+///
+/// Rollback is restore-only: a pre-existing cache/metadata pair is always
+/// restored byte-for-byte, never deleted — reuse/revive paths must not hit
+/// the delete-style rollback that would erase last-known-good state
+/// (A1' rollback contract).
+#[allow(clippy::too_many_arguments)]
+fn commit_subscription_entry_at(
+    paths: &AppPaths,
+    id: &str,
+    kind: SubscriptionCommitKind,
+    yaml_content: &str,
+    subs: &mut Vec<SubscriptionMeta>,
+    url: &str,
+    user_agent: Option<String>,
+    activate: Option<bool>,
+) -> anyhow::Result<(SubscriptionCommit, SubscriptionPreImages)> {
     let cache_path = paths.subscription_file_path(id);
     let metadata_path = paths.subscriptions_meta_path();
     let active_path = paths.active_file_path();
@@ -238,24 +486,47 @@ fn commit_new_subscription_at(
     let active_snapshot = snapshot_optional_file(&active_path)?;
     let fixed_user_agent = user_agent.is_some();
 
-    ensure_subscriptions_directory(paths)?;
-    utils::atomic_write_file_for_original_user(&cache_path.display().to_string(), yaml_content)?;
-
-    subs.push(SubscriptionMeta {
-        id: id.to_string(),
-        url: url.to_string(),
-        updated: Utc::now(),
-        user_agent,
-        user_agent_mode: Some(if fixed_user_agent {
-            UserAgentMode::Fixed
-        } else {
-            UserAgentMode::Auto
+    // Resolve the identity before touching disk: a missing Reuse/Revive entry
+    // must fail without having rewritten the cache.
+    match &kind {
+        SubscriptionCommitKind::New => subs.push(SubscriptionMeta {
+            id: id.to_string(),
+            url: url.to_string(),
+            updated: Utc::now(),
+            user_agent,
+            user_agent_mode: Some(if fixed_user_agent {
+                UserAgentMode::Fixed
+            } else {
+                UserAgentMode::Auto
+            }),
+            retired: false,
+            retired_at: None,
         }),
-    });
+        SubscriptionCommitKind::Reuse | SubscriptionCommitKind::Revive { .. } => {
+            let entry = subs
+                .iter_mut()
+                .find(|sub| sub.id == id)
+                .ok_or_else(|| anyhow::anyhow!("Subscription not found: {id}"))?;
+            entry.updated = Utc::now();
+            if let Some(ua) = user_agent {
+                entry.user_agent = Some(ua);
+                entry.user_agent_mode = Some(UserAgentMode::Fixed);
+            }
+            // Revive: identity, selections slot and overlay continue; only the
+            // tombstone markers are cleared (A1').
+            entry.retired = false;
+            entry.retired_at = None;
+        }
+    }
     let should_activate = match activate {
         Some(value) => value,
-        None => subs.len() == 1,
+        // "First subscription" counts living entries only, so a pile of
+        // tombstones does not suppress first-add activation.
+        None => subs.iter().filter(|sub| sub.is_alive()).count() == 1,
     };
+
+    ensure_subscriptions_directory(paths)?;
+    utils::atomic_write_file_for_original_user(&cache_path.display().to_string(), yaml_content)?;
 
     let result = (|| {
         save_subscriptions_at(paths, subs)?;
@@ -267,13 +538,15 @@ fn commit_new_subscription_at(
 
     if let Err(error) = result {
         let mut rollback_errors = Vec::new();
-        if let Err(rollback_error) = restore_optional_file(&cache_path, cache_snapshot) {
+        if let Err(rollback_error) = restore_optional_file(&cache_path, cache_snapshot.clone()) {
             rollback_errors.push(format!("subscription cache: {rollback_error}"));
         }
-        if let Err(rollback_error) = restore_optional_file(&metadata_path, metadata_snapshot) {
+        if let Err(rollback_error) =
+            restore_optional_file(&metadata_path, metadata_snapshot.clone())
+        {
             rollback_errors.push(format!("subscriptions metadata: {rollback_error}"));
         }
-        if let Err(rollback_error) = restore_optional_file(&active_path, active_snapshot) {
+        if let Err(rollback_error) = restore_optional_file(&active_path, active_snapshot.clone()) {
             rollback_errors.push(format!("active subscription: {rollback_error}"));
         }
         if rollback_errors.is_empty() {
@@ -285,12 +558,33 @@ fn commit_new_subscription_at(
             error
         );
     }
-    Ok(())
+    Ok((
+        SubscriptionCommit {
+            id: id.to_string(),
+            kind,
+        },
+        SubscriptionPreImages {
+            cache: cache_snapshot,
+            metadata: metadata_snapshot,
+            active: active_snapshot,
+            activated: should_activate,
+        },
+    ))
 }
 
-/// Remove a subscription by ID.
+/// Retire a subscription by ID (A1' tombstone semantics).
+///
+/// The metadata entry is kept as `retired: true` so a byte-identical URL
+/// re-add revives the same subscription id with its selections/overlay
+/// slots intact; only the downloaded cache is deleted. Tombstones are capped
+/// at [`RETIRED_TOMBSTONE_LIMIT`] (FIFO by `retired_at`), one log line per
+/// eviction.
 pub fn remove_subscription_at(paths: &AppPaths, id: &str) -> anyhow::Result<()> {
     validate_subscription_id(id)?;
+    // Defect 3: every subscriptions.yaml writer holds the config write lock
+    // and re-reads inside it, so a lock-external download window can never
+    // write back a stale list that resurrects a concurrently retired entry.
+    let _lock = crate::lock::ConfigLock::acquire(paths.config_dir())?;
     let mut subs = load_subscriptions_at(paths)?;
     let active = get_active_id_at(paths)?;
 
@@ -304,11 +598,39 @@ pub fn remove_subscription_at(paths: &AppPaths, id: &str) -> anyhow::Result<()> 
         .iter()
         .position(|s| s.id == id)
         .ok_or_else(|| anyhow::anyhow!("Subscription not found: {}", id))?;
+    if subs[idx].retired {
+        crate::log!("Subscription {} is already retired", id);
+        return Ok(());
+    }
     let cache_path = paths.subscription_file_path(id);
     let metadata_path = paths.subscriptions_meta_path();
     let cache_snapshot = snapshot_optional_file(&cache_path)?;
     let metadata_snapshot = snapshot_optional_file(&metadata_path)?;
-    subs.remove(idx);
+    subs[idx].retired = true;
+    subs[idx].retired_at = Some(Utc::now());
+
+    // Tombstone FIFO: drop the oldest retired entries beyond the cap.
+    let mut retired: Vec<(DateTime<Utc>, usize)> = subs
+        .iter()
+        .enumerate()
+        .filter(|(_, sub)| sub.retired)
+        .map(|(index, sub)| (sub.retired_at.unwrap_or(DateTime::<Utc>::UNIX_EPOCH), index))
+        .collect();
+    retired.sort();
+    let mut evicted: Vec<String> = Vec::new();
+    if retired.len() > RETIRED_TOMBSTONE_LIMIT {
+        let excess = retired.len() - RETIRED_TOMBSTONE_LIMIT;
+        let mut doomed: Vec<usize> = retired
+            .into_iter()
+            .take(excess)
+            .map(|(_, index)| index)
+            .collect();
+        doomed.sort_unstable_by(|a, b| b.cmp(a));
+        for index in doomed {
+            evicted.push(subs[index].id.clone());
+            subs.remove(index);
+        }
+    }
 
     let result = (|| {
         save_subscriptions_at(paths, &subs)?;
@@ -333,23 +655,48 @@ pub fn remove_subscription_at(paths: &AppPaths, id: &str) -> anyhow::Result<()> 
         );
     }
 
-    crate::log!("Removed subscription {}", id);
+    for id in &evicted {
+        crate::log!(
+            "Evicted retired subscription {} (tombstone FIFO limit {})",
+            id,
+            RETIRED_TOMBSTONE_LIMIT
+        );
+    }
+    crate::log!(
+        "Retired subscription {} (tombstone kept; re-adding the same URL revives it)",
+        id
+    );
     Ok(())
 }
 
-/// Refresh a subscription by ID: re-download and update file
+/// Refresh a subscription by ID: re-download and update file.
+/// Test-only convenience wrapper over prepare + lock-internal commit.
+#[cfg(test)]
 pub async fn refresh_subscription_at(paths: &AppPaths, id: &str) -> anyhow::Result<()> {
-    refresh_subscription_at_with_user_agent(paths, id, None).await
+    let prepared = prepare_subscription_refresh_at(paths, id, None).await?;
+    commit_refreshes_checked_at(paths, vec![(id.to_string(), prepared)], || Ok(()))?;
+    Ok(())
 }
 
-pub async fn refresh_subscription_at_with_user_agent(
+/// Phase 1 (outside the config write lock): resolve URL/UA from metadata and
+/// download + convert + validate. No disk write happens here — the identity
+/// re-read, pre-images and writes all happen in the lock-internal commit
+/// (`commit_refreshes_checked_at`), so this download window cannot resurrect a
+/// concurrently retired entry (defect 1/3).
+pub async fn prepare_subscription_refresh_at(
     paths: &AppPaths,
     id: &str,
     override_user_agent: Option<&str>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PreparedSubscription> {
     let subs = load_subscriptions_at(paths)?;
     let sub = find_subscription(&subs, id)
         .ok_or_else(|| anyhow::anyhow!("Subscription not found: {}", id))?;
+    if !sub.is_alive() {
+        anyhow::bail!(
+            "Subscription {} is retired (tombstone). Re-add its URL to revive it, or remove it to discard.",
+            id
+        );
+    }
     let url = sub.url.clone();
     let fixed_user_agent =
         override_user_agent
@@ -379,39 +726,138 @@ pub async fn refresh_subscription_at_with_user_agent(
         serde_yaml::from_str(&yaml_content).context("Downloaded content is not valid YAML")?;
     validate_subscription_yaml(&yaml)?;
 
-    // Cache + metadata form one last-known-good transaction. If either write
-    // fails, restore both files so callers never observe a new cache paired
-    // with stale metadata (or the reverse).
-    let sub_path = paths.subscription_file_path(id);
-    let meta_path = paths.subscriptions_meta_path();
-    let previous_cache = snapshot_file(&sub_path)?;
-    let previous_meta = snapshot_file(&meta_path)?;
-    utils::atomic_write_file_for_original_user(&sub_path.display().to_string(), &yaml_content)?;
+    Ok(PreparedSubscription { yaml_content })
+}
 
-    // Update metadata timestamp
-    let mut subs = subs;
-    if let Some(s) = subs.iter_mut().find(|s| s.id == id) {
-        s.updated = Utc::now();
-    }
-    if let Err(error) = save_subscriptions_at(paths, &subs) {
-        let cache_rollback = restore_file_snapshot(&sub_path, previous_cache);
-        let meta_rollback = restore_file_snapshot(&meta_path, previous_meta);
-        if let Err(rollback_error) = cache_rollback.and(meta_rollback) {
-            anyhow::bail!(
-                "Subscription refresh metadata write failed and rollback was incomplete: {rollback_error}.\n  Original error: {error}"
-            );
+/// Phase 2 (lock-internal): commit prepared refresh content for one or more
+/// identities and run `after_commit` (config merge validation) inside the SAME
+/// config write lock hold. Metadata is re-read inside the lock; per-identity
+/// cache pre-images and the metadata pre-image are taken inside the lock, so a
+/// merge failure restores exactly this transaction's state and can never
+/// overwrite another command's commit made during the download window
+/// (defect 1/3).
+/// Pre-images captured inside the config write lock for one refresh commit;
+/// used to restore exactly this transaction's state if the critical section
+/// (including the caller's config merge validation) fails.
+struct RefreshCommitPreImages {
+    caches: Vec<(std::path::PathBuf, Option<String>)>,
+    /// `None` = do not touch the metadata file at all (this transaction never
+    /// reached the metadata save); `Some(pre)` = restore it to `pre`.
+    metadata: Option<Option<String>>,
+}
+
+impl RefreshCommitPreImages {
+    fn restore(self, paths: &AppPaths) -> anyhow::Result<()> {
+        let mut errors = Vec::new();
+        for (path, pre) in self.caches {
+            if let Err(error) = restore_optional_file(&path, pre) {
+                errors.push(format!("{}: {error}", path.display()));
+            }
         }
-        anyhow::bail!(
-            "Subscription refresh metadata write failed; restored last-known-good cache.\n  {error}"
-        );
+        if let Some(pre) = self.metadata {
+            if let Err(error) = restore_optional_file(&paths.subscriptions_meta_path(), pre) {
+                errors.push(format!("metadata: {error}"));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("{}", errors.join("; "))
+        }
+    }
+}
+
+pub fn commit_refreshes_checked_at(
+    paths: &AppPaths,
+    items: Vec<(String, PreparedSubscription)>,
+    after_commit: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<RefreshAllReport> {
+    let _lock = crate::lock::ConfigLock::acquire(paths.config_dir())?;
+    let mut report = RefreshAllReport {
+        refreshed: Vec::new(),
+        failed: Vec::new(),
+    };
+    let mut subs = load_subscriptions_at(paths)?;
+    let meta_path = paths.subscriptions_meta_path();
+    let previous_meta = snapshot_file(&meta_path)?;
+    let mut previous_caches: Vec<(std::path::PathBuf, Option<String>)> = Vec::new();
+    let mut metadata_dirty = false;
+
+    for (id, prepared) in items {
+        let alive = match subs.iter().find(|s| s.id == id) {
+            Some(entry) => entry.is_alive(),
+            None => {
+                report
+                    .failed
+                    .push((id, "Subscription not found during refresh.".to_string()));
+                continue;
+            }
+        };
+        if !alive {
+            report.failed.push((
+                id,
+                "Subscription was retired during refresh. Re-add its URL to revive it.".to_string(),
+            ));
+            continue;
+        }
+        let entry = subs
+            .iter_mut()
+            .find(|s| s.id == id)
+            .expect("entry checked alive above");
+        let cache_path = paths.subscription_file_path(&id);
+        let previous_cache = snapshot_file(&cache_path)?;
+        if let Err(error) = utils::atomic_write_file_for_original_user(
+            &cache_path.display().to_string(),
+            &prepared.yaml_content,
+        ) {
+            // Metadata is not saved until after this loop, so only the caches
+            // written earlier in this transaction need restoring.
+            let rollback = RefreshCommitPreImages {
+                caches: std::mem::take(&mut previous_caches),
+                metadata: None,
+            };
+            let _ = rollback.restore(paths);
+            return Err(error).context(format!("Subscription refresh cache write failed for {id}"));
+        }
+        previous_caches.push((cache_path, previous_cache));
+        entry.updated = Utc::now();
+        metadata_dirty = true;
+        report.refreshed.push(id);
     }
 
-    crate::log!(
-        "Refreshed subscription {} with {} lines",
-        id,
-        yaml_content.lines().count()
-    );
-    Ok(())
+    if metadata_dirty {
+        if let Err(error) = save_subscriptions_at(paths, &subs) {
+            let rollback = RefreshCommitPreImages {
+                caches: previous_caches,
+                metadata: Some(previous_meta),
+            }
+            .restore(paths);
+            match rollback {
+                Ok(()) => anyhow::bail!(
+                    "Subscription refresh metadata write failed; restored last-known-good cache.\n  {error}"
+                ),
+                Err(rollback_error) => anyhow::bail!(
+                    "Subscription refresh metadata write failed and rollback is incomplete: {rollback_error}.\n  Original error: {error}"
+                ),
+            };
+        }
+    }
+
+    let pre_images = RefreshCommitPreImages {
+        caches: previous_caches,
+        metadata: Some(previous_meta),
+    };
+    if let Err(error) = after_commit() {
+        match pre_images.restore(paths) {
+            Ok(()) => anyhow::bail!(
+                "Subscription refresh produced an invalid config; restored all last-known-good caches.\n  {error}"
+            ),
+            Err(rollback_error) => anyhow::bail!(
+                "Subscription refresh produced an invalid config and rollback is incomplete: {rollback_error}.\n  Original error: {error}"
+            ),
+        };
+    }
+    Ok(report)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -435,23 +881,33 @@ impl RefreshAllReport {
 }
 
 /// Refresh all subscriptions and report every individual outcome.
-pub async fn refresh_all_at(paths: &AppPaths) -> anyhow::Result<RefreshAllReport> {
+///
+/// Downloads happen OUTSIDE the config write lock; the commit + merge +
+/// failure recovery happen together in `commit_refreshes_checked_at`
+/// (defect 1/3). Download failures are collected per subscription instead of
+/// aborting the batch.
+pub async fn prepare_subscription_refresh_all_at(
+    paths: &AppPaths,
+    override_user_agent: Option<&str>,
+) -> anyhow::Result<(Vec<(String, PreparedSubscription)>, Vec<(String, String)>)> {
     let subs = load_subscriptions_at(paths)?;
-    let mut report = RefreshAllReport {
-        refreshed: Vec::new(),
-        failed: Vec::new(),
-    };
+    let mut prepared = Vec::new();
+    let mut failed = Vec::new();
     for sub in &subs {
+        if !sub.is_alive() {
+            crate::log!("Skipping retired subscription {} (tombstone)", sub.id);
+            continue;
+        }
         crate::log!("Refreshing subscription {}...", sub.id);
-        match refresh_subscription_at(paths, &sub.id).await {
-            Ok(()) => report.refreshed.push(sub.id.clone()),
+        match prepare_subscription_refresh_at(paths, &sub.id, override_user_agent).await {
+            Ok(item) => prepared.push((sub.id.clone(), item)),
             Err(error) => {
                 crate::log!("Failed to refresh {}: {}", sub.id, error);
-                report.failed.push((sub.id.clone(), error.to_string()));
+                failed.push((sub.id.clone(), error.to_string()));
             }
         }
     }
-    Ok(report)
+    Ok((prepared, failed))
 }
 
 /// Switch to a subscription by ID by updating subscriptions/active.
@@ -460,8 +916,13 @@ pub async fn refresh_all_at(paths: &AppPaths) -> anyhow::Result<RefreshAllReport
 /// a missing or malformed cache cannot create an invalid active state.
 pub fn switch_subscription_at(paths: &AppPaths, id: &str) -> anyhow::Result<()> {
     let subs = load_subscriptions_at(paths)?;
-    if find_subscription(&subs, id).is_none() {
-        anyhow::bail!("Subscription not found: {}", id);
+    match find_subscription(&subs, id) {
+        None => anyhow::bail!("Subscription not found: {}", id),
+        Some(sub) if !sub.is_alive() => anyhow::bail!(
+            "Subscription {} is retired (tombstone) and cannot be activated. Re-add its URL to revive it.",
+            id
+        ),
+        Some(_) => {}
     }
 
     let cache_path = paths.subscription_file_path(id);
@@ -486,6 +947,9 @@ pub fn set_subscription_user_agent_at(
     id: &str,
     user_agent: Option<String>,
 ) -> anyhow::Result<()> {
+    // Defect 3: metadata writes hold the config write lock and re-read inside
+    // it, so a concurrent retire/commit cannot be clobbered by a stale list.
+    let _lock = crate::lock::ConfigLock::acquire(paths.config_dir())?;
     let mut subs = load_subscriptions_at(paths)?;
     let sub = subs
         .iter_mut()
@@ -1441,7 +1905,7 @@ pub fn generate_config_yaml_with_fake_ip_filters_for_endpoint(
         .as_mapping_mut()
         .ok_or_else(|| anyhow::anyhow!("Subscription is not a valid YAML mapping"))?;
 
-    // 0. 收敛旧版模板遗留的 DNS 默认值（Issue #022 A3/A4），只动我们自己写过的取值。
+    // 0. 收敛旧版模板遗留的 DNS 默认值（A3/A4），只动我们自己写过的取值。
     normalize_dns_legacy_defaults(config_map);
 
     // 1. Merge rules
@@ -1659,10 +2123,17 @@ fn apply_override_at_endpoint(
             .with_context(|| {
                 format!("Failed to parse override.yaml: {}", override_path.display())
             })?;
+        if !override_yaml.is_mapping() {
+            anyhow::bail!("override.yaml must be a YAML mapping");
+        }
+        // 缺陷 2：类型绕过（tun: null/标量/数组）必须在合并前拒绝。
+        validate_override_tun_shape(&override_yaml)?;
+        validate_override_proxies_append_shape(&override_yaml)?;
+        merge_proxies_append(config, &mut override_yaml);
         let override_map = override_yaml
             .as_mapping_mut()
-            .ok_or_else(|| anyhow::anyhow!("override.yaml must be a YAML mapping"))?;
-        // Issue #022 §4.7：TUN 管辖字段与受管 runtime 端点不得静默从 override 透入配置。
+            .expect("mapping checked above");
+        // §4.7：TUN 管辖字段与受管 runtime 端点不得静默从 override 透入配置。
         warn_rejected_transaction_owned_override_keys(override_map);
         deep_merge_yaml(config, override_yaml);
     }
@@ -1674,7 +2145,192 @@ fn apply_override_at_endpoint(
     Ok(())
 }
 
-/// 有界、不跟随 symlink 的配置读取（对齐 Issue #024 的加固读法，review MINOR-e）。
+/// 缺陷 2（裁决定稿）：override 的 `tun` 必须是映射。
+///
+/// `tun: null` / 标量 / 数组属于**类型绕过**：递归合并会把已有的 tun 映射整块顶掉
+/// （等于关掉 TUN 并丢掉全部控制键）。必须在写入前拒绝，`tun: {}` 不算删除（空映射
+/// 合并不改变任何键）。TUN 控制键另由 `TUN_TRANSACTION_CONTROLLED_KEYS` 独占。
+pub(crate) fn validate_override_tun_shape(override_yaml: &serde_yaml::Value) -> anyhow::Result<()> {
+    let Some(tun) = override_yaml.get("tun") else {
+        return Ok(());
+    };
+    if tun.is_mapping() {
+        return Ok(());
+    }
+    let shape = match tun {
+        serde_yaml::Value::Null => "null",
+        serde_yaml::Value::Bool(_) => "boolean",
+        serde_yaml::Value::Number(_) => "number",
+        serde_yaml::Value::String(_) => "string",
+        serde_yaml::Value::Sequence(_) => "sequence",
+        _ => "non-mapping",
+    };
+    anyhow::bail!(
+        "override.yaml: `tun` must be a YAML mapping (found {shape}); a non-mapping `tun` would replace the whole TUN block.\n  Write only the keys you want to change, e.g.:\n    tun:\n      route-exclude-address:\n      - 224.0.0.0/4\n  TUN 的开关与控制键由 `tun on/off` 独占（override 不能开关 TUN）；nothing was written"
+    )
+}
+
+pub(crate) fn validate_override_proxies_append_shape(
+    override_yaml: &serde_yaml::Value,
+) -> anyhow::Result<()> {
+    let Some(append) = override_yaml.get("proxies-append") else {
+        return Ok(());
+    };
+    let Some(list) = append.as_sequence() else {
+        anyhow::bail!("override.yaml: `proxies-append` must be a YAML sequence of proxy mappings");
+    };
+    let mut names = std::collections::HashSet::new();
+    for (idx, item) in list.iter().enumerate() {
+        let Some(map) = item.as_mapping() else {
+            anyhow::bail!("override.yaml: `proxies-append[{idx}]` must be a YAML mapping");
+        };
+        let name = map
+            .get("name")
+            .and_then(serde_yaml::Value::as_str)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "override.yaml: `proxies-append[{idx}]` must have a non-empty `name`"
+                )
+            })?;
+        if name.trim().is_empty() {
+            anyhow::bail!("override.yaml: `proxies-append[{idx}].name` cannot be empty");
+        }
+        let ptype = map
+            .get("type")
+            .and_then(serde_yaml::Value::as_str)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "override.yaml: `proxies-append[{idx}]` ({name}) must have a non-empty `type`"
+                )
+            })?;
+        if ptype.trim().is_empty() {
+            anyhow::bail!("override.yaml: `proxies-append[{idx}]` ({name}) `type` cannot be empty");
+        }
+        if !names.insert(name) {
+            anyhow::bail!("override.yaml: duplicate proxy name `{name}` in `proxies-append`");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn merge_proxies_append(
+    config: &mut serde_yaml::Value,
+    override_yaml: &mut serde_yaml::Value,
+) {
+    let append_val = match override_yaml.as_mapping_mut() {
+        Some(map) => map.remove("proxies-append"),
+        None => None,
+    };
+    if let Some(serde_yaml::Value::Sequence(appended_proxies)) = append_val {
+        let config_map = match config.as_mapping_mut() {
+            Some(m) => m,
+            None => return,
+        };
+        let proxies_key = serde_yaml::Value::String("proxies".to_string());
+        let current_proxies = match config_map.entry(proxies_key) {
+            serde_yaml::mapping::Entry::Occupied(entry) => match entry.into_mut() {
+                serde_yaml::Value::Sequence(seq) => seq,
+                other => {
+                    *other = serde_yaml::Value::Sequence(Vec::new());
+                    match other {
+                        serde_yaml::Value::Sequence(seq) => seq,
+                        _ => unreachable!(),
+                    }
+                }
+            },
+            serde_yaml::mapping::Entry::Vacant(entry) => {
+                match entry.insert(serde_yaml::Value::Sequence(Vec::new())) {
+                    serde_yaml::Value::Sequence(seq) => seq,
+                    _ => unreachable!(),
+                }
+            }
+        };
+
+        for proxy in appended_proxies {
+            let proxy_name = proxy
+                .as_mapping()
+                .and_then(|m| m.get("name"))
+                .and_then(serde_yaml::Value::as_str);
+            if let Some(name) = proxy_name {
+                if let Some(idx) = current_proxies.iter().position(|p| {
+                    p.as_mapping()
+                        .and_then(|m| m.get("name"))
+                        .and_then(serde_yaml::Value::as_str)
+                        == Some(name)
+                }) {
+                    current_proxies[idx] = proxy;
+                } else {
+                    current_proxies.push(proxy);
+                }
+            } else {
+                current_proxies.push(proxy);
+            }
+        }
+    }
+    if let Some(map) = config.as_mapping_mut() {
+        map.remove("proxies-append");
+    }
+}
+
+pub fn extract_override_proxies(override_val: &serde_yaml::Value) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(map) = override_val.as_mapping() {
+        if let Some(list) = map.get("proxies-append").and_then(|v| v.as_sequence()) {
+            for item in list {
+                if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        if let Some(list) = map.get("proxies").and_then(|v| v.as_sequence()) {
+            for item in list {
+                if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+pub fn extract_override_providers(override_val: &serde_yaml::Value) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(map) = override_val.as_mapping() {
+        if let Some(providers) = map.get("proxy-providers").and_then(|v| v.as_mapping()) {
+            for key in providers.keys() {
+                if let Some(name) = key.as_str() {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+pub fn extract_inline_provider_payload_nodes(
+    val: &serde_yaml::Value,
+) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    if let Some(root) = val.as_mapping() {
+        if let Some(providers) = root.get("proxy-providers").and_then(|v| v.as_mapping()) {
+            for (pname_val, pcfg) in providers {
+                let Some(pname) = pname_val.as_str() else {
+                    continue;
+                };
+                if let Some(payload) = pcfg.get("payload").and_then(|v| v.as_sequence()) {
+                    for node in payload {
+                        if let Some(nname) = node.get("name").and_then(|v| v.as_str()) {
+                            map.insert(nname.to_string(), pname.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
+/// 有界、不跟随 symlink 的配置读取（对齐 的加固读法，review MINOR-e）。
 fn read_config_text_bounded(path: &std::path::Path) -> anyhow::Result<String> {
     let bytes = crate::utils::read_file_no_follow_limited(
         path,
@@ -1685,19 +2341,9 @@ fn read_config_text_bounded(path: &std::path::Path) -> anyhow::Result<String> {
         .map_err(|e| anyhow::anyhow!("{} is not valid UTF-8: {e}", path.display()))
 }
 
-/// Issue #022 §4.7：TUN **控制键**（由 `tun on/off` 事务写入或归一化的字段）。
-///
-/// 只有这些键从 override 中剔除；`mtu` / `device` / `route-exclude-address` 等
-/// 非控制键仍按 ADR-22 作为 override 的权威取值进入 intent（review 回归-3：
-/// 整块拒绝会让这些键彻底失去入口，`route-exclude-address` 更是 #023 的推荐手段）。
-pub(crate) const TUN_TRANSACTION_CONTROLLED_KEYS: &[&str] = &[
-    "enable",
-    "stack",
-    "dns-hijack",
-    "strict-route",
-    "auto-route",
-    "auto-detect-interface",
-];
+/// 控制键常量归 TUN 事务模块所有；这里只做再导出，保持 config 内
+/// 既有引用与 `config::TUN_TRANSACTION_CONTROLLED_KEYS` 调用点不变。
+pub(crate) use crate::tun_transaction::TUN_TRANSACTION_CONTROLLED_KEYS;
 
 /// 从 override 中**剔除**事务/受管端点独占的键，返回被剔除的键名。
 ///
@@ -1747,7 +2393,7 @@ fn warn_rejected_transaction_owned_override_keys(override_map: &mut serde_yaml::
     let rejected = reject_transaction_owned_override_keys(override_map);
     if !rejected.is_empty() {
         crate::log!(
-            "  ⚠ override 中的 {} 由 TUN 事务/受管端点管辖，合并时拒绝（Issue #022 §4.7）；TUN 请用 tun on/off 调整",
+            "  ⚠ override 中的 {} 由 TUN 事务/受管端点管辖，合并时拒绝（§4.7）；TUN 请用 tun on/off 调整",
             rejected.join(", ")
         );
     }
@@ -1779,7 +2425,7 @@ pub(crate) struct ReconciledIntent {
     pub(crate) revision: String,
 }
 
-/// Issue #022 B：把 `override.yaml` **幂等地**合并回 intent `config.yaml`（锁内版本）。
+/// B：把 `override.yaml` **幂等地**合并回 intent `config.yaml`（锁内版本）。
 ///
 /// `override import` 本身会合并，但配置的其它写入路径可能产出不含 override 派生键的
 /// intent；随后 `restart` 会把这个残缺的 intent 当作启动 payload，静默丢掉用户的 override。
@@ -1825,6 +2471,13 @@ pub(crate) fn reconcile_override_into_intent_checked(
     let override_content = read_config_text_bounded(&paths.override_path())?;
     let mut override_value: serde_yaml::Value = serde_yaml::from_str(&override_content)
         .map_err(|e| anyhow::anyhow!("override.yaml is not valid YAML: {e}"))?;
+    // 缺陷 2：类型绕过（tun: null/标量/数组）在合并前拒绝，`tun: {}` 放行。
+    validate_override_tun_shape(&override_value)?;
+    validate_override_proxies_append_shape(&override_value)?;
+    let current_value: serde_yaml::Value = serde_yaml::from_str(&current)
+        .map_err(|e| anyhow::anyhow!("config.yaml is not valid YAML: {e}"))?;
+    let mut merged = current_value.clone();
+    merge_proxies_append(&mut merged, &mut override_value);
     let override_map = override_value
         .as_mapping_mut()
         .ok_or_else(|| anyhow::anyhow!("override.yaml must be a YAML mapping"))?;
@@ -1834,9 +2487,6 @@ pub(crate) fn reconcile_override_into_intent_checked(
     // 这里**静默**剔除（MINOR-c）：用户已在 `override import` 与生成路径收到过告警，
     // 每次 reload/restart 重复打印会淹没正常输出。
     let _rejected = reject_transaction_owned_override_keys(override_map);
-    let current_value: serde_yaml::Value = serde_yaml::from_str(&current)
-        .map_err(|e| anyhow::anyhow!("config.yaml is not valid YAML: {e}"))?;
-    let mut merged = current_value.clone();
     deep_merge_yaml(&mut merged, override_value);
     // 与生成流程同序（override → 悬空规则兜底），否则 override 中指向已删除组的旧规则
     // 会把已兜底成 DIRECT 的取值改回去，reload 时配置校验失败且每次都不收敛（review MAJOR-2）。
@@ -1865,6 +2515,184 @@ pub(crate) fn reconcile_override_into_intent_checked(
     })
 }
 
+/// Warning produced by the enterprise intranet guard linter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntranetGuardWarning {
+    pub message: String,
+    pub recommendation: String,
+}
+
+/// RFC1918 IPv4 ranges the intranet guard expects to be covered by DIRECT or route exclusion.
+const PRIVATE_V4_RANGES: &[&str] = &["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
+
+/// Parse an IPv4 CIDR into an inclusive integer interval. Invalid or IPv6 values are ignored.
+fn parse_ipv4_cidr(cidr: &str) -> Option<(u32, u32)> {
+    let (addr, prefix) = cidr.trim().split_once('/')?;
+    let ip: std::net::Ipv4Addr = addr.parse().ok()?;
+    let prefix: u32 = prefix.parse().ok()?;
+    if prefix > 32 {
+        return None;
+    }
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    let start = u32::from(ip) & mask;
+    Some((start, start | !mask))
+}
+
+/// Whether the union of `cidrs` fully covers `target` (an IPv4 CIDR).
+fn cidrs_cover(cidrs: &[String], target: &str) -> bool {
+    let Some((target_start, target_end)) = parse_ipv4_cidr(target) else {
+        return false;
+    };
+    let mut intervals: Vec<(u32, u32)> = cidrs
+        .iter()
+        .filter_map(|cidr| parse_ipv4_cidr(cidr))
+        .filter_map(|(start, end)| {
+            let start = start.max(target_start);
+            let end = end.min(target_end);
+            (start <= end).then_some((start, end))
+        })
+        .collect();
+    intervals.sort_unstable();
+
+    let mut covered_until = target_start;
+    for (start, end) in intervals {
+        if start > covered_until {
+            return false;
+        }
+        if end >= target_end {
+            return true;
+        }
+        if end >= covered_until {
+            covered_until = end.saturating_add(1);
+        }
+    }
+    false
+}
+
+fn covers_private_ranges(cidrs: &[String]) -> bool {
+    PRIVATE_V4_RANGES
+        .iter()
+        .all(|target| cidrs_cover(cidrs, target))
+}
+
+/// SPEC: Lint configuration for intranet asset protection.
+pub fn lint_intranet_guard(config: &serde_yaml::Value) -> Vec<IntranetGuardWarning> {
+    let mut warnings = Vec::new();
+
+    // 1. Check if sniffer override-destination is enabled
+    let sniffer_override = config
+        .get("sniffer")
+        .and_then(|s| s.as_mapping())
+        .is_some_and(|m| {
+            let enabled = m
+                .get(serde_yaml::Value::String("enable".into()))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let override_dest = m
+                .get(serde_yaml::Value::String("override-destination".into()))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            enabled && override_dest
+        });
+
+    if !sniffer_override {
+        return warnings;
+    }
+
+    // 2. Check if the fallback / MATCH policy routes to proxy.
+    let mut fallback_is_proxy = false;
+    let mut direct_cidrs: Vec<String> = Vec::new();
+    let mut geoip_private_direct = false;
+
+    if let Some(rules) = config.get("rules").and_then(|v| v.as_sequence()) {
+        for r in rules {
+            if let Some(s) = r.as_str() {
+                let s_trim = s.trim();
+                let upper = s_trim.to_ascii_uppercase();
+                if upper.starts_with("MATCH,") {
+                    let policy = s_trim.split(',').nth(1).unwrap_or("").trim();
+                    if !policy.eq_ignore_ascii_case("DIRECT")
+                        && !policy.eq_ignore_ascii_case("REJECT")
+                        && !policy.eq_ignore_ascii_case("REJECT-DROP")
+                        && !policy.eq_ignore_ascii_case("PASS")
+                    {
+                        fallback_is_proxy = true;
+                    }
+                } else if upper.starts_with("IP-CIDR,") || upper.starts_with("IP-CIDR6,") {
+                    let parts: Vec<&str> = s_trim.split(',').map(str::trim).collect();
+                    if parts.len() >= 3 && parts[2].eq_ignore_ascii_case("DIRECT") {
+                        direct_cidrs.push(parts[1].to_string());
+                    }
+                } else if upper.starts_with("GEOIP,") {
+                    let parts: Vec<&str> = s_trim.split(',').map(str::trim).collect();
+                    if parts.len() >= 3 && parts[2].eq_ignore_ascii_case("DIRECT") {
+                        let country = parts[1].to_ascii_uppercase();
+                        if country == "PRIVATE" || country == "LAN" {
+                            geoip_private_direct = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let direct_rules_cover_private = geoip_private_direct || covers_private_ranges(&direct_cidrs);
+
+    // 3. Check if tun.route-exclude-address excludes RFC1918
+    let mut exclude_cidrs: Vec<String> = Vec::new();
+
+    if let Some(tun) = config.get("tun").and_then(|v| v.as_mapping()) {
+        if let Some(excludes) = tun
+            .get(serde_yaml::Value::String("route-exclude-address".into()))
+            .and_then(|v| v.as_sequence())
+        {
+            for item in excludes {
+                if let Some(cidr) = item.as_str() {
+                    exclude_cidrs.push(cidr.trim().to_string());
+                }
+            }
+        }
+    }
+
+    let exclude_covers_private = covers_private_ranges(&exclude_cidrs);
+
+    // If sniffer overrides destination and fallback is proxy, but private ranges are unprotected:
+    if fallback_is_proxy && !direct_rules_cover_private && !exclude_covers_private {
+        warnings.push(IntranetGuardWarning {
+            message: "检测到内网安全隐患拓扑：已启用 Sniffer 目标覆写（override-destination: true）且兜底规则为代理，但未完整配置 RFC1918 私有网段直连保护或路由排除。".to_string(),
+            recommendation: "内网流量被嗅探后若无精确直连规则，可能滑落至代理节点导致连接被强拆。建议在 override.yaml 的 tun.route-exclude-address 中排除内网网段（如 [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]），或在 rules.yaml 中添加内网 IP-CIDR/DOMAIN 直连规则。".to_string(),
+        });
+    }
+
+    warnings
+}
+
+/// Extract the policy from a simple `TYPE,PARAM,POLICY[,OPTION]` or `MATCH,POLICY` rule.
+/// Logical rules contain parentheses or nested commas; they are returned as `None` so the
+/// fallback never rewrites a structure it cannot parse safely.
+fn simple_rule_policy(rule: &str) -> Option<&str> {
+    if rule.contains('(') || rule.contains(')') {
+        return None;
+    }
+    let parts: Vec<&str> = rule.split(',').map(str::trim).collect();
+    if parts.iter().any(|part| part.is_empty()) {
+        return None;
+    }
+    match parts.as_slice() {
+        [rule_type, policy] if rule_type.eq_ignore_ascii_case("MATCH") => Some(*policy),
+        [rule_type, _, policy] | [rule_type, _, policy, _]
+            if !rule_type.eq_ignore_ascii_case("MATCH") =>
+        {
+            Some(*policy)
+        }
+        _ => None,
+    }
+}
+
 /// Rewrite rules whose target policy is absent from the merged config (groups + proxies +
 /// built-ins) to target `DIRECT`, emitting a warning for each rewritten rule.
 ///
@@ -1872,7 +2700,6 @@ pub(crate) fn reconcile_override_into_intent_checked(
 /// `rules.yaml` on disk.
 fn apply_dangling_rule_fallback_to_config_text(config_content: &str) -> anyhow::Result<String> {
     use crate::groups::BUILTIN_POLICIES;
-    use crate::rules::rule_policy;
 
     let mut config: serde_yaml::Value = serde_yaml::from_str(config_content).map_err(|e| {
         anyhow::anyhow!(
@@ -1933,7 +2760,7 @@ fn apply_dangling_rule_fallback_to_config_text(config_content: &str) -> anyhow::
         let Some(rule) = rule_val.as_str() else {
             continue;
         };
-        let Some(policy) = rule_policy(rule) else {
+        let Some(policy) = simple_rule_policy(rule) else {
             continue;
         };
         if valid_policies.contains(policy) {
@@ -1942,7 +2769,7 @@ fn apply_dangling_rule_fallback_to_config_text(config_content: &str) -> anyhow::
         // Policy is dangling – rewrite to DIRECT
         let rewritten = rewrite_rule_policy(rule, "DIRECT");
         eprintln!(
-            "  ⚠ [WARN] Rule [{rule}] target group `{policy}` missing in the effective config; temporarily downgraded to DIRECT"
+            "  ⚠ [WARN] Rule [{rule}] target group `{policy}` missing in the effective config; downgraded to DIRECT for the effective config"
         );
         *rule_val = serde_yaml::Value::String(rewritten);
     }
@@ -1950,7 +2777,7 @@ fn apply_dangling_rule_fallback_to_config_text(config_content: &str) -> anyhow::
     Ok(serde_yaml::to_string(&config)?)
 }
 
-/// Issue #011: carry the user's TUN intent across config regeneration.
+/// carry the user's TUN intent across config regeneration.
 ///
 /// `tun on` commits a `tun` block into the intent `config.yaml`
 /// (`compare_and_commit_user_intent`). The regeneration pipeline rebuilds
@@ -1958,8 +2785,9 @@ fn apply_dangling_rule_fallback_to_config_text(config_content: &str) -> anyhow::
 /// making `configured_tun` unobservable and breaking runtime attestation
 /// (`launched == active == intent`). Preserve the previous `tun` block when the
 /// freshly generated content does not define one. The block is appended last,
-/// matching the daemon's `merge_tun_block_into_config_yaml` insertion point, so
-/// the promoted runtime snapshot and the intent file stay byte-identical.
+/// matching the daemon's `merge_snapshot_tun_block_into_config_yaml` insertion
+/// point, so the promoted runtime snapshot and the intent file stay
+/// byte-identical.
 fn carry_over_tun_block_from_previous_config(
     previous_content: Option<&str>,
     new_content: &str,
@@ -1967,6 +2795,11 @@ fn carry_over_tun_block_from_previous_config(
     let Some(previous) = previous_content else {
         return Ok(new_content.to_string());
     };
+    // （P2-4，deliberate）：上一份 intent 不可解析或根节点不是
+    // 映射时，这里**有意**静默降级为“没有可携带的 TUN 意图”。I/O 不可读已在
+    // 调用方 fail-closed（EACCES/读失败直接拒绝重生成）；只有内容已损坏的历史
+    // 文件会走到这里，此时再失败只会让 refresh/import 永久不可用，而新生成的
+    // 配置随后仍需通过完整 YAML 校验。
     let Ok(previous_yaml) = serde_yaml::from_str::<serde_yaml::Value>(previous) else {
         return Ok(new_content.to_string());
     };
@@ -1983,6 +2816,8 @@ fn carry_over_tun_block_from_previous_config(
             e
         )
     })?;
+    // 新生成内容不是映射时同样直接返回原文：carry-over 不制造第二种错误，
+    // 后续 validate 会以既有文案拒绝该配置。
     let Some(map) = config.as_mapping_mut() else {
         return Ok(new_content.to_string());
     };
@@ -1996,7 +2831,7 @@ fn carry_over_tun_block_from_previous_config(
         );
         return Ok(serde_yaml::to_string(&config)?);
     }
-    // Issue #022 B：新配置里已经有一个 `tun` 块（订阅/模板自带 `enable: false`，
+    // B：新配置里已经有一个 `tun` 块（订阅/模板自带 `enable: false`，
     // 或 override 的非控制键）时，不能直接跳过——否则上一次 `tun on` 写下的
     // 完整 TUN 意图（enable/stack/dns-hijack…）会被这个块静默顶掉，`tun.enable` 直接消失。
     //
@@ -2013,16 +2848,9 @@ fn carry_over_tun_block_from_previous_config(
     if let (serde_yaml::Value::Mapping(previous_tun), serde_yaml::Value::Mapping(merged_map)) =
         (&tun_block, &mut merged_tun)
     {
-        for (key, value) in previous_tun {
-            let key_str = key.as_str().unwrap_or_default();
-            let controlled = TUN_TRANSACTION_CONTROLLED_KEYS.contains(&key_str);
-            let present_in_new = new_tun
-                .as_mapping()
-                .is_some_and(|map| map.contains_key(key));
-            if controlled || !present_in_new {
-                merged_map.insert(key.clone(), value.clone());
-            }
-        }
+        // fill=true：新生成内容是订阅模板，缺失非控制键只表示模板没提，
+        // 必须由历史 intent 补齐；该语义与 promotion 的 payload-strict 不同。
+        crate::tun_transaction::merge_tun_key_policy(previous_tun, merged_map, true);
     }
     map.insert(serde_yaml::Value::String("tun".to_string()), merged_tun);
     Ok(serde_yaml::to_string(&config)?)
@@ -2031,7 +2859,7 @@ fn carry_over_tun_block_from_previous_config(
 /// 参考实现（mihomo 官方 wiki `config/inbound/tun` 与 Clash Verge Rev 默认配置）
 /// 为 TUN 声明的 DNS 劫持目标。
 ///
-/// Issue #022：只劫持 UDP 53 无法覆盖走 TCP 的 DNS 查询，对齐参考实现需要
+/// 只劫持 UDP 53 无法覆盖走 TCP 的 DNS 查询，对齐参考实现需要
 /// 同时包含 `any:53` 与 `tcp://any:53`。
 pub(crate) const DEFAULT_DNS_HIJACK_SPEC: &str = "any:53,tcp://any:53";
 
@@ -2079,7 +2907,7 @@ fn yaml_string_sequence(entries: Vec<String>) -> serde_yaml::Value {
     serde_yaml::Value::Sequence(entries.into_iter().map(serde_yaml::Value::String).collect())
 }
 
-/// `tun on` 归一化 TUN 块，使其与参考实现一致（Issue #022 对齐清单）：
+/// `tun on` 归一化 TUN 块，使其与参考实现一致（对齐清单）：
 ///
 /// - `dns-hijack`：显式 `--dns-hijack` 优先；未指定时，仅当现有值缺失、为空，或仍是
 ///   旧版单项默认（`any:53` / `0.0.0.0:53`）才收敛为 [`DEFAULT_DNS_HIJACK_SPEC`]，
@@ -2113,7 +2941,7 @@ pub(crate) fn normalize_tun_block_for_enable(
     }
 }
 
-/// Issue #022（A3/A4）：收敛旧版模板遗留的 DNS 默认值，使其与参考实现一致。
+/// （A3/A4）：收敛旧版模板遗留的 DNS 默认值，使其与参考实现一致。
 ///
 /// - `dns.fake-ip-range` 曾默认 `28.0.0.1/8`（真实公网地址段，且 TUN 接口地址由该段派生），
 ///   收敛为参考实现的 `198.18.0.1/16`；
@@ -2216,6 +3044,8 @@ fn apply_groups_override_to_config_text_with_mode(
     }
 
     let global_override_path = paths.override_path();
+    let mut override_proxies = Vec::new();
+    let mut override_providers = Vec::new();
     if global_override_path.exists() {
         let global_content = std::fs::read_to_string(&global_override_path).with_context(|| {
             format!(
@@ -2238,6 +3068,8 @@ fn apply_groups_override_to_config_text_with_mode(
                 "groups overlay cannot be applied while override.yaml defines proxy-groups; remove that section or edit it through its owning configuration"
             );
         }
+        override_proxies = extract_override_proxies(&global);
+        override_providers = extract_override_providers(&global);
     }
 
     let mut config: serde_yaml::Value = serde_yaml::from_str(config_content).map_err(|e| {
@@ -2258,7 +3090,7 @@ fn apply_groups_override_to_config_text_with_mode(
         }
         None => Vec::new(),
     };
-    let known_proxies = config_map
+    let mut known_proxies: std::collections::HashSet<String> = config_map
         .get(serde_yaml::Value::String("proxies".into()))
         .and_then(serde_yaml::Value::as_sequence)
         .into_iter()
@@ -2272,13 +3104,20 @@ fn apply_groups_override_to_config_text_with_mode(
         })
         .map(str::to_owned)
         .collect();
-    let known_providers = config_map
+    for p in override_proxies {
+        known_proxies.insert(p);
+    }
+
+    let mut known_providers: std::collections::HashSet<String> = config_map
         .get(serde_yaml::Value::String("proxy-providers".into()))
         .and_then(serde_yaml::Value::as_mapping)
         .into_iter()
         .flatten()
         .filter_map(|(name, _)| name.as_str().map(str::to_owned))
         .collect();
+    for p in override_providers {
+        known_providers.insert(p);
+    }
     let (merged, report) = overlay.merged_groups_with_mode(
         &original_groups,
         &known_proxies,
@@ -2379,20 +3218,21 @@ pub fn merge_user_config_at_endpoint(
             &config_content,
             crate::groups::MergeMode::PassiveTolerant,
         )?;
-        // Issue #010: the dangling-rule fallback must see the FINAL merged view,
+        // the dangling-rule fallback must see the FINAL merged view,
         // so groups defined only in override.yaml count as valid targets.
         let config_content =
             apply_override_to_config_text_at_endpoint(paths, &config_content, endpoint)?;
         let config_content = apply_dangling_rule_fallback_to_config_text(&config_content)?;
-        // Issue #011: regeneration must not drop the TUN intent committed by `tun on`.
+        // regeneration must not drop the TUN intent committed by `tun on`.
+        // 读不到上一份 intent 时**不能**退化成"没有 TUN 意图"继续写——
+        // 那会把用户的 tun 控制键静默删除（override import / config -u 都会走到这里）。
         let previous_config = match std::fs::read_to_string(paths.config_path()) {
             Ok(content) => Some(content),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
             Err(err) => {
-                crate::log!(
-                    "  ⚠ [WARN] Failed to read previous config.yaml for TUN intent carry-over: {err}"
+                anyhow::bail!(
+                    "cannot read the existing config.yaml for TUN intent carry-over: {err}\n  config.yaml was NOT modified."
                 );
-                None
             }
         };
         let config_content =
@@ -2442,6 +3282,7 @@ pub fn merge_user_config_at_endpoint(
         }
         let result =
             apply_override_to_config_text_at_endpoint(paths, &editor.into_source(), endpoint)?;
+        let result = apply_dangling_rule_fallback_to_config_text(&result)?;
         serde_yaml::from_str::<serde_yaml::Value>(&result)
             .map_err(|e| anyhow::anyhow!("Merged config is invalid YAML: {e}"))?;
         if result != config_content {
@@ -2477,6 +3318,7 @@ pub fn merge_user_config_at_endpoint(
         )?;
         let config_content =
             apply_override_to_config_text_at_endpoint(paths, &config_content, endpoint)?;
+        let config_content = apply_dangling_rule_fallback_to_config_text(&config_content)?;
         serde_yaml::from_str::<serde_yaml::Value>(&config_content)
             .map_err(|e| anyhow::anyhow!("Generated direct-only config is invalid YAML: {e}"))?;
         utils::atomic_write_file_for_original_user(
@@ -2838,7 +3680,7 @@ mod tests {
     #[test]
     fn test_merge_user_rules_front_is_valid_yaml() {
         let (_tmp, paths) = setup_config(
-            "mixed-port: 7890\nrules:\n  - DOMAIN-SUFFIX,google.com,Proxy\n  - DOMAIN-SUFFIX,github.com,DIRECT\ndns:\n  enable: true\n  enhanced-mode: fake-ip\n",
+            "mixed-port: 7890\nproxy-groups:\n  - name: Proxy\n    type: select\n    proxies: [DIRECT]\nrules:\n  - DOMAIN-SUFFIX,google.com,Proxy\n  - DOMAIN-SUFFIX,github.com,DIRECT\ndns:\n  enable: true\n  enhanced-mode: fake-ip\n",
         );
         rules::save_rules_at(
             &paths,
@@ -2869,7 +3711,7 @@ mod tests {
     #[test]
     fn test_merge_user_rules_back_before_next_top_level_key() {
         let (_tmp, paths) = setup_config(
-            "mixed-port: 7890\nrules:\n  - DOMAIN-SUFFIX,google.com,Proxy\n  - DOMAIN-SUFFIX,github.com,DIRECT\ndns:\n  enable: true\n  enhanced-mode: fake-ip\n",
+            "mixed-port: 7890\nproxy-groups:\n  - name: Proxy\n    type: select\n    proxies: [DIRECT]\nrules:\n  - DOMAIN-SUFFIX,google.com,Proxy\n  - DOMAIN-SUFFIX,github.com,DIRECT\ndns:\n  enable: true\n  enhanced-mode: fake-ip\n",
         );
         rules::set_position_at(&paths, RulePosition::Back).unwrap();
         rules::save_rules_at(&paths, &["DOMAIN-SUFFIX,back.com,DIRECT".to_string()]).unwrap();
@@ -2893,7 +3735,7 @@ mod tests {
     #[test]
     fn test_merge_empty_rules_removes_marker_block() {
         let (_tmp, paths) = setup_config(
-            "mixed-port: 7890\nrules:\n# === USER RULES START ===\n  - DOMAIN-SUFFIX,old.com,DIRECT\n# === USER RULES END ===\n  - DOMAIN-SUFFIX,google.com,Proxy\n",
+            "mixed-port: 7890\nproxy-groups:\n  - name: Proxy\n    type: select\n    proxies: [DIRECT]\nrules:\n# === USER RULES START ===\n  - DOMAIN-SUFFIX,old.com,DIRECT\n# === USER RULES END ===\n  - DOMAIN-SUFFIX,google.com,Proxy\n",
         );
         rules::clear_rules_at(&paths).unwrap();
 
@@ -3185,6 +4027,8 @@ external-controller-unix: /tmp/stale-user.sock
                 updated: Utc::now(),
                 user_agent: None,
                 user_agent_mode: Some(UserAgentMode::Auto),
+                retired: false,
+                retired_at: None,
             },
             SubscriptionMeta {
                 id: "sub-def67890".to_string(),
@@ -3192,6 +4036,8 @@ external-controller-unix: /tmp/stale-user.sock
                 updated: Utc::now(),
                 user_agent: None,
                 user_agent_mode: Some(UserAgentMode::Auto),
+                retired: false,
+                retired_at: None,
             },
         ];
 
@@ -3234,6 +4080,8 @@ external-controller-unix: /tmp/stale-user.sock
                 updated: Utc::now(),
                 user_agent: None,
                 user_agent_mode: Some(UserAgentMode::Auto),
+                retired: false,
+                retired_at: None,
             },
             SubscriptionMeta {
                 id: "sub-def67890".to_string(),
@@ -3241,6 +4089,8 @@ external-controller-unix: /tmp/stale-user.sock
                 updated: Utc::now(),
                 user_agent: None,
                 user_agent_mode: Some(UserAgentMode::Auto),
+                retired: false,
+                retired_at: None,
             },
         ];
 
@@ -3638,6 +4488,33 @@ rules:
     }
 
     #[test]
+    fn merge_user_config_legacy_flow_downgrades_dangling_rules_to_direct() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(
+            paths.config_path(),
+            "mixed-port: 7897\nproxies: []\nproxy-groups:\n  - name: ValidGroup\n    type: select\n    proxies: [DIRECT]\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+        std::fs::write(
+            paths.rules_path(),
+            "rules:\n  - DOMAIN-SUFFIX,example.com,DIRECT\n  - DOMAIN-SUFFIX,openai.com,MissingGroup\n",
+        )
+        .unwrap();
+        let endpoint =
+            ApiEndpoint::UnixSocket(std::path::PathBuf::from("/var/run/mihomo/mihomo.sock"));
+
+        merge_user_config_at_endpoint(&paths, &endpoint).unwrap();
+
+        let config = std::fs::read_to_string(paths.config_path()).unwrap();
+        assert!(
+            config.contains("DOMAIN-SUFFIX,openai.com,DIRECT"),
+            "Dangling rule with MissingGroup should be downgraded to DIRECT in legacy flow, but was: {config}"
+        );
+    }
+
+    #[test]
     fn test_merge_user_config_missing_subscription() {
         let tmp = TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());
@@ -3677,6 +4554,8 @@ rules:
                 updated: Utc::now(),
                 user_agent: None,
                 user_agent_mode: Some(UserAgentMode::Auto),
+                retired: false,
+                retired_at: None,
             },
             SubscriptionMeta {
                 id: sub2.to_string(),
@@ -3684,6 +4563,8 @@ rules:
                 updated: Utc::now(),
                 user_agent: None,
                 user_agent_mode: Some(UserAgentMode::Auto),
+                retired: false,
+                retired_at: None,
             },
         ];
         save_subscriptions_at(&paths, &subs).unwrap();
@@ -3692,13 +4573,20 @@ rules:
         // Remove sub2
         remove_subscription_at(&paths, sub2).unwrap();
 
-        // Verify
+        // A1' tombstone: metadata entry is retired, not deleted; cache is gone.
         let remaining = load_subscriptions_at(&paths).unwrap();
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].id, sub1);
+        assert_eq!(remaining.len(), 2);
+        let retired = remaining.iter().find(|s| s.id == sub2).unwrap();
+        assert!(!retired.is_alive());
+        assert!(retired.retired_at.is_some());
+        assert!(remaining.iter().find(|s| s.id == sub1).unwrap().is_alive());
         assert!(!paths.subscription_file_path(sub2).exists());
         // Active should still be sub1
         assert_eq!(get_active_id_at(&paths).unwrap(), Some(sub1.to_string()));
+
+        // Idempotent re-remove of the tombstone succeeds without change.
+        remove_subscription_at(&paths, sub2).unwrap();
+        assert_eq!(load_subscriptions_at(&paths).unwrap().len(), 2);
     }
 
     #[test]
@@ -3716,6 +4604,8 @@ rules:
             updated: Utc::now(),
             user_agent: None,
             user_agent_mode: Some(UserAgentMode::Auto),
+            retired: false,
+            retired_at: None,
         }];
         save_subscriptions_at(&paths, &subs).unwrap();
         set_active_id_at(&paths, sub1).unwrap();
@@ -3791,6 +4681,8 @@ rules:
                 updated: Utc::now(),
                 user_agent: None,
                 user_agent_mode: Some(UserAgentMode::Auto),
+                retired: false,
+                retired_at: None,
             },
             SubscriptionMeta {
                 id: sub2.to_string(),
@@ -3798,6 +4690,8 @@ rules:
                 updated: Utc::now(),
                 user_agent: None,
                 user_agent_mode: Some(UserAgentMode::Auto),
+                retired: false,
+                retired_at: None,
             },
         ];
         save_subscriptions_at(&paths, &subs).unwrap();
@@ -3831,6 +4725,8 @@ rules:
                     updated: Utc::now(),
                     user_agent: None,
                     user_agent_mode: Some(UserAgentMode::Auto),
+                    retired: false,
+                    retired_at: None,
                 },
                 SubscriptionMeta {
                     id: sub2.to_string(),
@@ -3838,6 +4734,8 @@ rules:
                     updated: Utc::now(),
                     user_agent: None,
                     user_agent_mode: Some(UserAgentMode::Auto),
+                    retired: false,
+                    retired_at: None,
                 },
             ],
         )
@@ -4027,7 +4925,7 @@ rules:
         );
     }
 
-    /// Issue #010 regression: a rule targeting a group that only exists in
+    /// regression: a rule targeting a group that only exists in
     /// override.yaml must survive config regeneration without being downgraded
     /// to DIRECT.
     #[test]
@@ -4100,7 +4998,7 @@ proxy-groups:
         );
     }
 
-    /// Issue #011 regression: a `tun` block committed into the intent config.yaml
+    /// regression: a `tun` block committed into the intent config.yaml
     /// by `tun on` must survive config regeneration (e.g. triggered by `rule add`).
     #[test]
     fn tun_intent_block_survives_config_regeneration() {
@@ -4180,7 +5078,7 @@ stack: mixed
         );
     }
 
-    /// Issue #022 对齐清单：`config` 转换产出的 TUN/DNS 默认段必须与参考实现
+    /// 对齐清单：`config` 转换产出的 TUN/DNS 默认段必须与参考实现
     /// （mihomo 官方 wiki / Clash Verge Rev 默认配置）一致，且不得默认开启 sniffer 兜底。
     #[test]
     fn generated_template_aligns_with_reference_tun_and_dns_defaults() {
@@ -4778,6 +5676,8 @@ mod subscription_info_tests {
                 updated,
                 user_agent: None,
                 user_agent_mode: Some(UserAgentMode::Auto),
+                retired: false,
+                retired_at: None,
             }],
         )
         .unwrap();
@@ -4936,7 +5836,7 @@ mod tun_carry_over_tests {
         )
     }
 
-    /// Issue #022 B：override 只定义 `tun.dns-hijack` 时，绝不能把上一次 `tun on`
+    /// B：override 只定义 `tun.dns-hijack` 时，绝不能把上一次 `tun on`
     /// 写下的完整 TUN 意图整块顶掉（`tun.enable` 必须存活）。
     #[test]
     fn partial_tun_block_must_not_drop_previous_tun_intent() {
@@ -5051,6 +5951,397 @@ tun:
     }
 }
 
+/// `override import` 对 `tun` 块必须是深合并——只覆盖/新增 override 显式
+/// 给出的键，控制键（enable/stack/dns-hijack/strict-route/auto-route）与未提及的
+/// 非控制键一律保留。
+#[cfg(test)]
+mod issue041_tun_merge_tests {
+    use super::*;
+    use serde_yaml::Value;
+    use tempfile::TempDir;
+
+    fn seq(items: &[&str]) -> Value {
+        Value::Sequence(
+            items
+                .iter()
+                .map(|item| Value::String((*item).to_string()))
+                .collect(),
+        )
+    }
+
+    const TUN_INTENT_FIXTURE: &str = "\
+enable: true
+stack: mixed
+auto-route: true
+strict-route: true
+dns-hijack:
+- any:53
+- tcp://any:53
+route-exclude-address:
+- 224.0.0.0/4
+";
+
+    const OVERRIDE_ONLY_ROUTE_EXCLUDE: &str = "\
+tun:
+  route-exclude-address:
+  - 239.0.0.0/8
+";
+
+    // 裁决验收口径：完整性断言解析 YAML 比对**整个 TUN map**（而非只看 `tun:`/`enable`）。
+    const EXPECTED_TUN_AFTER_ROUTE_EXCLUDE_OVERRIDE: &str = "\
+enable: true
+stack: mixed
+auto-route: true
+strict-route: true
+dns-hijack:
+- any:53
+- tcp://any:53
+route-exclude-address:
+- 239.0.0.0/8
+";
+
+    const EXPECTED_TUN_AFTER_ROUTE_EXCLUDE_CLEARED: &str = "\
+enable: true
+stack: mixed
+auto-route: true
+strict-route: true
+dns-hijack:
+- any:53
+- tcp://any:53
+route-exclude-address: []
+";
+
+    fn assert_whole_tun_map(tun: &serde_yaml::Value, expected: &str, context: &str) {
+        let expected: serde_yaml::Value =
+            serde_yaml::from_str(expected).expect("valid expected tun map");
+        assert_eq!(tun, &expected, "the whole TUN map must match ({context})");
+    }
+
+    fn assert_tun_control_keys_kept(tun: &serde_yaml::Value, context: &str) {
+        assert_eq!(
+            tun["enable"],
+            serde_yaml::Value::Bool(true),
+            "tun.enable must survive override import ({context})"
+        );
+        assert_eq!(
+            tun["stack"],
+            serde_yaml::Value::String("mixed".to_string()),
+            "tun.stack must survive override import ({context})"
+        );
+        assert_eq!(
+            tun["auto-route"],
+            serde_yaml::Value::Bool(true),
+            "tun.auto-route must survive override import ({context})"
+        );
+        assert_eq!(
+            tun["strict-route"],
+            serde_yaml::Value::Bool(true),
+            "tun.strict-route must survive override import ({context})"
+        );
+        assert_eq!(
+            tun["dns-hijack"],
+            seq(&["any:53", "tcp://any:53"]),
+            "tun.dns-hijack must survive override import ({context})"
+        );
+    }
+
+    /// 缺陷 2：`override import` 只带 `tun.route-exclude-address` 时，
+    /// tun 块必须**深合并**（控制键保留、显式键覆盖），不得整块替换。
+    #[test]
+    fn issue041_override_import_deep_merges_tun_with_active_subscription() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.subscriptions_dir()).unwrap();
+        let sub_id = "sub-041";
+        std::fs::write(
+            paths.subscription_file_path(sub_id),
+            "proxies:\n  - name: HK01\n    type: http\n    server: hk.example.com\n    port: 443\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+        set_active_id_at(&paths, sub_id).unwrap();
+        merge_user_config_at(&paths).unwrap();
+
+        // `tun on` committed intent: full tun block (incl. route-exclude-address).
+        let mut doc: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(paths.config_path()).unwrap()).unwrap();
+        doc.as_mapping_mut().unwrap().insert(
+            serde_yaml::Value::String("tun".to_string()),
+            serde_yaml::from_str(TUN_INTENT_FIXTURE).unwrap(),
+        );
+        std::fs::write(paths.config_path(), serde_yaml::to_string(&doc).unwrap()).unwrap();
+
+        std::fs::write(paths.override_path(), OVERRIDE_ONLY_ROUTE_EXCLUDE).unwrap();
+        merge_user_config_at(&paths).unwrap();
+
+        let text = std::fs::read_to_string(paths.config_path()).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+        let tun = &config["tun"];
+        assert_tun_control_keys_kept(tun, "active subscription");
+        assert_whole_tun_map(
+            tun,
+            EXPECTED_TUN_AFTER_ROUTE_EXCLUDE_OVERRIDE,
+            "active subscription",
+        );
+        assert_eq!(
+            tun["route-exclude-address"],
+            seq(&["239.0.0.0/8"]),
+            "override 显式给出的键覆盖原值; config was:\n{text}"
+        );
+    }
+
+    /// 缺陷 2（无 active subscription 的 legacy 分支同样必须深合并）。
+    #[test]
+    fn issue041_override_import_deep_merges_tun_without_subscription() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let mut doc: serde_yaml::Value = serde_yaml::from_str(
+            "mixed-port: 7897\nproxies: []\nproxy-groups: []\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+        doc.as_mapping_mut().unwrap().insert(
+            serde_yaml::Value::String("tun".to_string()),
+            serde_yaml::from_str(TUN_INTENT_FIXTURE).unwrap(),
+        );
+        std::fs::write(paths.config_path(), serde_yaml::to_string(&doc).unwrap()).unwrap();
+        std::fs::write(paths.override_path(), OVERRIDE_ONLY_ROUTE_EXCLUDE).unwrap();
+        merge_user_config_at(&paths).unwrap();
+
+        let text = std::fs::read_to_string(paths.config_path()).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+        let tun = &config["tun"];
+        assert_tun_control_keys_kept(tun, "legacy config");
+        assert_whole_tun_map(
+            tun,
+            EXPECTED_TUN_AFTER_ROUTE_EXCLUDE_OVERRIDE,
+            "legacy config",
+        );
+        assert_eq!(
+            tun["route-exclude-address"],
+            seq(&["239.0.0.0/8"]),
+            "override 显式给出的键覆盖原值; config was:\n{text}"
+        );
+    }
+
+    /// 缺陷 2：重生成时读不到上一份 intent，不能退化成「没有 TUN 意图」
+    /// 继续写（那会把 tun 控制键静默删除）；必须 fail-closed 且不改动 intent。
+    #[cfg(unix)]
+    #[test]
+    fn issue041_generation_fails_closed_when_previous_intent_unreadable() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root 无视 0o000，无法构造不可读
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.subscriptions_dir()).unwrap();
+        let sub_id = "sub-041-unreadable";
+        std::fs::write(
+            paths.subscription_file_path(sub_id),
+            "proxies:\n  - name: HK01\n    type: http\n    server: hk.example.com\n    port: 443\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+        set_active_id_at(&paths, sub_id).unwrap();
+        std::fs::write(
+            paths.config_path(),
+            "mode: rule\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+        std::fs::write(paths.override_path(), OVERRIDE_ONLY_ROUTE_EXCLUDE).unwrap();
+        std::fs::set_permissions(paths.config_path(), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+
+        let error =
+            merge_user_config_at(&paths).expect_err("unreadable intent must not be overwritten");
+        assert!(
+            error.to_string().contains("TUN intent carry-over"),
+            "{error}"
+        );
+        let meta = std::fs::metadata(paths.config_path()).unwrap();
+        assert_eq!(
+            meta.len(),
+            "mode: rule\nrules:\n  - MATCH,DIRECT\n".len() as u64
+        );
+    }
+
+    /// 缺陷 2（裁决定稿）：数组整体替换、不追加；`[]` 是显式清空。
+    #[test]
+    fn issue041_override_tun_arrays_replace_not_append() {
+        let cases: [(&str, Vec<&str>); 2] = [
+            (
+                "tun:\n  route-exclude-address:\n  - 239.0.0.0/8\n",
+                vec!["239.0.0.0/8"],
+            ),
+            ("tun:\n  route-exclude-address: []\n", vec![]),
+        ];
+        for (override_text, expected) in cases {
+            let tmp = TempDir::new().unwrap();
+            let paths = AppPaths::for_test(tmp.path());
+            std::fs::create_dir_all(paths.config_dir()).unwrap();
+            let mut doc: serde_yaml::Value =
+                serde_yaml::from_str("mixed-port: 7897\nproxies: []\nrules:\n  - MATCH,DIRECT\n")
+                    .unwrap();
+            doc.as_mapping_mut().unwrap().insert(
+                serde_yaml::Value::String("tun".to_string()),
+                serde_yaml::from_str(TUN_INTENT_FIXTURE).unwrap(),
+            );
+            std::fs::write(paths.config_path(), serde_yaml::to_string(&doc).unwrap()).unwrap();
+            std::fs::write(paths.override_path(), override_text).unwrap();
+            merge_user_config_at(&paths).unwrap();
+
+            let text = std::fs::read_to_string(paths.config_path()).unwrap();
+            let config: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+            let tun = &config["tun"];
+            assert_tun_control_keys_kept(tun, override_text);
+            assert_whole_tun_map(
+                tun,
+                if expected.is_empty() {
+                    EXPECTED_TUN_AFTER_ROUTE_EXCLUDE_CLEARED
+                } else {
+                    EXPECTED_TUN_AFTER_ROUTE_EXCLUDE_OVERRIDE
+                },
+                override_text,
+            );
+            assert_eq!(
+                tun["route-exclude-address"],
+                seq(&expected),
+                "array must be replaced wholesale (no append); override={override_text} config was:\n{text}"
+            );
+        }
+    }
+
+    /// 缺陷 2：重复 import 幂等——同一 override 连续应用两次，结果字节一致。
+    #[test]
+    fn issue041_override_import_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let mut doc: serde_yaml::Value =
+            serde_yaml::from_str("mixed-port: 7897\nproxies: []\nrules:\n  - MATCH,DIRECT\n")
+                .unwrap();
+        doc.as_mapping_mut().unwrap().insert(
+            serde_yaml::Value::String("tun".to_string()),
+            serde_yaml::from_str(TUN_INTENT_FIXTURE).unwrap(),
+        );
+        std::fs::write(paths.config_path(), serde_yaml::to_string(&doc).unwrap()).unwrap();
+        std::fs::write(paths.override_path(), OVERRIDE_ONLY_ROUTE_EXCLUDE).unwrap();
+
+        merge_user_config_at(&paths).unwrap();
+        let first = std::fs::read_to_string(paths.config_path()).unwrap();
+        merge_user_config_at(&paths).unwrap();
+        let second = std::fs::read_to_string(paths.config_path()).unwrap();
+        assert_eq!(first, second, "repeated imports must converge");
+    }
+
+    /// 缺陷 2：TUN 控制键由事务独占——override 写 `enable: false` / `stack`
+    /// / `strict-route` / `dns-hijack`（含数组）一律不生效。
+    #[test]
+    fn issue041_override_cannot_change_tun_control_keys() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let mut doc: serde_yaml::Value =
+            serde_yaml::from_str("mixed-port: 7897\nproxies: []\nrules:\n  - MATCH,DIRECT\n")
+                .unwrap();
+        doc.as_mapping_mut().unwrap().insert(
+            serde_yaml::Value::String("tun".to_string()),
+            serde_yaml::from_str(TUN_INTENT_FIXTURE).unwrap(),
+        );
+        std::fs::write(paths.config_path(), serde_yaml::to_string(&doc).unwrap()).unwrap();
+        std::fs::write(
+            paths.override_path(),
+            "tun:\n  enable: false\n  stack: system\n  strict-route: false\n  dns-hijack:\n  - 1.1.1.1:53\n  mtu: 9000\n",
+        )
+        .unwrap();
+
+        merge_user_config_at(&paths).unwrap();
+        let text = std::fs::read_to_string(paths.config_path()).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+        let tun = &config["tun"];
+        assert_tun_control_keys_kept(tun, "control-key override");
+        assert_eq!(
+            tun["mtu"],
+            serde_yaml::Value::Number(serde_yaml::Number::from(9000_i64)),
+            "non-control keys still flow through override; config was:\n{text}"
+        );
+    }
+
+    /// 缺陷 2：类型绕过（`tun: null` / 标量 / 数组）必须在写入前拒绝，
+    /// intent 保持原样；`tun: {}` 不是删除。
+    #[test]
+    fn issue041_override_non_mapping_tun_is_rejected() {
+        for bad in ["tun: null\n", "tun: 5\n", "tun: disabled\n", "tun:\n- a\n"] {
+            let tmp = TempDir::new().unwrap();
+            let paths = AppPaths::for_test(tmp.path());
+            std::fs::create_dir_all(paths.config_dir()).unwrap();
+            let mut doc: serde_yaml::Value =
+                serde_yaml::from_str("mixed-port: 7897\nproxies: []\nrules:\n  - MATCH,DIRECT\n")
+                    .unwrap();
+            doc.as_mapping_mut().unwrap().insert(
+                serde_yaml::Value::String("tun".to_string()),
+                serde_yaml::from_str(TUN_INTENT_FIXTURE).unwrap(),
+            );
+            let before = serde_yaml::to_string(&doc).unwrap();
+            std::fs::write(paths.config_path(), &before).unwrap();
+            std::fs::write(paths.override_path(), bad).unwrap();
+
+            let error = merge_user_config_at(&paths)
+                .expect_err("a non-mapping `tun` must be refused before writing");
+            assert!(
+                error.to_string().contains("must be a YAML mapping"),
+                "{bad}: {error}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(paths.config_path()).unwrap(),
+                before,
+                "intent must be untouched for override `{bad}`"
+            );
+        }
+
+        // `tun: {}` 是空映射（不是删除）：控制键原样保留。
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let mut doc: serde_yaml::Value =
+            serde_yaml::from_str("mixed-port: 7897\nproxies: []\nrules:\n  - MATCH,DIRECT\n")
+                .unwrap();
+        doc.as_mapping_mut().unwrap().insert(
+            serde_yaml::Value::String("tun".to_string()),
+            serde_yaml::from_str(TUN_INTENT_FIXTURE).unwrap(),
+        );
+        std::fs::write(paths.config_path(), serde_yaml::to_string(&doc).unwrap()).unwrap();
+        std::fs::write(paths.override_path(), "tun: {}\n").unwrap();
+        merge_user_config_at(&paths).unwrap();
+        let text = std::fs::read_to_string(paths.config_path()).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+        assert_tun_control_keys_kept(&config["tun"], "empty tun mapping");
+    }
+
+    /// 缺陷 2：reconcile（restart/apply 入口的 override 收敛）同样拒绝类型绕过。
+    #[test]
+    fn issue041_reconcile_rejects_non_mapping_tun() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let before = format!("mode: rule\nrules:\n  - MATCH,DIRECT\ntun:\n{TUN_INTENT_FIXTURE}");
+        std::fs::write(paths.config_path(), &before).unwrap();
+        std::fs::write(paths.override_path(), "tun: null\n").unwrap();
+
+        let error = reconcile_override_into_intent_checked(&paths, None)
+            .err()
+            .expect("reconcile must refuse a non-mapping tun");
+        assert!(
+            error.to_string().contains("must be a YAML mapping"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.config_path()).unwrap(),
+            before,
+            "intent must be untouched"
+        );
+    }
+}
+
 #[cfg(test)]
 mod yaml_structural_equality_tests {
     use super::yaml_structurally_equal;
@@ -5095,7 +6386,7 @@ mod override_reconcile_tests {
         AppPaths::new(dir)
     }
 
-    /// Issue #022 B：reconcile 只在 override 派生键确实缺失时才写 intent。
+    /// B：reconcile 只在 override 派生键确实缺失时才写 intent。
     /// 键序差异不得触发重写（会破坏“tun 为最后一个顶层键”的契约）。
     #[test]
     fn reconcile_does_not_rewrite_when_only_key_order_differs() {
@@ -5282,5 +6573,582 @@ mod override_reconcile_tests {
             std::fs::read_to_string(paths.config_path()).unwrap()
         );
         let _ = std::fs::remove_dir_all(paths.config_dir());
+    }
+}
+
+#[cfg(test)]
+mod a1_tombstone_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn meta(id: &str, url: &str) -> SubscriptionMeta {
+        SubscriptionMeta {
+            id: id.to_string(),
+            url: url.to_string(),
+            updated: Utc::now(),
+            user_agent: None,
+            user_agent_mode: Some(UserAgentMode::Auto),
+            retired: false,
+            retired_at: None,
+        }
+    }
+
+    #[test]
+    fn revive_same_url_keeps_identity_and_selections() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let id = "sub-aaaa1111";
+        std::fs::create_dir_all(paths.subscriptions_dir()).unwrap();
+        std::fs::write(paths.subscription_file_path(id), "proxies: []").unwrap();
+        save_subscriptions_at(&paths, &[meta(id, "https://a.com")]).unwrap();
+        let sel = paths.selection_state_path_for_subscription(id);
+        std::fs::create_dir_all(paths.selections_dir()).unwrap();
+        std::fs::write(&sel, "Test: DIRECT\n").unwrap();
+
+        remove_subscription_at(&paths, id).unwrap();
+        assert!(!paths.subscription_file_path(id).exists());
+
+        let commit = commit_subscription_matched_at(
+            &paths,
+            "https://a.com",
+            "proxies: []\n",
+            None,
+            Some(false),
+        )
+        .unwrap();
+        assert_eq!(commit.id, id);
+        assert!(matches!(commit.kind, SubscriptionCommitKind::Revive { .. }));
+
+        let subs = load_subscriptions_at(&paths).unwrap();
+        assert_eq!(subs.len(), 1);
+        assert!(subs[0].is_alive());
+        assert!(subs[0].retired_at.is_none());
+        assert_eq!(subs[0].url, "https://a.com");
+        // Identity-adjacent state survives revive.
+        assert!(paths.subscription_file_path(id).exists());
+        assert_eq!(std::fs::read_to_string(&sel).unwrap(), "Test: DIRECT\n");
+    }
+
+    #[test]
+    fn living_same_url_reuses_identity() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let id = "sub-bbbb2222";
+        std::fs::create_dir_all(paths.subscriptions_dir()).unwrap();
+        std::fs::write(paths.subscription_file_path(id), "proxies: []").unwrap();
+        save_subscriptions_at(&paths, &[meta(id, "https://b.com")]).unwrap();
+
+        let commit = commit_subscription_matched_at(
+            &paths,
+            "https://b.com",
+            "proxies: []\n",
+            None,
+            Some(false),
+        )
+        .unwrap();
+        assert_eq!(commit.id, id);
+        assert_eq!(commit.kind, SubscriptionCommitKind::Reuse);
+        assert_eq!(load_subscriptions_at(&paths).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ambiguous_living_urls_fail_fast_with_convergence_guidance() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.subscriptions_dir()).unwrap();
+        save_subscriptions_at(
+            &paths,
+            &[
+                meta("sub-cccc1111", "https://c.com"),
+                meta("sub-dddd2222", "https://c.com"),
+            ],
+        )
+        .unwrap();
+
+        let err = commit_subscription_matched_at(
+            &paths,
+            "https://c.com",
+            "proxies: []\n",
+            None,
+            Some(false),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("multiple living subscriptions"), "{err}");
+        assert!(err.contains("--switch sub-cccc1111"), "{err}");
+        assert!(err.contains("--remove sub-dddd2222"), "{err}");
+        // No identity was created or modified.
+        let subs = load_subscriptions_at(&paths).unwrap();
+        assert_eq!(subs.len(), 2);
+        assert!(!paths.subscription_file_path("sub-cccc1111").exists());
+    }
+
+    #[test]
+    fn reuse_failure_rollback_restores_preexisting_cache() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let id = "sub-eeee3333";
+        std::fs::create_dir_all(paths.subscriptions_dir()).unwrap();
+        let cache = paths.subscription_file_path(id);
+        std::fs::write(&cache, "old-cache").unwrap();
+        save_subscriptions_at(&paths, &[meta(id, "https://e.com")]).unwrap();
+
+        // Reuse identity resolution inside commit_subscription_entry_at fails
+        // after the cache write (id absent from the metadata handed in), so the
+        // rollback must restore the pre-existing cache byte-for-byte instead of
+        // deleting it (A1' restore-only rollback contract).
+        let mut orphan_subs = vec![meta("sub-other00", "https://other.com")];
+        let err = commit_subscription_entry_at(
+            &paths,
+            id,
+            SubscriptionCommitKind::Reuse,
+            "new-cache",
+            &mut orphan_subs,
+            "https://e.com",
+            None,
+            Some(false),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Subscription not found"), "{err}");
+        assert_eq!(std::fs::read_to_string(&cache).unwrap(), "old-cache");
+        // Metadata untouched.
+        let subs = load_subscriptions_at(&paths).unwrap();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].id, id);
+        assert!(subs[0].is_alive());
+    }
+
+    #[test]
+    fn checked_commit_failure_does_not_cover_later_commit() {
+        // N1: T1 succeeds, T2 fails → T1's data must survive intact.
+        // Tests the after_commit failure path in commit_subscription_matched_checked_at.
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.subscriptions_dir()).unwrap();
+
+        // T1: commit_subscription_matched_at succeeds with URL "https://a.com"
+        let t1 = commit_subscription_matched_at(
+            &paths,
+            "https://a.com",
+            "t1-cache-content",
+            None,
+            Some(false),
+        )
+        .unwrap();
+        let t1_id = t1.id.clone();
+        let t1_cache = paths.subscription_file_path(&t1_id);
+        assert_eq!(
+            std::fs::read_to_string(&t1_cache).unwrap(),
+            "t1-cache-content"
+        );
+        let t1_subs = load_subscriptions_at(&paths).unwrap();
+        assert_eq!(t1_subs.len(), 1);
+        assert_eq!(t1_subs[0].id, t1_id);
+
+        // T2: commit_subscription_matched_checked_at with URL "https://b.com"
+        // succeeds in commit but after_commit returns Err → must rollback T2's
+        // own pre-image, NOT overwrite T1's data.
+        let t2_result = commit_subscription_matched_checked_at(
+            &paths,
+            "https://b.com",
+            "t2-cache-content",
+            None,
+            Some(false),
+            |_commit, _pre_images| {
+                // Simulate after_commit failure (e.g., merge validation failed)
+                anyhow::bail!("simulated after_commit failure")
+            },
+        );
+        assert!(t2_result.is_err(), "T2 must fail");
+
+        // T1's data must survive intact
+        assert_eq!(
+            std::fs::read_to_string(&t1_cache).unwrap(),
+            "t1-cache-content",
+            "T1 cache must not be overwritten by T2 rollback"
+        );
+        let final_subs = load_subscriptions_at(&paths).unwrap();
+        assert_eq!(final_subs.len(), 1, "T1 metadata must survive");
+        assert_eq!(final_subs[0].id, t1_id);
+        assert_eq!(final_subs[0].url, "https://a.com");
+
+        // T2's cache must not exist (it was new, so pre-image was None → removed)
+        let t2_caches: Vec<_> = std::fs::read_dir(paths.subscriptions_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path() != t1_cache
+                    && e.path().extension().and_then(|s| s.to_str()) == Some("yaml")
+            })
+            .collect();
+        assert!(
+            t2_caches.is_empty(),
+            "T2 cache must be removed on rollback (new identity has no pre-image)"
+        );
+    }
+
+    #[test]
+    fn tombstone_fifo_evicts_oldest_beyond_limit() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.subscriptions_dir()).unwrap();
+
+        let base = Utc::now() - chrono::Duration::days(2);
+        let mut subs: Vec<SubscriptionMeta> = (0..RETIRED_TOMBSTONE_LIMIT)
+            .map(|i| {
+                let mut entry = meta(&format!("sub-{i:08}"), &format!("https://t{i}.com"));
+                entry.retired = true;
+                entry.retired_at = Some(base + chrono::Duration::minutes(i as i64));
+                entry
+            })
+            .collect();
+        let living = "sub-9999eeee";
+        subs.push(meta(living, "https://live.com"));
+        save_subscriptions_at(&paths, &subs).unwrap();
+
+        remove_subscription_at(&paths, living).unwrap();
+
+        let after = load_subscriptions_at(&paths).unwrap();
+        assert_eq!(after.len(), RETIRED_TOMBSTONE_LIMIT);
+        // Oldest tombstone evicted, newest retained.
+        assert!(!after.iter().any(|s| s.id == "sub-00000000"));
+        assert!(after.iter().any(|s| s.id == living && s.retired));
+        let last_kept = format!("sub-{:08}", RETIRED_TOMBSTONE_LIMIT - 1);
+        assert!(after.iter().any(|s| s.id == last_kept));
+    }
+
+    #[tokio::test]
+    async fn retired_entries_are_invisible_to_switch_and_refresh() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let id = "sub-ffff4444";
+        std::fs::create_dir_all(paths.subscriptions_dir()).unwrap();
+        std::fs::write(paths.subscription_file_path(id), "proxies: []").unwrap();
+        save_subscriptions_at(&paths, &[meta(id, "https://f.com")]).unwrap();
+        remove_subscription_at(&paths, id).unwrap();
+
+        let err = switch_subscription_at(&paths, id).unwrap_err().to_string();
+        assert!(err.contains("retired"), "{err}");
+
+        let err = refresh_subscription_at(&paths, id)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("retired"), "{err}");
+    }
+
+    #[test]
+    fn first_living_add_activates_even_with_tombstones_present() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.subscriptions_dir()).unwrap();
+        let mut tomb = meta("sub-gone0000", "https://gone.com");
+        tomb.retired = true;
+        tomb.retired_at = Some(Utc::now());
+        save_subscriptions_at(&paths, &[tomb]).unwrap();
+
+        let commit =
+            commit_subscription_matched_at(&paths, "https://new.com", "proxies: []\n", None, None)
+                .unwrap();
+        assert_eq!(commit.kind, SubscriptionCommitKind::New);
+        assert_eq!(get_active_id_at(&paths).unwrap(), Some(commit.id));
+    }
+
+    #[test]
+    fn test_validate_override_proxies_append_shape_matrix() {
+        // Valid case
+        let valid_yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+            proxies-append:
+              - name: SG-corp-host
+                type: socks5
+                server: 127.0.0.1
+                port: 11080
+              - name: HK-vps
+                type: ss
+                server: 1.2.3.4
+                port: 8388
+            "#,
+        )
+        .unwrap();
+        assert!(validate_override_proxies_append_shape(&valid_yaml).is_ok());
+
+        // Absent proxies-append is ok
+        let no_append: serde_yaml::Value = serde_yaml::from_str(
+            "tun: {}
+",
+        )
+        .unwrap();
+        assert!(validate_override_proxies_append_shape(&no_append).is_ok());
+
+        // Non-sequence
+        let bad_seq: serde_yaml::Value = serde_yaml::from_str(
+            "proxies-append: true
+",
+        )
+        .unwrap();
+        assert!(validate_override_proxies_append_shape(&bad_seq)
+            .unwrap_err()
+            .to_string()
+            .contains("must be a YAML sequence"));
+
+        // Item non-mapping
+        let bad_item: serde_yaml::Value = serde_yaml::from_str(
+            "proxies-append: [123]
+",
+        )
+        .unwrap();
+        assert!(validate_override_proxies_append_shape(&bad_item)
+            .unwrap_err()
+            .to_string()
+            .contains("must be a YAML mapping"));
+
+        // Missing name
+        let no_name: serde_yaml::Value = serde_yaml::from_str(
+            "proxies-append: [{type: socks5}]
+",
+        )
+        .unwrap();
+        assert!(validate_override_proxies_append_shape(&no_name)
+            .unwrap_err()
+            .to_string()
+            .contains("must have a non-empty `name`"));
+
+        // Empty name
+        let empty_name: serde_yaml::Value = serde_yaml::from_str(
+            "proxies-append: [{name: ' ', type: socks5}]
+",
+        )
+        .unwrap();
+        assert!(validate_override_proxies_append_shape(&empty_name)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be empty"));
+
+        // Missing type
+        let no_type: serde_yaml::Value = serde_yaml::from_str(
+            "proxies-append: [{name: 'node1'}]
+",
+        )
+        .unwrap();
+        assert!(validate_override_proxies_append_shape(&no_type)
+            .unwrap_err()
+            .to_string()
+            .contains("must have a non-empty `type`"));
+
+        // Duplicate name
+        let dup: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+            proxies-append:
+              - name: SG-node
+                type: socks5
+              - name: SG-node
+                type: ss
+            "#,
+        )
+        .unwrap();
+        assert!(validate_override_proxies_append_shape(&dup)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate proxy name `SG-node`"));
+    }
+
+    #[test]
+    fn test_merge_proxies_append_appends_and_overwrites_by_name() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+            proxies:
+              - name: SubNode1
+                type: ss
+                server: 1.1.1.1
+              - name: SharedNode
+                type: vmess
+                server: 2.2.2.2
+            "#,
+        )
+        .unwrap();
+
+        let mut override_val: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+            proxies-append:
+              - name: SharedNode
+                type: socks5
+                server: 127.0.0.1
+              - name: CustomNode
+                type: socks5
+                server: 127.0.0.1
+                port: 1080
+            "#,
+        )
+        .unwrap();
+
+        merge_proxies_append(&mut config, &mut override_val);
+
+        // proxies-append must be removed from override_val and absent in config
+        assert!(override_val.get("proxies-append").is_none());
+        assert!(config.get("proxies-append").is_none());
+
+        let proxies = config.get("proxies").and_then(|v| v.as_sequence()).unwrap();
+        assert_eq!(proxies.len(), 3);
+        assert_eq!(proxies[0]["name"].as_str().unwrap(), "SubNode1");
+        assert_eq!(proxies[1]["name"].as_str().unwrap(), "SharedNode");
+        assert_eq!(proxies[1]["type"].as_str().unwrap(), "socks5"); // updated
+        assert_eq!(proxies[2]["name"].as_str().unwrap(), "CustomNode"); // appended
+    }
+
+    #[test]
+    fn test_extract_override_proxies_and_providers() {
+        let override_val: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+            proxies-append:
+              - name: SG-corp-host
+                type: socks5
+            proxy-providers:
+              corp-host:
+                type: inline
+                payload:
+                  - name: SG-corp-host
+                    type: socks5
+            "#,
+        )
+        .unwrap();
+
+        let proxies = extract_override_proxies(&override_val);
+        assert_eq!(proxies, vec!["SG-corp-host"]);
+
+        let providers = extract_override_providers(&override_val);
+        assert_eq!(providers, vec!["corp-host"]);
+
+        let payload_nodes = extract_inline_provider_payload_nodes(&override_val);
+        assert_eq!(
+            payload_nodes.get("SG-corp-host").map(|s| s.as_str()),
+            Some("corp-host")
+        );
+    }
+
+    #[test]
+    fn test_intranet_guard_linter_flags_dangerous_topology() {
+        let dangerous_yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+sniffer:
+  enable: true
+  override-destination: true
+tun:
+  enable: true
+rules:
+  - DOMAIN-SUFFIX,google.com,Proxy
+  - MATCH,Proxy
+"#,
+        )
+        .unwrap();
+        let warnings = lint_intranet_guard(&dangerous_yaml);
+        assert!(
+            !warnings.is_empty(),
+            "Dangerous topology must produce an Intranet Guard warning"
+        );
+        assert!(warnings[0].message.contains("Sniffer"));
+
+        let safe_with_exclude: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+sniffer:
+  enable: true
+  override-destination: true
+tun:
+  enable: true
+  route-exclude-address:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+rules:
+  - DOMAIN-SUFFIX,google.com,Proxy
+  - MATCH,Proxy
+"#,
+        )
+        .unwrap();
+        assert!(lint_intranet_guard(&safe_with_exclude).is_empty());
+
+        let safe_with_direct_match: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+sniffer:
+  enable: true
+  override-destination: true
+tun:
+  enable: true
+rules:
+  - MATCH,DIRECT
+"#,
+        )
+        .unwrap();
+        assert!(lint_intranet_guard(&safe_with_direct_match).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod public_sync_063_fix_tests {
+    use super::*;
+
+    fn guard_config(excludes: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(&format!(
+            r#"
+sniffer:
+  enable: true
+  override-destination: true
+tun:
+  enable: true
+  route-exclude-address: {excludes}
+rules:
+  - MATCH,Proxy
+"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn intranet_guard_rejects_non_private_172_range() {
+        let config = guard_config("[10.0.0.0/8, 172.64.0.0/13, 192.168.0.0/16]");
+        assert!(
+            !lint_intranet_guard(&config).is_empty(),
+            "172.64.0.0/13 is not RFC1918 and must not suppress the warning"
+        );
+    }
+
+    #[test]
+    fn intranet_guard_rejects_partial_private_range() {
+        let config = guard_config("[10.0.0.0/9, 172.16.0.0/12, 192.168.0.0/16]");
+        assert!(
+            !lint_intranet_guard(&config).is_empty(),
+            "10.0.0.0/9 alone does not cover the whole 10.0.0.0/8 private range"
+        );
+    }
+
+    #[test]
+    fn intranet_guard_accepts_supernet_and_union_coverage() {
+        let supernet = guard_config("[10.0.0.0/8, 172.0.0.0/8, 192.0.0.0/8]");
+        assert!(lint_intranet_guard(&supernet).is_empty());
+        let union = guard_config("[10.0.0.0/9, 10.128.0.0/9, 172.16.0.0/12, 192.168.0.0/16]");
+        assert!(lint_intranet_guard(&union).is_empty());
+    }
+
+    #[test]
+    fn dangling_fallback_leaves_logical_rule_intact() {
+        let rule = "AND,((NETWORK,udp),(DST-PORT,443)),REJECT";
+        let yaml = format!(
+            "proxy-groups:\n  - name: Proxy\n    type: select\n    proxies: [DIRECT]\nrules:\n  - '{rule}'\n  - MATCH,DIRECT\n"
+        );
+        let output = apply_dangling_rule_fallback_to_config_text(&yaml).unwrap();
+        let value: serde_yaml::Value = serde_yaml::from_str(&output).unwrap();
+        assert_eq!(value["rules"][0].as_str(), Some(rule));
+    }
+
+    #[test]
+    fn dangling_fallback_still_rewrites_simple_rules() {
+        let yaml = "proxy-groups:\n  - name: Proxy\n    type: select\n    proxies: [DIRECT]\nrules:\n  - DOMAIN-SUFFIX,x.com,Missing\n  - MATCH,Missing\n";
+        let output = apply_dangling_rule_fallback_to_config_text(yaml).unwrap();
+        let value: serde_yaml::Value = serde_yaml::from_str(&output).unwrap();
+        assert_eq!(
+            value["rules"][0].as_str(),
+            Some("DOMAIN-SUFFIX,x.com,DIRECT")
+        );
+        assert_eq!(value["rules"][1].as_str(), Some("MATCH,DIRECT"));
     }
 }

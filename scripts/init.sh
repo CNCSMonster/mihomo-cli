@@ -47,7 +47,7 @@ case "$PROFILE" in
             echo "macOS targets 已内置（native）"
         else
             echo "  当前平台: $(uname)（未知）"
-            echo "  使用 'just init all' 安装所有 targets"
+            echo "  使用 'bash scripts/init.sh all' 安装所有 targets"
         fi
         ;;
     all)

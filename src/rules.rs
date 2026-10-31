@@ -215,10 +215,9 @@ pub fn export_rules_at(paths: &AppPaths, dest_path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
 
-    fn setup_test_paths() -> (TempDir, AppPaths) {
-        let tmp = TempDir::new().unwrap();
+    fn setup_test_paths() -> (tempfile::TempDir, AppPaths) {
+        let tmp = tempfile::TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());
         (tmp, paths)
     }
@@ -612,11 +611,34 @@ pub fn available_policies_at(paths: &AppPaths) -> Result<Vec<String>> {
                     }
                 }
             }
+            if let Some(proxies) = yaml.get("proxies").and_then(|v| v.as_sequence()) {
+                for p in proxies {
+                    if let Some(name) = p.get("name").and_then(|v| v.as_str()) {
+                        if !policies.iter().any(|p| p == name) {
+                            policies.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Also include any proxies from override.yaml if not yet merged into config.yaml
+    let override_path = paths.override_path();
+    if override_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&override_path) {
+            if let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+                for name in crate::config::extract_override_proxies(&yaml) {
+                    if !policies.iter().any(|p| p == &name) {
+                        policies.push(name);
+                    }
+                }
+            }
         }
     }
     Ok(policies)
 }
 
+#[allow(dead_code)]
 pub fn available_policies() -> Result<Vec<String>> {
     available_policies_at(&AppPaths::from_system())
 }
@@ -624,7 +646,6 @@ pub fn available_policies() -> Result<Vec<String>> {
 #[cfg(test)]
 mod validation_tests {
     use super::*;
-    use tempfile::TempDir;
 
     #[test]
     fn validate_rule_accepts_common_valid_rules() {
@@ -674,7 +695,7 @@ mod validation_tests {
 
     #[test]
     fn validate_rules_file_checks_each_rule() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
         let ok = tmp.path().join("ok.yaml");
         std::fs::write(
             &ok,
@@ -690,7 +711,7 @@ mod validation_tests {
 
     #[test]
     fn available_policies_includes_builtins_and_proxy_groups_without_duplicates() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());
         std::fs::create_dir_all(paths.config_dir()).unwrap();
         std::fs::write(
@@ -919,5 +940,37 @@ rules:
                 .policy,
             "Final"
         );
+    }
+
+    #[test]
+    fn available_policies_includes_proxies_and_override_append() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let config_yaml = r#"
+proxy-groups:
+  - name: GroupA
+    type: select
+    proxies: [Node1]
+proxies:
+  - name: Node1
+    type: ss
+"#;
+        std::fs::write(paths.config_path(), config_yaml).unwrap();
+
+        let override_yaml = r#"
+proxies-append:
+  - name: SG-custom
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+"#;
+        std::fs::write(paths.override_path(), override_yaml).unwrap();
+
+        let policies = available_policies_at(&paths).unwrap();
+        assert!(policies.contains(&"DIRECT".to_string()));
+        assert!(policies.contains(&"GroupA".to_string()));
+        assert!(policies.contains(&"Node1".to_string()));
+        assert!(policies.contains(&"SG-custom".to_string()));
     }
 }

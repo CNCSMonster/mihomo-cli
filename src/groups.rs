@@ -52,6 +52,19 @@ pub struct GroupPatch {
     pub add_proxies: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remove_proxies: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub add_use: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove_use: Vec<String>,
+}
+
+impl GroupPatch {
+    pub fn is_empty(&self) -> bool {
+        self.add_proxies.is_empty()
+            && self.remove_proxies.is_empty()
+            && self.add_use.is_empty()
+            && self.remove_use.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -176,6 +189,11 @@ impl GroupsOverlay {
                             bail!("proxy group `{name}` patch cannot simultaneously add and remove member `{add}`");
                         }
                     }
+                    for add in &patch.add_use {
+                        if patch.remove_use.contains(add) {
+                            bail!("proxy group `{name}` patch cannot simultaneously add and remove provider `{add}`");
+                        }
+                    }
                 }
 
                 let mut current_members = group_members(group)?;
@@ -192,6 +210,32 @@ impl GroupsOverlay {
                     Value::String("proxies".into()),
                     Value::Sequence(current_members.into_iter().map(Into::into).collect()),
                 );
+
+                if !patch.add_use.is_empty() || !patch.remove_use.is_empty() {
+                    let mut current_uses: Vec<String> = map
+                        .get(Value::String("use".into()))
+                        .and_then(Value::as_sequence)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect();
+                    current_uses.retain(|item| !patch.remove_use.contains(item));
+                    for add in &patch.add_use {
+                        if !current_uses.contains(add) {
+                            current_uses.push(add.clone());
+                        }
+                    }
+                    if current_uses.is_empty() {
+                        map.remove(Value::String("use".into()));
+                    } else {
+                        map.insert(
+                            Value::String("use".into()),
+                            Value::Sequence(current_uses.into_iter().map(Into::into).collect()),
+                        );
+                    }
+                }
+
                 groups.push(patched_group);
             } else {
                 groups.push(group.clone());
@@ -462,6 +506,9 @@ fn validate_and_prune_groups(
 
                     match mode {
                         MergeMode::ActiveStrict => {
+                            if known_providers.contains(&member) {
+                                bail!("proxy group `{name}` references unknown member `{member}` (`{member}` is a proxy-provider; did you mean `use: [{member}]`?)");
+                            }
                             bail!("proxy group `{name}` references unknown member `{member}`");
                         }
                         MergeMode::PassiveTolerant => {
@@ -706,6 +753,7 @@ mod tests {
             GroupPatch {
                 add_proxies: vec!["CustomHK".to_string()],
                 remove_proxies: vec!["StaleNode".to_string()],
+                ..Default::default()
             },
         );
         let overlay = GroupsOverlay {
@@ -756,6 +804,7 @@ mod tests {
             GroupPatch {
                 add_proxies: vec!["Custom01".to_string()],
                 remove_proxies: vec![],
+                ..Default::default()
             },
         );
         let overlay = GroupsOverlay {
@@ -791,6 +840,7 @@ mod tests {
             GroupPatch {
                 add_proxies: vec!["NodeA".to_string()],
                 remove_proxies: vec![],
+                ..Default::default()
             },
         );
         let overlay = GroupsOverlay {
@@ -829,6 +879,7 @@ mod tests {
             GroupPatch {
                 add_proxies: vec!["ConflictNode".to_string()],
                 remove_proxies: vec!["ConflictNode".to_string()],
+                ..Default::default()
             },
         );
         let overlay = GroupsOverlay {
@@ -931,6 +982,7 @@ mod tests {
             GroupPatch {
                 add_proxies: vec!["A".to_string()],
                 remove_proxies: vec![],
+                ..Default::default()
             },
         );
         let overlay = GroupsOverlay {
@@ -1006,6 +1058,7 @@ mod tests {
             GroupPatch {
                 add_proxies: vec!["NodeA".to_string(), "NodeB".to_string()],
                 remove_proxies: vec!["OldNode".to_string()],
+                ..Default::default()
             },
         );
         let overlay = GroupsOverlay {
@@ -1076,5 +1129,47 @@ mod tests {
             err.to_string().contains("must specify `proxies`"),
             "expected missing source error, got: {err}"
         );
+    }
+
+    #[test]
+    fn delta_patch_supports_add_and_remove_use_providers() {
+        let mut patches = BTreeMap::new();
+        patches.insert(
+            "AppleGroup".to_string(),
+            GroupPatch {
+                add_use: vec!["corp-host".to_string()],
+                remove_use: vec!["old-provider".to_string()],
+                ..Default::default()
+            },
+        );
+        let overlay = GroupsOverlay {
+            prepend: vec![],
+            append: vec![],
+            delete: vec![],
+            patches,
+        };
+
+        let original = vec![value(
+            "name: AppleGroup\ntype: select\nproxies: [Node1]\nuse: [old-provider, keep-provider]",
+        )];
+        let known_proxies: HashSet<String> = ["Node1".to_string()].into();
+        let known_providers: HashSet<String> =
+            ["corp-host".to_string(), "keep-provider".to_string()].into();
+
+        let merged = overlay
+            .merged_groups(&original, &known_proxies, &known_providers)
+            .expect("patch with use must succeed");
+
+        let group = &merged[0];
+        let uses: Vec<String> = group
+            .get("use")
+            .and_then(Value::as_sequence)
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
+
+        assert_eq!(uses, vec!["keep-provider", "corp-host"]);
     }
 }
