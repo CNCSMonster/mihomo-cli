@@ -242,6 +242,19 @@ pub fn prove_core_api_peer(
     let Some(socket) = endpoint_unix_path(endpoint) else {
         return CoreIdentityProof::Unprovable(format!("unsupported Core API endpoint: {endpoint}"));
     };
+    // 不存在就是 Absent，必须先于平台 peer 探测：macOS/其他 Unix 没有
+    // SO_PEERCRED，若先走平台探测会把「没有 socket」误报成 Unprovable。
+    match std::fs::metadata(socket) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return CoreIdentityProof::Absent
+        }
+        Err(error) => {
+            return CoreIdentityProof::Unprovable(format!(
+                "cannot stat Core API socket {socket} ({error})"
+            ))
+        }
+    }
     let credentials = match api_peer_credentials(Path::new(socket)) {
         Ok(credentials) => credentials,
         Err(ConnectionClass::Absent) => return CoreIdentityProof::Absent,
@@ -449,6 +462,9 @@ mod tests {
         child.wait().unwrap();
     }
 
+    // pidfd 是 Linux 内核句柄语义；macOS 的 observe_process_exit 按设计返回
+    // Unprovable，不能伪装成已观测退出。
+    #[cfg(target_os = "linux")]
     #[test]
     fn pidfd_observes_a_real_exit_and_never_a_bare_signal() {
         let mut child = std::process::Command::new("/bin/sh")
@@ -469,6 +485,8 @@ mod tests {
         let _ = child.wait();
     }
 
+    // ESRCH/pidfd 语义仅 Linux 可用；macOS 一律 Unprovable。
+    #[cfg(target_os = "linux")]
     #[test]
     fn unknown_pid_is_unprovable_but_gone_pid_is_exited() {
         // A pid we never owned (init) exists but our identity probe has no proof.

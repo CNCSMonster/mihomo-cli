@@ -10472,6 +10472,47 @@ mod protected_domain_authorization_tests {
         assert!(authorize_protected_domain_operations(&ctx, "restart", "重启").is_ok());
     }
 
+    #[test]
+    fn generation_root_authorization_matrix() {
+        // First install: only a non-root process needs one authorization to create
+        // the root-owned trust root.
+        assert!(generation_trust_root_requires_authorization(
+            false, false, false
+        ));
+        assert!(!generation_trust_root_requires_authorization(
+            false, true, false
+        ));
+        // Existing readable state is a no-op.
+        assert!(!generation_trust_root_requires_authorization(
+            true, false, false
+        ));
+        // Existing identity-limited root still needs authorization.
+        assert!(generation_trust_root_requires_authorization(
+            true, false, true
+        ));
+        assert!(generation_trust_root_requires_authorization(
+            true, true, true
+        ));
+    }
+
+    /// First install on macOS/Linux: the trust root does not exist yet, so a
+    /// non-root process must ask for one administrator authorization before the
+    /// first root-owned write. Root must not ask again.
+    #[cfg(unix)]
+    #[test]
+    fn missing_generation_root_requires_authorization_for_non_root_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = planned_system_ctx(tmp.path());
+        std::fs::remove_dir_all(&ctx.paths.generation_store_root).unwrap();
+
+        let expected = if is_current_process_root() {
+            Vec::new()
+        } else {
+            vec![ProtectedDomain::GenerationTrustRoot]
+        };
+        assert_eq!(protected_domains_requiring_authorization(&ctx), expected);
+    }
+
     /// 拆分之二：**必要业务阶段受控授权**。generation 信任根不可读时，业务阶段
     /// （暂存/应用）必须识别出「需要授权」，而不是把它折叠成「无需处理」。
     #[cfg(target_os = "linux")]

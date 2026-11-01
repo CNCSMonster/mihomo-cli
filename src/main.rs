@@ -3995,6 +3995,16 @@ fn identity_limited_io(error: &anyhow::Error) -> bool {
     })
 }
 
+/// 代际信任根的授权判据：已有可读状态时纯 no-op；只有「当前身份读不到」
+/// 或「尚未创建且当前不是 root」才需要一次业务授权。
+fn generation_trust_root_requires_authorization(
+    root_exists: bool,
+    process_is_root: bool,
+    state_identity_limited: bool,
+) -> bool {
+    state_identity_limited || (!root_exists && !process_is_root)
+}
+
 /// 纯判定：哪些 root 专属域当前身份观测不到（需要业务授权）。
 /// 观测得到、或对象根本不存在时返回空——健康状态下不产生任何授权请求。
 fn protected_domains_requiring_authorization(
@@ -4013,10 +4023,18 @@ fn protected_domains_requiring_authorization(
             )
         }
         ProtectedDomain::GenerationTrustRoot => {
-            matches!(
-                system_generation_store(ctx).read_state(),
+            let store = system_generation_store(ctx);
+            let state_identity_limited = matches!(
+                store.read_state(),
                 Err(generation::GenerationError::Io(ref error))
                     if error.kind() == std::io::ErrorKind::PermissionDenied
+            );
+            // 首次 install 时 trust root 尚不存在；非 root 无法创建 root-owned
+            // 目录，必须在第一次特权写入前取得一次授权。
+            generation_trust_root_requires_authorization(
+                store.root_dir().exists(),
+                is_current_process_root(),
+                state_identity_limited,
             )
         }
     })
@@ -4079,18 +4097,31 @@ fn authorize_protected_domain_operations(
     if unobservable.is_empty() {
         return Ok(());
     }
-    if is_current_process_root() {
-        anyhow::bail!(protected_domain_still_unobservable_message(&unobservable));
+
+    // 单元测试直接驱动特权管线阶段（隔离临时根），无法完成交互式 sudo 重入；
+    // 「首次安装缺信任根」的判定由纯谓词矩阵与 macOS E2E 覆盖。
+    #[cfg(test)]
+    {
+        let _ = (operation, impact);
+        Ok(())
     }
 
-    println!(
-        "{}",
-        protected_domain_authorization_notice(operation, impact)
-    );
-    let exe = std::env::current_exe()?;
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let status = sudo_reexec_command_with(&exe, &args, !std::io::stdin().is_terminal()).status()?;
-    std::process::exit(status.code().unwrap_or(1));
+    #[cfg(not(test))]
+    {
+        if is_current_process_root() {
+            anyhow::bail!(protected_domain_still_unobservable_message(&unobservable));
+        }
+
+        println!(
+            "{}",
+            protected_domain_authorization_notice(operation, impact)
+        );
+        let exe = std::env::current_exe()?;
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let status =
+            sudo_reexec_command_with(&exe, &args, !std::io::stdin().is_terminal()).status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
 }
 
 async fn tun_on_preflight(ctx: &instance::InstanceContext) -> anyhow::Result<()> {

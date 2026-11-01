@@ -11,6 +11,7 @@
 - **system 权限与安装提示** — `install --system` 完成后会在普通用户不在 `mihomo` 组时给出非阻塞加组提示；事务日志权限不足时保持零写入，并按 Linux/macOS/Windows 给出对应恢复路径。
 - **规则与诊断** — `rule test` 对复合规则会提示结果不完整；组删除会识别逻辑规则依赖；`doctor` 的 Split-DNS 与内网守卫判断更准确，减少误报。
 - **macOS 构建修复** — 统一 `stat.st_mode` 的平台类型差异，修复 macOS release 构建失败；同时消除 macOS 上的 unused import 警告。
+- **macOS 首次 system 安装** — 创建代际信任根前先取得一次管理员授权，避免非 root 写入受管目录失败；socket 不存在时不再误报为身份不可证明。
 
 ### 📚 Documentation
 

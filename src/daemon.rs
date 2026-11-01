@@ -11528,7 +11528,10 @@ mod autostart_tests {
         std::fs::remove_dir_all(&active_dir).ok();
     }
 
-    #[cfg(unix)]
+    // 该用例用 argv[0] 伪造受管 Core 身份，依赖 /proc/<pid>/cmdline 的
+    // argv[0] 语义；macOS 的 ps 输出无法无歧义还原含空格的受管二进制路径，
+    // 故只在 Linux 覆盖，macOS 由真机验证 D4/D5 承担。
+    #[cfg(target_os = "linux")]
     #[test]
     fn managed_core_liveness_only_trusts_the_recorded_core_process() {
         use std::os::unix::process::CommandExt;
@@ -11624,7 +11627,7 @@ mod legacy_reset_admission_tests {
     fn managed_launch_record(pid: u32) -> CorePidMetadata {
         CorePidMetadata {
             pid,
-            config_path: PathBuf::from("/var/lib/mihomo-cli/tun-config.yaml"),
+            config_path: PathBuf::from(managed_runtime_dir_text()).join("tun-config.yaml"),
             core_binary: expected_system_core_binary_path(),
             api_endpoint: Some(format!("unix://{}", expected_system_core_api_endpoint())),
             config_revision: Some("launch-revision".to_string()),
