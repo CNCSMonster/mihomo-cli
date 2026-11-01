@@ -7177,6 +7177,7 @@ mod controlled_reset_proof_tests {
             .is_none());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn reset_isolates_a_broken_cache_db_only_after_the_proof() {
         // With an installed service account the fixture would be PermissionDrift
@@ -7484,7 +7485,8 @@ mod controlled_reset_proof_tests {
 
     #[test]
     fn only_restart_grants_the_legacy_reset_admission() {
-        let source = include_str!("main.rs");
+        let source_raw = include_str!("main.rs");
+        let source = source_raw.replace("\r\n", "\n");
 
         let tun_start = source
             .find("async fn execute_system_tun_transaction(")
@@ -8885,7 +8887,8 @@ mod gen036_pipeline_tests {
     /// C-12：锁序契约——generation 锁先于 config 锁，且无反向持锁路径。
     #[test]
     fn generation_lock_precedes_config_lock_and_never_reverses() {
-        let source = include_str!("main.rs");
+        let source_raw = include_str!("main.rs");
+        let source = source_raw.replace("\r\n", "\n");
 
         // Within the pipeline, the generation lock precedes the frozen config
         // snapshot (the only place that takes the config lock).
@@ -8902,7 +8905,7 @@ mod gen036_pipeline_tests {
         );
 
         // No function may hold the config lock while staging/applying generations.
-        for function in split_functions(source) {
+        for function in split_functions(&source) {
             if function.contains("ConfigLock::acquire") {
                 assert!(
                     !function.contains("prepare_system_generation(")
@@ -9167,6 +9170,7 @@ mod gen036_pipeline_tests {
 
     /// SPEC P0/P1-3：恢复入口**单点**留证——证据在任何恢复动作之前落盘，
     /// 且恢复本身失败也不影响证据与原文件。
+    #[cfg(unix)]
     #[tokio::test]
     async fn evidence_is_preserved_before_any_recovery_action() {
         // With an installed service account the fixture would be PermissionDrift
@@ -9269,7 +9273,8 @@ mod gen036_pipeline_tests {
     /// recovery marker 与任何恢复动作（所有恢复入口共享该单点）。
     #[test]
     fn recovery_entry_preserves_evidence_before_marker_and_actions() {
-        let source = include_str!("main.rs");
+        let source_raw = include_str!("main.rs");
+        let source = source_raw.replace("\r\n", "\n");
         let start = source
             .find("pub(crate) async fn maybe_auto_recover_active_transaction(")
             .expect("recovery entry must exist");
@@ -9597,15 +9602,16 @@ route-exclude-address:
     }
 
     /// 取 `main.rs` 中某个函数的函数体（到第一个顶格 `}` 为止，与既有静态扫描同构）。
-    fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
-        let start = source
+    fn function_body(source: &str, signature: &str) -> String {
+        let normalized = source.replace("\r\n", "\n");
+        let start = normalized
             .find(signature)
             .unwrap_or_else(|| panic!("signature not found: {signature}"));
-        let body_end = source[start..]
+        let body_end = normalized[start..]
             .find("\n}\n")
             .unwrap_or_else(|| panic!("function end not found for {signature}"))
             + start;
-        &source[start..body_end]
+        normalized[start..body_end].to_string()
     }
 
     /// 缺陷 3 P1-1：owner 闸门必须与首次写入同处 ConfigLock 临界区
@@ -10227,7 +10233,7 @@ mod issue_044_json_mode_stdout_pollution_tests {
         utils::AppPaths::new(tmp.path().to_path_buf())
     }
 
-    fn body_of(source: &'static str, start: &str, end: &str) -> &'static str {
+    fn body_of<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
         let start_at = source.find(start).expect("锚点缺失");
         let end_at = source[start_at..].find(end).expect("结束锚点缺失") + start_at;
         &source[start_at..end_at]
@@ -10236,7 +10242,8 @@ mod issue_044_json_mode_stdout_pollution_tests {
     /// push_selection_mirror_update 必须包含 json 通道参数并在 json 模式路由至 eprintln。
     #[test]
     fn push_selection_mirror_update_routes_to_eprintln_when_json_is_true() {
-        let source = include_str!("main.rs");
+        let source_raw = include_str!("main.rs");
+        let source = source_raw.replace("\r\n", "\n");
         assert!(
             source.contains("async fn push_selection_mirror_update(paths: &utils::AppPaths, subscription_id: &str, json: bool)"),
             "push_selection_mirror_update 必须包含 json 参数"
@@ -10258,9 +10265,10 @@ mod issue_044_json_mode_stdout_pollution_tests {
     /// update_group_overlay 原生组隐藏与 reset no-op 必须在 json 模式下避免污染 stdout。
     #[test]
     fn update_group_overlay_routes_notices_to_eprintln_in_json_mode() {
-        let source = include_str!("main.rs");
+        let source_raw = include_str!("main.rs");
+        let source = source_raw.replace("\r\n", "\n");
         let body = body_of(
-            source,
+            &source,
             "async fn update_group_overlay(",
             "async fn cmd_rule(",
         );
@@ -10277,9 +10285,10 @@ mod issue_044_json_mode_stdout_pollution_tests {
     /// apply_selected_proxy 在 json 模式下输出结构化 JSON envelope，非 json 模式输出 Switched。
     #[test]
     fn apply_selected_proxy_emits_json_envelope_when_json_is_true() {
-        let source = include_str!("main.rs");
+        let source_raw = include_str!("main.rs");
+        let source = source_raw.replace("\r\n", "\n");
         let body = body_of(
-            source,
+            &source,
             "async fn apply_selected_proxy(",
             "async fn print_selection_replay_after_ready(",
         );
@@ -10296,8 +10305,9 @@ mod issue_044_json_mode_stdout_pollution_tests {
     /// main 错误退出时，在 json 模式下向 stdout 打印结构化错误 envelope。
     #[test]
     fn main_error_exit_emits_error_envelope_on_stdout_when_json_is_true() {
-        let source = include_str!("main.rs");
-        let body = body_of(source, "async fn main() {", "async fn run(cli: Cli)");
+        let source_raw = include_str!("main.rs");
+        let source = source_raw.replace("\r\n", "\n");
+        let body = body_of(&source, "async fn main() {", "async fn run(cli: Cli)");
         assert!(
             body.contains(
                 "let error_envelope = json_error_envelope(cmd_name, &format!(\"{e:#}\"));"
@@ -10309,7 +10319,7 @@ mod issue_044_json_mode_stdout_pollution_tests {
             "错误 envelope 必须写到 stdout"
         );
         let envelope = body_of(
-            source,
+            &source,
             "fn json_error_envelope(",
             "fn validate_config_at_paths_with_binary_json(",
         );

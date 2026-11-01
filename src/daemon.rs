@@ -11624,6 +11624,7 @@ mod legacy_reset_admission_tests {
 
     // ----------------: current-instance ownership ----------------
 
+    #[cfg(unix)]
     fn managed_launch_record(pid: u32) -> CorePidMetadata {
         CorePidMetadata {
             pid,
@@ -11634,6 +11635,7 @@ mod legacy_reset_admission_tests {
         }
     }
 
+    #[cfg(unix)]
     fn state_with_launch_record(
         pid_file: &std::path::Path,
         record: &CorePidMetadata,
@@ -11652,6 +11654,7 @@ mod legacy_reset_admission_tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn current_instance_ownership_accepts_a_live_child_with_matching_record() {
         let temp = tempfile::tempdir().unwrap();
         let child = tokio::process::Command::new("sleep")
@@ -11686,6 +11689,7 @@ mod legacy_reset_admission_tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn current_instance_ownership_refuses_a_missing_or_mismatched_record() {
         let temp = tempfile::tempdir().unwrap();
         let child = tokio::process::Command::new("sleep")
@@ -11730,6 +11734,7 @@ mod legacy_reset_admission_tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn current_instance_ownership_without_a_child_needs_a_proven_peer() {
         let temp = tempfile::tempdir().unwrap();
         let pid_file = temp.path().join("core.pid");

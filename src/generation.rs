@@ -2210,6 +2210,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn migration_marks_withdrawn_evidence_untrusted() {
         let temp = TempDir::new().unwrap();
@@ -2872,6 +2873,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_tombstone_withdraw_and_collision() {
         let temp = TempDir::new().unwrap();
@@ -3141,6 +3143,7 @@ mod tests {
         assert!(manifest.metadata["missing"].contains("mihomo"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_migration_four_state_matrix() {
         let temp = TempDir::new().unwrap();
@@ -3173,6 +3176,7 @@ mod tests {
 
     /// SPEC P1-1/P0-2: migration publishes the built staging tree with one
     /// no-replace rename and leaves no staging residue behind.
+    #[cfg(unix)]
     #[test]
     fn test_migration_publishes_atomically_without_staging_residue() {
         let temp = TempDir::new().unwrap();
@@ -3401,6 +3405,7 @@ mod tests {
         assert!(store.validate_generation(&id).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_migration_marks_migrated_generations_untrusted() {
         let temp = TempDir::new().unwrap();
@@ -3531,6 +3536,7 @@ mod tests {
         assert_eq!(state.previous, None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_migration_cleans_precreated_empty_root() {
         let temp = TempDir::new().unwrap();

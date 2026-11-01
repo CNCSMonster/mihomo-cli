@@ -4618,6 +4618,7 @@ rules:
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn recovery_marker_dead_pid_is_reclaimed() {
         // P2-5: a dead holder's marker must be reclaimed so recovery can proceed.

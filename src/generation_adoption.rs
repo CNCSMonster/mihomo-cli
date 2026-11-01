@@ -76,7 +76,7 @@ enum PreviewOutcome {
 
 /// Test-only fault/ID injection. Thread-local so parallel tests cannot arm each
 /// other, and compiled out entirely in production (no configuration backdoor).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod test_hooks {
     use std::cell::RefCell;
     use std::path::{Path, PathBuf};
@@ -122,18 +122,18 @@ mod test_hooks {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn fire_fault(point: &str) -> anyhow::Result<()> {
     test_hooks::fire(point)
 }
 
-#[cfg(not(test))]
+#[cfg(not(all(test, unix)))]
 fn fire_fault(_point: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
 fn next_generation_id() -> anyhow::Result<GenerationId> {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     if let Some(raw) = test_hooks::take_generation_id() {
         return Ok(GenerationId::new(raw)?);
     }
@@ -164,7 +164,7 @@ fn sync_directory_no_follow(path: &Path) -> anyhow::Result<()> {
 
 fn sync_dir(point: &str, path: &Path) -> anyhow::Result<()> {
     fire_fault(point)?;
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     test_hooks::record_sync(path);
     sync_directory_no_follow(path)
 }
@@ -1036,7 +1036,7 @@ fn inspect(ctx: &instance::InstanceContext, json: bool) -> anyhow::Result<()> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
