@@ -417,11 +417,15 @@ fn atomic_write_bytes_impl(
                 return Err(std::io::Error::last_os_error().into());
             }
             let stat = unsafe { stat.assume_init() };
+            #[cfg(target_os = "macos")]
+            let actual_mode = u32::from(stat.st_mode);
+            #[cfg(not(target_os = "macos"))]
+            let actual_mode = stat.st_mode;
             if stat.st_uid != uid
                 || stat.st_gid != gid
                 || stat.st_mode & libc::S_IFMT != libc::S_IFREG
                 || stat.st_nlink != 1
-                || stat.st_mode & 0o7777 != u32::from(mode) & 0o7777
+                || actual_mode & 0o7777 != u32::from(mode) & 0o7777
             {
                 anyhow::bail!(
                     "temp file for {} did not retain the requested owner/mode",
@@ -3054,6 +3058,7 @@ fn rename_no_replace_c_paths(
 /// must fail closed instead of risking evidence loss.
 #[cfg(unix)]
 pub fn rename_no_replace(from: &Path, to: &Path) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
     use std::os::unix::ffi::OsStrExt;
 
     // Both parents are opened no-follow first: the rename must not be redirected

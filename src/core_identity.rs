@@ -10,7 +10,9 @@
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 /// 已证明归属的受管 Core 进程身份（供日志/证据使用）。
 #[derive(Debug, Clone, PartialEq, Eq)]
