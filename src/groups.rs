@@ -34,6 +34,14 @@ const GROUP_TYPES: &[&str] = &["select", "url-test", "fallback", "load-balance",
 pub const BUILTIN_POLICIES: &[&str] =
     &["DIRECT", "REJECT", "REJECT-DROP", "REJECT-NO-DROP", "PASS"];
 
+/// Built-in Mihomo rule targets are matched case-insensitively; custom group/node
+/// names remain exact-match so a typo cannot silently point at the wrong group.
+pub fn is_builtin_policy(name: &str) -> bool {
+    BUILTIN_POLICIES
+        .iter()
+        .any(|policy| policy.eq_ignore_ascii_case(name))
+}
+
 pub const RESERVED_NAMES: &[&str] = &[
     "DIRECT",
     "REJECT",

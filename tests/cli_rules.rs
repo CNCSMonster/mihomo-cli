@@ -70,6 +70,25 @@ fn rule_add_valid_rule_writes_to_isolated_config_dir() {
 }
 
 #[test]
+fn rule_add_accepts_reject_no_drop() {
+    let tmp = TempDir::new().unwrap();
+
+    let output = Command::new(bin())
+        .env("MIHOMO_CLI_CONFIG_DIR", tmp.path())
+        .args(["rule", "add", "DOMAIN-SUFFIX,example.com,REJECT-NO-DROP"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rules = std::fs::read_to_string(tmp.path().join("rules.yaml")).unwrap();
+    assert!(rules.contains("DOMAIN-SUFFIX,example.com,REJECT-NO-DROP"));
+}
+
+#[test]
 fn rule_types_and_policies_are_printable() {
     let tmp = TempDir::new().unwrap();
     std::fs::write(

@@ -2603,6 +2603,18 @@ pub fn lint_intranet_guard(config: &serde_yaml::Value) -> Vec<IntranetGuardWarni
         return warnings;
     }
 
+    // The guard describes a TUN topology risk (sniffer override + proxy fallback +
+    // private ranges captured by TUN). Without TUN enabled the warning would be a
+    // false positive for system-proxy/per-user users.
+    let tun_enabled = config
+        .get("tun")
+        .and_then(|tun| tun.get("enable"))
+        .and_then(|enabled| enabled.as_bool())
+        .unwrap_or(false);
+    if !tun_enabled {
+        return warnings;
+    }
+
     // 2. Check if the fallback / MATCH policy routes to proxy.
     let mut fallback_is_proxy = false;
     let mut direct_cidrs: Vec<String> = Vec::new();
@@ -2669,28 +2681,6 @@ pub fn lint_intranet_guard(config: &serde_yaml::Value) -> Vec<IntranetGuardWarni
     }
 
     warnings
-}
-
-/// Extract the policy from a simple `TYPE,PARAM,POLICY[,OPTION]` or `MATCH,POLICY` rule.
-/// Logical rules contain parentheses or nested commas; they are returned as `None` so the
-/// fallback never rewrites a structure it cannot parse safely.
-fn simple_rule_policy(rule: &str) -> Option<&str> {
-    if rule.contains('(') || rule.contains(')') {
-        return None;
-    }
-    let parts: Vec<&str> = rule.split(',').map(str::trim).collect();
-    if parts.iter().any(|part| part.is_empty()) {
-        return None;
-    }
-    match parts.as_slice() {
-        [rule_type, policy] if rule_type.eq_ignore_ascii_case("MATCH") => Some(*policy),
-        [rule_type, _, policy] | [rule_type, _, policy, _]
-            if !rule_type.eq_ignore_ascii_case("MATCH") =>
-        {
-            Some(*policy)
-        }
-        _ => None,
-    }
 }
 
 /// Rewrite rules whose target policy is absent from the merged config (groups + proxies +
@@ -2760,10 +2750,10 @@ fn apply_dangling_rule_fallback_to_config_text(config_content: &str) -> anyhow::
         let Some(rule) = rule_val.as_str() else {
             continue;
         };
-        let Some(policy) = simple_rule_policy(rule) else {
+        let Some(policy) = crate::rules::simple_rule_policy(rule) else {
             continue;
         };
-        if valid_policies.contains(policy) {
+        if valid_policies.contains(policy) || crate::groups::is_builtin_policy(policy) {
             continue;
         }
         // Policy is dangling – rewrite to DIRECT
@@ -7101,6 +7091,35 @@ rules:
 "#
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn intranet_guard_requires_tun_enabled() {
+        let no_tun: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+sniffer:
+  enable: true
+  override-destination: true
+rules:
+  - MATCH,Proxy
+"#,
+        )
+        .unwrap();
+        assert!(lint_intranet_guard(&no_tun).is_empty());
+
+        let tun_disabled: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+sniffer:
+  enable: true
+  override-destination: true
+tun:
+  enable: false
+rules:
+  - MATCH,Proxy
+"#,
+        )
+        .unwrap();
+        assert!(lint_intranet_guard(&tun_disabled).is_empty());
     }
 
     #[test]

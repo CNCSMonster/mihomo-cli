@@ -4,6 +4,17 @@
 
 ---
 
+## 2026-11-01
+
+### 🐛 Bug Fixes
+
+- **system 权限与安装提示** — `install --system` 完成后会在普通用户不在 `mihomo` 组时给出非阻塞加组提示；事务日志权限不足时保持零写入，并按 Linux/macOS/Windows 给出对应恢复路径。
+- **规则与诊断** — `rule test` 对复合规则会提示结果不完整；组删除会识别逻辑规则依赖；`doctor` 的 Split-DNS 与内网守卫判断更准确，减少误报。
+
+### 📚 Documentation
+
+- 更新 system 模式权限、规则降级与故障排查说明。
+
 ## 2026-10-31
 
 ### ✨ Features

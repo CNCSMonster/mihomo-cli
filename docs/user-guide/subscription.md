@@ -162,6 +162,11 @@ mihomo-cli rule add DOMAIN-SUFFIX,example.com,DIRECT --position front  # 指定�
 
 # 列出规则
 mihomo-cli rule list         # alias: ls
+# 目标标注 [Active] / [Fallback: DIRECT ...]；DIRECT、REJECT、REJECT-DROP、
+# REJECT-NO-DROP、PASS 是内建策略，其他组名必须与配置完全一致。
+# 策略集读取失败时只提示“未判定”，不会伪装成 Active。
+# 悬空策略降级：有 active 订阅时只影响生成配置，磁盘 rules.yaml 不变；
+# 无 active 订阅的 legacy/direct-only 配置会把降级结果写回 config.yaml（持久化）。
 
 # 删除规则（按 1-based 索引）
 mihomo-cli rule remove 2     # alias: rm
@@ -190,6 +195,8 @@ mihomo-cli rule policies
 # 测试域名匹配哪条规则
 mihomo-cli rule test google.com
 mihomo-cli rule test 192.168.1.1
+# 复合规则（AND/SUB-RULE 等）无法离线求值：会跳过并在 stderr 提示结果可能不完整，
+# 不要据此断言复合规则未命中。
 ```
 
 **支持的规则类型：**

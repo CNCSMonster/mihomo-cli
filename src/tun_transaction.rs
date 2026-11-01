@@ -1645,6 +1645,54 @@ pub fn remove_user_gate(
 /// 事务窗口内的 intent 写入会让事务的 `base_intent_revision` 立刻失真：后续提交只能
 /// 走 Conflict，最坏情况下残留 recovery 会用旧 candidate 覆盖用户刚写下的内容。因此
 /// `override import/clear`（以及其它会改写 intent 的用户命令）在写入前调用本函数。
+fn error_is_permission_denied(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    })
+}
+
+fn permission_denied_recovery_hint_linux(state_dir: &Path) -> String {
+    format!(
+        "  The system state directory `{}` (usually 0770 root:mihomo) is not readable by the current identity.\n  Fix: add the current user to the `mihomo` group and sign in again (e.g. sudo usermod -aG mihomo \"$USER\"), or run this operation with the required system authorization.\n  Do not use `mihomo-cli status` as the fix; it cannot read the same directory.",
+        state_dir.display()
+    )
+}
+
+fn permission_denied_recovery_hint_macos(state_dir: &Path) -> String {
+    format!(
+        "  The protected macOS state directory `{}` (root:wheel, guarded by the system LaunchDaemon account) is not readable by the current identity.\n  Fix: retry from a managed system-authorized context (for example the system instance with sudo/administrator authorization), or repair the LaunchDaemon/state directory ownership through the supported install or system configuration.\n  Do not use `mihomo-cli status` as the fix; it cannot read the same directory.",
+        state_dir.display()
+    )
+}
+
+fn permission_denied_recovery_hint_windows(state_dir: &Path) -> String {
+    format!(
+        "  The protected Windows state directory `{}` (under %ProgramData%\\mihomo-cli, governed by the service account/DACL) is not readable by the current identity.\n  Fix: retry from an elevated/administrator or managed service context, or repair the directory DACL through the supported installer (for example: icacls \"%ProgramData%\\mihomo-cli\" /grant ...).\n  Do not use `mihomo-cli status` as the fix; it cannot read the same directory.",
+        state_dir.display()
+    )
+}
+
+fn permission_denied_recovery_hint_generic(state_dir: &Path) -> String {
+    format!(
+        "  The protected system state directory `{}` is not readable by the current identity.\n  Fix: retry from a managed system-authorized context, or repair the state directory ownership through the supported installer.\n  Do not use `mihomo-cli status` as the fix; it cannot read the same directory.",
+        state_dir.display()
+    )
+}
+
+fn permission_denied_recovery_hint(state_dir: &Path) -> String {
+    if cfg!(target_os = "linux") {
+        permission_denied_recovery_hint_linux(state_dir)
+    } else if cfg!(target_os = "macos") {
+        permission_denied_recovery_hint_macos(state_dir)
+    } else if cfg!(target_os = "windows") {
+        permission_denied_recovery_hint_windows(state_dir)
+    } else {
+        permission_denied_recovery_hint_generic(state_dir)
+    }
+}
+
 pub fn ensure_no_non_terminal_transaction(
     ctx: &InstanceContext,
     action: &str,
@@ -1652,11 +1700,20 @@ pub fn ensure_no_non_terminal_transaction(
     if ctx.mode != crate::instance::InstanceMode::System {
         return Ok(());
     }
-    let active = read_active_journal(ctx).map_err(|error| {
-        anyhow::anyhow!(
+    let active = match read_active_journal(ctx) {
+        Ok(active) => active,
+        Err(error) if error_is_permission_denied(&error) => {
+            let transactions = transactions_dir(ctx);
+            let state_dir = transactions.parent().unwrap_or(transactions.as_path());
+            anyhow::bail!(
+                "cannot read the system TUN transaction journal, so `{action}` was refused before writing anything: {error}\n  Your configuration was NOT modified.\n{}",
+                permission_denied_recovery_hint(state_dir)
+            )
+        }
+        Err(error) => anyhow::bail!(
             "cannot read the transaction journal, so `{action}` was refused before writing anything: {error}\n  Every transaction artifact is kept.\n  Fix: mihomo-cli status"
-        )
-    })?;
+        ),
+    };
     if let Some(journal) = active {
         if !matches!(
             journal.phase,
@@ -4342,6 +4399,112 @@ rules:
         let error = ensure_no_non_terminal_transaction(&ctx, "override import")
             .expect_err("a pending legacy journal must block config writes");
         assert!(error.to_string().contains("legacy TUN transaction"));
+    }
+
+    /// Issue 064: 普通用户读不到 system 事务日志时必须 fail-closed，但错误分类
+    /// 必须与日志损坏区分，并给出 Linux 组权限/授权路径，而不是把 `status` 当作修复。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn issue064_permission_denied_message_is_actionable_and_zero_write() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root 绕过 0000 模式位，构造不出 EACCES。
+        }
+        let (_tmp, ctx) = test_context();
+        let tx = transactions_dir(&ctx);
+        std::fs::create_dir_all(&tx).unwrap();
+        std::fs::set_permissions(&tx, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let before = std::fs::read(&ctx.paths.intent_config_file).ok();
+        let error = ensure_no_non_terminal_transaction(&ctx, "override import")
+            .expect_err("unreadable system transaction directory must fail closed");
+        std::fs::set_permissions(&tx, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let message = error.to_string();
+        assert!(message.contains("Permission denied"), "{message}");
+        assert!(message.contains("mihomo"), "{message}");
+        assert!(message.contains("usermod"), "{message}");
+        assert!(message.contains("NOT modified"), "{message}");
+        assert!(
+            !message.contains("Fix: mihomo-cli status"),
+            "status is equally unreadable and must not be suggested as the fix: {message}"
+        );
+        assert_eq!(std::fs::read(&ctx.paths.intent_config_file).ok(), before);
+    }
+
+    /// Issue 064 Q3: 运行期 EACCES 文案必须按平台区分，macOS/Windows 不得出现
+    /// Linux 组或 `usermod` 指引；所有平台都不得把 `status` 当作修复。
+    #[test]
+    fn issue064_permission_denied_hint_is_platform_specific() {
+        let state_dir = Path::new("/var/lib/mihomo-cli");
+
+        let linux = permission_denied_recovery_hint_linux(state_dir);
+        assert!(linux.contains("0770 root:mihomo"), "{linux}");
+        assert!(linux.contains("mihomo"), "{linux}");
+        assert!(linux.contains("usermod"), "{linux}");
+        assert!(linux.contains("sign in again"), "{linux}");
+        assert!(
+            !linux.contains("Fix: mihomo-cli status"),
+            "status must not be suggested as the fix: {linux}"
+        );
+
+        let macos = permission_denied_recovery_hint_macos(state_dir);
+        assert!(!macos.contains("usermod"), "{macos}");
+        assert!(!macos.contains("root:mihomo"), "{macos}");
+        assert!(macos.contains("root:wheel"), "{macos}");
+        assert!(macos.contains("LaunchDaemon"), "{macos}");
+        assert!(macos.contains("authorization"), "{macos}");
+        assert!(
+            !macos.contains("Fix: mihomo-cli status"),
+            "status must not be suggested as the fix: {macos}"
+        );
+
+        let windows = permission_denied_recovery_hint_windows(state_dir);
+        assert!(!windows.contains("usermod"), "{windows}");
+        assert!(!windows.contains("root:mihomo"), "{windows}");
+        assert!(windows.contains("DACL"), "{windows}");
+        assert!(windows.contains("%ProgramData%"), "{windows}");
+        assert!(windows.contains("icacls"), "{windows}");
+        assert!(
+            !windows.contains("Fix: mihomo-cli status"),
+            "status must not be suggested as the fix: {windows}"
+        );
+
+        let generic = permission_denied_recovery_hint_generic(state_dir);
+        assert!(!generic.contains("usermod"), "{generic}");
+        assert!(!generic.contains("mihomo group"), "{generic}");
+        assert!(generic.contains("managed system-authorized"), "{generic}");
+        assert!(
+            !generic.contains("Fix: mihomo-cli status"),
+            "status must not be suggested as the fix: {generic}"
+        );
+    }
+
+    /// Issue 064 Q3: host 平台选择器必须与真实目标一致。
+    #[test]
+    fn issue064_permission_denied_hint_selects_host_platform() {
+        let hint = permission_denied_recovery_hint(Path::new("/var/lib/mihomo-cli"));
+
+        #[cfg(target_os = "linux")]
+        {
+            assert!(hint.contains("usermod"), "{hint}");
+            assert!(hint.contains("0770 root:mihomo"), "{hint}");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(!hint.contains("usermod"), "{hint}");
+            assert!(hint.contains("LaunchDaemon"), "{hint}");
+            assert!(hint.contains("root:wheel"), "{hint}");
+        }
+        #[cfg(target_os = "windows")]
+        {
+            assert!(!hint.contains("usermod"), "{hint}");
+            assert!(hint.contains("DACL"), "{hint}");
+            assert!(hint.contains("%ProgramData%"), "{hint}");
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            assert!(!hint.contains("usermod"), "{hint}");
+            assert!(hint.contains("managed system-authorized"), "{hint}");
+        }
     }
 
     /// 缺陷 3（结果诚实）：回滚失败时 phase 不允许被当作终态——planner 只能拒

@@ -1536,7 +1536,7 @@ fn doctor_pending_generation_check(store: &generation::GenerationStore) -> Optio
         generation::PendingObservation::HasPending(pending_id) => Some(DoctorCheck::fail(
             "待应用更新",
             format!("发现 pending generation ({pending_id})"),
-            "应用更新: mihomo-cli restart".to_string(),
+            doctor_daemon_binary_skew_hint().to_string(),
         )),
         generation::PendingObservation::Undeterminable(error) => Some(DoctorCheck::neutral(
             "待应用更新",
@@ -10930,11 +10930,12 @@ async fn doctor_dns_probe_check(
             ),
         )),
         dns_probe::ProbeVerdict::BypassesMihomo => {
-            if has_split_dns_intent(&config_text) {
+            let resolver_addrs = dns_probe::system_resolver_addrs();
+            if has_split_dns_intent(&config_text, &resolver_addrs) {
                 Some(DoctorCheck::neutral(
                     "系统 DNS 路径",
                     format!(
-                        "{} → 真实地址，系统解析直连内网（检测到 Split-DNS / route-exclude 策略配置，内网解析未受 TUN 劫持；判据：{source_label}）",
+                        "{} → 真实地址，检测到覆盖该探测域或系统解析器的 Split-DNS / route-exclude 配置；判据：{source_label}",
                         dns_probe::PROBE_DOMAIN
                     ),
                 ))
@@ -11825,6 +11826,166 @@ fn format_install_service_skipped() -> Vec<String> {
     vec!["  ⚠ Service skipped — run: mihomo-cli restart".to_string()]
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SystemInstallGroupHintDecision {
+    Prompt,
+    SilentAlreadyInGroup,
+    SkipNoOperator,
+    SkipGroupCheckUnavailable,
+}
+
+pub(crate) fn decide_system_install_group_hint(
+    operator: Option<&str>,
+    in_group: Option<bool>,
+) -> SystemInstallGroupHintDecision {
+    let Some(user) = operator else {
+        return SystemInstallGroupHintDecision::SkipNoOperator;
+    };
+    let user = user.trim();
+    if user.is_empty() || user == "root" {
+        return SystemInstallGroupHintDecision::SkipNoOperator;
+    }
+    match in_group {
+        Some(true) => SystemInstallGroupHintDecision::SilentAlreadyInGroup,
+        Some(false) => SystemInstallGroupHintDecision::Prompt,
+        None => SystemInstallGroupHintDecision::SkipGroupCheckUnavailable,
+    }
+}
+
+pub(crate) fn resolve_system_install_operator_from(
+    sudo_user_env: Option<&str>,
+    current_user: Option<&str>,
+    is_root: bool,
+) -> Option<String> {
+    if let Some(user) = sudo_user_env {
+        let user = user.trim();
+        if !user.is_empty() && user != "root" {
+            return Some(user.to_string());
+        }
+    }
+    if is_root {
+        return None;
+    }
+    if let Some(user) = current_user {
+        let user = user.trim();
+        if !user.is_empty() && user != "root" {
+            return Some(user.to_string());
+        }
+    }
+    None
+}
+
+pub(crate) fn format_system_install_group_hint(user: &str) -> Vec<String> {
+    vec![
+        "".to_string(),
+        format!("  Notice: user '{user}' is not in the 'mihomo' group."),
+        "  Normal users cannot inspect managed state or run `override import`/`status` without group access.".to_string(),
+        format!("  To grant access: sudo usermod -aG mihomo {user}"),
+        "  Sign out and sign back in for the new group membership to take effect.".to_string(),
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn is_user_in_group_linux(user: &str, group_name: &str) -> Option<bool> {
+    use std::ffi::CString;
+    let c_group = CString::new(group_name).ok()?;
+    let c_user = CString::new(user).ok()?;
+    unsafe {
+        let grp = libc::getgrnam(c_group.as_ptr());
+        if grp.is_null() {
+            return None;
+        }
+        let target_gid = (*grp).gr_gid;
+
+        let pwd = libc::getpwnam(c_user.as_ptr());
+        if pwd.is_null() {
+            return None;
+        }
+        let user_gid = (*pwd).pw_gid;
+        if user_gid == target_gid {
+            return Some(true);
+        }
+
+        let mut ngroups: libc::c_int = 32;
+        let mut groups: Vec<libc::gid_t> = vec![0; ngroups as usize];
+        let mut ret =
+            libc::getgrouplist(c_user.as_ptr(), user_gid, groups.as_mut_ptr(), &mut ngroups);
+        if ret == -1 {
+            groups.resize(ngroups as usize, 0);
+            ret = libc::getgrouplist(c_user.as_ptr(), user_gid, groups.as_mut_ptr(), &mut ngroups);
+        }
+        if ret == -1 {
+            return None;
+        }
+        Some(groups[..ngroups as usize].contains(&target_gid))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_user_in_group_linux(_user: &str, _group_name: &str) -> Option<bool> {
+    None
+}
+
+/// Q1 裁决 A：只有 system 模式、且操作者确实不在 `mihomo` 组时才返回提示行。
+/// 该函数把“模式门控 + 决策矩阵 + 文案”收敛到一处，便于单测安装调用点的行为。
+pub(crate) fn system_install_group_hint_lines(
+    mode: instance::InstanceMode,
+    operator: Option<&str>,
+    in_group: Option<bool>,
+) -> Option<Vec<String>> {
+    if mode != instance::InstanceMode::System {
+        return None;
+    }
+    match decide_system_install_group_hint(operator, in_group) {
+        SystemInstallGroupHintDecision::Prompt => operator.map(format_system_install_group_hint),
+        SystemInstallGroupHintDecision::SilentAlreadyInGroup
+        | SystemInstallGroupHintDecision::SkipNoOperator
+        | SystemInstallGroupHintDecision::SkipGroupCheckUnavailable => None,
+    }
+}
+
+/// 非阻塞提示必须保证安装退出码不受 stdout 写失败影响：
+/// 使用 best-effort 写入，忽略断管/关闭错误。
+fn print_lines_best_effort(lines: impl IntoIterator<Item = String>) {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for line in lines {
+        let _ = writeln!(out, "{line}");
+    }
+    let _ = out.flush();
+}
+
+fn maybe_print_system_install_group_hint(mode: instance::InstanceMode) {
+    let sudo_user = std::env::var("SUDO_USER").ok();
+    let current_user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok();
+    #[cfg(unix)]
+    let current_user = current_user.or_else(|| {
+        let uid = unsafe { libc::getuid() };
+        let pwd = unsafe { libc::getpwuid(uid) };
+        if pwd.is_null() {
+            None
+        } else {
+            let name = unsafe { std::ffi::CStr::from_ptr((*pwd).pw_name) };
+            name.to_str().ok().map(|s| s.to_string())
+        }
+    });
+    let is_root = is_current_process_root();
+    let operator = resolve_system_install_operator_from(
+        sudo_user.as_deref(),
+        current_user.as_deref(),
+        is_root,
+    );
+    let in_group = operator
+        .as_deref()
+        .and_then(|u| is_user_in_group_linux(u, "mihomo"));
+    if let Some(lines) = system_install_group_hint_lines(mode, operator.as_deref(), in_group) {
+        print_lines_best_effort(lines);
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // install flags mirror the CLI surface 1:1
 async fn cmd_install_entry(
     system: bool,
@@ -11875,7 +12036,10 @@ async fn cmd_install_entry(
             instance::InstanceMode::User
         }
     };
-    cmd_install_instance(mode, force, version, github_mirror, skip_config, yes).await
+    cmd_install_instance(mode, force, version, github_mirror, skip_config, yes).await?;
+    // Q1 A: 非阻塞组提示；模式门控在 helper 内，user 模式不会输出。
+    maybe_print_system_install_group_hint(mode);
+    Ok(())
 }
 
 fn install_mode_conflict_message(
@@ -15207,13 +15371,9 @@ pub(crate) fn format_rule_list_annotated(
     } else {
         lines.extend(rules.iter().enumerate().map(|(i, rule)| {
             let annotation = if let Some(policies) = available_policies {
-                if let Some(target) = crate::rules::rule_policy(rule) {
-                    let is_builtin = target.eq_ignore_ascii_case("DIRECT")
-                        || target.eq_ignore_ascii_case("REJECT")
-                        || target.eq_ignore_ascii_case("REJECT-DROP")
-                        || target.eq_ignore_ascii_case("PASS");
-                    let is_available =
-                        is_builtin || policies.iter().any(|p| p.eq_ignore_ascii_case(target));
+                if let Some(target) = crate::rules::rule_target(rule) {
+                    let is_builtin = crate::groups::is_builtin_policy(target);
+                    let is_available = is_builtin || policies.iter().any(|p| p == target);
                     if is_available {
                         " [Active]".to_string()
                     } else {
@@ -15235,18 +15395,16 @@ pub(crate) fn doctor_daemon_binary_skew_hint() -> &'static str {
     "应用更新: mihomo-cli restart --system"
 }
 
-pub(crate) fn has_split_dns_intent(config_text: &str) -> bool {
+#[cfg(unix)]
+pub(crate) fn has_split_dns_intent(
+    config_text: &str,
+    resolver_addrs: &[std::net::SocketAddr],
+) -> bool {
     let Ok(val) = serde_yaml::from_str::<serde_yaml::Value>(config_text) else {
         return false;
     };
-    if let Some(map) = val
-        .get("dns")
-        .and_then(|d| d.get("nameserver-policy"))
-        .and_then(|np| np.as_mapping())
-    {
-        if !map.is_empty() {
-            return true;
-        }
+    if nameserver_policy_covers(&val, dns_probe::PROBE_DOMAIN) {
+        return true;
     }
     if let Some(seq) = val
         .get("tun")
@@ -15254,13 +15412,10 @@ pub(crate) fn has_split_dns_intent(config_text: &str) -> bool {
         .and_then(|r| r.as_sequence())
     {
         for item in seq {
-            if let Some(s) = item.as_str() {
-                let trimmed = s.trim();
-                if trimmed.starts_with("10.")
-                    || trimmed.starts_with("172.")
-                    || trimmed.starts_with("192.168.")
-                    || trimmed.starts_with("fd")
-                    || trimmed.starts_with("fc")
+            if let Some(cidr) = item.as_str() {
+                if resolver_addrs
+                    .iter()
+                    .any(|addr| cidr_contains_addr(cidr, addr.ip()))
                 {
                     return true;
                 }
@@ -15268,6 +15423,69 @@ pub(crate) fn has_split_dns_intent(config_text: &str) -> bool {
         }
     }
     false
+}
+
+/// Split-DNS neutralization requires evidence that the probe domain itself is
+/// covered by `nameserver-policy`; an unrelated internal domain is not enough.
+#[cfg(unix)]
+fn nameserver_policy_covers(config: &serde_yaml::Value, domain: &str) -> bool {
+    let Some(map) = config
+        .get("dns")
+        .and_then(|d| d.get("nameserver-policy"))
+        .and_then(|np| np.as_mapping())
+    else {
+        return false;
+    };
+    let domain = domain.to_ascii_lowercase();
+    map.keys().filter_map(|key| key.as_str()).any(|key| {
+        let pattern = key.trim();
+        if pattern.starts_with("geosite:")
+            || pattern.starts_with("geoip:")
+            || pattern.starts_with("rule-set:")
+        {
+            return false;
+        }
+        let pattern = pattern
+            .strip_prefix("DOMAIN-SUFFIX,")
+            .unwrap_or(pattern)
+            .trim_start_matches("+.")
+            .trim_start_matches("*.")
+            .trim_start_matches('.')
+            .to_ascii_lowercase();
+        !pattern.is_empty() && (domain == pattern || domain.ends_with(&format!(".{pattern}")))
+    })
+}
+
+#[cfg(unix)]
+fn cidr_contains_addr(cidr: &str, ip: std::net::IpAddr) -> bool {
+    let Some((addr, prefix)) = cidr.trim().split_once('/') else {
+        return false;
+    };
+    let Ok(net) = addr.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    match (net, ip) {
+        (std::net::IpAddr::V4(net), std::net::IpAddr::V4(ip)) if prefix <= 32 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            (u32::from(net) & mask) == (u32::from(ip) & mask)
+        }
+        (std::net::IpAddr::V6(net), std::net::IpAddr::V6(ip)) if prefix <= 128 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            (u128::from(net) & mask) == (u128::from(ip) & mask)
+        }
+        _ => false,
+    }
 }
 
 fn format_rule_apply_result(merged: bool, apply: RuntimeApplyOutcome) -> Vec<String> {
@@ -16295,7 +16513,7 @@ async fn update_group_overlay(
 
             // Dimension 1: rules.yaml references
             for rule in &rules {
-                if crate::rules::rule_policy(rule) == Some(name.as_str()) {
+                if crate::rules::rule_target(rule) == Some(name.as_str()) {
                     blockers.push(format!("  - rule: {rule}"));
                 }
             }
@@ -16804,7 +17022,9 @@ async fn cmd_rule(system: bool, user: bool, action: RuleAction) -> anyhow::Resul
             let rules_snapshot = snapshot_file(&paths.rules_path())?;
             if let Some(policy) = target_policy.as_deref() {
                 let policies = crate::rules::available_policies_at(&paths)?;
-                if !policies.iter().any(|p| p == policy) {
+                if !crate::groups::is_builtin_policy(policy)
+                    && !policies.iter().any(|p| p == policy)
+                {
                     let payload_nodes = known_provider_payload_nodes(&paths);
                     if let Some(pname) = payload_nodes.get(policy) {
                         anyhow::bail!(
@@ -16836,7 +17056,11 @@ async fn cmd_rule(system: bool, user: bool, action: RuleAction) -> anyhow::Resul
             let rules = crate::rules::list_rules_at(&paths)?;
             let pos = crate::rules::get_position_at(&paths).unwrap_or_default();
             let policies = crate::rules::available_policies_at(&paths).ok();
-            for line in format_rule_list_annotated(&rules, pos, policies.as_deref()) {
+            let policies_slice = policies.as_deref();
+            if policies.is_none() {
+                eprintln!("  ⚠ 策略集不可读，规则目标未判定；请检查 config.yaml 或运行 doctor");
+            }
+            for line in format_rule_list_annotated(&rules, pos, policies_slice) {
                 println!("{line}");
             }
             Ok(())
@@ -16953,7 +17177,11 @@ async fn cmd_rule(system: bool, user: bool, action: RuleAction) -> anyhow::Resul
         }
         RuleAction::Test { target } => {
             let paths = read_paths()?;
-            let matched = crate::rules::test_rule_match_at(&paths, &target)?;
+            let (matched, skipped_logical) =
+                crate::rules::test_rule_match_at_with_skipped(&paths, &target)?;
+            if skipped_logical {
+                eprintln!("  ⚠ 复合规则（AND/SUB-RULE 等）无法离线判定，已跳过；结果可能不完整。");
+            }
             print_lines(format_rule_test_result(&target, matched.as_ref()));
             Ok(())
         }

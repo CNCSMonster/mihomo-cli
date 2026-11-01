@@ -60,6 +60,30 @@ mihomo-cli install --github-mirror https://ghproxy.com/  # core/geo 下载走 Gi
 
 > 💡 `--github-mirror`：Mihomo core 二进制和 geo 数据（geoip/geosite）等 GitHub public assets 下载的镜像前缀。国内网络直连 GitHub 慢时可指定镜像站（如 `https://ghproxy.com/`）；不影响订阅下载。
 
+#### system 模式的目录权限与 `mihomo` 组
+
+Linux system 模式将 `/var/lib/mihomo-cli` 收敛为 `root:mihomo 0770`；`transactions/` 等受管运行态由服务账号 `mihomo` 写入，目录为 `mihomo:mihomo 0750`（writer 发布时可为 `2750` setgid），`mihomo` 组只读/穿越，不授予写权限。安装**不会**自动把当前用户加入 `mihomo` 组。
+
+当执行 `install --system` 成功后，若检测到操作者（`SUDO_USER` 或当前非 root 用户）不在 `mihomo` 组，CLI 会输出一条非阻塞提示，提醒普通用户后续执行 `override import` / `status` 前需要加组；安装过程不会自动修改系统账户，也不影响安装退出码。
+
+运行期遇到 `EACCES` 时，`override import` / `override clear` 的前置事务闸门保持 fail-closed、配置零修改，并按平台给出恢复路径：Linux 指引加入 `mihomo` 组并重新登录；macOS 按 LaunchDaemon 账号与 `root:wheel` 状态目录、Windows 按服务账号与 `%ProgramData%` DACL，指引受管系统授权或归属修复；macOS/Windows 均不会输出 Linux 组或 `usermod` 指引。
+
+普通用户不在组内时：
+
+- `status` / `doctor` 对不可读的特权状态保持 `unknown`（❓ 无法判定），不会伪造健康；
+- `override import` / `override clear` 等配置写入会在前置事务闸门前 **fail-closed**，配置零修改；
+- 工具不会因为读不到状态就自动 sudo，也不会把“读不到”当成“没有事务”。
+
+需要以普通用户执行这些操作时，显式加入组并重新登录：
+
+```bash
+sudo usermod -aG mihomo "$USER"
+# 重新登录后验证
+id -nG
+```
+
+`mihomo` 组只授予读取/管理受管状态所需的权限，不改变服务边界。若无法加组，请在具备系统授权的受管上下文中执行；不要把 `status` 当作修复命令，它读取的是同一受管目录。macOS/Windows 的服务权限模型不同，按各自平台的服务账号处理。
+
 ---
 
 ### `uninstall` (alias: `u`)

@@ -564,6 +564,61 @@ fn validate_cidr(s: &str, ipv6: bool) -> Result<()> {
 
 // Selection intent persistence lives in `crate::selection`.
 
+/// Read-only target extraction for both simple and logical Clash rules. Logical
+/// rules are parsed at top-level commas only; the fallback writer deliberately
+/// uses [`simple_rule_policy`] so it never rewrites a nested rule.
+pub fn rule_target(rule: &str) -> Option<&str> {
+    if rule.contains('(') {
+        logical_rule_target(rule)
+    } else {
+        simple_rule_policy(rule)
+    }
+}
+
+fn logical_rule_target(rule: &str) -> Option<&str> {
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut tokens: Vec<&str> = Vec::new();
+    for (index, ch) in rule.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                tokens.push(rule[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    tokens.push(rule[start..].trim());
+    tokens
+        .into_iter()
+        .rev()
+        .find(|token| !token.is_empty() && !token.eq_ignore_ascii_case("no-resolve"))
+}
+
+/// Extract the policy from a simple `TYPE,PARAM,POLICY[,OPTION]` or `MATCH,POLICY` rule.
+/// Logical rules contain parentheses or nested commas; they return `None` so callers never
+/// guess a policy from a structure they cannot parse safely.
+pub fn simple_rule_policy(rule: &str) -> Option<&str> {
+    if rule.contains('(') || rule.contains(')') {
+        return None;
+    }
+    let parts: Vec<&str> = rule.split(',').map(str::trim).collect();
+    if parts.iter().any(|part| part.is_empty()) {
+        return None;
+    }
+    match parts.as_slice() {
+        [rule_type, policy] if rule_type.eq_ignore_ascii_case("MATCH") => Some(*policy),
+        [rule_type, _, policy] | [rule_type, _, policy, _]
+            if !rule_type.eq_ignore_ascii_case("MATCH") =>
+        {
+            Some(*policy)
+        }
+        _ => None,
+    }
+}
+
 /// Extract the policy/target token from a Clash rule string.
 pub fn rule_policy(rule: &str) -> Option<&str> {
     let parts: Vec<&str> = rule.split(',').map(str::trim).collect();
@@ -580,8 +635,8 @@ pub fn rule_policy_warnings_at(paths: &AppPaths, rules: &[String]) -> Result<Vec
     let policies = available_policies_at(paths)?;
     let mut warnings = Vec::new();
     for rule in rules {
-        if let Some(policy) = rule_policy(rule) {
-            if !policies.iter().any(|p| p == policy) {
+        if let Some(policy) = rule_target(rule) {
+            if !crate::groups::is_builtin_policy(policy) && !policies.iter().any(|p| p == policy) {
                 warnings.push(format!(
                     "Warning: rule target `{policy}` is not available in current proxy groups/policies. Rule: {rule}"
                 ));
@@ -592,12 +647,10 @@ pub fn rule_policy_warnings_at(paths: &AppPaths, rules: &[String]) -> Result<Vec
 }
 
 pub fn available_policies_at(paths: &AppPaths) -> Result<Vec<String>> {
-    let mut policies = vec![
-        "DIRECT".to_string(),
-        "REJECT".to_string(),
-        "REJECT-DROP".to_string(),
-        "PASS".to_string(),
-    ];
+    let mut policies: Vec<String> = crate::groups::BUILTIN_POLICIES
+        .iter()
+        .map(|policy| (*policy).to_string())
+        .collect();
     let path = paths.config_path();
     if path.exists() {
         let content = std::fs::read_to_string(&path)?;
@@ -710,6 +763,53 @@ mod validation_tests {
     }
 
     #[test]
+    fn rule_target_parses_logical_rules_without_guessing() {
+        assert_eq!(
+            rule_target("AND,((NETWORK,udp),(DST-PORT,443)),REJECT"),
+            Some("REJECT")
+        );
+        assert_eq!(
+            rule_target("AND,((NETWORK,udp),(DST-PORT,443)),Proxy,no-resolve"),
+            Some("Proxy")
+        );
+        assert_eq!(
+            rule_target("DOMAIN-SUFFIX,example.com,Proxy"),
+            Some("Proxy")
+        );
+        assert_eq!(rule_target("MATCH,DIRECT"), Some("DIRECT"));
+    }
+
+    #[test]
+    fn rule_policy_warnings_report_logical_rule_targets() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let warnings = rule_policy_warnings_at(
+            &paths,
+            &["AND,((NETWORK,udp),(DST-PORT,443)),MissingGroup".to_string()],
+        )
+        .unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("MissingGroup")),
+            "logical rule target must be checked: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn rule_policy_warnings_ignore_logical_rules() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let warnings = rule_policy_warnings_at(
+            &paths,
+            &["AND,((NETWORK,udp),(DST-PORT,443)),REJECT".to_string()],
+        )
+        .unwrap();
+        assert!(
+            warnings.is_empty(),
+            "logical rule must not be warned: {warnings:?}"
+        );
+    }
+
+    #[test]
     fn available_policies_includes_builtins_and_proxy_groups_without_duplicates() {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());
@@ -731,6 +831,7 @@ proxy-groups:
         let policies = available_policies_at(&paths).unwrap();
         assert_eq!(policies[0], "DIRECT");
         assert!(policies.contains(&"REJECT".to_string()));
+        assert!(policies.contains(&"REJECT-NO-DROP".to_string()));
         assert!(policies.contains(&"Proxy".to_string()));
         assert!(policies.contains(&"Final".to_string()));
         assert_eq!(
@@ -748,13 +849,32 @@ pub struct RuleMatch {
 }
 
 pub fn test_rule_match_at(paths: &AppPaths, target: &str) -> Result<Option<RuleMatch>> {
+    Ok(test_rule_match_at_with_skipped(paths, target)?.0)
+}
+
+/// Like [`test_rule_match_at`], but also reports whether any logical rule
+/// (`AND`, `SUB-RULE`, ...) had to be skipped because it cannot be evaluated
+/// offline. The caller can show one short notice instead of silently implying
+/// that the match result is complete.
+pub fn test_rule_match_at_with_skipped(
+    paths: &AppPaths,
+    target: &str,
+) -> Result<(Option<RuleMatch>, bool)> {
     let config_path = paths.config_path();
     let content = std::fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
-    test_rule_match_in_config(&content, target)
+    test_rule_match_in_config_with_skipped(&content, target)
 }
 
+#[cfg(test)]
 pub fn test_rule_match_in_config(config_content: &str, target: &str) -> Result<Option<RuleMatch>> {
+    Ok(test_rule_match_in_config_with_skipped(config_content, target)?.0)
+}
+
+pub fn test_rule_match_in_config_with_skipped(
+    config_content: &str,
+    target: &str,
+) -> Result<(Option<RuleMatch>, bool)> {
     let yaml: serde_yaml::Value =
         serde_yaml::from_str(config_content).with_context(|| "Failed to parse config.yaml")?;
     let rules = yaml
@@ -762,20 +882,28 @@ pub fn test_rule_match_in_config(config_content: &str, target: &str) -> Result<O
         .and_then(|v| v.as_sequence())
         .ok_or_else(|| anyhow::anyhow!("config.yaml does not contain a rules array"))?;
 
+    let mut skipped_logical = false;
     for (idx, rule_value) in rules.iter().enumerate() {
         let Some(rule) = rule_value.as_str() else {
             continue;
         };
+        if rule.contains('(') {
+            skipped_logical = true;
+            continue;
+        }
         if rule_matches_target(rule, target)? {
-            return Ok(Some(RuleMatch {
-                index: idx + 1,
-                rule: rule.to_string(),
-                policy: rule_policy(rule).unwrap_or_default().to_string(),
-            }));
+            return Ok((
+                Some(RuleMatch {
+                    index: idx + 1,
+                    rule: rule.to_string(),
+                    policy: rule_policy(rule).unwrap_or_default().to_string(),
+                }),
+                skipped_logical,
+            ));
         }
     }
 
-    Ok(None)
+    Ok((None, skipped_logical))
 }
 
 fn rule_matches_target(rule: &str, target: &str) -> Result<bool> {
@@ -864,6 +992,15 @@ fn ipv6_in_cidr(ip: std::net::Ipv6Addr, cidr: &str) -> Result<bool> {
 #[cfg(test)]
 mod rule_test_tests {
     use super::*;
+
+    #[test]
+    fn test_rule_match_reports_skipped_logical_rules() {
+        let config = "rules:\n  - AND,((NETWORK,udp),(DST-PORT,443)),DIRECT\n  - MATCH,DIRECT\n";
+        let (matched, skipped) =
+            test_rule_match_in_config_with_skipped(config, "example.com").unwrap();
+        assert!(skipped, "logical rule must be reported as skipped");
+        assert_eq!(matched.expect("later MATCH must still match").index, 2);
+    }
 
     #[test]
     fn test_rule_match_uses_first_matching_rule() {

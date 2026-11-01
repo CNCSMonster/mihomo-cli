@@ -42,7 +42,7 @@ tun:
     - 192.168.0.0/16
 ```
 
-或在 `rules.yaml` 中添加对应的 `IP-CIDR,...,DIRECT` 规则。检查按 CIDR 区间并集判断覆盖：只写 `10.0.0.0/9` 仍是部分覆盖；`172.64.0.0/13` 等非 RFC1918 的 `172` 段不能替代 `172.16.0.0/12`。该告警只说明静态拓扑风险，不代表内网数据面已经验证可用。
+或在 `rules.yaml` 中添加对应的 `IP-CIDR,...,DIRECT` 规则。检查按 CIDR 区间并集判断覆盖：只写 `10.0.0.0/9` 仍是部分覆盖；`172.64.0.0/13` 等非 RFC1918 的 `172` 段不能替代 `172.16.0.0/12`。该告警只在 `tun.enable: true` 时触发；未启用 TUN 不会告警。它只识别字面 `IP-CIDR`/`GEOIP` 直连规则，`RULE-SET` 等间接私网规则不会被自动识别，需要人工确认。该告警只说明静态拓扑风险，不代表内网数据面已经验证可用。
 
 #### `refusing to use config path ... expected config.yaml`
 
@@ -115,6 +115,12 @@ mihomo-cli tun on
    ```bash
    ls -la ~/.config/mihomo/
    ```
+
+### `doctor` 的 DNS / Split-DNS 判定
+
+`doctor` 只有在**探测域本身命中 `dns.nameserver-policy`**，或**当前系统 resolver 地址位于 `tun.route-exclude-address` 内**时，才把系统 DNS 绕过显示为中性（Split-DNS/直连解析）。仅配置了无关的内网域名策略，或只排除了其他内网网段，仍会报 ❌，因为探测域 `example.com` 没有被该策略覆盖。
+
+排查时确认：`nameserver-policy` 的键是否覆盖探测域（如 `+.example.com`），以及 `/etc/resolv.conf` 中的 resolver 地址是否落在 `route-exclude-address` 的 CIDR 内。该判定只说明配置与探测证据匹配，不证明所有内网解析或数据面已经可用。
 
 ### 重置状态
 

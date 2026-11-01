@@ -11095,6 +11095,10 @@ mod issue_048_pending_visibility_tests {
         assert!(warned
             .detail
             .contains(&format!("发现 pending generation ({id})")));
+        assert_eq!(
+            warned.hint.as_deref(),
+            Some("应用更新: mihomo-cli restart --system")
+        );
     }
 
     /// doctor + status 对不可读信任根：❓「无法判定」、诚实且可执行、零 sudo 计划。
@@ -11284,6 +11288,7 @@ mod issue_048_pending_visibility_tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn doctor_split_dns_intent_detection() {
         let split_dns_config = r#"
@@ -11292,7 +11297,15 @@ dns:
   nameserver-policy:
     '+.corp.example': 10.10.1.1
 "#;
-        assert!(has_split_dns_intent(split_dns_config));
+        assert!(!has_split_dns_intent(split_dns_config, &[]));
+
+        let matching_dns_config = r#"
+dns:
+  enable: true
+  nameserver-policy:
+    '+.example.com': 10.10.1.1
+"#;
+        assert!(has_split_dns_intent(matching_dns_config, &[]));
 
         let route_exclude_config = r#"
 tun:
@@ -11300,7 +11313,7 @@ tun:
   route-exclude-address:
     - 10.0.0.0/8
 "#;
-        assert!(has_split_dns_intent(route_exclude_config));
+        assert!(!has_split_dns_intent(route_exclude_config, &[]));
 
         let normal_config = r#"
 dns:
@@ -11308,13 +11321,44 @@ dns:
 tun:
   enable: true
 "#;
-        assert!(!has_split_dns_intent(normal_config));
+        assert!(!has_split_dns_intent(normal_config, &[]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_split_dns_requires_resolver_or_probe_domain_evidence() {
+        use std::net::{IpAddr, SocketAddr};
+
+        let route_exclude_config = r#"
+tun:
+  enable: true
+  route-exclude-address:
+    - 10.0.0.0/8
+"#;
+        assert!(has_split_dns_intent(
+            route_exclude_config,
+            &[SocketAddr::new(IpAddr::from([10, 0, 0, 1]), 53)]
+        ));
+        assert!(!has_split_dns_intent(
+            route_exclude_config,
+            &[SocketAddr::new(IpAddr::from([192, 0, 2, 53]), 53)]
+        ));
+
+        let matching_dns_config = r#"
+dns:
+  enable: true
+  nameserver-policy:
+    '+.example.com': 10.10.1.1
+"#;
+        assert!(has_split_dns_intent(matching_dns_config, &[]));
     }
 
     #[test]
     fn format_rule_list_annotated_marks_active_and_fallback_rules() {
         let rules = vec![
             "DOMAIN-SUFFIX,corp.example,DIRECT".to_string(),
+            "DOMAIN-SUFFIX,reject.example,REJECT-NO-DROP".to_string(),
+            "AND,((NETWORK,udp),(DST-PORT,443)),REJECT".to_string(),
             "DOMAIN-KEYWORD,openai,OpenRouter".to_string(),
         ];
         let policies = vec!["DIRECT".to_string(), "Proxy".to_string()];
@@ -11329,8 +11373,20 @@ tun:
         assert!(
             lines
                 .iter()
+                .any(|l| l.contains("REJECT-NO-DROP") && l.contains("[Active]")),
+            "REJECT-NO-DROP is a built-in policy and must be active, got: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
                 .any(|l| l.contains("DOMAIN-KEYWORD,openai,OpenRouter") && l.contains("Fallback")),
             "Expected fallback annotation for missing policy rule, got: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("AND,((NETWORK,udp)") && l.contains("[Active]")),
+            "Logical rule with a built-in target must be annotated active, got: {lines:?}"
         );
     }
 
@@ -11390,5 +11446,126 @@ rules:
 
         let checks = doctor_intranet_guard_checks(&config_file);
         assert!(checks.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_system_install_operator_matrix() {
+        // 1. SUDO_USER priority
+        assert_eq!(
+            resolve_system_install_operator_from(Some("alice"), Some("root"), true),
+            Some("alice".to_string())
+        );
+        assert_eq!(
+            resolve_system_install_operator_from(Some("alice"), Some("bob"), false),
+            Some("alice".to_string())
+        );
+        // 2. SUDO_USER is root or empty
+        assert_eq!(
+            resolve_system_install_operator_from(Some("root"), Some("root"), true),
+            None
+        );
+        assert_eq!(
+            resolve_system_install_operator_from(Some(""), Some("root"), true),
+            None
+        );
+        assert_eq!(
+            resolve_system_install_operator_from(Some("   "), Some("root"), true),
+            None
+        );
+        // 3. Fallback to current user when not root
+        assert_eq!(
+            resolve_system_install_operator_from(None, Some("alice"), false),
+            Some("alice".to_string())
+        );
+        // 4. Root without SUDO_USER
+        assert_eq!(
+            resolve_system_install_operator_from(None, Some("root"), true),
+            None
+        );
+        assert_eq!(resolve_system_install_operator_from(None, None, true), None);
+        assert_eq!(
+            resolve_system_install_operator_from(None, None, false),
+            None
+        );
+    }
+
+    #[test]
+    fn test_decide_system_install_group_hint_matrix() {
+        // 在组内不提示 (SilentAlreadyInGroup)
+        assert_eq!(
+            decide_system_install_group_hint(Some("alice"), Some(true)),
+            SystemInstallGroupHintDecision::SilentAlreadyInGroup
+        );
+        // 不在组内提示 (Prompt)
+        assert_eq!(
+            decide_system_install_group_hint(Some("alice"), Some(false)),
+            SystemInstallGroupHintDecision::Prompt
+        );
+        // 无法确定用户不提示 (SkipNoOperator)
+        assert_eq!(
+            decide_system_install_group_hint(None, Some(false)),
+            SystemInstallGroupHintDecision::SkipNoOperator
+        );
+        assert_eq!(
+            decide_system_install_group_hint(Some(""), Some(false)),
+            SystemInstallGroupHintDecision::SkipNoOperator
+        );
+        assert_eq!(
+            decide_system_install_group_hint(Some("root"), Some(false)),
+            SystemInstallGroupHintDecision::SkipNoOperator
+        );
+        // 组检查不可用/失败跳过 (SkipGroupCheckUnavailable)
+        assert_eq!(
+            decide_system_install_group_hint(Some("alice"), None),
+            SystemInstallGroupHintDecision::SkipGroupCheckUnavailable
+        );
+    }
+
+    #[test]
+    fn test_format_system_install_group_hint_text() {
+        let lines = format_system_install_group_hint("testuser");
+        let text = lines.join("\n");
+        assert!(text.contains("mihomo"), "{text}");
+        assert!(text.contains("usermod"), "{text}");
+        assert!(text.contains("testuser"), "{text}");
+        assert!(text.contains("sudo usermod -aG mihomo testuser"), "{text}");
+        assert!(text.contains("override import"), "{text}");
+        assert!(text.contains("status"), "{text}");
+        assert!(
+            !text.contains("Fix: mihomo-cli status"),
+            "must not suggest status as fix: {text}"
+        );
+    }
+
+    #[test]
+    fn test_system_install_group_hint_mode_gate_and_text() {
+        use instance::InstanceMode;
+
+        // user 模式绝不输出。
+        assert_eq!(
+            system_install_group_hint_lines(InstanceMode::User, Some("alice"), Some(false)),
+            None
+        );
+        // system 模式但已在组内 / 无操作者 / 组检查不可用都不输出。
+        assert_eq!(
+            system_install_group_hint_lines(InstanceMode::System, Some("alice"), Some(true)),
+            None
+        );
+        assert_eq!(
+            system_install_group_hint_lines(InstanceMode::System, Some("root"), Some(false)),
+            None
+        );
+        assert_eq!(
+            system_install_group_hint_lines(InstanceMode::System, Some("alice"), None),
+            None
+        );
+        // system 模式且确实不在组内时输出可执行指引。
+        let lines =
+            system_install_group_hint_lines(InstanceMode::System, Some("alice"), Some(false))
+                .expect("system mode + not in group must produce hint lines");
+        let text = lines.join("\n");
+        assert!(text.contains("alice"), "{text}");
+        assert!(text.contains("usermod"), "{text}");
+        assert!(text.contains("sudo usermod -aG mihomo alice"), "{text}");
     }
 }

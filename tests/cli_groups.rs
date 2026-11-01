@@ -400,6 +400,34 @@ fn group_delete_blocked_by_rule_reference() {
     );
 }
 
+/// Test: `group delete` is blocked when a logical rule references the group.
+#[test]
+fn group_delete_blocked_by_logical_rule_reference() {
+    let tmp = TempDir::new().unwrap();
+    setup(tmp.path());
+
+    let create_out = run(
+        tmp.path(),
+        &[
+            "group", "create", "MyGroup", "--type", "select", "--member", "Node-A",
+        ],
+    );
+    assert!(create_out.status.success());
+    std::fs::write(
+        tmp.path().join("rules.yaml"),
+        "rules:\n  - \"AND,((NETWORK,udp),(DST-PORT,443)),MyGroup\"\n",
+    )
+    .unwrap();
+
+    let delete_out = run(tmp.path(), &["group", "delete", "MyGroup"]);
+    assert!(!delete_out.status.success());
+    let stderr = String::from_utf8_lossy(&delete_out.stderr);
+    assert!(
+        stderr.contains("Blocked") || stderr.contains("referenced"),
+        "expected cascade block message, stderr: {stderr}"
+    );
+}
+
 /// Test: `group delete` is blocked when another group's proxies reference it
 #[test]
 fn group_delete_blocked_by_other_group_member_reference() {
