@@ -4,21 +4,7 @@
 
 ---
 
-## 2026-11-01
-
-### 🐛 Bug Fixes
-
-- **system 权限与安装提示** — `install --system` 完成后会在普通用户不在 `mihomo` 组时给出非阻塞加组提示；事务日志权限不足时保持零写入，并按 Linux/macOS/Windows 给出对应恢复路径。
-- **规则与诊断** — `rule test` 对复合规则会提示结果不完整；组删除会识别逻辑规则依赖；`doctor` 的 Split-DNS 与内网守卫判断更准确，减少误报。
-- **macOS 构建修复** — 统一 `stat.st_mode` 的平台类型差异，修复 macOS release 构建失败；同时消除 macOS 上的 unused import 警告。
-- **macOS 首次 system 安装** — 创建代际信任根前先取得一次管理员授权，避免非 root 写入受管目录失败；socket 不存在时不再误报为身份不可证明。
-- **Windows 测试与平台门控** — 规范化源码与手册换行处理，补齐 Windows 跨平台测试及采纳拒绝门控。
-
-### 📚 Documentation
-
-- 更新 system 模式权限、规则降级与故障排查说明。
-
-## 2026-10-31
+## 0.6.0 (2026-11-02)
 
 ### ✨ Features
 
@@ -29,13 +15,14 @@
 
 ### 🐛 Bug Fixes
 
-- 修复 Windows 用户模式启动、服务卸载与命名管道重试的若干可靠性问题。
-- 修复规则降级对复合规则的误改写，以及 TUN/DNS 诊断误判。
-- 修复 selection 清理与配置切换中的并发一致性问题。
+- **system 权限与安装提示** — `install --system` 完成后会在普通用户不在 `mihomo` 组时给出非阻塞加组提示；事务日志权限不足时保持零写入，并按 Linux/macOS/Windows 给出对应恢复路径。
+- **macOS 首次 system 安装与构建** — 创建代际信任根前先取得一次管理员授权，修复非 root 写入失败；统一 `stat.st_mode` 平台类型差异，修复 macOS release 构建。
+- **Windows 测试与平台门控** — 规范化源码与手册换行处理，补齐 Windows 跨平台测试及采纳拒绝门控。
+- **规则与诊断** — `rule test` 对复合规则会提示结果不完整；组删除会识别逻辑规则依赖；`doctor` 的 Split-DNS 与内网守卫判断更准确。
 
 ### 📚 Documentation
 
-- 用户手册按主题拆分并内嵌到二进制；公开文档仅保留 README、用户手册、CHANGELOG 与许可证。
+- 更新 system 模式权限、规则降级与故障排查说明。
 
 ## 2026-10-05
 
