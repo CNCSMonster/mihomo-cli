@@ -626,7 +626,9 @@ rules:
     // Check patch in groups.yaml
     let overlay_path = tmp.path().join("overrides/sub-12345678/groups.yaml");
     let content = std::fs::read_to_string(&overlay_path).unwrap();
-    assert!(content.contains("remove_proxies:\n    - Node-A"));
+    assert!(content
+        .replace("\r\n", "\n")
+        .contains("remove_proxies:\n    - Node-A"));
 
     // Verify it is marked as [patched]
     let list_patched = run(tmp.path(), &["group", "list"]);

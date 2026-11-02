@@ -16,7 +16,10 @@ fn unconfirmed_noninteractive_adoption_fails_before_any_privileged_access() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     let message = String::from_utf8_lossy(&output.stderr);
+    #[cfg(unix)]
     assert!(message.contains("--yes"));
+    #[cfg(not(unix))]
+    assert!(message.contains("Unix"));
     assert!(!message.contains("sudo:"));
 }
 
@@ -26,7 +29,10 @@ fn json_unconfirmed_adoption_is_exactly_one_error_envelope() {
     assert!(!output.status.success());
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["ok"], false);
+    #[cfg(unix)]
     assert!(String::from_utf8_lossy(&output.stdout).contains("--yes"));
+    #[cfg(not(unix))]
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Unix"));
 }
 
 #[test]

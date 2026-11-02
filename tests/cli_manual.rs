@@ -35,7 +35,9 @@ fn manual_default_and_index_are_identical() {
     assert!(index.status.success());
     assert!(default.stderr.is_empty(), "stderr must stay empty");
     let stdout = String::from_utf8_lossy(&default.stdout);
-    assert!(stdout.starts_with("# mihomo-cli 用户手册\n"));
+    assert!(stdout
+        .replace("\r\n", "\n")
+        .starts_with("# mihomo-cli 用户手册\n"));
     assert_eq!(default.stdout, index.stdout);
     assert_untouched(&default_tmp);
     assert_untouched(&index_tmp);
@@ -83,7 +85,10 @@ fn manual_renders_topic_content_verbatim() {
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with("# TUN 透明代理\n"), "stdout:\n{stdout}");
+    assert!(
+        stdout.replace("\r\n", "\n").starts_with("# TUN 透明代理\n"),
+        "stdout:\n{stdout}"
+    );
     assert_untouched(&tmp);
 }
 
