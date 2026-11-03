@@ -346,7 +346,7 @@ jobs:
               sudo useradd -m -s /bin/bash test_unpriv || true
               sudo chmod 770 /var/lib/mihomo-cli 2>/dev/null || true
               set +e
-              OUT=$(sudo -u test_unpriv $CLI override import "$FIXTURE" --system 2>&1)
+              OUT=$(sudo -u test_unpriv $CLI override import "$FIXTURE" 2>&1)
               CODE=$?
               set -e
               echo "$OUT"
@@ -379,7 +379,7 @@ jobs:
               sudo chmod 700 "$TX_DIR"
 
               set +e
-              OUT=$(sudo -u test_unpriv $CLI override import "$FIXTURE" --system 2>&1)
+              OUT=$(sudo -u test_unpriv $CLI override import "$FIXTURE" 2>&1)
               CODE=$?
               set -e
               echo "$OUT"
@@ -416,7 +416,7 @@ jobs:
               icacls.exe "$PROGRAMDATA\\mihomo-cli\\transactions" /deny "$USERNAME:(OI)(CI)(R)"
 
               set +e
-              OUT=$($CLI override import "$FIXTURE" --system 2>&1)
+              OUT=$($CLI override import "$FIXTURE" 2>&1)
               CODE=$?
               set -e
               echo "$OUT"
