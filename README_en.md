@@ -38,6 +38,24 @@ For transparent proxying, explicitly run `mihomo-cli tun on` only after the conf
 
 See the [user guide](docs/user-guide/README.md) for details, or run `mihomo-cli --help` for command-line help.
 
+## Development & Testing
+
+This project supports standard `cargo` workflows as well as convenient `justfile` recipes (requires [just](https://github.com/casey/just)):
+
+```bash
+# 1. Format and Clippy checks
+just check    # or: cargo fmt --check && cargo clippy --all-targets -- -D warnings
+
+# 2. Run unit and integration tests
+just test     # or: cargo test
+
+# 3. Build locally
+just build    # or: cargo build
+just build-release # or: cargo build --release
+```
+
+Run `just --list` to inspect all available recipes (including container E2E and cross-compilation tasks).
+
 ## Feedback
 
 Please open a [GitHub Issue](https://github.com/CNCSMonster/mihomo-cli/issues) for questions or suggestions.

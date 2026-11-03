@@ -38,6 +38,24 @@ mihomo-cli list
 
 更多操作与注意事项见[用户手册](docs/user-guide/README.md)；命令行帮助可通过 `mihomo-cli --help` 查看。
 
+## 本地开发与测试
+
+本项目支持标准 `cargo` 命令，也提供了便捷的 `justfile` 任务入口（需安装 [just](https://github.com/casey/just)）：
+
+```bash
+# 1. 快速检查代码格式与 Clippy Lint
+just check    # 或 cargo fmt --check && cargo clippy --all-targets -- -D warnings
+
+# 2. 运行单元与集成测试
+just test     # 或 cargo test
+
+# 3. 本地构建
+just build    # 或 cargo build
+just build-release # 或 cargo build --release
+```
+
+运行 `just --list` 可查看完整的可用命令列表（含容器端到端测试与交叉编译任务）。
+
 ## 反馈
 
 问题和建议请提交 [GitHub Issue](https://github.com/CNCSMonster/mihomo-cli/issues)。
