@@ -33,7 +33,7 @@ if [ -f "$FAKE_CORE" ]; then
     cp -f "$FAKE_CORE" "$CORE" || fail "cannot install fake core"
 fi
 "$CORE" -v | grep -q fake || fail "fake core missing at $CORE"
-cp -f /work/target/release/mihomo-cli /usr/local/bin/mihomo-cli
+[ -f /work/target/release/mihomo-cli ] && cp -f /work/target/release/mihomo-cli /usr/local/bin/mihomo-cli
 systemctl stop mihomo 2>/dev/null || true
 systemctl disable mihomo 2>/dev/null || true
 rm -f /etc/systemd/system/mihomo.service
@@ -81,24 +81,59 @@ chown root:root "$RT/cache.db"
 chmod 0644 "$RT/cache.db"
 echo "2 PASS (injected all-zero cache.db with root ownership)"
 
+step "2.1 等待 daemon 60s 诊断 tick 告警"
+# 等 daemon 诊断 tick（60s 周期，留 80s 余量）
+ALERT_SEEN=0
+for i in $(seq 1 16); do
+    if grep -q "cache.db is" /tmp/daemon-hygiene.log 2>/dev/null; then
+        ALERT_SEEN=1
+        break
+    fi
+    sleep 5
+done
+[ "$ALERT_SEEN" = 1 ] || { tail -20 /tmp/daemon-hygiene.log; fail "daemon never diagnosed corrupt/permission-drift cache.db on 60s tick"; }
+grep "cache.db is" /tmp/daemon-hygiene.log | grep -q "mihomo-cli restart --system" \
+    || fail "cache.db diagnosis alert is missing the one-click fix command"
+echo "2.1 PASS (diagnosed cache.db on 60s tick)"
+
 step "3 restart: 断言确认合同、停机窗口隔离、留证 K=3"
 # restart 应该检测到异常 cache.db 并隔离
 OUT=$($CLI restart --system --yes 2>&1) || { echo "$OUT"; fail "restart failed"; }
 echo "$OUT"
-# 检查是否有 quarantine 相关输出
-echo "$OUT" | grep -qi "quarantine\|cache.db\|isolat" || echo "(restart may have handled cache.db silently)"
-# 检查 quarantine 文件是否存在
+# C1 修复合同：root 属主的 cache.db 必须先修权限（或明确报告 repair_required），不得静默放行
+echo "$OUT" | grep -qi "permission\|repair" || fail "restart did not surface the ownership/permission repair contract"
+# A2：内容不合格必须在停机窗口内隔离留证，且路径可解释
+echo "$OUT" | grep -qi "quarantine" || fail "restart did not report cache.db quarantine"
 QUARANTINE_COUNT=$(ls -1 "$RT"/cache.db.corrupt-* 2>/dev/null | wc -l)
 echo "quarantine artifacts: $QUARANTINE_COUNT"
+[ "$QUARANTINE_COUNT" -ge 1 ] || fail "no quarantine artifact was produced for the all-zero cache.db"
 # K=3 retention: 最多保留 3 个
 [ "$QUARANTINE_COUNT" -le 3 ] || fail "quarantine retention exceeded K=3: $QUARANTINE_COUNT"
 echo "3 PASS"
 
 step "4 core 正常起"
-# 检查 core 是否正常运行
-sleep 2
-pgrep -f "$(basename "$CORE")" >/dev/null || fail "core not running after restart"
+# 检查 core 是否正常运行（CLI 观测到的 API 可达，而非进程名子串匹配）
+STATUS_OUT=$($CLI status --system 2>&1) || { echo "$STATUS_OUT"; fail "status failed after restart"; }
+echo "$STATUS_OUT" | grep -q "API: *reachable" || { echo "$STATUS_OUT"; fail "core API is not reachable after quarantine + restart"; }
+# 留证必须保留原始字节（16 KiB 全零），不是空壳
+QFILE=$(ls -1 "$RT"/cache.db.corrupt-* 2>/dev/null | head -1)
+[ -n "$QFILE" ] || fail "quarantine artifact disappeared"
+[ "$(stat -c %s "$QFILE")" = 16384 ] || fail "quarantine artifact did not preserve the original bytes ($(stat -c %s "$QFILE") bytes)"
 echo "4 PASS"
+
+step "5 留证 K=3：连续再隔离 3 次只保留最新 3 份"
+for i in 1 2 3; do
+    $CLI stop --system >/dev/null 2>&1; sleep 1
+    head -c 16384 /dev/zero > "$RT/cache.db"
+    chown root:root "$RT/cache.db"
+    chmod 0644 "$RT/cache.db"
+    OUT=$($CLI restart --system --yes 2>&1) || { echo "$OUT"; fail "restart $i failed during the K=3 retention run"; }
+    sleep 1
+done
+COUNT=$(ls -1 "$RT"/cache.db.corrupt-* 2>/dev/null | wc -l)
+echo "quarantine artifacts after 4 isolations: $COUNT"
+[ "$COUNT" -eq 3 ] || fail "K=3 retention violated: expected 3 artifacts after 4 isolations, got $COUNT"
+echo "5 PASS"
 
 step "ALL PASS"
 cleanup

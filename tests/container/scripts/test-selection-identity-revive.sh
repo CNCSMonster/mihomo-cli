@@ -35,7 +35,7 @@ if [ -f "$FAKE_CORE" ]; then
     cp -f "$FAKE_CORE" "$CORE" || fail "cannot install fake core"
 fi
 "$CORE" -v | grep -q fake || fail "fake core missing at $CORE"
-cp -f /work/target/release/mihomo-cli /usr/local/bin/mihomo-cli
+[ -f /work/target/release/mihomo-cli ] && cp -f /work/target/release/mihomo-cli /usr/local/bin/mihomo-cli
 systemctl stop mihomo 2>/dev/null || true
 systemctl disable mihomo 2>/dev/null || true
 rm -f /etc/systemd/system/mihomo.service
@@ -81,16 +81,23 @@ OUT=$($CLI select --system --group Test --node DIRECT 2>&1) || { echo "$OUT"; fa
 echo "1 PASS"
 
 step "2 switch + remove: 切换到另一订阅并删除原订阅"
-# 添加第二个订阅
-OUT=$($CLI config --add "$SUB_URL" --yes 2>&1) || { echo "$OUT"; fail "second config --add failed"; }
+# 第二个订阅必须是不同 URL——同 URL 走的是 revive/复用路径，无法构成「原订阅退役」
+SUB2_URL="http://127.0.0.1:$PORT/sub2"
+OUT=$($CLI config --add "$SUB2_URL" --activate --yes 2>&1) || { echo "$OUT"; fail "second config --add failed"; }
+SECOND_ID=$(tr -d '[:space:]' < "$MIRROR_DIR/active") || fail "second mirror active pointer missing"
+[ "$SECOND_ID" != "$SUB_ID" ] || fail "second add reused the first subscription id ($SECOND_ID)"
 # 记录原始 ID
 ORIG_ID="$SUB_ID"
 # 删除原订阅（retire）
 OUT=$($CLI config --remove "$ORIG_ID" --yes 2>&1) || { echo "$OUT"; fail "config --remove failed"; }
+grep -q "retired: true" "$CFG/subscriptions.yaml" || fail "remove did not leave a retired tombstone"
+grep -A6 "id: $ORIG_ID" "$CFG/subscriptions.yaml" | grep -q "retired: true" \
+    || fail "retired marker missing on $ORIG_ID"
 echo "2 PASS"
 
 step "3 add 同 URL: 复活同一 ID"
-OUT=$($CLI config --add "$SUB_URL" --yes 2>&1) || { echo "$OUT"; fail "revive config --add failed"; }
+OUT=$($CLI config --add "$SUB_URL" --activate --yes 2>&1) || { echo "$OUT"; fail "revive config --add failed"; }
+echo "$OUT" | grep -q "revived" || { echo "$OUT"; fail "config --add did not report a revival"; }
 REVIVED_ID=$(tr -d '[:space:]' < "$MIRROR_DIR/active") || fail "revived mirror active pointer missing"
 echo "revived subscription: $REVIVED_ID"
 [ "$REVIVED_ID" = "$ORIG_ID" ] || fail "revive did not restore the same subscription ID (expected $ORIG_ID, got $REVIVED_ID)"
@@ -100,7 +107,10 @@ step "4 restart: 选点恢复"
 $CLI restart --system --yes >/dev/null 2>&1; sleep 2
 [ -f "$CFG/selections/$REVIVED_ID.yaml" ] || fail "selection file missing after restart"
 # 选点内容应延续
-grep -q "Test" "$CFG/selections/$REVIVED_ID.yaml" || fail "selection content lost after revive + restart"
+grep -q "Test: DIRECT" "$CFG/selections/$REVIVED_ID.yaml" || fail "selection content lost after revive + restart"
+# 意图必须真正参与比对：doctor 的只读 drift 检查须看到 1 项一致（而非「无持久化选点」）
+$CLI doctor --system 2>&1 | grep -q "Selection drift.*一致（1 项）\|一致（1 项）" \
+    || { $CLI doctor --system 2>&1 | grep -A1 "Selection drift"; fail "doctor did not report a consistent 1-entry intent after restart"; }
 echo "4 PASS"
 
 step "ALL PASS"

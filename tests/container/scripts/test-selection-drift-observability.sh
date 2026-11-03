@@ -35,7 +35,7 @@ if [ -f "$FAKE_CORE" ]; then
     cp -f "$FAKE_CORE" "$CORE" || fail "cannot install fake core"
 fi
 "$CORE" -v | grep -q fake || fail "fake core missing at $CORE"
-cp -f /work/target/release/mihomo-cli /usr/local/bin/mihomo-cli
+[ -f /work/target/release/mihomo-cli ] && cp -f /work/target/release/mihomo-cli /usr/local/bin/mihomo-cli
 systemctl stop mihomo 2>/dev/null || true
 systemctl disable mihomo 2>/dev/null || true
 rm -f /etc/systemd/system/mihomo.service
@@ -77,35 +77,48 @@ echo "active subscription: $SUB_ID"
 OUT=$($CLI select --system --group Test --node DIRECT 2>&1) || { echo "$OUT"; fail "select failed"; }
 echo "1 PASS"
 
-step "2 API 旁路切换: 直接调 Core API 切换选点（绕过 CLI/daemon）"
-# 等 daemon 采样一次（60s 周期，测试环境可能更快）
-# 直接通过 fake core 的 PUT 记录来模拟旁路切换
-# fake core 记录所有 PUT /proxies/Test 请求
-# 我们直接修改 mirror 来模拟 drift
-echo "Test: OTHER_NODE" > "$MIRROR_DIR/$SUB_ID.yaml"
-# 等 daemon 采样（最多等 70s）
-for i in $(seq 1 14); do
-    STATUS_OUT=$($CLI status --system --json 2>/dev/null) || true
-    if echo "$STATUS_OUT" | grep -q "drift"; then
+step "2 旁路切换: 运行态与持久意图不一致（fake core 静态返回 Test=DIRECT）"
+# fake core 的 GET /proxies 固定为 Test→DIRECT，无法制造 runtime 变化；等价构造
+# 「runtime≠intent」的另一半：把镜图像素改成 runtime 不存在的节点。比对逻辑对称，
+# 仍走 daemon 的 60s 只读采样 + 单调序号屏障完整路径。
+cat > "$MIRROR_DIR/$SUB_ID.yaml" <<'MIRROR'
+selections:
+  Test: OTHER_NODE
+MIRROR
+DRIFT_SEEN=0
+for i in $(seq 1 16); do
+    STATUS_OUT=$($CLI status --system 2>/dev/null) || true
+    if echo "$STATUS_OUT" | grep -q "Selection drift: [1-9]"; then
+        DRIFT_SEEN=1
         break
     fi
     sleep 5
 done
-echo "2 PASS (drift should be observable)"
+[ "$DRIFT_SEEN" = 1 ] || {
+    echo "$($CLI status --system 2>&1)"
+    fail "drift was not observable within 80s (expected ≤65s on healthy sampling)"
+}
+echo "2 PASS (drift observable)"
 
 step "3 一键固化: 用 status 输出的 fix 命令固化"
 STATUS_OUT=$($CLI status --system 2>&1) || true
 echo "$STATUS_OUT" | grep -q "Fix:" || { echo "status output:"; echo "$STATUS_OUT"; fail "status must show fix command"; }
-FIX_CMD=$(echo "$STATUS_OUT" | grep "Fix:" | head -1 | sed 's/.*Fix:\s*//')
+FIX_CMD=$(echo "$STATUS_OUT" | grep "Fix:" | head -1 | sed 's/.*Fix: *//')
 echo "fix command: $FIX_CMD"
-# 执行固化命令
+# 固化命令必须把 intent 追平到 runtime 节点
+echo "$FIX_CMD" | grep -q "select" && echo "$FIX_CMD" | grep -q "DIRECT" \
+    || fail "fix command does not converge to the runtime node: $FIX_CMD"
 eval "$FIX_CMD" 2>&1 || fail "fix command failed"
+grep -q "DIRECT" "$MIRROR_DIR/$SUB_ID.yaml" || fail "fix did not persist the runtime node into the mirror"
 echo "3 PASS"
 
 step "4 restart 不回退: restart 后选点保持固化结果"
 $CLI restart --system --yes >/dev/null 2>&1; sleep 2
-# 检查 mirror 内容
-grep -q "OTHER_NODE" "$MIRROR_DIR/$SUB_ID.yaml" || fail "restart reverted the fix"
+# restart 不得把固化结果回退成旧的 OTHER_NODE 意图
+grep -q "OTHER_NODE" "$MIRROR_DIR/$SUB_ID.yaml" && fail "restart reverted the fix back to the drifted intent"
+grep -q "Test: DIRECT" "$MIRROR_DIR/$SUB_ID.yaml" || fail "restart lost the converged selection"
+$CLI doctor --system 2>&1 | grep -q "一致（1 项）" \
+    || { $CLI doctor --system 2>&1 | grep -A1 "Selection drift"; fail "doctor does not see a consistent intent after restart"; }
 echo "4 PASS"
 
 step "ALL PASS"

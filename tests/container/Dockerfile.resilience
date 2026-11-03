@@ -1,0 +1,29 @@
+# Runtime-only image for the resilience E2E contracts (identity revive, drift observability, cache.db hygiene, stale TUN diagnosis).
+# Like Dockerfile.tun-contract it bakes the prepared artifacts, but keeps the
+# mock subscription server and the shell tooling the resilience scripts use.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    procps \
+    python3 \
+    sudo \
+    systemd \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY target/container-test/mihomo-cli /usr/local/bin/mihomo-cli
+COPY target/container-test/mihomo /usr/local/lib/mihomo/mihomo
+COPY tests/container/scripts/ /tests/scripts/
+COPY tests/container/mock/ /tests/mock/
+
+RUN chmod 755 /usr/local/bin/mihomo-cli /usr/local/lib/mihomo/mihomo /tests/scripts/*.sh && \
+    mkdir -p /var/lib/mihomo-cli /var/run/mihomo /var/log/mihomo /root/.config/mihomo && \
+    useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin mihomo && \
+    systemctl mask systemd-udevd.service systemd-udevd-kernel.socket \
+      systemd-udevd-control.socket systemd-modules-load.service \
+      systemd-networkd.service systemd-resolved.service && \
+    : > /etc/machine-id
+
+WORKDIR /tests

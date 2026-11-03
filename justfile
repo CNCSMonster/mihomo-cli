@@ -103,6 +103,12 @@ real-core-systemd-test:
 real-core-select-promotion-test:
     bash tests/container/real-core-select-promotion-test.sh
 
+# 严格验证 selection mirror 韧性 / cache.db 卫生 / TUN 事务诊断的容器合约
+test-resilience-contract *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bash tests/container/resilience-test.sh {{ARGS}}
+
 # 聚合入口：runner 自检 + 全部离线容器测试 + user mode + 严格 systemd 合约
 quick-test:
     bash tests/container/quick-test.sh

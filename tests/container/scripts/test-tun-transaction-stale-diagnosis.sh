@@ -15,6 +15,7 @@ export HOME=/root
 IPC_SOCK=/var/run/mihomo/service.sock
 PORT=$((20000 + RANDOM % 20000))
 TX_DIR="$RT/transactions"
+ACTIVE_TX_DIR="$TX_DIR/active"
 
 step() { printf '\n########## %s ##########\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$1" >&2; printf '%s\n' '---- daemon log ----' >&2; tail -n 40 /tmp/daemon-tun.log >&2 || true; cleanup; exit 1; }
@@ -34,7 +35,7 @@ if [ -f "$FAKE_CORE" ]; then
     cp -f "$FAKE_CORE" "$CORE" || fail "cannot install fake core"
 fi
 "$CORE" -v | grep -q fake || fail "fake core missing at $CORE"
-cp -f /work/target/release/mihomo-cli /usr/local/bin/mihomo-cli
+[ -f /work/target/release/mihomo-cli ] && cp -f /work/target/release/mihomo-cli /usr/local/bin/mihomo-cli
 systemctl stop mihomo 2>/dev/null || true
 systemctl disable mihomo 2>/dev/null || true
 rm -f /etc/systemd/system/mihomo.service
@@ -76,52 +77,86 @@ echo "1 PASS"
 step "2 注入旧 RollbackPending journal"
 # 停机
 $CLI stop --system >/dev/null 2>&1; sleep 2
-# 创建 transactions 目录并注入旧 journal
-mkdir -p "$TX_DIR"
-cat > "$TX_DIR/active-journal.json" <<'EOF'
+# journal 真实位置是 transactions/active/journal.json（active_dir + journal.json），
+# 且必须是完整 schema——缺必填字段会让 read_active_journal 反序列化失败、诊断与 reset 全部静默。
+mkdir -p "$ACTIVE_TX_DIR"
+cat > "$ACTIVE_TX_DIR/journal.json" <<'EOF'
 {
   "schema_version": 1,
   "transaction_id": "tx-old-stale",
   "generation": 1,
   "phase": "RollbackPending",
-  "created_at": "2020-01-01T00:00:00+00:00",
-  "updated_at": "2020-01-01T00:00:00+00:00",
+  "original_uid": 0,
+  "target_runtime_tun": true,
+  "candidate_revision": "1111111111111111111111111111111111111111111111111111111111111111",
   "old_runtime_digest": "0000000000000000000000000000000000000000000000000000000000000000",
-  "candidate_runtime_digest": "0000000000000000000000000000000000000000000000000000000000000000"
+  "updated_at": "2020-01-01T00:00:00+00:00"
 }
 EOF
 chown -R mihomo:mihomo "$TX_DIR" 2>/dev/null || true
-chmod 750 "$TX_DIR"
-chmod 640 "$TX_DIR/active-journal.json"
+chmod 750 "$TX_DIR" "$ACTIVE_TX_DIR"
+chmod 640 "$ACTIVE_TX_DIR/journal.json"
+# 注入必须被产品真正读到（否则后续断言全部空转）
+python3 - "$ACTIVE_TX_DIR/journal.json" <<'PY' || fail "injected journal is not readable/parseable by the expected schema"
+import json, sys
+data = json.load(open(sys.argv[1]))
+required = {"schema_version", "transaction_id", "generation", "phase",
+            "original_uid", "target_runtime_tun", "candidate_revision", "old_runtime_digest"}
+missing = required - set(data)
+if missing:
+    raise SystemExit(f"fixture missing required journal fields: {sorted(missing)}")
+PY
+# 产品必须真正读到这个 journal：可变更路径的运行时应用必须如实报出在途事务（不得静默）
+OUT=$($CLI config --refresh --yes 2>&1) || { echo "$OUT"; fail "config --refresh failed hard under an in-flight journal"; }
+echo "$OUT" | grep -q "tx-old-stale" || { echo "$OUT"; fail "mutation path did not surface the in-flight transaction"; }
 echo "2 PASS (injected stale RollbackPending journal)"
 
 step "3 只读命令可用"
-# status 应该仍然可用
+# 只读命令必须仍在非终态 journal 下工作（B4 豁免）
 OUT=$($CLI status --system 2>&1) || { echo "$OUT"; fail "status failed with stale journal"; }
 echo "$OUT" | head -5
+OUT=$($CLI tun status 2>&1) || { echo "$OUT"; fail "tun status failed with stale journal"; }
+echo "$OUT" | head -4
+OUT=$($CLI config --list 2>&1) || { echo "$OUT"; fail "config --list failed with stale journal"; }
 echo "3 PASS (read-only commands work)"
 
 step "4 告警含一键命令"
-# 等 daemon 诊断 tick（最多等 70s）
-for i in $(seq 1 14); do
-    if grep -q "TUN transaction.*stale\|RollbackPending" /tmp/daemon-tun.log 2>/dev/null; then
+# 等 daemon 诊断 tick（60s 周期，留 80s 余量）
+ALERT_SEEN=0
+for i in $(seq 1 16); do
+    if grep -q "TUN transaction tx-old-stale" /tmp/daemon-tun.log 2>/dev/null; then
+        ALERT_SEEN=1
         break
     fi
     sleep 5
 done
-# 检查 daemon 日志是否有告警
-grep -q "TUN transaction\|stale\|restart --system" /tmp/daemon-tun.log || echo "(daemon may not have diagnosed yet)"
+[ "$ALERT_SEEN" = 1 ] || { tail -20 /tmp/daemon-tun.log; fail "daemon never diagnosed the stale journal on its 60s tick"; }
+grep "TUN transaction tx-old-stale" /tmp/daemon-tun.log | grep -q "stale" \
+    || fail "diagnosis did not classify the journal as stale"
+grep "TUN transaction tx-old-stale" /tmp/daemon-tun.log | grep -q "mihomo-cli restart --system" \
+    || fail "diagnosis alert is missing the one-click fix command"
 echo "4 PASS"
 
 step "5 显式 restart 受控 reset 恢复"
+# SPEC B2：RollbackPending 执行超时后的 durable 后继相位是 RecoveryRequired，
+# 其唯一后继是显式 restart 受控 reset（不再规划 RetryApply）。把注入态推进到该相位，
+# 并让 intent 与 base 同源，从而命中 RefuseNeedsEvidence → 受控 reset 分支。
+BASE_REV=$(sha256sum "$CFG/config.yaml" | cut -d' ' -f1)
+python3 - "$ACTIVE_TX_DIR/journal.json" "$BASE_REV" <<'PY' || fail "failed to advance the fixture to RecoveryRequired"
+import json, sys
+path, base = sys.argv[1], sys.argv[2]
+data = json.load(open(path))
+data["phase"] = "RecoveryRequired"
+data["base_intent_revision"] = base
+json.dump(data, open(path, "w"))
+PY
 OUT=$($CLI restart --system --yes 2>&1) || { echo "$OUT"; fail "restart failed"; }
 echo "$OUT"
-# 检查 journal 是否被清理或 reset
-if [ -f "$TX_DIR/active-journal.json" ]; then
-    PHASE=$(python3 -c "import json; print(json.load(open('$TX_DIR/active-journal.json')).get('phase', 'unknown'))" 2>/dev/null || echo "unknown")
-    echo "journal phase after restart: $PHASE"
-    [ "$PHASE" != "RollbackPending" ] || fail "restart did not reset the stale journal"
-fi
+echo "$OUT" | grep -q "重置 mihomo 运行状态\|reset" || { echo "$OUT"; fail "restart did not run the controlled reset"; }
+[ ! -e "$ACTIVE_TX_DIR/journal.json" ] || fail "controlled reset left the stale journal in place"
+ls -d "$TX_DIR"/gc/reset-1-tx-old-stale >/dev/null 2>&1 || fail "controlled reset did not quarantine the transaction under gc/"
+STATUS_OUT=$($CLI status --system 2>&1) || true
+echo "$STATUS_OUT" | grep -q "API: *reachable" || { echo "$STATUS_OUT"; fail "runtime not re-established after the controlled reset"; }
 echo "5 PASS"
 
 step "ALL PASS"
