@@ -319,6 +319,133 @@ jobs:
           echo "=== doctor in system mode ==="
           $CLI doctor --system || true
 
+      - name: Verify unprivileged user boundaries and platform EACCES recovery (regression)
+        shell: bash
+        run: |
+          # Regression test for platform-specific EACCES recovery under an unprivileged identity:
+          # Verify that privileged operations with an unprivileged identity or under unreadable state dir:
+          # 1. Fail closed (exit code != 0) with zero configuration modifications;
+          # 2. Emit accurate platform-specific recovery guidance (Linux/macOS/Windows);
+          # 3. Strictly exclude the deadlocking advice "Fix: mihomo-cli status".
+
+          case "${{ matrix.os }}" in
+            windows-latest)
+              FIXTURE="$TEMP/test-override-unpriv.yaml"
+              printf "proxy-groups:\n  - name: UnprivTest\n    type: select\n    proxies:\n      - DIRECT\n" > "$FIXTURE"
+              ;;
+            *)
+              FIXTURE="/tmp/test-override-unpriv.yaml"
+              printf "proxy-groups:\n  - name: UnprivTest\n    type: select\n    proxies:\n      - DIRECT\n" > "$FIXTURE"
+              chmod 644 "$FIXTURE"
+              ;;
+          esac
+
+          case "${{ matrix.os }}" in
+            ubuntu-latest)
+              echo "=== Linux unprivileged boundary test ==="
+              sudo useradd -m -s /bin/bash test_unpriv || true
+              sudo chmod 770 /var/lib/mihomo-cli 2>/dev/null || true
+              set +e
+              OUT=$(sudo -u test_unpriv $CLI override import "$FIXTURE" --system 2>&1)
+              CODE=$?
+              set -e
+              echo "$OUT"
+              sudo userdel -r test_unpriv 2>/dev/null || true
+              if [ $CODE -eq 0 ]; then
+                echo "ERROR: unprivileged override import on Linux should fail"
+                exit 1
+              fi
+              echo "$OUT" | grep -F "0770 root:mihomo" || { echo "ERROR: missing 0770 root:mihomo"; exit 1; }
+              echo "$OUT" | grep -F "usermod" || { echo "ERROR: missing usermod hint"; exit 1; }
+              echo "$OUT" | grep -F "Your configuration was NOT modified" || { echo "ERROR: missing zero-write confirmation"; exit 1; }
+              if echo "$OUT" | grep -F "Fix: mihomo-cli status"; then
+                echo "ERROR: must not suggest status as fix on permission error"
+                exit 1
+              fi
+              ;;
+
+            macos-latest)
+              echo "=== macOS unprivileged boundary test ==="
+              sudo dscl . -create /Users/test_unpriv 2>/dev/null || true
+              sudo dscl . -create /Users/test_unpriv UserShell /bin/zsh 2>/dev/null || true
+              sudo dscl . -create /Users/test_unpriv UniqueID 1999 2>/dev/null || true
+              sudo dscl . -create /Users/test_unpriv PrimaryGroupID 20 2>/dev/null || true
+              sudo dscl . -create /Users/test_unpriv NFSHomeDirectory /Users/test_unpriv 2>/dev/null || true
+              sudo createhomedir -c -u test_unpriv >/dev/null 2>&1 || true
+
+              TX_DIR="/Library/Application Support/mihomo-cli/transactions"
+              sudo mkdir -p "$TX_DIR"
+              sudo chown -R root:wheel "$TX_DIR"
+              sudo chmod 700 "$TX_DIR"
+
+              set +e
+              OUT=$(sudo -u test_unpriv $CLI override import "$FIXTURE" --system 2>&1)
+              CODE=$?
+              set -e
+              echo "$OUT"
+
+              sudo dscl . -delete /Users/test_unpriv 2>/dev/null || true
+              sudo rm -rf /Users/test_unpriv 2>/dev/null || true
+              sudo chmod 755 "$TX_DIR" 2>/dev/null || true
+
+              if [ $CODE -eq 0 ]; then
+                echo "ERROR: unprivileged override import on macOS should fail"
+                exit 1
+              fi
+              if ! echo "$OUT" | grep -E "LaunchDaemon|root:wheel"; then
+                echo "ERROR: macOS output should contain LaunchDaemon or root:wheel hint"
+                exit 1
+              fi
+              echo "$OUT" | grep -F "Your configuration was NOT modified" || { echo "ERROR: missing zero-write confirmation"; exit 1; }
+              if echo "$OUT" | grep -F "usermod"; then
+                echo "ERROR: macOS output must not contain 'usermod'"
+                exit 1
+              fi
+              if echo "$OUT" | grep -F "Fix: mihomo-cli status"; then
+                echo "ERROR: macOS output must not suggest 'Fix: mihomo-cli status'"
+                exit 1
+              fi
+              ;;
+
+            windows-latest)
+              echo "=== Windows unprivileged / DACL boundary test ==="
+              TX_DIR="$PROGRAMDATA/mihomo-cli/transactions"
+              mkdir -p "$TX_DIR"
+
+              # Deny read access to transactions directory for the current user to trigger Win32 EACCES
+              icacls.exe "$PROGRAMDATA\\mihomo-cli\\transactions" /deny "$USERNAME:(OI)(CI)(R)"
+
+              set +e
+              OUT=$($CLI override import "$FIXTURE" --system 2>&1)
+              CODE=$?
+              set -e
+              echo "$OUT"
+
+              # Restore ACL permissions
+              icacls.exe "$PROGRAMDATA\\mihomo-cli\\transactions" /remove:d "$USERNAME" || true
+
+              if [ $CODE -eq 0 ]; then
+                echo "ERROR: restricted override import on Windows should fail"
+                exit 1
+              fi
+              if ! echo "$OUT" | grep -E "%ProgramData%|DACL|icacls"; then
+                echo "ERROR: Windows output should contain ProgramData/DACL/icacls hint"
+                exit 1
+              fi
+              echo "$OUT" | grep -F "Your configuration was NOT modified" || { echo "ERROR: missing zero-write confirmation"; exit 1; }
+              if echo "$OUT" | grep -F "0770 root:mihomo"; then
+                echo "ERROR: Windows output must not contain Linux group hint"
+                exit 1
+              fi
+              if echo "$OUT" | grep -F "Fix: mihomo-cli status"; then
+                echo "ERROR: Windows output must not suggest 'Fix: mihomo-cli status'"
+                exit 1
+              fi
+              ;;
+          esac
+
+          rm -f "$FIXTURE"
+
       - name: System mode uninstall
         shell: bash
         run: |
