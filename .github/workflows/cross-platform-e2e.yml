@@ -346,7 +346,7 @@ jobs:
               sudo useradd -m -s /bin/bash testuser || true
               sudo chmod 770 /var/lib/mihomo-cli 2>/dev/null || true
               set +e
-              OUT=$(sudo -u testuser env HOME=/home/testuser $CLI override import "$FIXTURE" 2>&1)
+              OUT=$(sudo -u testuser env -u SUDO_UID HOME=/home/testuser $CLI override import "$FIXTURE" 2>&1)
               CODE=$?
               set -e
               echo "$OUT"
@@ -379,7 +379,7 @@ jobs:
               sudo chmod 700 "$TX_DIR"
 
               set +e
-              OUT=$(sudo -u testuser env HOME=/Users/testuser $CLI override import "$FIXTURE" 2>&1)
+              OUT=$(sudo -u testuser env -u SUDO_UID HOME=/Users/testuser $CLI override import "$FIXTURE" 2>&1)
               CODE=$?
               set -e
               echo "$OUT"
@@ -408,36 +408,102 @@ jobs:
               ;;
 
             windows-latest)
-              echo "=== Windows unprivileged / DACL boundary test ==="
-              TX_DIR="$PROGRAMDATA/mihomo-cli/transactions"
-              mkdir -p "$TX_DIR"
+              echo "=== Windows standard-user boundary test ==="
+              PUB_TMP="$(cygpath -u 'C:\Windows\Temp')"
+              TX_DIR="$ProgramData/mihomo-cli/transactions"
+              TX_DIR_U="$(cygpath -u "$TX_DIR")"
+              # 为什么不用 icacls /deny：system 模式的写入由 LocalSystem daemon 代理，
+              # 对当前管理员 deny 读权限无法影响 SYSTEM，CLI 仍会成功。
+              # 为什么不用 Start-Process -Credential：runner 以服务方式运行，创建登录会话
+              # 常返回 Access is denied（依赖 seclogon）。
+              # 采用 schtasks /RU /RP：由 Task Scheduler 以标准用户身份非交互运行，可真实覆盖 D5 场景。
+              PW='MihomoTest#2026x'
+              powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "if (-not (Get-LocalUser -Name testuser -ErrorAction SilentlyContinue)) { New-LocalUser -Name testuser -Password (ConvertTo-SecureString '$PW' -AsPlainText -Force) -PasswordNeverExpires | Out-Null }"
+              if ! MSYS_NO_PATHCONV=1 net.exe user testuser >/dev/null 2>&1; then
+                echo "ERROR: failed to create local testuser (see New-LocalUser output above)"
+                exit 1
+              fi
+              echo "created local standard user: testuser"
+              # 标准用户默认没有「作为批处理作业登录」权限；不授予则计划任务不会启动（0x41303）
+              cat > "$PUB_TMP/grant-batch.ps1" <<'PS1'
+              $sid = (Get-LocalUser -Name 'testuser').SID.Value
+              $cfg = Join-Path $env:TEMP 'mihomo-secpol.inf'
+              secedit /export /cfg $cfg /quiet | Out-Null
+              $lines = Get-Content $cfg -Encoding Unicode
+              $line = $lines | Where-Object { $_ -match '^SeBatchLogonRight' } | Select-Object -First 1
+              if ($line) {
+                $cur = ($line -split '=', 2)[1].Trim()
+                $new = if ($cur) { $cur + ',*' + $sid } else { '*' + $sid }
+                $lines = $lines -replace [regex]::Escape($line), ('SeBatchLogonRight = ' + $new)
+              } else {
+                $lines += ('SeBatchLogonRight = *' + $sid)
+              }
+              $lines | Set-Content $cfg -Encoding Unicode
+              secedit /configure /db (Join-Path $env:TEMP 'mihomo-secedit.sdb') /cfg $cfg /areas USER_RIGHTS /quiet | Out-Null
+          PS1
+              powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$PUB_TMP/grant-batch.ps1")"
+              MSYS_NO_PATHCONV=1 net.exe localgroup Users testuser >/dev/null 2>&1 || true
+              cp "$FIXTURE" "$PUB_TMP/mihomo-unpriv.yaml"
+              chmod 644 "$PUB_TMP/mihomo-unpriv.yaml" 2>/dev/null || true
+              CLI_WIN="$(cygpath -w "$CLI")"
+              FIX_WIN="$(cygpath -w "$PUB_TMP/mihomo-unpriv.yaml")"
+              OUT_WIN="$(cygpath -w "$PUB_TMP/mihomo-unpriv.out")"
+              icacls.exe "$(cygpath -w "$(dirname "$CLI")")" /grant 'testuser:(OI)(CI)RX' >/dev/null 2>&1 || true
 
-              # Deny read access to transactions directory for the current user to trigger Win32 EACCES
-              icacls.exe "$PROGRAMDATA\\mihomo-cli\\transactions" /deny "$USERNAME:(OI)(CI)(R)"
-
-              set +e
-              OUT=$($CLI override import "$FIXTURE" 2>&1)
-              CODE=$?
-              set -e
+              cat > "$PUB_TMP/unpriv.cmd" <<EOF
+              @echo off
+              "$CLI_WIN" override import "$FIX_WIN" > "$OUT_WIN" 2>&1
+              exit /b %ERRORLEVEL%
+          EOF
+              TR_WIN="$(cygpath -w "$PUB_TMP/unpriv.cmd")"
+              echo "--- batch logon right for testuser ---"
+              powershell.exe -NoProfile -Command "whoami /priv | Select-String -Pattern 'SeBatchLogonRight'" 2>&1 | sed 's/\r$//' || true
+              echo "--- creating scheduled task ---"
+              if ! MSYS_NO_PATHCONV=1 schtasks.exe /create /tn mihomo-unpriv /tr "$TR_WIN" /sc once /st 00:00 /ru testuser /rp "$PW" /f; then
+                echo "ERROR: schtasks create failed (rc=$?)"
+                exit 1
+              fi
+              SYS_BEFORE=$(find "$TX_DIR_U" -type f -print0 2>/dev/null | xargs -0 -r sha256sum 2>/dev/null | sort || true)
+              MSYS_NO_PATHCONV=1 schtasks.exe /run /tn mihomo-unpriv >/dev/null || true
+              for _ in $(seq 1 40); do
+                sleep 1
+                st=$(MSYS_NO_PATHCONV=1 schtasks.exe /query /tn mihomo-unpriv /fo LIST /v 2>/dev/null | tr -d '\r' | awk -F: '/^Status/{gsub(/^ +/,"",$2); print $2; exit}' || true)
+                case "$st" in
+                  *Running*) continue ;;
+                  *) break ;;
+                esac
+              done
+              CODE=$(MSYS_NO_PATHCONV=1 schtasks.exe /query /tn mihomo-unpriv /fo LIST /v 2>/dev/null | tr -d '\r' | awk -F: '/Last Result/{gsub(/ /,"",$2); print $2; exit}' || true)
+              SYS_AFTER=$(find "$TX_DIR_U" -type f -print0 2>/dev/null | xargs -0 -r sha256sum 2>/dev/null | sort || true)
+              OUT=$(cat "$PUB_TMP/mihomo-unpriv.out" 2>/dev/null || true)
+              echo "--- CLI output (as standard user testuser) ---"
               echo "$OUT"
+              echo "--- exit code: ${CODE:-unknown} ---"
+              MSYS_NO_PATHCONV=1 schtasks.exe /delete /tn mihomo-unpriv /f >/dev/null 2>&1 || true
+              powershell.exe -NoProfile -Command "Remove-LocalUser -Name testuser -ErrorAction SilentlyContinue" >/dev/null 2>&1 || true
 
-              # Restore ACL permissions
-              icacls.exe "$PROGRAMDATA\\mihomo-cli\\transactions" /remove:d "$USERNAME" || true
-
-              if [ $CODE -eq 0 ]; then
-                echo "ERROR: restricted override import on Windows should fail"
+              # 契约：非 owner 的标准用户不得影响系统态。
+              # owner record 绑定安装者账号，标准用户解析为 user 模式（只写自己的配置），
+              # 因此允许 exit 0，但必须证明系统态零写入、且不出现 Linux 专属提示。
+              if printf '%s' "$OUT" | grep -qF "system configuration promoted"; then
+                echo "ERROR: non-owner standard user must not promote system configuration"
                 exit 1
               fi
-              if ! echo "$OUT" | grep -E "%ProgramData%|DACL|icacls"; then
-                echo "ERROR: Windows output should contain ProgramData/DACL/icacls hint"
+              if [ "$SYS_BEFORE" != "$SYS_AFTER" ]; then
+                echo "ERROR: system state directory changed by non-owner user"
+                echo "before: $SYS_BEFORE"
+                echo "after:  $SYS_AFTER"
                 exit 1
               fi
-              echo "$OUT" | grep -F "Your configuration was NOT modified" || { echo "ERROR: missing zero-write confirmation"; exit 1; }
-              if echo "$OUT" | grep -F "0770 root:mihomo"; then
+              if printf '%s' "$OUT" | grep -F "0770 root:mihomo"; then
                 echo "ERROR: Windows output must not contain Linux group hint"
                 exit 1
               fi
-              if echo "$OUT" | grep -F "Fix: mihomo-cli status"; then
+              if printf '%s' "$OUT" | grep -F "usermod"; then
+                echo "ERROR: Windows output must not contain usermod hint"
+                exit 1
+              fi
+              if printf '%s' "$OUT" | grep -F "Fix: mihomo-cli status"; then
                 echo "ERROR: Windows output must not suggest 'Fix: mihomo-cli status'"
                 exit 1
               fi
